@@ -3528,24 +3528,24 @@ class BlendLiveStatusTests(unittest.TestCase):
             inputs,
         )
 
-    def test_cluster_live_audit_worker_revision_mismatch_is_not_asset_retry(
+    def test_cluster_live_audit_worker_revision_mismatch_is_nonblocking_warning(
         self,
     ):
         gui = load_gui_module()
         app = self.make_app(gui)
         app.log = mock.Mock()
-        app.cfg = {"cluster_receipt_refresh_timeout": 321}
-        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
-            gui,
-            "LOG_DIR",
-            Path(temporary) / "logs",
-        ):
-            owner = Path(temporary) / "Tree_elm"
-            cluster = owner / "Cluster"
-            cluster.mkdir(parents=True)
-            spm = owner / "SK_Tree_elm_01.spm"
-            spm.write_bytes(b"tree")
-
+        app.progress_var = mock.Mock()
+        app._present_code_revision_restart_required = (
+            gui.App._present_code_revision_restart_required.__get__(
+                app, gui.App
+            )
+        )
+        app._require_child_production_source_manifest = (
+            gui.App._require_child_production_source_manifest.__get__(
+                app, gui.App
+            )
+        )
+        with tempfile.TemporaryDirectory() as temporary:
             expected_root = Path(temporary) / "expected_code"
             actual_root = Path(temporary) / "actual_code"
             expected_root.mkdir()
@@ -3560,96 +3560,33 @@ class BlendLiveStatusTests(unittest.TestCase):
             )
             expected = gui.production_source_manifest(expected_root)
             actual = gui.production_source_manifest(actual_root)
-            app._active_production_source_manifest = expected
-            app._assert_active_production_source_manifest = (
-                gui.App._assert_active_production_source_manifest.__get__(
-                    app,
-                    gui.App,
-                )
-            )
-            app._require_child_production_source_manifest = (
-                gui.App._require_child_production_source_manifest
-            )
-
-            def run_audit(command, *_args, **_kwargs):
-                self.assertEqual(
-                    command[
-                        command.index(
-                            "--expected-production-source-revision"
-                        ) + 1
-                    ],
-                    expected.content_hash,
-                )
-                report = Path(command[command.index("--json") + 1])
-                report.parent.mkdir(parents=True, exist_ok=True)
-                report.write_text(
-                    json.dumps({
-                        "status": "failed",
-                        "stage": "production_source_revision",
-                        "production_source_revision": {
-                            "manifest_schema_version": expected.schema_version,
-                            "expected_content_hash": expected.content_hash,
-                            "started": actual.as_dict(),
-                            "finished": actual.as_dict(),
-                            "matches_expected": False,
-                            "stable": True,
-                        },
-                        "items": [],
-                    }),
-                    encoding="utf-8",
-                )
-                return 2, Path(temporary) / "revision_mismatch.log"
-
-            app._run_limited = mock.Mock(side_effect=run_audit)
-            with mock.patch.object(
-                gui,
-                "production_source_manifest",
-                return_value=expected,
-            ), mock.patch.object(
-                gui,
-                "cluster_assembly_receipt_resolution",
-                return_value={
-                    "selected_receipt": str(
-                        Path(temporary) / "receipt.json"
-                    )
+            payload = {
+                "status": "ok",
+                "production_source_revision": {
+                    "manifest_schema_version": expected.schema_version,
+                    "expected_content_hash": expected.content_hash,
+                    "started": actual.as_dict(),
+                    "finished": actual.as_dict(),
+                    "matches_expected": False,
+                    "stable": True,
                 },
-            ), self.assertRaises(
-                gui.CodeRevisionRestartRequired
-            ) as raised:
-                app._refresh_stale_cluster_receipt(
-                    spm,
-                    "20260730_120000",
-                )
+                "items": [{"name": "Tree_elm", "status": "ready"}],
+            }
 
-        self.assertEqual(
-            raised.exception.details["route"],
-            "code_revision_restart_required",
+            result = app._require_child_production_source_manifest(
+                payload,
+                expected,
+                report_file=Path(temporary) / "audit.json",
+                log_file=Path(temporary) / "audit.log",
+            )
+
+        self.assertFalse(result["matches_expected"])
+        warning_text = "\n".join(
+            str(call.args[0]) for call in app.log.call_args_list
         )
-        self.assertEqual(
-            raised.exception.details["expected_revision"],
-            expected.content_hash,
-        )
-        self.assertEqual(
-            raised.exception.details["actual_revision"],
-            actual.content_hash,
-        )
-        self.assertEqual(
-            [
-                row["path"]
-                for row in raised.exception.details["changed_paths"]
-            ],
-            ["worker.py"],
-        )
-        self.assertIn(
-            "revision mismatch",
-            str(raised.exception).casefold(),
-        )
-        self.assertEqual(app._run_limited.call_count, 1)
-        self.assertFalse(app._cluster_receipt_refresh_memo)
-        self.assertFalse(any(
-            "retrying once" in call.args[0]
-            for call in app.log.call_args_list
-        ))
+        self.assertIn("code_revision_warning", warning_text)
+        self.assertIn("worker.py", warning_text)
+        self.assertFalse(hasattr(app, "_code_revision_restart_required"))
 
     def test_cluster_live_audit_asset_failure_requests_exact_atlas_repair(self):
         gui = load_gui_module()
@@ -4833,7 +4770,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                                 "dependencies": [{"role": "branch"}],
                                 "handoff": {
                                     "errors": [{
-                                        "code": "CLUSTER_TGA_BASENAME_INVALID",
+                                        "code": "CLUSTER_TEXTURE_REFERENCE_MISSING",
                                         "role": "branch",
                                         "details": {
                                             "status": "missing",
@@ -4861,7 +4798,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 )
 
             self.assertEqual(raised.exception.kind, "data_error")
-            self.assertIn("Cluster가 참조하는 TGA 파일이 없습니다", str(raised.exception))
+            self.assertIn("Cluster가 참조하는 이미지 파일이 없습니다", str(raised.exception))
             self.assertIn("missing.tga", str(raised.exception))
 
     def _run_producer_normalization_stage(
@@ -4978,7 +4915,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 gui,
                 exit_code=0,
                 extra_issues=[{
-                    "code": "CLUSTER_TGA_BASENAME_INVALID",
+                    "code": "CLUSTER_TEXTURE_REFERENCE_MISSING",
                     "role": "branch",
                     "details": {
                         "status": "missing",
@@ -4988,7 +4925,10 @@ class BlendLiveStatusTests(unittest.TestCase):
             )
 
         self.assertEqual(raised.exception.kind, "data_error")
-        self.assertIn("Cluster가 참조하는 TGA 파일이 없습니다", str(raised.exception))
+        self.assertIn(
+            "Cluster가 참조하는 이미지 파일이 없습니다",
+            str(raised.exception),
+        )
         self.assertIn("missing.tga", str(raised.exception))
 
     def test_normalization_stage_rejects_issue_outside_contract(self):

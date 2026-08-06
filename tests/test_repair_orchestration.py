@@ -311,10 +311,10 @@ class RepairOrchestrationTests(unittest.TestCase):
                     [str(self.target)],
                 )
 
-    def test_missing_cluster_tga_is_exact_korean_final_block(self):
+    def test_missing_cluster_texture_is_exact_korean_final_block(self):
         evidence = {
             "issues": [{
-                "code": "CLUSTER_TGA_BASENAME_INVALID",
+                "code": "CLUSTER_TEXTURE_REFERENCE_MISSING",
                 "details": {
                     "status": "missing",
                     "missing": ["missing.tga"],
@@ -326,7 +326,7 @@ class RepairOrchestrationTests(unittest.TestCase):
         plan = self.plan(evidence)
 
         self.assertEqual(decision["status"], REPAIR_UI_BLOCKED)
-        self.assertIn("TGA 파일이 없습니다", decision["reason"])
+        self.assertIn("이미지 파일이 없습니다", decision["reason"])
         self.assertIn("missing.tga", decision["reason"])
         self.assertFalse(plan.supported)
         self.assertEqual(plan.friendly_reason, decision["reason"])

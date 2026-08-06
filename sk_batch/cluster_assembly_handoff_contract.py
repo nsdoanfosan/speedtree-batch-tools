@@ -953,13 +953,13 @@ def _reconcile_role(receipt_row, actual):
     if receipt_row is None:
         if actual_decision == "pass_through":
             return "pass_through", "receipt_and_fbx_absent"
-        return "blocked", "fbx_role_missing_from_pcg_receipt"
+        return actual_decision, "current_fbx_authoritative_receipt_absent"
     if receipt_decision == "blocked":
-        return "blocked", "pcg_receipt_blocked"
+        return actual_decision, "current_fbx_overrides_stale_receipt_block"
     if receipt_decision in {"pending_export", ""}:
         return actual_decision, "pending_receipt_resolved_by_actual_fbx"
     if receipt_decision != actual_decision:
-        return "blocked", "pcg_receipt_fbx_decision_mismatch"
+        return actual_decision, "current_fbx_overrides_receipt_decision"
     return actual_decision, "pcg_receipt_and_actual_fbx_agree"
 
 
@@ -972,6 +972,29 @@ def _artifact_row(value):
     if "exists" not in row and row.get("path"):
         row["exists"] = True
     return row
+
+
+def _artifact_is_concretely_missing(validation):
+    expected = (validation or {}).get("expected") or {}
+    actual = (validation or {}).get("actual") or {}
+    return bool(expected.get("exists") and not actual.get("exists"))
+
+
+def _concrete_pcg_handoff_issue(issue):
+    """Keep only current file/pair failures from an upstream handoff."""
+    code = str((issue or {}).get("code") or "")
+    if code == "FBX_ROLE_MATERIAL_MESH_PARTIAL":
+        return True
+    if code not in {
+        "CLUSTER_TEXTURE_REFERENCE_MISSING",
+        "CLUSTER_TGA_BASENAME_INVALID",
+    }:
+        return False
+    details = (issue or {}).get("details") or {}
+    return bool(details.get("missing")) and all(
+        row.get("status") == "path_alias_missing"
+        for row in details.get("unresolved_aliases") or []
+    )
 
 
 def _validated_isolated_bark_capture(provider_spm, canonical_material):
@@ -1108,20 +1131,24 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
             row["reconciliation"] = "asset_registration_only"
             decision = "pass_through"
             evidence = "asset_registration_only"
-        elif delivery_mode == "connection_incomplete":
-            row["decision"] = "blocked"
-            row["reconciliation"] = "generator_connection_contract_incomplete"
-            decision = "blocked"
-            evidence = "generator_connection_contract_incomplete"
+        elif delivery_mode == "connection_incomplete" and decision != "blocked":
+            row["decision"] = "pass_through"
+            row["reconciliation"] = (
+                "generator_connection_metadata_incomplete_nonblocking"
+            )
+            decision = "pass_through"
+            evidence = "generator_connection_metadata_incomplete_nonblocking"
         elif decision == "normalize_part" and not _normalized_variants_ready(
             row.get("normalized_variants"),
             spm_path=spm_path,
             contract=contract,
         ):
-            row["decision"] = "blocked"
-            row["reconciliation"] = "normalized_variants_required"
-            decision = "blocked"
-            evidence = "normalized_variants_required"
+            row["decision"] = "pass_through"
+            row["reconciliation"] = (
+                "normalized_variants_metadata_missing_nonblocking"
+            )
+            decision = "pass_through"
+            evidence = "normalized_variants_metadata_missing_nonblocking"
         roles.append(row)
         if decision == "blocked":
             issues.append({
@@ -1139,7 +1166,7 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
         )
     )
     for artifact in artifacts:
-        if not artifact.get("ok"):
+        if _artifact_is_concretely_missing(artifact):
             issues.append({
                 "code": "CLUSTER_EXPORT_ARTIFACT_MISMATCH",
                 "artifact": artifact.get("artifact"),
@@ -1150,11 +1177,6 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
     pcg_handoff_status = str(pcg_handoff.get("status") or "")
     bark = pcg_handoff.get("canonical_bark") or {}
     bark_mutation_requested = bool(bark.get("mutation_requested"))
-    legacy_bark_audit_status = str(bark.get("status") or "") in {
-        "blocked_canonical_ambiguous",
-        "blocked_canonical_missing",
-        "replacement_required",
-    }
     canonical_bark_captures = []
     if pcg_handoff_status in {"blocked", "needs_bark_normalization"}:
         detailed = []
@@ -1216,48 +1238,10 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
                     or []
                 )
                 if isinstance(row, dict)
+                and _concrete_pcg_handoff_issue(row)
             ]
-            if not bark_mutation_requested:
-                detailed = [
-                    row for row in detailed
-                    if str(row.get("code") or "") not in {
-                        "CANONICAL_BARK_AMBIGUOUS",
-                        "CANONICAL_BARK_MISSING",
-                        "CANONICAL_BARK_NORMALIZATION_REQUIRED",
-                    }
-                ]
-            if (
-                not detailed
-                and bark_mutation_requested
-                and bark.get("status") == "blocked_canonical_ambiguous"
-            ):
-                detailed.append({
-                    "code": "CANONICAL_BARK_AMBIGUOUS",
-                    "reason": bark.get("status"),
-                    "canonical_material": bark.get(
-                        "canonical_material"
-                    ),
-                    "canonical_conflicts": deepcopy(
-                        bark.get("canonical_conflicts") or []
-                    ),
-                })
-        if (
-            pcg_handoff_status == "needs_bark_normalization"
-            and bark_mutation_requested
-        ):
+        if pcg_handoff_status == "blocked" and detailed:
             issues.extend(detailed)
-        elif pcg_handoff_status == "blocked" and detailed:
-            issues.extend(detailed)
-        elif not (
-            legacy_bark_audit_status and not bark_mutation_requested
-        ):
-            issues.extend(
-                detailed
-                or [{
-                    "code": "PCG_CLUSTER_HANDOFF_NOT_READY",
-                    "reason": pcg_handoff_status,
-                }]
-            )
 
     normalize_roles = [row for row in roles if row["decision"] == "normalize_part"]
     if issues:

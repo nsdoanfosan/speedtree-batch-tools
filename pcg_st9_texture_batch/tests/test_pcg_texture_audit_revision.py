@@ -25,31 +25,44 @@ class PCGTextureAuditProductionRevisionTests(unittest.TestCase):
         ):
             return audit.main()
 
-    def test_mismatched_batch_revision_fails_before_asset_audit(self):
+    def test_mismatched_batch_revision_warns_and_runs_asset_audit(self):
         with tempfile.TemporaryDirectory() as temporary:
             report_path = Path(temporary) / "audit.json"
+            report = {
+                "generated_at": "test",
+                "status": "ok",
+                "summary": {"total": 1, "by_status": {"ready": 1}},
+                "items": [{"name": "tree", "status": "ready"}],
+            }
             with mock.patch.object(
                 audit,
                 "load_config",
+                return_value={},
             ) as load_config, mock.patch.object(
                 audit,
                 "make_report",
-            ) as make_report:
-                with self.assertRaises(SystemExit) as raised:
-                    self._run_main(
-                        "--expected-production-source-revision",
-                        "0" * 64,
-                        "--json",
-                        str(report_path),
-                    )
-            self.assertEqual(raised.exception.code, 2)
-            load_config.assert_not_called()
-            make_report.assert_not_called()
+                return_value=report,
+            ) as make_report, mock.patch.object(
+                audit,
+                "save_spm_analysis_cache",
+            ):
+                self._run_main(
+                    "--expected-production-source-revision",
+                    "0" * 64,
+                    "--no-receipt",
+                    "--json",
+                    str(report_path),
+                )
+            load_config.assert_called_once()
+            make_report.assert_called_once()
             payload = json.loads(report_path.read_text(encoding="utf-8"))
-            self.assertEqual(payload["stage"], "production_source_revision")
+            self.assertEqual(payload["status"], "ok")
             self.assertFalse(
                 payload["production_source_revision"]["matches_expected"]
             )
+            warning = payload["production_source_revision_warning"]
+            self.assertEqual(warning["severity"], "warning")
+            self.assertFalse(warning["asset_failure"])
 
     def test_matching_batch_revision_is_written_to_child_report(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -99,7 +112,7 @@ class PCGTextureAuditProductionRevisionTests(unittest.TestCase):
             self.assertTrue(revision["matches_expected"])
             self.assertTrue(revision["stable"])
 
-    def test_source_change_during_audit_fails_before_receipt_persistence(self):
+    def test_source_change_during_audit_warns_and_keeps_results(self):
         with tempfile.TemporaryDirectory() as temporary:
             report_path = Path(temporary) / "audit.json"
             started = audit._PROCESS_PRODUCTION_SOURCE_MANIFEST
@@ -135,16 +148,14 @@ class PCGTextureAuditProductionRevisionTests(unittest.TestCase):
                 audit,
                 "save_spm_analysis_cache",
             ) as save_cache:
-                with self.assertRaises(SystemExit) as raised:
-                    self._run_main(
-                        "--expected-production-source-revision",
-                        started.content_hash,
-                        "--json",
-                        str(report_path),
-                    )
-            self.assertEqual(raised.exception.code, 2)
-            persist.assert_not_called()
-            save_cache.assert_not_called()
+                self._run_main(
+                    "--expected-production-source-revision",
+                    started.content_hash,
+                    "--json",
+                    str(report_path),
+                )
+            persist.assert_called_once()
+            save_cache.assert_called_once()
             payload = json.loads(report_path.read_text(encoding="utf-8"))
             revision = payload["production_source_revision"]
             self.assertEqual(
@@ -156,6 +167,9 @@ class PCGTextureAuditProductionRevisionTests(unittest.TestCase):
                 finished.content_hash,
             )
             self.assertFalse(revision["stable"])
+            warning = payload["production_source_revision_warning"]
+            self.assertEqual(warning["severity"], "warning")
+            self.assertFalse(warning["asset_failure"])
 
     def test_asset_audit_failure_keeps_revision_and_exact_repair_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:

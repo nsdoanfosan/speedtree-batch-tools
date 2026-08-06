@@ -777,9 +777,10 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 dependency["texture_dependencies"][0]["path"], expected
             )
             self.assertIn(
-                "CLUSTER_TGA_BASENAME_INVALID",
+                "CLUSTER_TEXTURE_REFERENCE_MISSING",
                 [row["code"] for row in contract["handoff"]["errors"]],
             )
+            self.assertEqual(contract["handoff"]["status"], "blocked")
 
             # Missing source data is a handoff error, not a reason for a newly
             # written snapshot receipt to invalidate itself.  Downstream reads
@@ -791,7 +792,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 receipt, requested_spm=target
             )
             self.assertIn(
-                "CLUSTER_TGA_BASENAME_INVALID",
+                "CLUSTER_TEXTURE_REFERENCE_MISSING",
                 [
                     row["code"]
                     for row in payload["cluster_assembly"]["handoff"]["errors"]
@@ -904,9 +905,16 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 validation = dependency["tga_basename_validation"]
                 self.assertEqual(validation["status"], "missing")
                 self.assertEqual(validation["reason"], "path_alias_missing")
-                self.assertIn(
+                self.assertNotIn(
+                    "CLUSTER_TGA_BASENAME_INVALID",
+                    [row["code"] for row in contract["handoff"]["issues"]],
+                )
+                self.assertNotIn(
                     "CLUSTER_TGA_BASENAME_INVALID",
                     [row["code"] for row in contract["handoff"]["errors"]],
+                )
+                self.assertNotEqual(
+                    contract["handoff"]["status"], "blocked"
                 )
                 expected_group_status = (
                     "path_alias_ambiguous"
@@ -919,46 +927,31 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 ))
                 self.assertEqual(case["consumer"].read_bytes(), before_consumer)
 
-    def test_issue_67_nothofagus_suffix_and_basename_mismatch_stay_blocked(self):
+    def test_issue_178_live_texture_extensions_are_not_an_export_gate(self):
         with tempfile.TemporaryDirectory() as temp:
             cluster = Path(temp) / "Tree_nothofagus" / "Cluster"
             cluster.mkdir(parents=True)
             output_spm = cluster / "SK_branch_nothofagus_01.spm"
             legacy_output_spm = cluster / "branch_nothofagus_01.spm"
-            (cluster / "branch_nothofagus_01.tga").write_bytes(b"current")
-            old_root = Path(temp) / "sanitized_retired_sync" / "Cluster"
+            refs = [
+                cluster / "branch_nothofagus_01.png",
+                cluster / "branch_nothofagus_01_Opacity.jpg",
+                cluster / "branch_nothofagus_01_Normal.custom_image",
+            ]
+            for ref in refs:
+                ref.write_bytes(b"current")
 
-            for values in (
-                [
-                    old_root / "branch_nothofagus_01.tif",
-                    old_root / "branch_nothofagus_01_Opacity.png",
-                ],
-                [old_root / "branch_nothofagus_02.tga"],
-            ):
-                resolution = {}
-                refs, ignored = _canonical_cluster_texture_refs(
-                    values,
-                    cluster,
-                    resolution_out=resolution,
-                )
-                validation = _tga_basename_validation(
-                    output_spm,
-                    {},
-                    legacy_output_spm=legacy_output_spm,
-                    resolved_refs=refs,
-                    ignored_aliases=ignored,
-                    alias_resolution=resolution,
-                )
-                self.assertEqual(validation["status"], "basename_mismatch")
-                self.assertEqual(
-                    validation["reason"],
-                    "basename_or_suffix_mismatch",
-                )
-                self.assertTrue(validation["invalid"])
-                self.assertNotIn(
-                    str(cluster / "branch_nothofagus_01.tga"),
-                    validation["refs"],
-                )
+            validation = _tga_basename_validation(
+                output_spm,
+                {},
+                legacy_output_spm=legacy_output_spm,
+                resolved_refs=refs,
+            )
+
+            self.assertEqual(validation["status"], "ok")
+            self.assertIsNone(validation["reason"])
+            self.assertEqual(validation["missing"], [])
+            self.assertEqual(validation["invalid"], [])
 
     def test_legacy_texture_path_alias_does_not_stale_canonical_receipt(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1200,8 +1193,8 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             self.assertEqual(
                 len(contract["handoff"]["cluster_dependencies"]), 3)
             self.assertEqual(
-                contract["handoff"]["errors"],
-                contract["handoff"]["issues"],
+                [row["code"] for row in contract["handoff"]["errors"]],
+                ["FBX_ROLE_MATERIAL_MESH_PARTIAL"],
             )
             self.assertTrue(
                 contract["tree_source_identities"][0]["target_spm"]["sha256"])
@@ -3632,12 +3625,16 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 stale_primary["normalized_variants_stale"]["status"],
                 "needs_regeneration",
             )
-            self.assertIn(
+            self.assertNotIn(
                 "NORMALIZED_VARIANTS_STALE",
                 [
                     row["code"]
                     for row in stale_contract["handoff"]["issues"]
                 ],
+            )
+            self.assertEqual(
+                stale_contract["handoff"]["status"],
+                "pass_through",
             )
             self.assertEqual(
                 dependencies["SK_branch_elm_01"]["texture_contract_source"],

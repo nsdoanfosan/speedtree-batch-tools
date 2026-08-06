@@ -92,6 +92,70 @@ def write_physical_capture_manifest(manifest, role_paths):
 
 
 class TargetCollectionTests(unittest.TestCase):
+    def test_generic_cluster_folder_does_not_claim_other_species_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            birch = root / "tree_birch_paper" / "cluster"
+            locast = root / "weed_black_locast" / "cluster"
+            birch.mkdir(parents=True)
+            locast.mkdir(parents=True)
+            (birch / "SK_branch_birch_paper_01.spm").write_bytes(b"spm")
+            (locast / "SK_cluster_black_locast_side_01.spm").write_bytes(
+                b"spm"
+            )
+            targets = [
+                "branch_birch_paper_01",
+                "cluster_black_locast_side_01",
+            ]
+
+            self.assertEqual(
+                pcg_texture_audit.folder_target_mesh_names(birch, targets),
+                ["branch_birch_paper_01"],
+            )
+            self.assertEqual(
+                pcg_texture_audit.folder_target_mesh_names(locast, targets),
+                ["cluster_black_locast_side_01"],
+            )
+
+    def test_asset_token_does_not_prefix_match_unrelated_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "tree_elm"
+            folder.mkdir()
+
+            self.assertEqual(
+                pcg_texture_audit.folder_target_mesh_names(
+                    folder,
+                    ["tree_elm_01", "tree_elmtree_01"],
+                ),
+                ["tree_elm_01"],
+            )
+
+    def test_complete_live_handoff_suppresses_maintenance_actions(self):
+        item = {
+            "sk_spms": ["SK_tree_elm_01.spm"],
+            "material_renames_needed": [],
+            "materials_missing_m_prefix": [],
+            "cluster_items": [{
+                "shared_from": None,
+                "missing_export_maps": ["color"],
+                "connection_update_needed": True,
+            }],
+            "leaf_mesh_sources": [{
+                "atlas_blends": [],
+                "generator_connection_update_needed": True,
+            }],
+            "sbs_files": [],
+            "cluster_assembly": {
+                "canonical_bark": {"status": "replacement_required"},
+                "handoff": {"status": "pass_through"},
+            },
+        }
+
+        pcg_texture_audit.derive_status_actions(item)
+
+        self.assertEqual(item["status"], "ready")
+        self.assertEqual(item["actions"], [])
+
     def test_empty_leaf_inventory_skips_atlas_registry_scan(self):
         spm = Path("manifest-free-tree") / "SK_tree_test.spm"
         with mock.patch.object(
@@ -614,6 +678,42 @@ class SourceSelectionTests(unittest.TestCase):
 
         self.assertEqual(item["status"], "ready")
         self.assertEqual(item["actions"], [])
+
+    def test_issue_178_live_delivery_suppresses_advisory_texture_actions(self):
+        item = {
+            "sk_spms": [r"D:\Trees\nothofagus\SK_tree_01.spm"],
+            "chosen_spm": r"D:\Trees\nothofagus\SK_tree_01.spm",
+            "materials_missing_m_prefix": [],
+            "material_renames_needed": [],
+            "cluster_items": [{
+                "connection_update_needed": False,
+                "missing_export_maps": ["BaseColor"],
+            }],
+            "cluster_assembly": {"handoff": {"status": "pass_through"}},
+            "leaf_mesh_sources": [],
+            "sbs_files": [],
+        }
+
+        pcg_texture_audit.derive_status_actions(item)
+
+        self.assertEqual(item["status"], "ready")
+        self.assertEqual(item["actions"], [])
+
+    def test_issue_178_concrete_fbx_partial_remains_blocking(self):
+        item = {
+            "sk_spms": [r"D:\Trees\birch\SK_tree_01.spm"],
+            "chosen_spm": r"D:\Trees\birch\SK_tree_01.spm",
+            "materials_missing_m_prefix": [],
+            "material_renames_needed": [],
+            "cluster_items": [],
+            "cluster_assembly": {"handoff": {"status": "blocked"}},
+            "leaf_mesh_sources": [],
+            "sbs_files": [],
+        }
+
+        pcg_texture_audit.derive_status_actions(item)
+
+        self.assertEqual(item["status"], "needs_texture_work")
 
     def test_relative_image_resolve_cache_is_shared_by_spms_in_one_folder(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -248,8 +248,8 @@ POLICY_CONTRACTS = {
         "해당 exact SPM의 재질과 Generator 상태를 Modeler에서 확인한 뒤 수동 export를 시험하세요.",
     ),
     "cluster_data": _terminal(
-        "Cluster TGA 참조가 canonical SPM 파일 규칙과 다릅니다.",
-        "표시된 TGA를 복원하거나 canonical basename으로 다시 생성한 뒤 live audit을 재실행하세요.",
+        "Cluster가 현재 참조하는 이미지 파일이 실제로 없습니다.",
+        "표시된 참조 이미지 파일을 복원한 뒤 live audit을 다시 실행하세요.",
     ),
     "cluster_handoff": _terminal(
         "PCG Cluster handoff가 현재 실행 가능한 상태가 아닙니다.",
@@ -584,8 +584,14 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         UNCLASSIFIED, "sk_batch/sk_batch_gui.pyw", "",
     ),
     "basename_or_suffix_mismatch": ReasonRow(
-        UNSUPPORTED, "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
-        "cluster_data",
+        INFORMATIONAL,
+        "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
+        "cluster_handoff_diagnostic",
+    ),
+    "basename_mismatch": ReasonRow(
+        INFORMATIONAL,
+        "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
+        "cluster_handoff_diagnostic",
     ),
     "before_marker_restore": ReasonRow(
         UNCLASSIFIED, "sk_batch/spm_problem_node_marker.py", "",
@@ -607,6 +613,11 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     ),
     "blend_source_index_timeout": ReasonRow(
         UNCLASSIFIED, "pcg_st9_texture_batch/pcg_texture_audit.py", "",
+    ),
+    "production_source_revision_mismatch": ReasonRow(
+        INFORMATIONAL,
+        "pcg_st9_texture_batch/pcg_texture_audit.py",
+        "lifecycle_event",
     ),
     "blender_cluster_bake_origin_invalid": ReasonRow(
         UNCLASSIFIED, "sk_batch/jobs/speedtree_material_preflight.py", "",
@@ -771,6 +782,11 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         "cluster_source_integrity",
     ),
     "cluster_tga_basename_invalid": ReasonRow(
+        INFORMATIONAL,
+        "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
+        "cluster_handoff_diagnostic",
+    ),
+    "cluster_texture_reference_missing": ReasonRow(
         UNSUPPORTED,
         "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
         "cluster_data",
@@ -878,6 +894,11 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     ),
     "generator_connection_contract_incomplete": ReasonRow(
         REPAIRABLE, "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py", "generator_cluster",
+    ),
+    "generator_connection_metadata_incomplete_nonblocking": ReasonRow(
+        INFORMATIONAL,
+        "sk_batch/cluster_assembly_handoff_contract.py",
+        "cluster_handoff_diagnostic",
     ),
     "generator_connection_incomplete": ReasonRow(
         UNCLASSIFIED, "atlas_manifest_resolver.py", "",
@@ -1090,6 +1111,11 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         REPAIRABLE,
         "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
         "cluster_refresh",
+    ),
+    "normalized_variants_metadata_missing_nonblocking": ReasonRow(
+        INFORMATIONAL,
+        "sk_batch/cluster_assembly_handoff_contract.py",
+        "cluster_handoff_diagnostic",
     ),
     "normal_exit": ReasonRow(
         INFORMATIONAL, "process_lifecycle.py", "lifecycle_event",
@@ -2142,8 +2168,6 @@ _classify(
     REPAIRABLE, "cluster_refresh_variants_required",
     "normalized_variants_required",
 )
-
-
 _seeded_unclassified = {
     code for code, row in _REASON_SEEDS.items()
     if row.disposition == UNCLASSIFIED
@@ -2285,18 +2309,10 @@ def present_reason(
             cause = cause.rstrip(".") + f" ({attempts[0]}회)."
     elif row.policy == "cluster_data":
         missing = _detail_values(evidence, {"missing"})
-        invalid = _detail_values(evidence, {"invalid"})
-        expected = _detail_values(evidence, {"expected_base"})
         if missing:
-            cause = "Cluster가 참조하는 TGA 파일이 없습니다: " + ", ".join(
+            cause = "Cluster가 참조하는 이미지 파일이 없습니다: " + ", ".join(
                 missing[:8]
             )
-        elif invalid:
-            cause = "Cluster TGA basename이 올바르지 않습니다: " + ", ".join(
-                invalid[:8]
-            )
-        if expected:
-            action += " 기준 basename: " + ", ".join(expected[:4])
     return str(cause), str(action)
 
 

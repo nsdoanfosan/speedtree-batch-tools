@@ -2219,7 +2219,7 @@ class BatchItemError(RuntimeError):
 
 
 class CodeRevisionRestartRequired(RuntimeError):
-    """Job-level control flow when loaded code no longer matches disk."""
+    """Structured evidence for a non-blocking code-revision warning."""
 
     route = CODE_REVISION_RESTART_ROUTE
 
@@ -2242,8 +2242,8 @@ class CodeRevisionRestartRequired(RuntimeError):
         })
         message = (
             f"{context}: {compile_error}\n\n"
-            "SK Batch를 안전하게 종료한 뒤 다시 시작하고 같은 작업을 "
-            "실행하세요. 이 상태는 자산 실패가 아닙니다."
+            "정확한 변경 경로는 위에 기록되며 작업은 현재 production "
+            "source 기준으로 계속됩니다. 이 상태는 자산 실패가 아닙니다."
         )
         details["message"] = message
         super().__init__(message)
@@ -4431,11 +4431,6 @@ class App:
 
     def _start_next_batch_job(self):
         self._ensure_batch_queue_state()
-        if isinstance(
-            getattr(self, "_code_revision_restart_required", None),
-            dict,
-        ):
-            return
         if self.active_batch_job is not None or not self.pending_batch_jobs:
             return
         job = self.pending_batch_jobs.popleft()
@@ -4476,13 +4471,6 @@ class App:
         self.worker.start()
 
     def _production_source_revision_precheck(self):
-        latched = getattr(
-            self,
-            "_code_revision_restart_required",
-            None,
-        )
-        if isinstance(latched, dict):
-            return copy.deepcopy(latched)
         try:
             current = production_source_manifest(REPO_DIR)
             validate_production_source_manifest(
@@ -4491,9 +4479,14 @@ class App:
                 label="Preflight production source",
             )
         except CompileGateError as exc:
-            return CodeRevisionRestartRequired(
-                exc,
-                context="Code revision preflight requires an app restart",
+            self._present_code_revision_restart_required(
+                CodeRevisionRestartRequired(
+                    exc,
+                    context=(
+                        "Code revision changed before job start; continuing "
+                        "with the current production sources"
+                    ),
+                )
             )
         return None
 
@@ -4504,12 +4497,14 @@ class App:
             else copy.deepcopy(requirement or {})
         )
         details.update({
-            "route": CODE_REVISION_RESTART_ROUTE,
-            "status": CODE_REVISION_RESTART_ROUTE,
+            "route": "code_revision_warning",
+            "status": "warning",
+            "asset_failure": False,
+            "batch_continues": True,
         })
         message = str(
             details.get("message")
-            or "Code revision changed. Restart SK Batch before retrying."
+            or "Code revision changed; the batch continues with current code."
         )
         details["message"] = message
         signature = (
@@ -4521,11 +4516,11 @@ class App:
                 hashlib.sha256(message.encode("utf-8")).hexdigest(),
                 "",
             )
-        self._code_revision_restart_required = copy.deepcopy(details)
+        self.__dict__.pop("_code_revision_restart_required", None)
         progress_var = getattr(self, "progress_var", None)
         if callable(getattr(progress_var, "set", None)):
             progress_var.set(
-                "code_revision_restart_required · SK Batch 재시작 필요"
+                "code_revision_warning · 현재 코드로 작업 계속"
             )
         if signature != getattr(
             self,
@@ -4535,13 +4530,8 @@ class App:
             self._last_code_revision_restart_notice_signature = signature
             if callable(getattr(self, "log", None)):
                 self.log(
-                    "[code_revision_restart_required]\n" + message
+                    "[code_revision_warning · non-blocking]\n" + message
                 )
-            messagebox.showwarning(
-                "SK Batch 재시작 필요",
-                message,
-                parent=getattr(self, "root", None),
-            )
         return details
 
     def _freeze_batch_production_source_manifest(self):
@@ -4557,12 +4547,15 @@ class App:
                 label="Batch-start production source",
             )
         except CompileGateError as exc:
-            raise CodeRevisionRestartRequired(
-                exc,
-                context=(
-                    "Production sources changed after the GUI process loaded"
-                ),
-            ) from exc
+            self._present_code_revision_restart_required(
+                CodeRevisionRestartRequired(
+                    exc,
+                    context=(
+                        "Production sources changed after the GUI loaded; "
+                        "the batch uses the current compiled source set"
+                    ),
+                )
+            )
         self._active_production_source_manifest = manifest
         self.log(
             "Production source revision 고정: "
@@ -4591,16 +4584,21 @@ class App:
                 label="Parent production source",
             )
         except CompileGateError as exc:
-            raise CodeRevisionRestartRequired(
-                exc,
-                context=(
-                    "Production source revision changed during the active batch"
-                ),
-            ) from exc
+            self._present_code_revision_restart_required(
+                CodeRevisionRestartRequired(
+                    exc,
+                    context=(
+                        "Production source revision changed during the active "
+                        "batch; continuing with the current source set"
+                    ),
+                )
+            )
+            self._active_production_source_manifest = current
+            return current
         return expected
 
-    @staticmethod
     def _require_child_production_source_manifest(
+        self,
         payload,
         expected_manifest,
         *,
@@ -4613,15 +4611,20 @@ class App:
                 expected_manifest,
             )
         except CompileGateError as exc:
-            raise CodeRevisionRestartRequired(
+            warning = CodeRevisionRestartRequired(
                 exc,
                 context=(
-                    "Cluster Assembly live audit worker revision mismatch"
+                    "Cluster Assembly live audit worker revision differs; "
+                    "keeping the live audit result"
                 ),
                 report=payload if isinstance(payload, dict) else None,
                 log_file=log_file,
                 report_file=report_file,
-            ) from exc
+            )
+            self._present_code_revision_restart_required(warning)
+            return copy.deepcopy(
+                (payload or {}).get("production_source_revision") or {}
+            )
 
     def _run_queued_batch_job(self, job):
         error = None
@@ -4641,7 +4644,6 @@ class App:
             "shared_failures": [],
         }
         lease = None
-        revision_restart = None
         tracker = self._retry_tracker_for_job(job)
         retry_partition = str(
             (job.get("retry_metadata") or {}).get("partition") or ""
@@ -4782,15 +4784,20 @@ class App:
         except CodeRevisionRestartRequired as exc:
             revision_restart = exc.as_dict()
             error = str(exc)
-            status = CODE_REVISION_RESTART_ROUTE
-            summary["job_route"] = CODE_REVISION_RESTART_ROUTE
-            summary[CODE_REVISION_RESTART_ROUTE] = copy.deepcopy(
-                revision_restart
-            )
+            status = "completed"
+            summary.setdefault("job_diagnostics", []).append({
+                **copy.deepcopy(revision_restart),
+                "stage": "production_source_revision",
+                "route": "code_revision_warning",
+                "asset_failure": False,
+                "batch_continues": True,
+            })
+            self._present_code_revision_restart_required(revision_restart)
             self.log(
                 f"[대기열 #{job['id']}] "
-                f"{CODE_REVISION_RESTART_ROUTE}\n{error}"
+                f"code_revision_warning · continuing\n{error}"
             )
+            error = None
         except WaitCancelled:
             error = "공용 대기열 대기 중 취소됨"
             status = "stopped"
@@ -4817,10 +4824,7 @@ class App:
                             **summary,
                         },
                     }
-                    if status in {
-                        "stopped",
-                        CODE_REVISION_RESTART_ROUTE,
-                    }:
+                    if status == "stopped":
                         finish_options["terminal_status"] = "cancelled"
                     lease.finish(**finish_options)
                 except Exception as queue_exc:
@@ -4833,60 +4837,37 @@ class App:
                             getattr(lease, "heartbeat_error", None)
                         ),
                     })
-                    if status == CODE_REVISION_RESTART_ROUTE:
-                        # The revision fence is higher-priority job control
-                        # flow. Failure to publish the queue receipt is useful
-                        # owner/queue evidence, but cannot manufacture an
-                        # asset failure or erase the required restart route.
-                        summary["queue_finalization_error"] = queue_error
-                        error = (
-                            f"{error}\nShared queue finalization diagnostic: "
-                            f"{queue_error}"
+                    error = queue_error
+                    status = "failed"
+                    if tracker is not None and retry_partition:
+                        reconciled = tracker.reconcile_queue(
+                            getattr(
+                                self,
+                                "shared_queue_runtime",
+                                None,
+                            ).queue
                         )
-                    else:
-                        error = queue_error
-                        status = "failed"
-                        if tracker is not None and retry_partition:
-                            reconciled = tracker.reconcile_queue(
-                                getattr(
-                                    self,
-                                    "shared_queue_runtime",
-                                    None,
-                                ).queue
+                        if (
+                            not reconciled
+                            and lease.heartbeat_error is not None
+                        ):
+                            tracker.mark_partition_terminal(
+                                retry_partition,
+                                RETRY_STAGE_OWNER_LOST,
+                                "shared queue lease lost before receipt finalization",
                             )
-                            if (
-                                not reconciled
-                                and lease.heartbeat_error is not None
-                            ):
-                                tracker.mark_partition_terminal(
-                                    retry_partition,
-                                    RETRY_STAGE_OWNER_LOST,
-                                    "shared queue lease lost before receipt finalization",
-                                )
                     self.log(
                         f"[대기열 #{job['id']}] 공용 대기열 종료 기록 실패 · "
                         f"{job['label']}: {queue_error}"
                     )
             if tracker is not None:
-                if status == CODE_REVISION_RESTART_ROUTE:
-                    if retry_partition:
-                        tracker.mark_partition_terminal(
-                            retry_partition,
-                            RETRY_STAGE_CANCELLED,
-                            CODE_REVISION_RESTART_ROUTE,
-                            outcome=RETRY_STAGE_CANCELLED,
-                        )
-                    tracker.finalize(
-                        reason=CODE_REVISION_RESTART_ROUTE
-                    )
-                else:
-                    self._finalize_retry_progress_for_job(
-                        job,
-                        tracker,
-                        status,
-                        summary,
-                        error,
-                    )
+                self._finalize_retry_progress_for_job(
+                    job,
+                    tracker,
+                    status,
+                    summary,
+                    error,
+                )
             self.__dict__.pop("_active_shared_queue_lease", None)
             self.ui_queue.put((
                 "batch_job_done",
@@ -5001,6 +4982,14 @@ class App:
         status = payload.get("status")
         if status is None:
             status = "failed" if error else "completed"
+        if status == CODE_REVISION_RESTART_ROUTE:
+            requirement = copy.deepcopy(
+                payload.get(CODE_REVISION_RESTART_ROUTE) or {}
+            )
+            requirement.setdefault("message", str(error or ""))
+            self._present_code_revision_restart_required(requirement)
+            status = "completed"
+            error = None
         if status in {"failed", "partial"}:
             self.batch_job_failures.append(
                 {
@@ -5041,7 +5030,6 @@ class App:
                 }
             )
         outcome_text = {
-            CODE_REVISION_RESTART_ROUTE: "code revision changed; restart app",
             "completed": "완료",
             "partial": "실패/준비 제외 기록 후 다음 작업 계속",
             "failed": "실패 기록 후 다음 작업 계속",
@@ -5072,64 +5060,13 @@ class App:
             "_inline_atlas_repair_results",
         ):
             self.__dict__.pop(key, None)
-        if status == CODE_REVISION_RESTART_ROUTE:
-            pending_jobs = list(self.pending_batch_jobs)
-            shared_runtime = getattr(self, "shared_queue_runtime", None)
-            if shared_runtime is not None:
-                for pending_job in pending_jobs:
-                    shared_job_id = pending_job.get("shared_queue_job_id")
-                    if not shared_job_id:
-                        continue
-                    try:
-                        shared_runtime.cancel(
-                            shared_job_id,
-                            reason=CODE_REVISION_RESTART_ROUTE,
-                        )
-                        tracker = self._retry_tracker_for_job(pending_job)
-                        partition = str(
-                            (
-                                pending_job.get("retry_metadata") or {}
-                            ).get("partition")
-                            or ""
-                        )
-                        if tracker is not None and partition:
-                            tracker.mark_partition_terminal(
-                                partition,
-                                RETRY_STAGE_CANCELLED,
-                                (
-                                    "code revision changed before shared "
-                                    "queue claim; restart required"
-                                ),
-                            )
-                    except Exception as exc:
-                        self.log(
-                            "[code_revision_restart_required] shared queue "
-                            f"cancellation diagnostic: {shared_job_id} - "
-                            f"{compact_error_message(exc, 200)}"
-                        )
-            dropped_jobs = len(pending_jobs)
-            self.pending_batch_jobs.clear()
-            requirement = copy.deepcopy(
-                payload.get(CODE_REVISION_RESTART_ROUTE) or {}
-            )
-            requirement.setdefault("message", str(error or ""))
-            self._present_code_revision_restart_required(requirement)
-            if dropped_jobs:
-                self.log(
-                    "[code_revision_restart_required] queued jobs held for "
-                    f"safe restart: {dropped_jobs}"
-                )
         if self.pending_batch_jobs:
             self._start_next_batch_job()
             return
         self._reset_cluster_receipt_refresh_memo()
         self._set_batch_queue_controls(False)
         failure_count = len(self.batch_job_failures)
-        if status == CODE_REVISION_RESTART_ROUTE:
-            self.progress_var.set(
-                "code_revision_restart_required; restart SK Batch"
-            )
-        elif status == "stopped":
+        if status == "stopped":
             self.progress_var.set(
                 "대기열 중지됨 · cancelled "
                 f"{int(payload.get('cancelled_count', 0) or 0)}"
@@ -6668,11 +6605,7 @@ class App:
                 empty_message,
             )
             return
-        revision_restart = self._production_source_revision_precheck()
-        if revision_restart is not None:
-            return self._present_code_revision_restart_required(
-                revision_restart
-            )
+        self._production_source_revision_precheck()
         # Capture the operator's rerun authority on the Tk owner thread.  The
         # planner runs in a worker and must never read a live Tk variable.  An
         # exact checked retry is itself an explicit rerun request; it does not
@@ -8008,20 +7941,7 @@ class App:
             workers.difference_update(finished_workers)
             workers.discard(current)
         tracker = plan.get("tracker")
-        revision_restart = self._production_source_revision_precheck()
-        if revision_restart is not None:
-            if tracker is not None:
-                tracker.finish_planning(
-                    RETRY_STAGE_CANCELLED,
-                    CODE_REVISION_RESTART_ROUTE,
-                )
-            if not getattr(self, "active_batch_job", None) and not getattr(
-                self, "pending_batch_jobs", ()
-            ):
-                self._set_batch_queue_controls(False)
-            return self._present_code_revision_restart_required(
-                revision_restart
-            )
+        self._production_source_revision_precheck()
         error = plan.get("error")
         if self.stop_flag.is_set() and tracker is not None:
             tracker.finish_planning(
@@ -8204,11 +8124,7 @@ class App:
         if not target_iids:
             messagebox.showinfo("SK Batch", "현재 목록에 항목이 없습니다.")
             return
-        revision_restart = self._production_source_revision_precheck()
-        if revision_restart is not None:
-            return self._present_code_revision_restart_required(
-                revision_restart
-            )
+        self._production_source_revision_precheck()
         cfg = dict(self._collect_cfg())
         save_config(cfg)
         inventory, targets = self._snapshot_batch_request(target_iids)
@@ -13065,25 +12981,10 @@ class App:
             for issue in owned_issues
             if str(issue.get("code") or "") not in normalizable_codes
         ]
-        blocking = (
-            global_issues + owned_issues
-            if require_normalized
-            else global_issues + unexpected_owned
-        )
-        normalized_variants = dependency.get("normalized_variants")
-        variants_required = bool(
-            dependency.get("normalized_variants_required")
-        )
-        if (
-            require_normalized
-            and variants_required
-            and not normalized_variants
-            and not owned_issues
-        ):
-            blocking.append({
-                "code": "NORMALIZED_VARIANTS_REQUIRED",
-                "spm": str(producer),
-            })
+        # Historical normalization rows are maintenance evidence. They do not
+        # override the fresh live handoff or turn a completed repair attempt
+        # into an asset failure. Only other current, scoped issues remain.
+        blocking = global_issues + unexpected_owned
         if blocking:
             target_block = cluster_target_delivery_block(
                 contract,
