@@ -1412,8 +1412,8 @@ def _move_asset_for_publish(journal, source_path, target_path, role):
     moved = False
     for attempt in range(2):
         renamed = bool(
-            unreal.EditorAssetLibrary.rename_asset(
-                source_path,
+            unreal.EditorAssetLibrary.rename_loaded_asset(
+                asset,
                 target_path,
             )
         )

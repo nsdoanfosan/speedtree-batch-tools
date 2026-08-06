@@ -1289,6 +1289,20 @@ class UnrealIngestSaveTests(unittest.TestCase):
                 return True
 
             @staticmethod
+            def rename_loaded_asset(source_asset, target):
+                source = next(
+                    (
+                        path
+                        for path, value in assets.items()
+                        if value is source_asset
+                    ),
+                    None,
+                )
+                if source is None:
+                    return False
+                return FakeEditorAssetLibrary.rename_asset(source, target)
+
+            @staticmethod
             def delete_asset(path):
                 return assets.pop(path, None) is not None
 
@@ -1648,6 +1662,20 @@ class UnrealIngestSaveTests(unittest.TestCase):
                 return True
 
             @staticmethod
+            def rename_loaded_asset(source_asset, target):
+                source = next(
+                    (
+                        path
+                        for path, value in assets.items()
+                        if value is source_asset
+                    ),
+                    None,
+                )
+                if source is None:
+                    return False
+                return FakeEditorAssetLibrary.rename_asset(source, target)
+
+            @staticmethod
             def does_directory_exist(path):
                 prefix = path.rstrip("/") + "/"
                 return any(key.startswith(prefix) for key in assets)
@@ -1734,7 +1762,13 @@ class UnrealIngestSaveTests(unittest.TestCase):
         final_mesh_path = "/Game/Meshes/Trees/SK_Test"
         final_skeleton_path = final_mesh_path + "_Skeleton"
         assets = {}
-        calls = {"renamed": [], "rename_attempts": [], "deleted": []}
+        calls = {
+            "renamed": [],
+            "rename_attempts": [],
+            "rename_loaded_attempts": [],
+            "path_rename_attempts": [],
+            "deleted": [],
+        }
 
         class FakeAsset:
             def __init__(self, path, referencers=None):
@@ -1815,7 +1849,7 @@ class UnrealIngestSaveTests(unittest.TestCase):
                 return sorted(set(referencers))
 
             @staticmethod
-            def rename_asset(source, target):
+            def _rename_asset(source, target):
                 calls["rename_attempts"].append((source, target))
                 if (
                     fail_first_previous_mesh_move
@@ -1867,6 +1901,34 @@ class UnrealIngestSaveTests(unittest.TestCase):
                 ):
                     return False
                 return True
+
+            @staticmethod
+            def rename_loaded_asset(source_asset, target):
+                calls["rename_loaded_attempts"].append(
+                    (source_asset, target)
+                )
+                source = next(
+                    (
+                        path
+                        for path, value in assets.items()
+                        if value is source_asset
+                    ),
+                    None,
+                )
+                if source is None:
+                    return False
+                return FakeEditorAssetLibrary._rename_asset(
+                    source,
+                    target,
+                )
+
+            @staticmethod
+            def rename_asset(source, target):
+                calls["path_rename_attempts"].append((source, target))
+                return FakeEditorAssetLibrary._rename_asset(
+                    source,
+                    target,
+                )
 
             @staticmethod
             def delete_asset(path):
@@ -2031,6 +2093,33 @@ class UnrealIngestSaveTests(unittest.TestCase):
         self.assertTrue(
             previous_mesh["rename_api_disagreed_with_live_move"]
         )
+
+    def test_publish_move_uses_exact_loaded_asset_rename_api(self):
+        (
+            runner,
+            manifest_asset,
+            assets,
+            calls,
+            old_mesh,
+            _old_skeleton,
+        ) = self._transactional_publish_fixture(
+            mesh_referencers=["/Game/Maps/Test"],
+        )
+
+        runner._import_manifest_asset_with_fresh_skeleton(
+            object(),
+            manifest_asset,
+            {},
+        )
+
+        previous_move = next(
+            row
+            for row in calls["rename_loaded_attempts"]
+            if row[0] is old_mesh
+        )
+        self.assertIn("_Legacy_", previous_move[1])
+        self.assertFalse(calls["path_rename_attempts"])
+        self.assertIsNot(assets["/Game/Meshes/Trees/SK_Test"], old_mesh)
 
     def test_registry_move_proof_overrides_stale_loaded_object_path(self):
         (
@@ -2464,6 +2553,20 @@ class PreImportMaterialSlotNormalizationTests(unittest.TestCase):
                 assets[target] = asset
                 assets[source] = {"class": "ObjectRedirector"}
                 return True
+
+            @staticmethod
+            def rename_loaded_asset(source_asset, target):
+                source = next(
+                    (
+                        path
+                        for path, value in assets.items()
+                        if value is source_asset
+                    ),
+                    None,
+                )
+                if source is None:
+                    return False
+                return FakeEditorAssetLibrary.rename_asset(source, target)
 
             @staticmethod
             def delete_asset(path):
