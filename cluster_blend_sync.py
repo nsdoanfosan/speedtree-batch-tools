@@ -310,7 +310,7 @@ def _normalization_artifact_paths(recipe):
     if not recipe:
         return []
     paths = []
-    if recipe.get("normalization_required"):
+    if recipe.get("capture_output_dir") and recipe.get("capture_prefix"):
         output_dir = Path(
             recipe["capture_output_dir"]
         ).expanduser().absolute()
@@ -332,13 +332,18 @@ def _normalization_artifact_paths(recipe):
         paths.append(
             output_dir / f"{prefix}_auto_capture_manifest.json"
         )
+    if recipe.get("normalization_required"):
         # Normalizer saves both the rebuilt blend and its current-content
         # receipt before Atlas starts writing owner SPMs.
-        paths.extend(
-            [
-                Path(recipe["blend"]).expanduser().absolute(),
-                Path(recipe["receipt_path"]).expanduser().absolute(),
-            ]
+        paths.append(
+            Path(recipe["blend"]).expanduser().absolute()
+        )
+    # A current Normalizer can still advance its persisted Blender source
+    # index after Atlas publication.  Snapshot that receipt on every Sync, not
+    # only when the capture itself rebuilds.
+    if recipe.get("receipt_path"):
+        paths.append(
+            Path(recipe["receipt_path"]).expanduser().absolute()
         )
 
     blend = Path(recipe["blend"]).expanduser().absolute()

@@ -36,6 +36,10 @@ if str(REPO_DIR) not in sys.path:
     sys.path.insert(0, str(REPO_DIR))
 
 from process_lifecycle import owned_run
+from artifact_content_key import (
+    artifact_record_content_key,
+    file_content_key_snapshot,
+)
 
 from nanite_assembly_materials import (
     NaniteAssemblyMaterialError,
@@ -356,6 +360,89 @@ def _short_contract_value(value, max_chars=240):
 def _first_contract_difference(expected, actual, path):
     """Return one deterministic semantic mismatch with its exact field path."""
     if isinstance(expected, dict) and isinstance(actual, dict):
+        expected_is_artifact = bool(
+            expected.get("path")
+            and "exists" in expected
+            and any(
+                key in expected
+                for key in (
+                    "size",
+                    "mtime_ns",
+                    "sha256",
+                    "fingerprint",
+                )
+            )
+        )
+        actual_is_artifact = bool(
+            actual.get("path")
+            and "exists" in actual
+            and any(
+                key in actual
+                for key in (
+                    "size",
+                    "mtime_ns",
+                    "sha256",
+                    "fingerprint",
+                )
+            )
+        )
+        if expected_is_artifact and actual_is_artifact:
+            expected_path = _normalized_contract_path(expected["path"])
+            actual_path = _normalized_contract_path(actual["path"])
+            if expected_path != actual_path:
+                return (
+                    f"{path}.path: expected={expected_path} "
+                    f"actual={actual_path}"
+                )
+            for field in ("exists", "size"):
+                if expected.get(field) != actual.get(field):
+                    return (
+                        f"{path}.{field}: "
+                        f"expected={_short_contract_value(expected.get(field))} "
+                        f"actual={_short_contract_value(actual.get(field))}"
+                    )
+            try:
+                expected_content_key = artifact_record_content_key(expected)
+                actual_content_key = artifact_record_content_key(actual)
+            except (TypeError, ValueError):
+                expected_content_key = None
+                actual_content_key = None
+            if expected_content_key and actual_content_key:
+                if expected_content_key != actual_content_key:
+                    field = str(expected_content_key.get("field") or "content")
+                    return (
+                        f"{path}.{field}: "
+                        f"expected={_short_contract_value(expected_content_key)} "
+                        f"actual={_short_contract_value(actual_content_key)}"
+                    )
+                # mtime is a discovery hint. Once both contracts carry the
+                # same supported content key, a timestamp-only rewrite is not
+                # an artifact change and must not invalidate Push.
+                identity_fields = {
+                    "path",
+                    "exists",
+                    "size",
+                    "mtime_ns",
+                    "sha256",
+                    "fingerprint",
+                    "fingerprint_algorithm",
+                }
+                expected_extra = {
+                    key: value
+                    for key, value in expected.items()
+                    if key not in identity_fields
+                }
+                actual_extra = {
+                    key: value
+                    for key, value in actual.items()
+                    if key not in identity_fields
+                }
+                return _first_contract_difference(
+                    expected_extra,
+                    actual_extra,
+                    path,
+                )
+    if isinstance(expected, dict) and isinstance(actual, dict):
         for key in sorted(set(expected) | set(actual)):
             child_path = f"{path}.{key}"
             if key not in expected:
@@ -448,16 +535,34 @@ def _validate_contract_artifact_record(path, expected):
             f"{path}.size: expected={expected['size']} "
             f"actual={stat.st_size}; artifact={artifact_path}"
         )
-    expected_sha256 = str(expected.get("sha256") or "").casefold()
-    if expected_sha256:
-        actual_sha256 = str(
-            file_fingerprint(artifact_path).get("sha256") or ""
+    try:
+        expected_content_key = artifact_record_content_key(expected)
+    except (TypeError, ValueError) as exc:
+        raise ClusterAssemblyBuildError(
+            "Cluster pass-through artifact fingerprint is invalid at "
+            f"{path}: {exc}; artifact={artifact_path}"
+        ) from exc
+    if expected_content_key:
+        try:
+            actual_snapshot = file_content_key_snapshot(
+                artifact_path,
+                expected_content_key["algorithm"],
+            )
+        except (OSError, ValueError) as exc:
+            raise ClusterAssemblyBuildError(
+                "Cluster pass-through artifact could not be fingerprinted at "
+                f"{path}: {artifact_path}: {exc}"
+            ) from exc
+        actual_digest = str(actual_snapshot.get("digest") or "").casefold()
+        expected_digest = str(
+            expected_content_key.get("digest") or ""
         ).casefold()
-        if actual_sha256 != expected_sha256:
+        if actual_digest != expected_digest:
+            field = str(expected_content_key.get("field") or "content")
             raise ClusterAssemblyBuildError(
                 "Cluster pass-through artifact mismatch at "
-                f"{path}.sha256: expected={expected_sha256} "
-                f"actual={actual_sha256}; artifact={artifact_path}"
+                f"{path}.{field}: expected={expected_digest} "
+                f"actual={actual_digest}; artifact={artifact_path}"
             )
     elif expected.get("mtime_ns") is not None:
         if int(expected["mtime_ns"]) != stat.st_mtime_ns:

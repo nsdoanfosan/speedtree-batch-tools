@@ -14298,12 +14298,72 @@ class App:
         )
         return live_resolution
 
+    def _publish_current_repair_skip(self, iid, spm, repair_state):
+        """Publish one exact current Repair result without rediscovering work."""
+        if not isinstance(repair_state, dict) or not repair_state.get("current"):
+            return False
+        stage_evidence = None
+        if repair_state.get("push_ready"):
+            try:
+                stage_evidence = self._repair_stage_evidence_if_active(
+                    spm,
+                    repair_state.get("push_dependency_contract"),
+                )
+            except (
+                OSError,
+                TypeError,
+                ValueError,
+                RepairPushEvidenceError,
+            ) as exc:
+                self.log(
+                    "Current Repair output has no v2 stage evidence; "
+                    "rebuilding instead of falling through to standalone "
+                    f"Push: {Path(spm).name} · {compact_error_message(exc)}"
+                )
+                return False
+        self._record_live_blend_status(
+            iid,
+            spm,
+            repair_state=repair_state,
+        )
+        suffix = (
+            " · Unreal Push 차단 상태 유지"
+            if not repair_state.get("push_ready")
+            else ""
+        )
+        self._publish_repair_stage_contract(
+            spm,
+            ready=repair_state.get("push_ready") is True,
+            reason=repair_state.get("reason"),
+            kind=repair_state.get("kind"),
+            push_dependency_contract=repair_state.get(
+                "push_dependency_contract"
+            ),
+            evidence_bundle=stage_evidence,
+        )
+        self.log(f"건너뜀 (blend 최신{suffix}): {Path(spm).name}")
+        return True
+
     def _job_blender(self, iid, spm, item):
         from spm_audit import audit_spm, sk_readiness
 
         spm = self._prepare_pair_for_job(spm)
         cluster_source = is_cluster_source_spm(spm)
         self._refresh_canonical_atlas_manifests(spm)
+        if cluster_source and not self.force_rerun:
+            # The shared Repair decision already validates the exact SPM,
+            # blend, BWR report, material/wind output and Cluster dependency
+            # artifacts.  Re-running every consumer audit and relation Sync
+            # before consulting that result made a current provider rewrite
+            # its own capture files and invalidate the Push contract.  A force
+            # rebuild deliberately bypasses this fast path.
+            repair_state = self._repair_output_state(spm)
+            if self._publish_current_repair_skip(
+                iid,
+                spm,
+                repair_state,
+            ):
+                return
         producer_spm = speedtree_output_spm_for(spm)
         speedtree_spm = producer_spm
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -14595,55 +14655,11 @@ class App:
                         )
                         if relation_outputs_changed:
                             repair_state = self._repair_output_state(spm)
-                    stage_evidence = None
-                    if (
-                        repair_state["current"]
-                        and repair_state["push_ready"]
+                    if self._publish_current_repair_skip(
+                        iid,
+                        spm,
+                        repair_state,
                     ):
-                        try:
-                            stage_evidence = (
-                                self._repair_stage_evidence_if_active(
-                                    spm,
-                                    repair_state.get(
-                                        "push_dependency_contract"
-                                    ),
-                                )
-                            )
-                        except (
-                            OSError,
-                            TypeError,
-                            ValueError,
-                            RepairPushEvidenceError,
-                        ) as exc:
-                            repair_state["current"] = False
-                            self.log(
-                                "Current Repair output has no v2 stage "
-                                "evidence; rebuilding instead of falling "
-                                f"through to standalone Push: {spm.name} · "
-                                f"{compact_error_message(exc)}"
-                            )
-                    if repair_state["current"]:
-                        self._record_live_blend_status(
-                            iid,
-                            spm,
-                            repair_state=repair_state,
-                        )
-                        suffix = (
-                            " · Unreal Push 차단 상태 유지"
-                            if not repair_state["push_ready"]
-                            else ""
-                        )
-                        self._publish_repair_stage_contract(
-                            spm,
-                            ready=repair_state["push_ready"],
-                            reason=repair_state["reason"],
-                            kind=repair_state.get("kind"),
-                            push_dependency_contract=repair_state.get(
-                                "push_dependency_contract"
-                            ),
-                            evidence_bundle=stage_evidence,
-                        )
-                        self.log(f"건너뜀 (blend 최신{suffix}): {spm.name}")
                         return
                     self.log(
                         "Cluster 관계 산출물 갱신 후 Repair 상태가 변경되어 "
