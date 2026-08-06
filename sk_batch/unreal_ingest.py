@@ -1349,6 +1349,33 @@ def _finish_pending_asset_compilation_for_publish():
     return commands
 
 
+def _publish_move_observation(asset, source_path, target_path):
+    """Observe one exact move from registry state, not a cached UObject path."""
+    source_path = str(source_path).split(".", 1)[0]
+    target_path = str(target_path).split(".", 1)[0]
+    source_exists = bool(
+        unreal.EditorAssetLibrary.does_asset_exist(source_path)
+    )
+    target_exists = bool(
+        unreal.EditorAssetLibrary.does_asset_exist(target_path)
+    )
+    source_redirector = bool(
+        source_exists and _asset_path_is_redirector(source_path)
+    )
+    target_redirector = bool(
+        target_exists and _asset_path_is_redirector(target_path)
+    )
+    return {
+        "object_path": _asset_package_path(asset),
+        "source_exists": source_exists,
+        "source_redirector": source_redirector,
+        "source_is_asset": bool(source_exists and not source_redirector),
+        "target_exists": target_exists,
+        "target_redirector": target_redirector,
+        "target_is_asset": bool(target_exists and not target_redirector),
+    }
+
+
 def _move_asset_for_publish(journal, source_path, target_path, role):
     source_path = str(source_path).split(".", 1)[0]
     target_path = str(target_path).split(".", 1)[0]
@@ -1378,6 +1405,7 @@ def _move_asset_for_publish(journal, source_path, target_path, role):
         "moved": False,
         "source_redirector_cleared": False,
         "rename_api_returns": [],
+        "live_move_observations": [],
         "exact_retry_repair": [],
     }
     journal.append(record)
@@ -1390,10 +1418,15 @@ def _move_asset_for_publish(journal, source_path, target_path, role):
             )
         )
         record["rename_api_returns"].append(renamed)
-        actual_path = _asset_package_path(asset)
+        observation = _publish_move_observation(
+            asset,
+            source_path,
+            target_path,
+        )
+        record["live_move_observations"].append(observation)
         moved = (
-            actual_path.casefold() == target_path.casefold()
-            and unreal.EditorAssetLibrary.does_asset_exist(target_path)
+            observation["target_is_asset"]
+            and not observation["source_is_asset"]
         )
         if moved:
             break
@@ -1406,9 +1439,16 @@ def _move_asset_for_publish(journal, source_path, target_path, role):
         moved and not any(record["rename_api_returns"])
     )
     if not moved:
+        live = record["live_move_observations"][-1]
         raise RuntimeError(
-            f"{role} move failed: {source_path} -> {target_path}"
+            f"{role} move failed: {source_path} -> {target_path}; "
+            "live="
+            + json.dumps(live, ensure_ascii=False, sort_keys=True)
         )
+    refreshed_asset = unreal.EditorAssetLibrary.load_asset(target_path)
+    if refreshed_asset is not None:
+        record["asset"] = refreshed_asset
+    record["refreshed_asset_path"] = _asset_package_path(refreshed_asset)
     record["source_redirector_cleared"] = (
         _clear_transaction_redirector(source_path)
     )
@@ -1424,14 +1464,30 @@ def _rollback_asset_publish_moves(journal):
         source_path = record["source"]
         target_path = record["target"]
         asset = record["asset"]
-        actual_path = _asset_package_path(asset)
-        if actual_path.casefold() == source_path.casefold():
+        observation = _publish_move_observation(
+            asset,
+            source_path,
+            target_path,
+        )
+        record.setdefault("rollback_observations", []).append(observation)
+        if (
+            observation["source_is_asset"]
+            and not observation["target_is_asset"]
+        ):
             restored.append(record["role"])
             continue
-        if actual_path.casefold() != target_path.casefold():
+        if (
+            not observation["target_is_asset"]
+            or observation["source_is_asset"]
+        ):
             failed.append(
-                f"{record['role']}: asset is at {actual_path or '<missing>'}, "
-                f"expected {target_path}"
+                f"{record['role']}: live registry state cannot prove the "
+                "asset is at the rollback source; live="
+                + json.dumps(
+                    observation,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
             )
             continue
         try:
