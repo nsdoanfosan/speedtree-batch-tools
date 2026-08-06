@@ -1625,6 +1625,7 @@ class UnrealIngestSaveTests(unittest.TestCase):
             "events": [],
             "explicit_bindings": [],
             "manifest_pre_commands": [],
+            "skeleton_bindings": [],
         }
 
         class FakeAsset:
@@ -1732,6 +1733,31 @@ class UnrealIngestSaveTests(unittest.TestCase):
                 return True
 
         runner.unreal.EditorAssetLibrary = FakeEditorAssetLibrary
+
+        class FakeCodexMaterialToolsLibrary:
+            @staticmethod
+            def bind_skeletal_mesh_skeleton(
+                mesh,
+                skeleton,
+                require_exact_reference_skeleton,
+            ):
+                calls["skeleton_bindings"].append(
+                    (
+                        mesh.path,
+                        skeleton.path,
+                        require_exact_reference_skeleton,
+                    )
+                )
+                mesh.set_skeleton(skeleton)
+                return (
+                    True,
+                    json.dumps({"success": True, "bound": True}),
+                    [],
+                )
+
+        runner.unreal.CodexMaterialToolsLibrary = (
+            FakeCodexMaterialToolsLibrary
+        )
 
         class Options:
             def __init__(self):
@@ -1854,6 +1880,13 @@ class UnrealIngestSaveTests(unittest.TestCase):
         self.assertEqual(
             calls["explicit_bindings"],
             [published_skeleton_path],
+        )
+        self.assertEqual(
+            calls["skeleton_bindings"],
+            [
+                (final_mesh_path, published_skeleton_path, False),
+                (final_mesh_path, published_skeleton_path, True),
+            ],
         )
         self.assertEqual(
             result["staged_import"]["publish_mode"],

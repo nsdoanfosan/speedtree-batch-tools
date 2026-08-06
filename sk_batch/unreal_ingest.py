@@ -258,6 +258,40 @@ def _asset_package_path(asset):
         return str(getattr(asset, "path", "") or "").split(".", 1)[0]
 
 
+def _bind_skeletal_mesh_skeleton(
+    mesh,
+    skeleton,
+    *,
+    require_exact_reference_skeleton,
+    phase,
+):
+    """Use the project editor bridge for UE's read-only Python property."""
+
+    library = getattr(unreal, "CodexMaterialToolsLibrary", None)
+    binder = getattr(library, "bind_skeletal_mesh_skeleton", None)
+    if not callable(binder):
+        raise RuntimeError(
+            "CodexMaterialToolsLibrary.bind_skeletal_mesh_skeleton is "
+            "required for in-place SpeedTree Skeleton refresh"
+        )
+    result = _parse_codex_material_tool_result(
+        binder(
+            mesh,
+            skeleton,
+            bool(require_exact_reference_skeleton),
+        )
+    )
+    if (
+        result.get("returned_errors")
+        or not result.get("success")
+        or not result.get("bound")
+    ):
+        raise RuntimeError(
+            f"{phase} SpeedTree Skeleton binding failed: {result}"
+        )
+    return result
+
+
 def _normalized_unreal_asset_path(value):
     return str(value or "").split(".", 1)[0]
 
@@ -818,6 +852,19 @@ def _import_manifest_asset_with_fresh_skeleton(
             + published_skeleton_path
         )
 
+    canonical_mesh = unreal.EditorAssetLibrary.load_asset(final_asset_path)
+    pre_reimport_binding = None
+    if canonical_mesh is not None:
+        # Bind the staging-proven Skeleton before reimport.  Otherwise Unreal
+        # reuses the stale serialized Skeleton and opens an unattended
+        # merge-bones dialog before Python can repair the pointer.
+        pre_reimport_binding = _bind_skeletal_mesh_skeleton(
+            canonical_mesh,
+            published_skeleton,
+            require_exact_reference_skeleton=False,
+            phase="pre-reimport",
+        )
+
     final_manifest = deepcopy(manifest_asset)
     final_manifest["post_import_commands"] = []
     final_manifest["operations"] = {}
@@ -838,19 +885,13 @@ def _import_manifest_asset_with_fresh_skeleton(
             + final_asset_path
         )
     final_skeleton = final_mesh.get_editor_property("skeleton")
-    if (
-        _asset_package_path(final_skeleton).casefold()
-        != published_skeleton_path.casefold()
-    ):
-        setter = getattr(final_mesh, "set_skeleton", None)
-        if callable(setter):
-            setter(published_skeleton)
-        else:
-            final_mesh.set_editor_property(
-                "skeleton",
-                published_skeleton,
-            )
-        final_skeleton = final_mesh.get_editor_property("skeleton")
+    post_reimport_binding = _bind_skeletal_mesh_skeleton(
+        final_mesh,
+        published_skeleton,
+        require_exact_reference_skeleton=True,
+        phase="post-reimport",
+    )
+    final_skeleton = final_mesh.get_editor_property("skeleton")
     if final_skeleton is None:
         raise RuntimeError(
             "final SpeedTree mesh has no incoming FBX Skeleton: "
@@ -901,6 +942,8 @@ def _import_manifest_asset_with_fresh_skeleton(
             "publish_mode": "in_place_explicit_skeleton",
             "skeleton_publish_mode": skeleton_publish_mode,
             "canonical_mesh_referencers": canonical_mesh_referencers,
+            "pre_reimport_skeleton_binding": pre_reimport_binding,
+            "post_reimport_skeleton_binding": post_reimport_binding,
             "relocated_previous_assets": [],
             "cleared_unreferenced_redirectors": cleared_redirectors,
             "legacy_cleanup": {
