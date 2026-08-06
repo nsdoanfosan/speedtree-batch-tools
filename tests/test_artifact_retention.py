@@ -218,6 +218,33 @@ class ArtifactRetentionTests(unittest.TestCase):
             self.assertEqual(row["retention_basis"], "younger_than_min_age")
             self.assertEqual(plan["planned_delete_count"], 0)
 
+    def test_zero_min_age_does_not_depend_on_clock_rounding(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "Tree"
+            backup = self._write(
+                root
+                / "_spm_backups"
+                / "SK_tree.skbatch_backup_20260806_010101.spm"
+            )
+            with self._production_scope(root):
+                plan = plan_retention(
+                    root,
+                    scope=PRODUCTION_BACKUP_SCOPE,
+                    policy=RetentionPolicy(0, 0, 0),
+                    now=0,
+                )
+
+            row = next(
+                row
+                for row in plan["entries"]
+                if Path(row["path"]) == backup.resolve()
+            )
+            self.assertEqual(row["action"], "delete")
+            self.assertNotEqual(
+                row["retention_basis"],
+                "younger_than_min_age",
+            )
+
     def test_uncertain_nested_production_bundle_is_never_partially_planned(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "Tree"

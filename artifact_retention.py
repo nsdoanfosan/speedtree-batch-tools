@@ -1008,7 +1008,11 @@ def plan_retention(
             entry["retention_basis"] = "protected_current_active_or_referenced"
         elif _path_key(candidate) in protected:
             entry["retention_basis"] = "protected_current_active_or_referenced"
-        elif now - (entry["effective_time_ns"] / 1_000_000_000) < policy.min_age_seconds:
+        elif (
+            policy.min_age_seconds > 0
+            and now - (entry["effective_time_ns"] / 1_000_000_000)
+            < policy.min_age_seconds
+        ):
             entry["retention_basis"] = "younger_than_min_age"
         entries.append(entry)
 
