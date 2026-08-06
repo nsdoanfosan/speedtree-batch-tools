@@ -699,16 +699,14 @@ def _import_manifest_asset_with_fresh_skeleton(
     manifest_asset,
     item=None,
 ):
-    """Create the incoming Skeleton and mesh cleanly, then publish both.
+    """Validate a clean pair, then refresh the canonical mesh in place.
 
-    Deleting and immediately reimporting at the same package path can make
-    AssetTools reuse the pending-kill SkeletalMesh and its placeholder
-    Skeleton.  Import the FBX exactly once in a transient package, move that
-    proven mesh and its incoming Skeleton to their owned public paths, and only
-    then run the original post-import operations.  A second FBX import at the
-    just-deleted public path is deliberately avoided: Unreal can reload the
-    source-controlled placeholder package during that import and silently put
-    the shared placeholder Skeleton back on the final mesh.
+    The canonical SkeletalMesh can have many live Blueprint and level
+    referencers.  Renaming it out of the way turns ordinary usage into a
+    publish failure.  A staging import still proves the incoming FBX creates a
+    dedicated non-placeholder Skeleton.  That Skeleton is copied to an owned
+    path, then the same FBX is imported at the unchanged canonical mesh path
+    with the proven Skeleton bound explicitly.
     """
 
     original_asset_data = manifest_asset.get("asset_data") or {}
@@ -724,9 +722,13 @@ def _import_manifest_asset_with_fresh_skeleton(
 
     final_folder, final_name = final_asset_path.rsplit("/", 1)
     expected = _expected_final_skeleton_contract(item or {})
-    legacy_token = str((expected or {}).get("hash") or "")[:12]
+    contract_token = re.sub(
+        r"[^0-9A-Fa-f]+",
+        "",
+        str((expected or {}).get("hash") or ""),
+    )[:12]
     transaction_token = (
-        re.sub(r"[^0-9A-Za-z]+", "", legacy_token)[:12]
+        contract_token
         + f"{os.getpid():x}"
         + uuid.uuid4().hex[:8]
     )
@@ -734,12 +736,15 @@ def _import_manifest_asset_with_fresh_skeleton(
         f"{final_folder}/__SKBatchStaging_{transaction_token}"
     )
     staging_asset_path = f"{staging_folder}/{final_name}"
-    staging_skeleton_path = staging_asset_path + "_Skeleton"
 
     staged = deepcopy(manifest_asset)
     staged_asset_data = staged["asset_data"]
     staged_asset_data["asset_folder"] = staging_folder + "/"
     staged_asset_data["asset_path"] = staging_asset_path
+    # These commands target the canonical package path embedded in the
+    # manifest.  Run them once immediately before the canonical reimport, not
+    # during both the staging proof and the final publish.
+    staged["pre_import_commands"] = []
     staged["post_import_commands"] = []
     staged["operations"] = {}
     staged_result = _import_manifest_asset(send2ue_unreal, staged)
@@ -765,153 +770,117 @@ def _import_manifest_asset_with_fresh_skeleton(
         )
     incoming_skeleton_path = _asset_package_path(incoming_skeleton)
     final_skeleton_path = final_asset_path + "_Skeleton"
-    moves = []
-    relocated = []
-    cleared_redirectors = []
-    old_owned_skeletons = []
-    old_mesh = (
-        unreal.EditorAssetLibrary.load_asset(final_asset_path)
+    canonical_mesh_referencers = (
+        _asset_referencers(final_asset_path)
         if unreal.EditorAssetLibrary.does_asset_exist(final_asset_path)
-        else None
+        else []
     )
-    old_mesh_skeleton = (
-        old_mesh.get_editor_property("skeleton")
-        if old_mesh is not None
-        and not _asset_path_is_redirector(final_asset_path)
-        else None
-    )
-    old_mesh_skeleton_path = _asset_package_path(old_mesh_skeleton)
+
+    cleared_redirectors = []
     if (
-        old_mesh_skeleton_path
-        and old_mesh_skeleton is not None
-        and old_mesh_skeleton.get_name() != PLACEHOLDER_SKELETON_NAME
-        and _is_owned_final_skeleton_path(
-            old_mesh_skeleton_path,
-            final_skeleton_path,
-        )
-        and old_mesh_skeleton_path.casefold()
-        != final_skeleton_path.casefold()
+        unreal.EditorAssetLibrary.does_asset_exist(final_skeleton_path)
+        and _asset_path_is_redirector(final_skeleton_path)
     ):
-        old_owned_skeletons.append(old_mesh_skeleton_path)
+        cleanup = _clear_unreferenced_canonical_redirector(
+            final_skeleton_path
+        )
+        if cleanup is not None:
+            cleanup["role"] = "canonical Skeleton"
+            cleared_redirectors.append(cleanup)
 
-    try:
-        for canonical_path, role in (
-            (final_asset_path, "previous canonical mesh"),
-            (final_skeleton_path, "previous canonical Skeleton"),
+    if not unreal.EditorAssetLibrary.does_asset_exist(
+        final_skeleton_path
+    ):
+        published_skeleton_path = final_skeleton_path
+        skeleton_publish_mode = "canonical_copy"
+    else:
+        token = contract_token or transaction_token[:12]
+        base = f"{final_skeleton_path}_{token}"
+        published_skeleton_path = base
+        sequence = 1
+        while unreal.EditorAssetLibrary.does_asset_exist(
+            published_skeleton_path
         ):
-            if not unreal.EditorAssetLibrary.does_asset_exist(
-                canonical_path
-            ):
-                continue
-            if _asset_path_is_redirector(canonical_path):
-                cleanup = _clear_unreferenced_canonical_redirector(
-                    canonical_path
-                )
-                if cleanup is not None:
-                    cleanup["role"] = role
-                    cleared_redirectors.append(cleanup)
-                continue
-            legacy_path = _unique_transaction_asset_path(
-                canonical_path,
-                "Legacy",
-                transaction_token,
-            )
-            record = _move_asset_for_publish(
-                moves,
-                canonical_path,
-                legacy_path,
-                role,
-            )
-            relocated.append(record)
+            sequence += 1
+            published_skeleton_path = f"{base}_{sequence}"
+        skeleton_publish_mode = "content_addressed_copy"
 
-        _move_asset_for_publish(
-            moves,
-            incoming_skeleton_path,
-            final_skeleton_path,
-            "incoming Skeleton publish",
+    published_skeleton = (
+        unreal.EditorAssetLibrary.duplicate_loaded_asset(
+            incoming_skeleton,
+            published_skeleton_path,
         )
-        _move_asset_for_publish(
-            moves,
-            staging_asset_path,
-            final_asset_path,
-            "staged mesh publish",
-        )
-
-        final_mesh = unreal.EditorAssetLibrary.load_asset(
-            final_asset_path
-        )
-        final_skeleton = (
-            final_mesh.get_editor_property("skeleton")
-            if final_mesh is not None
-            else None
-        )
-        if final_skeleton is None:
-            raise RuntimeError(
-                "final SpeedTree mesh has no incoming FBX Skeleton: "
-                + final_asset_path
-            )
-        if final_skeleton.get_name() == PLACEHOLDER_SKELETON_NAME:
-            raise RuntimeError(
-                "final SpeedTree mesh still references the shared "
-                "placeholder Skeleton"
-            )
-        if (
-            _asset_package_path(final_skeleton).casefold()
-            != final_skeleton_path.casefold()
-        ):
-            raise RuntimeError(
-                "final SpeedTree mesh does not reference the canonical "
-                f"incoming Skeleton: {_asset_package_path(final_skeleton)}"
-            )
-
-        _execute_command_groups(
-            manifest_asset.get("post_import_commands"),
-            "post_import",
-        )
-        _run_lod_and_socket_operations(
-            send2ue_unreal,
-            manifest_asset,
-            original_asset_data,
-            manifest_asset.get("property_data") or {},
-        )
-    except Exception as exc:
-        rollback = _rollback_asset_publish_moves(moves)
-        redirector_note = (
-            "\nPre-existing unreferenced canonical redirector cleanup "
-            "was intentionally one-way and was not recreated: "
-            + ", ".join(
-                row["asset_path"] for row in cleared_redirectors
-            )
-            if cleared_redirectors
-            else ""
-        )
-        if rollback["failed"]:
-            raise RuntimeError(
-                f"{exc}\nSK Batch publish rollback also failed: "
-                + "; ".join(rollback["failed"])
-                + redirector_note
-            ) from exc
-        if redirector_note:
-            raise RuntimeError(str(exc) + redirector_note) from exc
-        raise
-
-    legacy_cleanup = _cleanup_unreferenced_legacy_assets(
-        [
-            record["target"]
-            for record in relocated
-            if record["role"] == "previous canonical mesh"
-        ]
-        + [
-            record["target"]
-            for record in relocated
-            if record["role"] == "previous canonical Skeleton"
-        ]
-        + old_owned_skeletons
     )
-    final_result = {
-        **staged_result,
-        "asset_path": final_asset_path,
-    }
+    if published_skeleton is None:
+        raise RuntimeError(
+            "validated incoming Skeleton could not be copied to its owned "
+            "publish path: "
+            + published_skeleton_path
+        )
+
+    final_manifest = deepcopy(manifest_asset)
+    final_manifest["post_import_commands"] = []
+    final_manifest["operations"] = {}
+    with _with_explicit_skeleton_binding(
+        send2ue_unreal,
+        published_skeleton_path,
+    ):
+        final_result = _import_manifest_asset(
+            send2ue_unreal,
+            final_manifest,
+        )
+
+    final_mesh = unreal.EditorAssetLibrary.load_asset(final_asset_path)
+    if final_mesh is None:
+        raise RuntimeError(
+            "in-place SpeedTree mesh import did not leave the canonical "
+            "asset: "
+            + final_asset_path
+        )
+    final_skeleton = final_mesh.get_editor_property("skeleton")
+    if (
+        _asset_package_path(final_skeleton).casefold()
+        != published_skeleton_path.casefold()
+    ):
+        setter = getattr(final_mesh, "set_skeleton", None)
+        if callable(setter):
+            setter(published_skeleton)
+        else:
+            final_mesh.set_editor_property(
+                "skeleton",
+                published_skeleton,
+            )
+        final_skeleton = final_mesh.get_editor_property("skeleton")
+    if final_skeleton is None:
+        raise RuntimeError(
+            "final SpeedTree mesh has no incoming FBX Skeleton: "
+            + final_asset_path
+        )
+    if final_skeleton.get_name() == PLACEHOLDER_SKELETON_NAME:
+        raise RuntimeError(
+            "final SpeedTree mesh still references the shared "
+            "placeholder Skeleton"
+        )
+    if (
+        _asset_package_path(final_skeleton).casefold()
+        != published_skeleton_path.casefold()
+    ):
+        raise RuntimeError(
+            "final SpeedTree mesh did not bind the validated incoming "
+            f"Skeleton: {_asset_package_path(final_skeleton)}"
+        )
+
+    _execute_command_groups(
+        manifest_asset.get("post_import_commands"),
+        "post_import",
+    )
+    _run_lod_and_socket_operations(
+        send2ue_unreal,
+        manifest_asset,
+        original_asset_data,
+        manifest_asset.get("property_data") or {},
+    )
+
     staging_cleanup = {
         "folder": staging_folder,
         "deleted": False,
@@ -921,6 +890,7 @@ def _import_manifest_asset_with_fresh_skeleton(
             unreal.EditorAssetLibrary.delete_directory(staging_folder)
         )
     return {
+        **staged_result,
         **final_result,
         "asset_path": final_asset_path,
         "staged_import": {
@@ -928,16 +898,15 @@ def _import_manifest_asset_with_fresh_skeleton(
             "incoming_skeleton": incoming_skeleton_path,
             "final_mesh": final_asset_path,
             "final_skeleton": _asset_package_path(final_skeleton),
-            "relocated_previous_assets": [
-                {
-                    key: value
-                    for key, value in record.items()
-                    if key != "asset"
-                }
-                for record in relocated
-            ],
+            "publish_mode": "in_place_explicit_skeleton",
+            "skeleton_publish_mode": skeleton_publish_mode,
+            "canonical_mesh_referencers": canonical_mesh_referencers,
+            "relocated_previous_assets": [],
             "cleared_unreferenced_redirectors": cleared_redirectors,
-            "legacy_cleanup": legacy_cleanup,
+            "legacy_cleanup": {
+                "cleaned": [],
+                "preserved": [],
+            },
             "staging_cleanup": staging_cleanup,
         },
     }
@@ -1631,12 +1600,12 @@ def _clear_placeholder_skeleton_before_import(item):
     pointer is null is likewise broken even when the item intentionally defers
     DynamicWind (for example, a normalized Cluster prototype); importing over
     that package in place can preserve its stale serialized dependency.  These
-    cases use the same clean staged pair publish.  This avoids Unreal's
+    cases use the same clean staging validation.  This avoids Unreal's
     unattended "FAILED TO MERGE BONES" dialog while preserving a matching
     current Skeleton.  Shared/custom Skeletons with foreign referencers are
-    never deleted.  Any replaceable canonical mesh/Skeleton is relocated only
-    after the incoming staged pair has been validated; publish then either
-    commits both assets or rolls every move back.
+    never deleted.  The validated Skeleton is copied to an owned path and the
+    canonical mesh is refreshed in place, so its live referencers are never
+    disrupted by a publish-time rename.
     """
     mesh_path = item.get("mesh_path")
     if not mesh_path:
