@@ -1732,141 +1732,6 @@ class PushQueueFlowTests(unittest.TestCase):
             for row in summary["target_outcomes"]
         ))
 
-    def test_failed_row_does_not_block_current_dependency_outputs(self):
-        gui = load_gui_module()
-        app = self.make_app(gui)
-        fixture = self.dependency_artifact_fixture()
-        provider = Path("Cluster") / "SK_provider_current.spm"
-        consumers = [
-            Path(f"SK_consumer_{index:02d}.spm")
-            for index in range(
-                fixture["shared_dependency_failed_targets"]
-            )
-        ]
-        dependency_map = {
-            str(consumer): (str(provider),)
-            for consumer in consumers
-        }
-        app._dependency_artifact_verdict = mock.Mock(return_value={
-            "status": "current",
-            "phase": "blender",
-            "reason": "current Repair output receipt",
-        })
-
-        blocked = app._pipeline_dependency_blocks(
-            [{"spm": consumer} for consumer in consumers],
-            dependency_map,
-            {str(provider)},
-        )
-
-        self.assertEqual(blocked, {})
-        self.assertEqual(
-            app._dependency_artifact_verdict.call_count,
-            fixture["shared_dependency_failed_targets"],
-        )
-        self.assertEqual(
-            fixture["current_consumer_evidence"]
-            + fixture["consumer_own_evidence_blocking"],
-            fixture["shared_dependency_failed_targets"],
-        )
-        self.assertEqual(
-            fixture["expected_dependency_blocked_after_artifact_check"],
-            0,
-        )
-        app._active_blender_dependency_map = dependency_map
-        own_blocked = consumers[
-            fixture["current_consumer_evidence"]:
-        ]
-        app._pipeline_planned_exclusions = {
-            str(consumer): {
-                "target": str(consumer),
-                "target_name": consumer.name,
-                "outcome": "planned_excluded",
-                "reason_token": "lineage_unproven",
-                "evidence": {"source": "consumer_own_evidence"},
-            }
-            for consumer in own_blocked
-        }
-        summary = app._build_pipeline_result_summary(
-            [{"spm": consumer} for consumer in consumers],
-            {str(provider)},
-            set(),
-            None,
-        )
-
-        self.assertEqual(
-            summary["completed_count"],
-            fixture["expected_current_consumers_released"],
-        )
-        self.assertEqual(
-            summary["blocked_count"],
-            fixture["expected_consumer_own_blocks_preserved"],
-        )
-        self.assertEqual(summary["dependency_blocked_count"], 0)
-        self.assertEqual(summary["shared_failures"], [])
-        current_row = next(
-            row for row in summary["target_outcomes"]
-            if row["outcome"] == "completed"
-        )
-        self.assertEqual(
-            current_row["evidence"]["dependency_resolution"],
-            "current_output_reused",
-        )
-
-    def test_missing_and_stale_dependency_outputs_are_named_in_korean(self):
-        gui = load_gui_module()
-        app = self.make_app(gui)
-        missing = str(Path("Cluster") / "SK_missing_output.spm")
-        stale = str(Path("Cluster") / "SK_stale_output.spm")
-        consumer = Path("SK_consumer_blocked.spm")
-        app._dependency_artifact_verdict = mock.Mock(side_effect=lambda value, **_: {
-            "status": "missing" if value == missing else "stale",
-            "phase": "blender",
-            "reason": (
-                "blend 파일이 없습니다."
-                if value == missing
-                else "SPM이 영수증 이후 변경되었습니다."
-            ),
-        })
-
-        blocked = app._pipeline_dependency_blocks(
-            [{"spm": consumer}],
-            {str(consumer): (missing, stale)},
-            {missing, stale},
-        )
-        with mock.patch.object(gui, "save_state"):
-            app._record_pipeline_dependency_block(
-                {"spm": consumer},
-                "blend_status",
-                blocked[str(consumer)],
-                persist=False,
-                dependency_verdicts=(
-                    app._pipeline_dependency_artifact_verdicts[
-                        str(consumer)
-                    ]
-                ),
-            )
-
-        entry = app.state[str(consumer)]
-        self.assertEqual(entry["blend_status_kind"], "dependency_blocked")
-        self.assertIn("산출물 없음", entry["blend_status"])
-        self.assertIn("산출물 낡음", entry["blend_status"])
-        evidence = entry["blend_status_error"]["dependency_artifacts"]
-        self.assertEqual(evidence[missing]["status"], "missing")
-        self.assertEqual(evidence[stale]["status"], "stale")
-        app._active_blender_dependency_map = {
-            str(consumer): (missing, stale)
-        }
-        summary = app._build_pipeline_result_summary(
-            [{"spm": consumer}],
-            {missing, stale},
-            {str(consumer)},
-            None,
-        )
-        row = summary["target_outcomes"][0]
-        self.assertEqual(row["reason_token"], "dependency_output_missing")
-        self.assertNotEqual(row["reason_token"], "shared_dependency_failed")
-
     def test_failure_record_is_bound_to_target_content_and_code_revision(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -2868,7 +2733,7 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertLess(order.index("a1_done"), order.index("a2"))
         self.assertIn("b1", order)
 
-    def test_failed_cluster_repair_blocks_only_its_dependent_roots(self):
+    def test_failed_cluster_repair_does_not_suppress_dependent_roots(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         app.cfg = {"blender_parallel_jobs": 1}
@@ -2910,16 +2775,12 @@ class PushQueueFlowTests(unittest.TestCase):
 
         self.assertTrue(result)
         self.assertIn(failed_cluster, calls)
-        self.assertNotIn(blocked_root, calls)
+        self.assertIn(blocked_root, calls)
         self.assertIn(independent_root, calls)
-        self.assertIn(str(blocked_root), app._phase_failed_items)
-        self.assertEqual(
-            app.state[str(blocked_root)]["blend_status_kind"],
+        self.assertNotIn(str(blocked_root), app._phase_failed_items)
+        self.assertNotEqual(
+            app.state.get(str(blocked_root), {}).get("blend_status_kind"),
             "dependency_blocked",
-        )
-        self.assertIn(
-            failed_cluster.name,
-            app.state[str(blocked_root)]["blend_status"],
         )
 
     def test_blender_repair_blocks_an_interactively_open_target(self):
@@ -3580,7 +3441,7 @@ class PushQueueFlowTests(unittest.TestCase):
             dependency_contract,
         )
 
-    def test_rpc_push_blocks_only_roots_whose_auto_cluster_failed(self):
+    def test_rpc_push_continues_roots_when_auto_cluster_failed(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         cluster = Path("Tree_elm") / "Cluster" / "SK_any_cluster.spm"
@@ -3625,9 +3486,12 @@ class PushQueueFlowTests(unittest.TestCase):
             )
 
         self.assertTrue(result)
-        self.assertEqual(attempted, [cluster, independent_root])
         self.assertEqual(
-            app.state[str(blocked_root)]["push_status_kind"],
+            attempted,
+            [cluster, blocked_root, independent_root],
+        )
+        self.assertNotEqual(
+            app.state.get(str(blocked_root), {}).get("push_status_kind"),
             "dependency_blocked",
         )
 
@@ -3684,7 +3548,7 @@ class PushQueueFlowTests(unittest.TestCase):
             "dependency_blocked",
         )
 
-    def test_full_pipeline_does_not_forward_failed_items_to_later_phases(self):
+    def test_full_pipeline_forwards_item_failures_to_later_phases(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         cluster_spm = Path("Tree_test") / "Cluster" / "SK_bad_spm.spm"
@@ -3701,7 +3565,9 @@ class PushQueueFlowTests(unittest.TestCase):
             calls.append((phase, [item["spm"].name for item in phase_targets]))
             if phase == "spm":
                 app._phase_failed_items = {str(cluster_spm)}
-            elif phase == "blender":
+            elif phase == "blender" and any(
+                item["spm"] == bad_blend for item in phase_targets
+            ):
                 app._phase_failed_items = {str(bad_blend)}
             else:
                 app._phase_failed_items = set()
@@ -3717,8 +3583,12 @@ class PushQueueFlowTests(unittest.TestCase):
             app._run_full_pipeline(targets)
 
         self.assertEqual(calls[0][1], ["SK_bad_spm.spm"])
-        self.assertEqual(calls[1][1], ["SK_bad_blend.spm", "SK_good.spm"])
-        self.assertEqual(calls[2][1], ["SK_good.spm"])
+        self.assertEqual(calls[1][1], ["SK_bad_spm.spm"])
+        self.assertEqual(calls[2][1], ["SK_bad_blend.spm", "SK_good.spm"])
+        self.assertEqual(
+            calls[3][1],
+            ["SK_bad_spm.spm", "SK_bad_blend.spm", "SK_good.spm"],
+        )
         final_progress = [
             payload for kind, payload in list(app.ui_queue.queue)
             if kind == "progress"
@@ -3727,7 +3597,7 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertIn("blocked 0", final_progress)
         self.assertIn("failed 2", final_progress)
 
-    def test_full_pipeline_cluster_failure_blocks_only_mapped_consumer(self):
+    def test_full_pipeline_cluster_failure_does_not_suppress_mapped_consumer(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         app.cfg = {
@@ -3829,47 +3699,49 @@ class PushQueueFlowTests(unittest.TestCase):
             result = app._run_full_pipeline(expanded)
 
         self.assertFalse(result)
-        self.assertEqual(blender_attempts, [unrelated_tree])
-        self.assertEqual(push_attempts, [unrelated_tree])
-        self.assertEqual(preflight_inputs, [[unrelated_tree]])
+        self.assertEqual(
+            blender_attempts,
+            [failed_cluster, blocked_tree, unrelated_tree],
+        )
+        self.assertEqual(
+            push_attempts,
+            [failed_cluster, blocked_tree, unrelated_tree],
+        )
+        self.assertEqual(
+            preflight_inputs,
+            [[failed_cluster, blocked_tree, unrelated_tree]],
+        )
         self.assertEqual(len(blocked_contracts_at_push_expand), 1)
-        blocked_contract = blocked_contracts_at_push_expand[0]
-        self.assertFalse(blocked_contract["ready"])
-        self.assertEqual(blocked_contract["kind"], "dependency_blocked")
-        self.assertIn("필수 producer 산출물", blocked_contract["reason"])
-        self.assertIn(failed_cluster.name, blocked_contract["reason"])
-        self.assertIn("산출물 없음", blocked_contract["reason"])
-        self.assertIn("current", blocked_contract["reason"])
+        self.assertIsNone(blocked_contracts_at_push_expand[0])
         self.assertEqual(
             [item["spm"] for item in expand_push.call_args.args[0]],
-            [unrelated_tree],
+            [failed_cluster, blocked_tree, unrelated_tree],
         )
-        self.assertEqual(app._active_push_auto_added_ids, set())
+        self.assertEqual(
+            app._active_push_auto_added_ids,
+            {str(failed_cluster)},
+        )
         self.assertEqual(
             app.state[str(failed_cluster)]["spm_status_kind"],
             "data_error",
         )
-        self.assertEqual(
-            app.state[str(blocked_tree)]["blend_status_kind"],
-            "dependency_blocked",
-        )
-        self.assertEqual(
-            app.state[str(blocked_tree)]["push_status_kind"],
+        self.assertNotEqual(
+            app.state.get(str(blocked_tree), {}).get("blend_status_kind"),
             "dependency_blocked",
         )
         self.assertEqual(
             app._phase_failed_items,
-            {str(failed_cluster), str(blocked_tree)},
+            {str(failed_cluster)},
         )
         final_progress = [
             payload for kind, payload in list(app.ui_queue.queue)
             if kind == "progress"
         ][-1]
-        self.assertIn("completed 1", final_progress)
-        self.assertIn("blocked 1", final_progress)
+        self.assertIn("completed 2", final_progress)
+        self.assertIn("blocked 0", final_progress)
         self.assertIn("failed 1", final_progress)
 
-    def test_full_pipeline_starts_consumer_when_saved_provider_is_current(self):
+    def test_full_pipeline_starts_consumer_without_provider_admission_check(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         provider = Path("Tree_blackgum") / "Cluster" / "SK_cluster_blackgum.spm"
@@ -3910,7 +3782,7 @@ class PushQueueFlowTests(unittest.TestCase):
                 "phase": "blender",
                 "reason": "current saved provider output",
             },
-        ):
+        ) as verdict:
             result = app._run_full_pipeline(
                 [consumer_item],
                 terminal_phase="blender",
@@ -3928,10 +3800,8 @@ class PushQueueFlowTests(unittest.TestCase):
         )
         row = app._phase_result_summary["target_outcomes"][0]
         self.assertEqual(row["outcome"], "completed")
-        self.assertEqual(
-            row["evidence"]["dependency_resolution"],
-            "current_output_reused",
-        )
+        self.assertNotIn("dependency_resolution", row["evidence"])
+        verdict.assert_not_called()
 
     def test_full_pipeline_finishes_cluster_before_tree_spm_and_blender(self):
         gui = load_gui_module()
@@ -4744,7 +4614,7 @@ class PushQueueFlowTests(unittest.TestCase):
             [str(cluster)],
         )
 
-    def test_headless_blocks_tree_before_unreal_when_cluster_export_failed(self):
+    def test_headless_queues_tree_when_cluster_export_failed(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         app.force_rerun = False
@@ -4765,6 +4635,7 @@ class PushQueueFlowTests(unittest.TestCase):
             "report_path": "root-report.json",
             "assets": [],
         }
+        captured = {}
 
         def export_item(iid, _spm, _stamp):
             if iid == str(cluster):
@@ -4774,36 +4645,42 @@ class PushQueueFlowTests(unittest.TestCase):
                 )
             return root_export
 
+        def capture_import(pending, *_args, **_kwargs):
+            captured["pending"] = copy.deepcopy(pending)
+            return True
+
         with mock.patch.object(
             app, "_export_manifest_item", side_effect=export_item
         ), mock.patch.object(
             app,
-            "_run_limited",
-            side_effect=AssertionError(
-                "Unreal must not start for a dependency-blocked tree"
-            ),
-        ) as commandlet, mock.patch.object(gui, "save_state"):
+            "_run_headless_import_items",
+            side_effect=capture_import,
+        ) as importer, mock.patch.object(gui, "save_state"):
             result = app._run_headless_push_batch(
                 targets,
                 emit_done=False,
             )
 
-        self.assertFalse(result)
-        commandlet.assert_not_called()
+        self.assertTrue(result)
+        importer.assert_called_once()
         self.assertEqual(
             app.state[str(cluster)]["push_status_kind"],
             "manual_required",
         )
         self.assertEqual(
-            app.state[str(root)]["push_status_kind"],
+            [item["queue_id"] for item in captured["pending"]],
+            [str(root)],
+        )
+        self.assertEqual(
+            captured["pending"][0]["depends_on_queue_ids"],
+            [],
+        )
+        self.assertNotEqual(
+            app.state.get(str(root), {}).get("push_status_kind"),
             "dependency_blocked",
         )
-        self.assertIn(
-            cluster.name,
-            app.state[str(root)]["push_status_error"]["message"],
-        )
 
-    def test_headless_continues_consumer_when_failed_provider_import_is_current(self):
+    def test_headless_continues_consumer_without_provider_admission_check(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         app.force_rerun = False
@@ -4843,7 +4720,7 @@ class PushQueueFlowTests(unittest.TestCase):
                 "phase": "push",
                 "reason": "기존 Unreal import 영수증 current",
             },
-        ), mock.patch.object(
+        ) as verdict, mock.patch.object(
             app, "_run_headless_import_items", return_value=True
         ) as run_import, mock.patch.object(gui, "save_state"):
             app._run_headless_push_batch(targets, emit_done=False)
@@ -4852,14 +4729,9 @@ class PushQueueFlowTests(unittest.TestCase):
         pending = run_import.call_args.args[0]
         self.assertEqual([row["queue_id"] for row in pending], [str(consumer)])
         self.assertEqual(pending[0]["depends_on_queue_ids"], [])
-        self.assertEqual(
-            app._pipeline_dependency_reuse_evidence[str(consumer)][
-                str(provider)
-            ]["status"],
-            "current",
-        )
+        verdict.assert_not_called()
 
-    def test_headless_reports_waiting_without_terminal_consumer_failure(self):
+    def test_headless_queues_consumer_without_provider_wait_gate(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         app.force_rerun = False
@@ -4895,17 +4767,23 @@ class PushQueueFlowTests(unittest.TestCase):
                 "phase": "push",
                 "reason": "export current, Unreal import 영수증 대기",
             },
-        ), mock.patch.object(
+        ) as verdict, mock.patch.object(
             app,
             "_run_headless_import_items",
-            side_effect=AssertionError("waiting consumer must not enter Unreal"),
-        ), mock.patch.object(gui, "save_state"):
+            return_value=True,
+        ) as importer, mock.patch.object(gui, "save_state"):
             result = app._run_headless_push_batch(targets, emit_done=False)
 
-        self.assertFalse(result)
-        entry = app.state[str(consumer)]
-        self.assertEqual(entry["push_status_kind"], "dependency_waiting")
-        self.assertNotIn("push_status_error", entry)
+        self.assertTrue(result)
+        importer.assert_called_once()
+        pending = importer.call_args.args[0]
+        self.assertEqual([row["queue_id"] for row in pending], [str(consumer)])
+        self.assertEqual(pending[0]["depends_on_queue_ids"], [])
+        self.assertNotEqual(
+            app.state.get(str(consumer), {}).get("push_status_kind"),
+            "dependency_waiting",
+        )
+        verdict.assert_not_called()
 
     def test_cached_manifest_item_finds_recovered_item_after_provider(self):
         gui = load_gui_module()

@@ -1527,6 +1527,12 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "superseded_legacy_name_record": ReasonRow(
         INFORMATIONAL, "atlas_manifest_resolver.py", "diagnostic_shadow",
     ),
+    # A fresh exact-target publication supersedes only a lower-precedence
+    # mirror that declares that exact target manifest and the same provider
+    # identity. It is cache retirement, not an asset warning or repair gate.
+    "superseded_same_source_mirror": ReasonRow(
+        INFORMATIONAL, "atlas_manifest_resolver.py", "diagnostic_shadow",
+    ),
     # send2ue_push_job.py writes this as a report stage/status, which is not a
     # reason field.  The token only becomes a reason code where the GUI turns
     # it into `reason_token`, so that module owns the registry row.

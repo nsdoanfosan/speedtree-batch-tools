@@ -1032,6 +1032,26 @@ def _receipt_is_current(recipe):
         or receipt.get("unit_probe_sha256") != recipe["unit_probe_sha256"]
     ):
         return False
+    build = receipt.get("build") or {}
+    current_source_fbx = recipe.get("source_fbx_identity")
+    if isinstance(current_source_fbx, dict):
+        recorded_source_fbx = build.get("source_3d_contract") or {}
+        if (
+            _normalized_path(recorded_source_fbx.get("source_fbx") or "")
+            != _normalized_path(current_source_fbx.get("path") or "")
+            or str(
+                recorded_source_fbx.get("source_fbx_sha256") or ""
+            ).casefold()
+            != str(current_source_fbx.get("sha256") or "").casefold()
+        ):
+            # The physical plan receipt is derived from this exact FBX.  BWR can
+            # legitimately rewrite it while preserving the SPM semantic graph
+            # (for example by removing a zero-face object).  Reusing the older
+            # receipt in that case publishes a brand-new target manifest whose
+            # embedded source hash is already stale.  Invalidate only this
+            # changed source generation so the existing Normalizer run rebuilds
+            # it once; an unchanged FBX continues to use the current receipt.
+            return False
     recorded_semantic = str(
         receipt.get("source_spm_semantic_fingerprint") or ""
     ).casefold()
@@ -1095,7 +1115,6 @@ def _receipt_is_current(recipe):
     # source geometry, and capture contract were unchanged. Accept those
     # receipts only when their embedded build evidence proves every actual
     # normalization dependency still matches.
-    build = receipt.get("build") or {}
     source_contract = build.get("source_3d_contract") or {}
     capture_contract = build.get("physical_capture_contract") or {}
     capture_frame = capture_contract.get("frame") or {}
@@ -1287,7 +1306,7 @@ def resolve_normalization_recipe(
         ),
     }
     normalization_contract = {
-        "version": 4,
+        "version": 5,
         "blend": str(blend),
         "canonical_spm": str(canonical),
         "source_spm_semantic_projection_version":
@@ -1314,6 +1333,12 @@ def resolve_normalization_recipe(
         "plan_refinement_levels": 1,
         **role,
     }
+    source_fbx = blend.parent / "fbx" / f"{blend.stem}.fbx"
+    if source_fbx.is_file():
+        normalization_contract["source_fbx_identity"] = {
+            "path": str(source_fbx),
+            "sha256": _sha256_file(source_fbx),
+        }
     if isolated_bark_bundle is not None:
         normalization_contract["isolated_bark_bundle"] = (
             isolated_bark_bundle

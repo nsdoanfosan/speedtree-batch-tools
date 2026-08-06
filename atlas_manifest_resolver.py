@@ -822,6 +822,40 @@ def resolve_atlas_manifests(
             if claims[key] != winner["_claims"][key]
         ]
         if disagreements:
+            # The per-target record is the publication authority for this exact
+            # provider/scope.  Once a new target record exists, an older scope
+            # or rolling-global mirror from the same provider must not remain a
+            # second operational candidate and resurrect superseded Material /
+            # Mesh bindings.  Other providers remain independent candidates;
+            # this only shadows a lower-precedence mirror of the same source.
+            superseded_same_source = next(
+                (
+                    winner
+                    for _key, winner in disagreements
+                    if winner.get("kind") == "exact_per_target"
+                    and winner.get("precedence", 99)
+                    < candidate.get("precedence", 99)
+                    and winner.get("source_identity")
+                    == candidate.get("source_identity")
+                    and normalized_manifest_path(
+                        (candidate.get("payload") or {}).get(
+                            "target_manifest"
+                        ) or ""
+                    )
+                    == normalized_manifest_path(winner.get("path") or "")
+                ),
+                None,
+            )
+            if superseded_same_source is not None:
+                resolution["shadowed"].append({
+                    "path": candidate["path"],
+                    "kind": candidate["kind"],
+                    "precedence": candidate["precedence"],
+                    "reason": "superseded_same_source_mirror",
+                    "superseded_by": superseded_same_source["path"],
+                    "source_identity": candidate.get("source_identity"),
+                })
+                continue
             # A record written against the legacy unprefixed name loses to one
             # written against the canonical output name: the pair contract
             # makes the canonical name the production identity, so the legacy

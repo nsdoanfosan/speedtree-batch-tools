@@ -8230,49 +8230,6 @@ class App:
         }
         self._enqueue_batch_job(job)
 
-    def _pipeline_dependency_blocks(
-        self,
-        targets,
-        dependency_map,
-        root_failed_ids,
-    ):
-        """Block only failed dependencies whose saved output is not current."""
-        failed = {str(value) for value in root_failed_ids}
-        blocked = {}
-        verdicts_by_target = {}
-        reused_by_target = self.__dict__.setdefault(
-            "_pipeline_dependency_reuse_evidence", {}
-        )
-        for item in targets:
-            iid = str(item["spm"])
-            causes = []
-            verdicts = {}
-            for dependency in dependency_map.get(iid, ()):
-                if dependency not in failed:
-                    continue
-                verdict = self._dependency_artifact_verdict(
-                    dependency,
-                    phase="blender",
-                )
-                verdicts[dependency] = verdict
-                if verdict["status"] == "current":
-                    reused_by_target.setdefault(iid, {})[
-                        dependency
-                    ] = copy.deepcopy(verdict)
-                    self.log(
-                        "[의존 산출물 재사용] "
-                        f"{Path(iid).name}: {Path(dependency).name}의 "
-                        "기존 Blender 산출물이 current이므로 이번 실패 "
-                        "행으로 consumer를 차단하지 않습니다."
-                    )
-                    continue
-                causes.append(dependency)
-            if causes:
-                blocked[iid] = tuple(causes)
-                verdicts_by_target[iid] = verdicts
-        self._pipeline_dependency_artifact_verdicts = verdicts_by_target
-        return blocked
-
     @staticmethod
     def _dependency_artifact_state_label(status):
         return {
@@ -8583,91 +8540,6 @@ class App:
             if done:
                 return result
         return ""
-
-    def _record_pipeline_dependency_block(
-        self,
-        item,
-        column,
-        blocked_sources,
-        *,
-        persist,
-        publish_repair_contract=False,
-        dependency_verdicts=None,
-    ):
-        iid = str(item["spm"])
-        root_decisions = []
-        for value in sorted(blocked_sources, key=lambda row: Path(row).name):
-            entry = self._failed_retry_state_entry(value)
-            decision = repair_ui_decision(entry)
-            root_decisions.append((Path(value).name, decision))
-        automatic = bool(root_decisions) and all(
-            decision["status"] == REPAIR_UI_AUTOMATIC
-            for _, decision in root_decisions
-        )
-        dependency_verdicts = (
-            dependency_verdicts
-            if isinstance(dependency_verdicts, dict)
-            else {}
-        )
-        status_prefix = "자동 복구 대상" if automatic else "최종 차단"
-        names = ", ".join(name for name, _ in root_decisions)
-        artifact_causes = []
-        artifact_actions = []
-        for value in blocked_sources:
-            verdict = dependency_verdicts.get(value) or {}
-            status = str(verdict.get("status") or "stale")
-            label = self._dependency_artifact_state_label(status)
-            artifact_causes.append(
-                f"{Path(value).name}: {label} · "
-                f"{verdict.get('reason') or 'current 증거 없음'}"
-            )
-            artifact_actions.append(
-                f"{Path(value).name}의 exact 산출물을 다시 생성한 뒤 "
-                "current 영수증으로 재검증"
-            )
-        root_causes = " | ".join(artifact_causes) or " | ".join(
-            f"{name}: {decision['reason']}"
-            for name, decision in root_decisions
-        ) or "상위 Cluster의 current 산출물 증거를 확인하지 못했습니다."
-        root_actions = " | ".join(dict.fromkeys(artifact_actions)) or (
-            " | ".join(dict.fromkeys(
-                decision["action"] for _, decision in root_decisions
-            ))
-            or "상위 Cluster의 current 산출물 증거를 다시 생성해야 합니다."
-        )
-        reason = (
-            f"필수 producer 산출물 · {names} · 원인: {root_causes} · "
-            f"조치: {root_actions}"
-        )
-        self._record_phase_status(
-            iid,
-            column,
-            f"{status_prefix}: {reason}",
-            "dependency_blocked",
-            reason,
-            details={
-                "blocked_by": list(blocked_sources),
-                "repair_disposition": (
-                    REPAIR_UI_AUTOMATIC if automatic else REPAIR_UI_BLOCKED
-                ),
-                "root_repair_decisions": {
-                    name: copy.deepcopy(decision)
-                    for name, decision in root_decisions
-                },
-                "dependency_artifacts": copy.deepcopy(
-                    dependency_verdicts
-                ),
-            },
-            persist=persist,
-        )
-        if publish_repair_contract:
-            self._publish_repair_stage_contract(
-                item["spm"],
-                ready=False,
-                reason=reason,
-                kind="dependency_blocked",
-            )
-        self.log(f"[{status_prefix}] {Path(iid).name}: {reason}")
 
     def _record_pipeline_planned_exclusion(self, target_spm, error):
         """Persist one target-local block without failing a shared producer."""
@@ -9275,48 +9147,10 @@ class App:
         for phase, scheduled_targets, label in schedule:
             if self.stop_flag.is_set():
                 break
-            stage_blocked = {}
-            if phase == "blender":
-                tree_targets = [
-                    item for item in scheduled_targets
-                    if not is_cluster_source_spm(item["spm"])
-                ]
-                stage_blocked = self._pipeline_dependency_blocks(
-                    tree_targets,
-                    self._active_blender_dependency_map,
-                    root_failed_ids,
-                )
-                for item in tree_targets:
-                    iid = str(item["spm"])
-                    blocked_sources = stage_blocked.get(iid)
-                    if blocked_sources:
-                        self._record_pipeline_dependency_block(
-                            item,
-                            "blend_status",
-                            blocked_sources,
-                            persist=True,
-                            publish_repair_contract=True,
-                            dependency_verdicts=(
-                                self._pipeline_dependency_artifact_verdicts.get(
-                                    iid, {}
-                                )
-                            ),
-                        )
-                blocked_consumer_ids.update(stage_blocked)
-                if stage_blocked:
-                    self.log(
-                        f"🌙 {label}: dependency 차단 "
-                        f"{len(stage_blocked)}개 · root 원인 "
-                        f"{len(root_failed_ids)}개"
-                    )
             planned_excluded_ids = set(
                 getattr(self, "_pipeline_planned_exclusions", {}) or {}
             )
-            excluded_ids = (
-                root_failed_ids
-                | blocked_consumer_ids
-                | planned_excluded_ids
-            )
+            excluded_ids = set(planned_excluded_ids)
             eligible_stage = self._filter_pipeline_excluded_targets(
                 scheduled_targets,
                 excluded_ids,
@@ -9325,7 +9159,7 @@ class App:
                 continue
             self._pipeline_root_failed_items = set(root_failed_ids)
             self._pipeline_blocked_items = set(blocked_consumer_ids)
-            self._pipeline_upstream_failed_items = set(excluded_ids)
+            self._pipeline_upstream_failed_items = set()
             self.log(f"🌙 {label} 시작")
             phase_ok = self._run_batch(
                 phase, eligible_stage, emit_done=False
@@ -9362,26 +9196,14 @@ class App:
             )
             if new_root_failures:
                 root_failed_ids.update(new_root_failures)
-                self.log(
-                    f"🌙 {label}: root 실패 "
-                    f"{len(new_root_failures)}개는 다음 단계로 넘기지 않습니다."
-                )
             self.log(f"🌙 {label} 종료")
             if not phase_ok:
                 pipeline_abort = getattr(self, "_phase_abort_reason", None)
                 if pipeline_abort or self.stop_flag.is_set():
                     break
-                # Item-local failures are inputs to the next dependency gate,
-                # not a fleet-wide abort.  The next stage either reuses a
-                # current producer output or records its exact missing/stale
-                # artifact for only the mapped consumers.
+                # Item-local failures do not suppress later target stages.
         planned_excluded_ids = set(
             getattr(self, "_pipeline_planned_exclusions", {}) or {}
-        )
-        excluded_ids = (
-            root_failed_ids
-            | blocked_consumer_ids
-            | planned_excluded_ids
         )
         summary = self._build_pipeline_result_summary(
             getattr(self, "_active_pipeline_selected_targets", targets),
@@ -9389,6 +9211,14 @@ class App:
             blocked_consumer_ids,
             pipeline_abort,
         )
+        excluded_ids = {
+            str(row.get("target") or "")
+            for row in summary["target_outcomes"]
+            if row.get("outcome") in {
+                "failed", "blocked", "planned_excluded", "owner_lost",
+            }
+        }
+        excluded_ids.discard("")
         self._phase_result_summary = copy.deepcopy(summary)
         all_completed = bool(summary["selected_count"]) and (
             summary["completed_count"] == summary["selected_count"]
@@ -9675,64 +9505,6 @@ class App:
                         stage_dependency_contracts or None
                     ),
                 )
-                upstream_root_failed = set(
-                    getattr(self, "_pipeline_root_failed_items", set())
-                )
-                upstream_blocked = set(
-                    getattr(self, "_pipeline_blocked_items", set())
-                )
-                upstream_excluded = upstream_root_failed | upstream_blocked
-                if upstream_excluded:
-                    expanded_by_id = {
-                        str(item["spm"]): item for item in targets
-                    }
-                    for iid in sorted(upstream_blocked):
-                        item = expanded_by_id.get(iid)
-                        if item is not None:
-                            blocked_sources = tuple(
-                                dependency
-                                for dependency in (
-                                    self._active_blender_dependency_map.get(
-                                        iid, ()
-                                    )
-                                )
-                                if dependency in upstream_root_failed
-                            )
-                            if blocked_sources:
-                                self._record_pipeline_dependency_block(
-                                    item,
-                                    "push_status",
-                                    blocked_sources,
-                                    persist=True,
-                                    dependency_verdicts=(
-                                        getattr(
-                                            self,
-                                            "_pipeline_dependency_artifact_verdicts",
-                                            {},
-                                        ).get(iid, {})
-                                    ),
-                                )
-                    removed_roots = {
-                        iid for iid in upstream_root_failed
-                        if iid in expanded_by_id
-                    }
-                    targets = self._filter_pipeline_excluded_targets(
-                        targets,
-                        upstream_excluded,
-                    )
-                    self._active_push_auto_added_ids.difference_update(
-                        upstream_excluded
-                    )
-                    if removed_roots:
-                        self.log(
-                            "Tree Push dependency: upstream root 실패 "
-                            f"{len(removed_roots)}개 재도입 차단"
-                        )
-                    if upstream_blocked:
-                        self.log(
-                            "Tree Push dependency: blocked consumer "
-                            f"{len(upstream_blocked)}개 Push 제외"
-                        )
             except (
                 PushDependencyError,
                 RepairPushEvidenceError,
@@ -9813,25 +9585,6 @@ class App:
         phase_abort = threading.Event()
         attempted = set()
         failed_items = set(preflight_skipped)
-        blender_dependency_map = (
-            getattr(self, "_active_blender_dependency_map", None)
-            if phase == "blender"
-            else None
-        )
-        if phase == "blender" and blender_dependency_map is None:
-            (
-                _expanded,
-                blender_dependency_map,
-                _auto_added,
-            ) = expand_blender_repair_targets(
-                targets,
-                self._batch_job_inventory()
-                or {str(item["spm"]): item for item in targets},
-            )
-        blender_dependency_map = blender_dependency_map or {}
-        upstream_failed_items = set(
-            getattr(self, "_pipeline_upstream_failed_items", set())
-        )
 
         def run_one(item):
             if self.stop_flag.is_set():
@@ -9863,103 +9616,6 @@ class App:
                 heartbeat=True,
             )
             try:
-                if phase == "push":
-                    dependencies = self._active_push_dependency_map.get(
-                        iid, ()
-                    )
-                    blocked = []
-                    waiting = []
-                    verdicts = {}
-                    for dependency in dependencies:
-                        if dependency not in failed_items:
-                            continue
-                        verdict = self._dependency_artifact_verdict(
-                            dependency,
-                            phase="push",
-                        )
-                        verdicts[dependency] = verdict
-                        if verdict["status"] == "current":
-                            self.__dict__.setdefault(
-                                "_pipeline_dependency_reuse_evidence", {}
-                            ).setdefault(iid, {})[
-                                dependency
-                            ] = copy.deepcopy(verdict)
-                            self.log(
-                                "[의존 산출물 재사용] "
-                                f"{spm.name}: {Path(dependency).name}의 "
-                                "기존 Unreal import가 current이므로 이번 "
-                                "실패 행으로 consumer를 차단하지 않습니다."
-                            )
-                        elif verdict["status"] == "waiting":
-                            waiting.append(dependency)
-                        else:
-                            blocked.append(dependency)
-                    if waiting and not blocked:
-                        reason = " | ".join(
-                            f"{Path(value).name}: "
-                            f"{verdicts[value].get('reason')}"
-                            for value in waiting
-                        )
-                        message = (
-                            "필수 producer Unreal 산출물 대기: " + reason
-                        )
-                        self._set_push_state(
-                            iid,
-                            "dependency_waiting",
-                            "대기: " + message,
-                            details={
-                                "reason_token": "dependency_waiting",
-                                "blocked_by": list(waiting),
-                                "dependency_artifacts": copy.deepcopy(
-                                    verdicts
-                                ),
-                            },
-                            message=message,
-                        )
-                        self.log(f"[의존 산출물 대기] {spm.name}: {reason}")
-                        return
-                    if blocked:
-                        reason = " | ".join(
-                            f"{Path(value).name}: "
-                            f"{self._dependency_artifact_state_label(verdicts[value].get('status'))}"
-                            f" · {verdicts[value].get('reason')}"
-                            for value in blocked
-                        )
-                        raise BatchItemError(
-                            "필수 producer Unreal 산출물이 current가 아닙니다: "
-                            + reason,
-                            kind="dependency_blocked",
-                            report={
-                                "reason_token": "shared_dependency_failed",
-                                "evidence": {
-                                    "blocked_by": list(blocked),
-                                    "dependency_artifacts": copy.deepcopy(
-                                        verdicts
-                                    ),
-                                },
-                            },
-                        )
-                if phase == "blender" and not is_cluster_source_spm(spm):
-                    blocked_sources = [
-                        dependency
-                        for dependency in blender_dependency_map.get(iid, ())
-                        if (
-                            dependency in failed_items
-                            or dependency in upstream_failed_items
-                        )
-                    ]
-                    if blocked_sources:
-                        raise BatchItemError(
-                            "Cluster source Repair failed, so downstream "
-                            "Repair was not run: "
-                            + ", ".join(
-                                sorted(
-                                    Path(value).name
-                                    for value in blocked_sources
-                                )
-                            ),
-                            kind="dependency_blocked",
-                        )
                 if phase == "check":
                     self._job_check(iid, spm)
                 elif phase == "spm":
@@ -11323,7 +10979,18 @@ class App:
         self.ui_queue.put(("cell", (iid, "blend_status", text)))
         if persist:
             with self.state_lock:
-                self.state.setdefault(iid, {})["blend_status"] = text
+                entry = self.state.setdefault(iid, {})
+                entry["blend_status"] = text
+                if (
+                    isinstance(repair_state, dict)
+                    and repair_state.get("current") is True
+                ):
+                    # Fresh live Repair evidence supersedes an older persisted
+                    # failure. Keeping data_error beside a current status made
+                    # retry planning strand already-repaired providers.
+                    entry["blend_status_kind"] = "ok"
+                    entry.pop("blend_status_error", None)
+                    entry.pop("blend_status_result", None)
                 save_state(self.state)
         return text
 
@@ -14992,15 +14659,11 @@ class App:
             spm,
             state_out=handoff_state,
         )
-        blend_status = (
-            self._blend_status_from_repair_state(handoff_state)
-            if handoff_state
-            else self._blend_status_text(spm)
+        blend_status = self._record_live_blend_status(
+            iid,
+            spm,
+            repair_state=handoff_state or None,
         )
-        self.ui_queue.put(("cell", (iid, "blend_status", blend_status)))
-        with self.state_lock:
-            entry["blend_status"] = blend_status
-            save_state(self.state)
         source_review = bool(
             result.get("source_review_required")
             or (result.get("handoff_preflight") or {}).get("status")
@@ -16256,91 +15919,6 @@ class App:
             for item in exported
             if item.get("queue_id")
         }
-        dependency_blocked_ids = set()
-        dependency_waiting_ids = set()
-        external_current_dependencies = {}
-        for item in exported:
-            iid = str(item.get("queue_id") or "")
-            unavailable = [
-                dependency
-                for dependency in dependency_map.get(iid, ())
-                if dependency not in exported_ids
-            ]
-            if not unavailable:
-                continue
-            blocked = []
-            waiting = []
-            verdicts = {}
-            for dependency in unavailable:
-                verdict = self._dependency_artifact_verdict(
-                    dependency,
-                    phase="push",
-                )
-                verdicts[dependency] = verdict
-                status = str(verdict.get("status") or "stale")
-                if status == "current":
-                    external_current_dependencies.setdefault(iid, set()).add(
-                        dependency
-                    )
-                    self.__dict__.setdefault(
-                        "_pipeline_dependency_reuse_evidence", {}
-                    ).setdefault(iid, {})[dependency] = copy.deepcopy(verdict)
-                    self.log(
-                        "[의존 산출물 재사용] "
-                        f"{Path(iid).name}: {Path(dependency).name}의 "
-                        "기존 Unreal import 영수증이 current이므로 진행합니다."
-                    )
-                elif status == "waiting":
-                    waiting.append(dependency)
-                else:
-                    blocked.append(dependency)
-            if blocked:
-                reason = "필수 producer 산출물이 current가 아닙니다: " + " | ".join(
-                    f"{Path(dependency).name}: "
-                    f"{self._dependency_artifact_state_label(verdicts[dependency].get('status'))} · "
-                    f"{verdicts[dependency].get('reason') or 'current 증거 없음'}"
-                    for dependency in blocked
-                )
-                self._set_push_state(
-                    iid,
-                    "dependency_blocked",
-                    self._failure_status_text(reason, "dependency_blocked"),
-                    details={
-                        "reason_token": "shared_dependency_failed",
-                        "blocked_by": blocked,
-                        "dependency_artifacts": copy.deepcopy(verdicts),
-                    },
-                    message=reason,
-                )
-                failed_items.add(iid)
-                dependency_blocked_ids.add(iid)
-                continue
-            if waiting:
-                reason = "필수 producer의 current export는 있으나 Unreal 반영 완료를 기다립니다: " + ", ".join(
-                    Path(dependency).name for dependency in waiting
-                )
-                self._set_push_state(
-                    iid,
-                    "dependency_waiting",
-                    f"대기: {reason}",
-                    details={
-                        "blocked_by": waiting,
-                        "dependency_artifacts": copy.deepcopy(verdicts),
-                    },
-                    message=reason,
-                )
-                dependency_waiting_ids.add(iid)
-                self.log(f"[의존 산출물 대기] {Path(iid).name}: {reason}")
-        unavailable_consumer_ids = (
-            dependency_blocked_ids | dependency_waiting_ids
-        )
-        if unavailable_consumer_ids:
-            exported = [
-                item
-                for item in exported
-                if str(item.get("queue_id") or "")
-                not in unavailable_consumer_ids
-            ]
 
         if self.stop_flag.is_set():
             for item in targets:
@@ -16361,9 +15939,7 @@ class App:
             item["depends_on_queue_ids"] = [
                 dependency
                 for dependency in dependency_map.get(iid, ())
-                if dependency not in external_current_dependencies.get(
-                    iid, set()
-                )
+                if dependency in exported_ids
             ]
             entry = self.state.setdefault(iid, {})
             import_cache_matches = (

@@ -378,7 +378,7 @@ class AtlasManifestResolverTests(unittest.TestCase):
             self.assertEqual(diagnostics["status"], "coherent")
             self.assertEqual(diagnostics["conflicting"], [])
 
-    def test_every_operational_precedence_disagreement_fails_closed(self):
+    def test_exact_target_shadows_superseded_same_source_mirrors(self):
         variants = {}
         with tempfile.TemporaryDirectory() as temporary:
             root, target, blend, payload = self.fixture(temporary)
@@ -411,6 +411,14 @@ class AtlasManifestResolverTests(unittest.TestCase):
                         "exact_per_target",
                         payload,
                     )
+                    payload["target_manifest"] = str(authority.resolve())
+                    authority.write_text(
+                        json.dumps(payload, sort_keys=True),
+                        encoding="utf-8",
+                    )
+                    conflicting_payload["target_manifest"] = str(
+                        authority.resolve()
+                    )
                     conflict = self.write_candidate(
                         root,
                         target,
@@ -418,20 +426,33 @@ class AtlasManifestResolverTests(unittest.TestCase):
                         conflicting_payload,
                     )
 
-                    with self.assertRaises(AtlasManifestResolutionError) as caught:
-                        resolve_atlas_manifests(target)
+                    if label == "source_identity":
+                        with self.assertRaises(
+                            AtlasManifestResolutionError
+                        ) as caught:
+                            resolve_atlas_manifests(target)
+                        evidence = caught.exception.resolution
+                        self.assertEqual(
+                            evidence["conflicting"][0]["reason"],
+                            "operational_candidate_disagreement",
+                        )
+                        continue
 
-                    evidence = caught.exception.resolution
+                    resolution = resolve_atlas_manifests(target)
                     self.assertEqual(
-                        evidence["conflicting"][0]["reason"],
-                        "operational_candidate_disagreement",
+                        [row["path"] for row in resolution["selected"]],
+                        [str(authority.resolve())],
+                    )
+                    shadow = next(
+                        row for row in resolution["shadowed"]
+                        if row["path"] == str(conflict.resolve())
                     )
                     self.assertEqual(
-                        evidence["conflicting"][0]["path"],
-                        str(conflict.resolve()),
+                        shadow["reason"],
+                        "superseded_same_source_mirror",
                     )
                     self.assertEqual(
-                        evidence["conflicting"][0]["conflicts_with"],
+                        shadow["superseded_by"],
                         str(authority.resolve()),
                     )
 
@@ -446,6 +467,9 @@ class AtlasManifestResolverTests(unittest.TestCase):
             )
             conflicting = copy.deepcopy(payload)
             conflicting["material_groups"][0]["mesh_ids"] = [99]
+            conflicting["blend_file"] = str(
+                Path(payload["blend_file"]).with_name("foreign.blend")
+            )
             conflict = self.write_candidate(
                 root,
                 target,
