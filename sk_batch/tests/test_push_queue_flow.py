@@ -5676,6 +5676,47 @@ class PushQueueFlowTests(unittest.TestCase):
             eligibility["items"][0]["classification"], "unreal_only"
         )
 
+    def test_checked_failed_retry_unreal_failure_resumes_immutable_job(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        iid = "checked_unreal_failed.spm"
+        jobs = self.configure_failed_retry_start(app, [iid])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, checkpoint = self.write_unreal_retry_parent(
+                gui, root, iid
+            )
+            app.state[iid] = {
+                "push_status_kind": "data_error",
+                "push_paths": {
+                    "manifest": str(manifest),
+                    "checkpoint": str(checkpoint),
+                },
+                "push_source_fingerprint_cache": {
+                    "fingerprint": "source-v1",
+                    "snapshot": {},
+                },
+            }
+            with mock.patch.object(gui, "save_config") as save_config:
+                app.start_checked_failed_results_retry()
+
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["mode"], "unreal_recovery")
+        self.assertFalse(jobs[0]["force_rerun"])
+        self.assertEqual(
+            jobs[0]["retry_metadata"]["execution_path"],
+            "immutable_unreal_only",
+        )
+        eligibility = jobs[0]["retry_metadata"]["eligibility"]
+        self.assertEqual(
+            eligibility["items"][0]["reason_code"],
+            "current_immutable_unreal_failure",
+        )
+        persisted = save_config.call_args.args[0]
+        self.assertNotIn("_retry_force_rerun", persisted)
+        self.assertNotIn("_retry_force_full_rebuild", persisted)
+
     def test_failed_results_retry_is_independent_of_checkbox_state(self):
         gui = load_gui_module()
         first = "first_repair_failed.spm"

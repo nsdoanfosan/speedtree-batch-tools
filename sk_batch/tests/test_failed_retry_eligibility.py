@@ -214,12 +214,25 @@ def test_current_immutable_unreal_failure_stays_unreal_only():
     assert decision.reason_code == "current_immutable_unreal_failure"
 
 
-def test_explicit_force_rerun_rebuilds_current_retryable_unreal_failure():
+def test_selected_retry_resumes_current_retryable_unreal_failure():
     decision = classify_failed_retry(
         {"push_status_kind": "data_error"},
         CURRENT_REPAIR,
         unreal_parent_status=UNREAL_PARENT_CURRENT,
         force_rerun=True,
+    )
+
+    assert decision.classification == UNREAL_ONLY
+    assert decision.reason_code == "current_immutable_unreal_failure"
+
+
+def test_explicit_force_full_rebuild_rebuilds_current_unreal_failure():
+    decision = classify_failed_retry(
+        {"push_status_kind": "data_error"},
+        CURRENT_REPAIR,
+        unreal_parent_status=UNREAL_PARENT_CURRENT,
+        force_rerun=True,
+        force_full_rebuild=True,
     )
 
     assert decision.classification == BLENDER_REBUILD
