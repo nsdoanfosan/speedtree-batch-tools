@@ -808,6 +808,11 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
         "audit_detail",
     ),
+    "current_live_pair_requires_assembly_part": ReasonRow(
+        INFORMATIONAL,
+        "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
+        "relation_decision_diagnostic",
+    ),
     "current_material_mesh_connection_incomplete": ReasonRow(
         UNCLASSIFIED, "pcg_st9_texture_batch/pcg_texture_audit.py", "",
     ),
