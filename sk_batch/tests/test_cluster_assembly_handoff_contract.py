@@ -771,7 +771,7 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
             )
             self.assertEqual(handoff["issues"], [])
 
-    def test_asset_registration_only_is_pass_through_before_bwr(self):
+    def test_actual_pair_overrides_asset_registration_only_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             spm = root / "SK_Tree_elm_01.spm"
@@ -809,13 +809,14 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                 row for row in handoff["roles"]
                 if row["role"] == "branch"
             )
-            self.assertEqual(branch["decision"], "pass_through")
+            self.assertEqual(handoff["status"], "ready")
+            self.assertEqual(branch["decision"], "normalize_part")
             self.assertEqual(
                 branch["reconciliation"],
-                "asset_registration_only",
+                "current_fbx_pair_overrides_asset_registration_only",
             )
 
-    def test_incomplete_generator_connection_metadata_is_nonblocking(self):
+    def test_actual_pair_overrides_incomplete_connection_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             spm = root / "SK_Tree_elm_01.spm"
@@ -848,15 +849,15 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
 
             handoff = build_assembly_handoff(receipt, spm, inventory)
 
-            self.assertEqual(handoff["status"], "pass_through")
+            self.assertEqual(handoff["status"], "ready")
             branch = next(
                 row for row in handoff["roles"]
                 if row["role"] == "branch"
             )
-            self.assertEqual(branch["decision"], "pass_through")
+            self.assertEqual(branch["decision"], "normalize_part")
             self.assertEqual(
                 branch["reconciliation"],
-                "generator_connection_metadata_incomplete_nonblocking",
+                "current_fbx_pair_overrides_connection_incomplete",
             )
             self.assertEqual(handoff["issues"], [])
 

@@ -169,6 +169,7 @@ from sk_common import (
     load_state,
     manifest_item_files_match,
     manual_bones_marker_path,
+    push_source_cache_matches_snapshot,
     save_config,
     save_state,
     scan_cluster_spm_sources,
@@ -8287,7 +8288,9 @@ class App:
                 "phase": "push",
                 "reason": f"Push 입력 파일을 확인할 수 없습니다: {exc}",
             }
-        if source_cache.get("snapshot") != current_snapshot:
+        if not push_source_cache_matches_snapshot(
+            source_cache, current_snapshot
+        ):
             return {
                 "status": "stale",
                 "phase": "push",
@@ -15593,11 +15596,15 @@ class App:
         return list(dict.fromkeys(self._push_dependency_paths()))
 
     def _push_source_dependency_paths(self, spm=None):
-        """Return code plus the per-asset Repair/Assembly contract."""
-        paths = list(self._push_dependency_paths())
-        if spm is not None:
-            paths.append(repair_pipeline_report_path(Path(spm)))
-        return paths
+        """Return only content that can change an asset's exported payload.
+
+        Executable code is tracked separately for diagnostics and Unreal
+        rebinding. Editing code must not invalidate every immutable FBX/JSON
+        export in the batch.
+        """
+        if spm is None:
+            return []
+        return [repair_pipeline_report_path(Path(spm))]
 
     @staticmethod
     def _push_material_contract(spm):
@@ -15703,8 +15710,10 @@ class App:
             )
         except (OSError, ValueError, KeyError):
             return "Push 재확인 필요 — 입력 파일 확인"
-        if source_cache.get("snapshot") != current_snapshot:
-            return "Push 재확인 필요 — Blender/파이프라인 변경"
+        if not push_source_cache_matches_snapshot(
+            source_cache, current_snapshot
+        ):
+            return "Push 재확인 필요 — Blender/콘텐츠 계약 변경"
         if export_cache.get("source_fingerprint") != source_cache.get(
             "fingerprint"
         ):

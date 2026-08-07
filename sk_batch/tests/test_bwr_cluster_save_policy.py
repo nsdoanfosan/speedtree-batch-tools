@@ -29,6 +29,22 @@ def load_save_helper():
     return namespace["save_cluster_source_mainfile"]
 
 
+def load_assembly_selection_helper():
+    tree = ast.parse(JOB_PATH.read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in tree.body
+        if (
+            isinstance(node, ast.FunctionDef)
+            and node.name == "select_cluster_assembly_build_handoff"
+        )
+    )
+    module = ast.Module(body=[function], type_ignores=[])
+    namespace = {}
+    exec(compile(module, str(JOB_PATH), "exec"), namespace)
+    return namespace["select_cluster_assembly_build_handoff"]
+
+
 class FakeBlender:
     def __init__(self, save_version, error=None):
         self.filepaths = types.SimpleNamespace(save_version=save_version)
@@ -49,6 +65,27 @@ class FakeBlender:
 
 
 class ClusterSavePolicyTests(unittest.TestCase):
+    def test_ready_fbx_handoff_overrides_receipt_pass_through(self):
+        helper = load_assembly_selection_helper()
+        receipt_handoff = {"status": "pass_through", "source": "receipt"}
+        inspected_handoff = {"status": "ready", "source": "fbx"}
+
+        mode, selected = helper(
+            {"handoff": receipt_handoff}, inspected_handoff
+        )
+
+        self.assertEqual(mode, "build")
+        self.assertIs(selected, inspected_handoff)
+
+    def test_receipt_pass_through_remains_without_ready_fbx_roles(self):
+        helper = load_assembly_selection_helper()
+        receipt_handoff = {"status": "pass_through", "source": "receipt"}
+
+        mode, selected = helper({"handoff": receipt_handoff}, None)
+
+        self.assertEqual(mode, "pass_through")
+        self.assertIs(selected, receipt_handoff)
+
     def test_cluster_save_disables_version_backup_for_operator_only(self):
         helper = load_save_helper()
         blender = FakeBlender(save_version=3)

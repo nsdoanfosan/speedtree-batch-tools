@@ -350,6 +350,30 @@ def require_cluster_assembly_handoff_ready(handoff):
     )
 
 
+def select_cluster_assembly_build_handoff(receipt_contract, inspected_handoff):
+    """Prefer current FBX evidence over a stale pass-through receipt.
+
+    The PCG receipt describes what was known before the final BWR FBX existed.
+    Once that FBX has been inspected, a ready handoff is the authoritative
+    content signal and must create Assembly inputs even when the older receipt
+    recorded ``pass_through``.
+    """
+    if (
+        isinstance(inspected_handoff, dict)
+        and inspected_handoff.get("status") == "ready"
+    ):
+        return "build", inspected_handoff
+
+    receipt_handoff = {}
+    if isinstance(receipt_contract, dict):
+        receipt_handoff = receipt_contract.get("handoff") or {}
+    if receipt_handoff.get("status") == "pass_through":
+        return "pass_through", receipt_handoff
+    if isinstance(inspected_handoff, dict):
+        return "build", inspected_handoff
+    return None, None
+
+
 def cluster_assembly_contract_from_material_contract(receipt_path, spm_path):
     """Find the additive PCG receipt inside the existing required contract."""
     try:
@@ -1085,20 +1109,19 @@ def main():
         report["source_review_required"] = handoff_status == "source_review"
         report["unreal_push_ready"] = handoff_status == "ok"
         assembly_manifest = None
-        pass_through_handoff = None
-        if isinstance(cluster_assembly_contract, dict):
-            candidate_handoff = (
-                cluster_assembly_contract.get("handoff") or {}
+        assembly_mode, selected_assembly_handoff = (
+            select_cluster_assembly_build_handoff(
+                cluster_assembly_contract,
+                cluster_assembly_handoff,
             )
-            if candidate_handoff.get("status") == "pass_through":
-                pass_through_handoff = candidate_handoff
-        if preflight["status"] == "ok" and pass_through_handoff is not None:
+        )
+        if preflight["status"] == "ok" and assembly_mode == "pass_through":
             # Persist "no content-driven Assembly" as a positive current
             # contract. Without this manifest, Push falls back to historical
             # target registries and can falsely dependency-orchestrate an
             # otherwise ordinary Full-SK asset.
             assembly_manifest = build_blender_assembly_inputs(
-                pass_through_handoff,
+                selected_assembly_handoff,
                 None,
                 None,
                 Path(blend_dir) / "assembly",
@@ -1111,7 +1134,7 @@ def main():
             report["cluster_assembly_manifest"] = assembly_manifest
         elif (
             preflight["status"] == "ok"
-            and cluster_assembly_handoff is not None
+            and assembly_mode == "build"
         ):
             if pipeline_data is None or merged_object is None:
                 raise RuntimeError(
@@ -1128,7 +1151,7 @@ def main():
                     "Cluster Assembly builder found no final Full SK FBX path"
                 )
             assembly_manifest = build_blender_assembly_inputs(
-                cluster_assembly_handoff,
+                selected_assembly_handoff,
                 final_armature,
                 merged_object,
                 Path(blend_dir) / "assembly",

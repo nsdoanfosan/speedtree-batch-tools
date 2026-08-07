@@ -525,6 +525,65 @@ class SkCommonOptimizationTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertNotEqual(second, changed)
 
+    def test_legacy_code_inclusive_cache_migrates_without_new_fingerprint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            blend = root / "large.blend"
+            content_contract = root / "repair_report.json"
+            exporter_code = root / "exporter.py"
+            blend.write_bytes(b"blend-content")
+            content_contract.write_text("content-v1", encoding="utf-8")
+            exporter_code.write_text("code-v1", encoding="utf-8")
+            old_fingerprint, legacy_cache, _hit = (
+                cached_push_source_fingerprint(
+                    blend, [content_contract, exporter_code]
+                )
+            )
+            legacy_cache.pop("fingerprint_contract")
+
+            exporter_code.write_text("code-v2", encoding="utf-8")
+            migrated, migrated_cache, cache_hit = (
+                cached_push_source_fingerprint(
+                    blend, [content_contract], cache=legacy_cache
+                )
+            )
+
+        self.assertTrue(cache_hit)
+        self.assertEqual(migrated, old_fingerprint)
+        self.assertEqual(
+            migrated_cache["fingerprint_contract"], "content_only_v2"
+        )
+        self.assertEqual(
+            migrated_cache["snapshot"]["dependencies"],
+            [legacy_cache["snapshot"]["dependencies"][0]],
+        )
+
+    def test_legacy_cache_does_not_migrate_after_content_contract_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            blend = root / "large.blend"
+            content_contract = root / "repair_report.json"
+            exporter_code = root / "exporter.py"
+            blend.write_bytes(b"blend-content")
+            content_contract.write_text("content-v1", encoding="utf-8")
+            exporter_code.write_text("code-v1", encoding="utf-8")
+            old_fingerprint, legacy_cache, _hit = (
+                cached_push_source_fingerprint(
+                    blend, [content_contract, exporter_code]
+                )
+            )
+            legacy_cache.pop("fingerprint_contract")
+
+            content_contract.write_text("content-v2", encoding="utf-8")
+            changed, _changed_cache, cache_hit = (
+                cached_push_source_fingerprint(
+                    blend, [content_contract], cache=legacy_cache
+                )
+            )
+
+        self.assertFalse(cache_hit)
+        self.assertNotEqual(changed, old_fingerprint)
+
     def test_file_snapshot_reuses_unchanged_stat_cache(self):
         with tempfile.TemporaryDirectory() as tmp:
             spm = Path(tmp) / "SK_tree.spm"
@@ -558,6 +617,32 @@ class SkCommonOptimizationTests(unittest.TestCase):
                 side_effect=AssertionError("unchanged export was rehashed"),
             ):
                 self.assertTrue(manifest_item_files_match(item))
+
+    def test_manifest_code_drift_does_not_invalidate_immutable_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            exported = root / "mesh.fbx"
+            code = root / "exporter.py"
+            exported.write_bytes(b"fbx")
+            code.write_text("version = 2", encoding="utf-8")
+            export_stat = exported.stat()
+            item = {
+                "fingerprint": "manifest",
+                "exported_files": [{
+                    "path": str(exported),
+                    "size": export_stat.st_size,
+                    "mtime_ns": export_stat.st_mtime_ns,
+                    "fingerprint": "not-needed",
+                }],
+                "code_files": [{
+                    "path": str(code),
+                    "size": 1,
+                    "mtime_ns": 1,
+                    "fingerprint": "old-code",
+                }],
+            }
+
+            self.assertTrue(manifest_item_files_match(item))
 
 
 if __name__ == "__main__":

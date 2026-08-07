@@ -4578,6 +4578,10 @@ class PushQueueFlowTests(unittest.TestCase):
         }
 
         self.assertIn(gui.repair_pipeline_report_path(spm), paths)
+        self.assertEqual(paths, {gui.repair_pipeline_report_path(spm)})
+        self.assertTrue(
+            paths.isdisjoint({Path(path) for path in app._push_dependency_paths()})
+        )
 
     def test_headless_exports_all_items_then_uses_one_commandlet_session(self):
         gui = load_gui_module()
