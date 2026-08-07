@@ -3510,6 +3510,222 @@ def _attachment_vertex_correspondence(
     return source_index, target_index
 
 
+def _attachment_uv_edge_point(obj, component, attachment_uv):
+    """Resolve one UV point on a unique geometric edge of a component."""
+    uv_layer = obj.data.uv_layers.active
+    candidates = []
+    uv_tolerance = 2.0e-6
+    for polygon_index in component["polygons"]:
+        polygon = obj.data.polygons[polygon_index]
+        loops = list(polygon.loop_indices)
+        for offset, first_loop in enumerate(loops):
+            second_loop = loops[(offset + 1) % len(loops)]
+            first_uv = uv_layer.data[first_loop].uv
+            second_uv = uv_layer.data[second_loop].uv
+            delta = (
+                float(second_uv.x) - float(first_uv.x),
+                float(second_uv.y) - float(first_uv.y),
+            )
+            length_squared = delta[0] * delta[0] + delta[1] * delta[1]
+            if length_squared <= 1.0e-20:
+                continue
+            relative = (
+                float(attachment_uv[0]) - float(first_uv.x),
+                float(attachment_uv[1]) - float(first_uv.y),
+            )
+            parameter = (
+                relative[0] * delta[0] + relative[1] * delta[1]
+            ) / length_squared
+            if parameter < -uv_tolerance or parameter > 1.0 + uv_tolerance:
+                continue
+            parameter = max(0.0, min(1.0, parameter))
+            projected = (
+                float(first_uv.x) + delta[0] * parameter,
+                float(first_uv.y) + delta[1] * parameter,
+            )
+            residual = math.dist(projected, attachment_uv)
+            if residual > uv_tolerance:
+                continue
+            first_index = int(obj.data.loops[first_loop].vertex_index)
+            second_index = int(obj.data.loops[second_loop].vertex_index)
+            first_coordinate = obj.data.vertices[first_index].co
+            second_coordinate = obj.data.vertices[second_index].co
+            coordinate = tuple(
+                float(first_coordinate[axis]) * (1.0 - parameter)
+                + float(second_coordinate[axis]) * parameter
+                for axis in range(3)
+            )
+            candidates.append({
+                "coordinate": coordinate,
+                "edge_vertices": [first_index, second_index],
+                "parameter": float(parameter),
+                "uv_residual": float(residual),
+            })
+    if not candidates:
+        return None
+
+    coordinates = [
+        tuple(float(value) for value in obj.data.vertices[index].co)
+        for index in component["vertices"]
+    ]
+    spans = [
+        max(point[axis] for point in coordinates)
+        - min(point[axis] for point in coordinates)
+        for axis in range(3)
+    ]
+    coordinate_tolerance = max(max(spans) * 2.0e-6, 1.0e-9)
+    groups = []
+    for candidate in sorted(
+        candidates,
+        key=lambda row: (
+            row["uv_residual"],
+            row["edge_vertices"],
+            row["parameter"],
+        ),
+    ):
+        group = next((
+            row for row in groups
+            if math.dist(row["coordinate"], candidate["coordinate"])
+            <= coordinate_tolerance
+        ), None)
+        if group is None:
+            groups.append({
+                "coordinate": candidate["coordinate"],
+                "candidates": [candidate],
+            })
+        else:
+            group["candidates"].append(candidate)
+    if len(groups) != 1:
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment UV crosses multiple geometric edges"
+        )
+    best = groups[0]["candidates"][0]
+    return {
+        "coordinate": groups[0]["coordinate"],
+        "edge_vertices": best["edge_vertices"],
+        "parameter": best["parameter"],
+        "uv_residual": best["uv_residual"],
+        "candidate_edge_count": len(candidates),
+    }
+
+
+def _attachment_point_correspondence(
+    source_obj,
+    source_component,
+    target_obj,
+    target_component,
+    attachment_uv,
+):
+    """Resolve an attachment as an exact vertex or a strict UV-edge point.
+
+    Older normalized plans can contain an authored origin vertex that is not
+    referenced by a face.  FBX removes that loose vertex, while preserving the
+    boundary edge on which the authored UV lies.  The compatibility path below
+    is limited to exact source/target topology matches and requires the source
+    edge interpolation to reconstruct local origin.
+    """
+    if (
+        not isinstance(attachment_uv, (list, tuple))
+        or len(attachment_uv) != 2
+    ):
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment vertex UV is missing or invalid"
+        )
+    try:
+        resolved_uv = tuple(float(value) for value in attachment_uv)
+    except (TypeError, ValueError) as exc:
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment vertex UV is missing or invalid"
+        ) from exc
+    if any(not math.isfinite(value) for value in resolved_uv):
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment vertex UV is missing or invalid"
+        )
+    if (
+        source_obj.data.uv_layers.active is None
+        or target_obj.data.uv_layers.active is None
+    ):
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment correspondence requires UV layers"
+        )
+
+    key = tuple(round(value, 6) for value in resolved_uv)
+    source_index = _coincident_uv_vertex_index(
+        source_obj, source_component, key
+    )
+    target_index = _coincident_uv_vertex_index(
+        target_obj, target_component, key
+    )
+    if source_index is not None and target_index is not None:
+        return {
+            "source_index": source_index,
+            "target_index": target_index,
+            "source_coordinate": tuple(
+                float(value) for value in source_obj.data.vertices[source_index].co
+            ),
+            "target_coordinate": tuple(
+                float(value) for value in target_obj.data.vertices[target_index].co
+            ),
+            "evidence": {
+                "policy": "exact_attachment_uv_vertex_v1",
+                "attachment_uv": list(resolved_uv),
+            },
+        }
+
+    if _component_signature(
+        source_obj.data, source_component
+    ) != _component_signature(target_obj.data, target_component):
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment pivot UV is absent from the "
+            "source/target render component"
+        )
+
+    source_edge = _attachment_uv_edge_point(
+        source_obj, source_component, resolved_uv
+    )
+    target_edge = _attachment_uv_edge_point(
+        target_obj, target_component, resolved_uv
+    )
+    if source_edge is None or target_edge is None:
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment pivot UV is absent from the "
+            "source/target render component"
+        )
+
+    source_coordinates = [
+        tuple(float(value) for value in source_obj.data.vertices[index].co)
+        for index in source_component["vertices"]
+    ]
+    spans = [
+        max(point[axis] for point in source_coordinates)
+        - min(point[axis] for point in source_coordinates)
+        for axis in range(3)
+    ]
+    origin_tolerance = max(max(spans) * 2.0e-6, 1.0e-8)
+    source_origin_error = math.dist(
+        source_edge["coordinate"], (0.0, 0.0, 0.0)
+    )
+    if source_origin_error > origin_tolerance:
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment UV edge does not resolve to the "
+            "normalized source origin"
+        )
+    return {
+        "source_index": source_index,
+        "target_index": target_index,
+        "source_coordinate": source_edge["coordinate"],
+        "target_coordinate": target_edge["coordinate"],
+        "evidence": {
+            "policy": "normalized_origin_uv_edge_interpolation_v1",
+            "attachment_uv": list(resolved_uv),
+            "source_origin_error": float(source_origin_error),
+            "source_origin_tolerance": float(origin_tolerance),
+            "source_edge": source_edge,
+            "target_edge": target_edge,
+        },
+    }
+
+
 def _normalized_prototype_for_component(prototypes, target_mesh, target_component):
     signature = _component_signature(target_mesh, target_component)
     exact = prototypes.get(signature)
@@ -3834,6 +4050,20 @@ def _world_points(obj, vertex_indices):
         tuple(float(value) for value in (obj.matrix_world @ obj.data.vertices[index].co))
         for index in vertex_indices
     ]
+
+
+def _world_coordinate(obj, coordinate):
+    matrix = obj.matrix_world
+    return tuple(
+        float(
+            sum(
+                float(matrix[row][axis]) * float(coordinate[axis])
+                for axis in range(3)
+            )
+            + float(matrix[row][3])
+        )
+        for row in range(3)
+    )
 
 
 def _component_influences(obj, component):
@@ -4821,22 +5051,23 @@ def build_blender_assembly_inputs(
                             f"{role}:{signature}:{instance_index}:"
                             f"{component['polygons'][0]}"
                         )
-                        (
-                            source_attachment_index,
-                            target_attachment_index,
-                        ) = _attachment_vertex_correspondence(
+                        attachment = _attachment_point_correspondence(
                             source_obj,
                             source_component,
                             final_merged_mesh,
                             component,
                             variant.get("attachment_vertex_uv"),
                         )
-                        source_attachment = _world_points(
-                            source_obj, [source_attachment_index]
-                        )[0]
-                        target_attachment = _world_points(
-                            final_merged_mesh, [target_attachment_index]
-                        )[0]
+                        source_attachment_index = attachment["source_index"]
+                        target_attachment_index = attachment["target_index"]
+                        source_attachment = _world_coordinate(
+                            source_obj,
+                            attachment["source_coordinate"],
+                        )
+                        target_attachment = _world_coordinate(
+                            final_merged_mesh,
+                            attachment["target_coordinate"],
+                        )
                         authored_component_cache[component_id] = {
                             "source_attachment_index": (
                                 source_attachment_index
@@ -4846,6 +5077,7 @@ def build_blender_assembly_inputs(
                             ),
                             "source_attachment": source_attachment,
                             "target_attachment": target_attachment,
+                            "attachment_correspondence": attachment["evidence"],
                         }
                         component_rows.append({
                             "component_id": component_id,
@@ -5005,25 +5237,32 @@ def build_blender_assembly_inputs(
                             target_attachment = cached_placement[
                                 "target_attachment"
                             ]
+                            attachment_correspondence = cached_placement[
+                                "attachment_correspondence"
+                            ]
                         else:
-                            (
-                                source_attachment_index,
-                                target_attachment_index,
-                            ) = _attachment_vertex_correspondence(
+                            attachment = _attachment_point_correspondence(
                                 source_obj,
                                 source_component,
                                 final_merged_mesh,
                                 component,
                                 attachment_vertex_uv,
                             )
-                            source_attachment = _world_points(
+                            source_attachment_index = attachment[
+                                "source_index"
+                            ]
+                            target_attachment_index = attachment[
+                                "target_index"
+                            ]
+                            source_attachment = _world_coordinate(
                                 source_obj,
-                                [source_attachment_index],
-                            )[0]
-                            target_attachment = _world_points(
+                                attachment["source_coordinate"],
+                            )
+                            target_attachment = _world_coordinate(
                                 final_merged_mesh,
-                                [target_attachment_index],
-                            )[0]
+                                attachment["target_coordinate"],
+                            )
+                            attachment_correspondence = attachment["evidence"]
                         authored_node = (
                             (cached_placement or {}).get("authored_node")
                         )
@@ -5175,6 +5414,9 @@ def build_blender_assembly_inputs(
                         transform["placement_source"] = placement_source
                         transform["correspondence_evidence"] = (
                             correspondence_evidence
+                        )
+                        transform["attachment_correspondence"] = deepcopy(
+                            attachment_correspondence
                         )
                         if authored_node is not None:
                             transform["attachment_pivot_error_scope"] = (

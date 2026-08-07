@@ -32,6 +32,7 @@ from cluster_assembly_builder import (  # noqa: E402
     scope_material_pipeline_for_destination,
     scope_material_pipeline_to_codex_tests,
     _attachment_vertex_correspondence,
+    _attachment_point_correspondence,
     _assembly_fit_summary,
     _build_unreal_assembly_provenance_payload,
     _coalesce_normalized_external_parts,
@@ -144,6 +145,28 @@ def stacked_uv_test_mesh(*, identical_faces=False, reverse_polygons=False):
         polygons=polygons,
         loops=loops,
         uv_layers=SimpleNamespace(active=SimpleNamespace(data=uv_data)),
+    )
+
+
+def edge_attachment_test_mesh(*, y_offset=0.0):
+    coordinates = [
+        (-1.0, y_offset, 0.0),
+        (1.0, y_offset, 0.0),
+        (0.0, y_offset + 1.0, 0.0),
+    ]
+    uvs = [(0.0, 0.0), (1.0, 0.0), (0.5, 1.0)]
+    return SimpleNamespace(
+        vertices=[SimpleNamespace(co=value) for value in coordinates],
+        polygons=[SimpleNamespace(
+            index=0,
+            vertices=(0, 1, 2),
+            loop_indices=(0, 1, 2),
+        )],
+        loops=[SimpleNamespace(vertex_index=index) for index in range(3)],
+        uv_layers=SimpleNamespace(active=SimpleNamespace(data=[
+            SimpleNamespace(uv=SimpleNamespace(x=uv[0], y=uv[1]))
+            for uv in uvs
+        ])),
     )
 
 
@@ -341,6 +364,47 @@ class ComponentTopologyTests(unittest.TestCase):
                 SimpleNamespace(data=target),
                 target_component,
                 [0.0, 0.0],
+            )
+
+    def test_loose_attachment_vertex_recovers_from_matching_uv_edges(self):
+        source = edge_attachment_test_mesh()
+        target = edge_attachment_test_mesh(y_offset=5.0)
+        source_component = _component_groups(source, [0])[0]
+        target_component = _component_groups(target, [0])[0]
+
+        result = _attachment_point_correspondence(
+            SimpleNamespace(data=source),
+            source_component,
+            SimpleNamespace(data=target),
+            target_component,
+            [0.5, 0.0],
+        )
+
+        self.assertIsNone(result["source_index"])
+        self.assertIsNone(result["target_index"])
+        self.assertEqual(result["source_coordinate"], (0.0, 0.0, 0.0))
+        self.assertEqual(result["target_coordinate"], (0.0, 5.0, 0.0))
+        self.assertEqual(
+            result["evidence"]["policy"],
+            "normalized_origin_uv_edge_interpolation_v1",
+        )
+
+    def test_uv_edge_fallback_rejects_a_non_origin_source_point(self):
+        source = edge_attachment_test_mesh(y_offset=1.0)
+        target = edge_attachment_test_mesh(y_offset=5.0)
+        source_component = _component_groups(source, [0])[0]
+        target_component = _component_groups(target, [0])[0]
+
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "does not resolve to the normalized source origin",
+        ):
+            _attachment_point_correspondence(
+                SimpleNamespace(data=source),
+                source_component,
+                SimpleNamespace(data=target),
+                target_component,
+                [0.5, 0.0],
             )
 
 
