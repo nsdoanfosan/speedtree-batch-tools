@@ -534,7 +534,13 @@ def _normalized_delivery_for_target(value, spm_path=None, contract=None):
     }
 
 
-def _normalized_variants_ready(value, spm_path=None, contract=None):
+def _normalized_variants_ready(
+    value,
+    spm_path=None,
+    contract=None,
+    *,
+    allow_actual_pair=False,
+):
     if not isinstance(value, dict) or value.get("status") != "ready":
         return False
     delivery = _normalized_delivery_for_target(
@@ -542,9 +548,18 @@ def _normalized_variants_ready(value, spm_path=None, contract=None):
         spm_path=spm_path,
         contract=contract,
     )
-    if (
-        not isinstance(delivery, dict)
-        or delivery.get("delivery_mode") != "render_connected"
+    if not isinstance(delivery, dict):
+        return False
+    delivery_mode = str(delivery.get("delivery_mode") or "")
+    if allow_actual_pair:
+        if delivery_mode not in {
+            "render_connected",
+            "connection_incomplete",
+            "asset_registration_only",
+        }:
+            return False
+    elif (
+        delivery_mode != "render_connected"
         or not list(delivery.get("generator_bindings") or [])
         or list(delivery.get("missing_live_bindings") or [])
         or list(delivery.get("binding_mismatches") or [])
@@ -1116,6 +1131,12 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
         delivery_mode = str(
             (delivery or {}).get("delivery_mode") or ""
         )
+        normalized_ready = _normalized_variants_ready(
+            normalized_variants,
+            spm_path=spm_path,
+            contract=contract,
+            allow_actual_pair=actual.get("status") == "complete_pair",
+        )
         row = {
             **actual,
             "decision": decision,
@@ -1126,7 +1147,13 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
             "normalized_variants": normalized_variants,
             "normalized_delivery_mode": delivery_mode or None,
         }
-        if delivery_mode == "asset_registration_only":
+        if decision == "normalize_part" and normalized_ready:
+            if delivery_mode != "render_connected":
+                row["reconciliation"] = (
+                    "current_fbx_pair_overrides_" + delivery_mode
+                )
+                evidence = row["reconciliation"]
+        elif delivery_mode == "asset_registration_only":
             row["decision"] = "pass_through"
             row["reconciliation"] = "asset_registration_only"
             decision = "pass_through"
@@ -1138,11 +1165,7 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
             )
             decision = "pass_through"
             evidence = "generator_connection_metadata_incomplete_nonblocking"
-        elif decision == "normalize_part" and not _normalized_variants_ready(
-            row.get("normalized_variants"),
-            spm_path=spm_path,
-            contract=contract,
-        ):
+        elif decision == "normalize_part" and not normalized_ready:
             row["decision"] = "pass_through"
             row["reconciliation"] = (
                 "normalized_variants_metadata_missing_nonblocking"

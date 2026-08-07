@@ -67,6 +67,7 @@ STATE_RECOVERY_LOG_PATH = LOG_DIR / "state_recovery.log"
 STATE_RECOVERY_LOG_MAX_BYTES = 64 * 1024
 PUSH_MANIFEST_SCHEMA_VERSION = 1
 PUSH_SOURCE_FINGERPRINT_CACHE_VERSION = 1
+PUSH_SOURCE_FINGERPRINT_CONTRACT = "content_only_v2"
 DEFAULT_SEND2UE_DIR = Path(
     r"C:\Users\PARK\Documents\GitHub\BlenderTools\src\addons\send2ue"
 )
@@ -587,6 +588,7 @@ def _push_source_fingerprint_record(blend_path, dependency_paths=()):
         ).encode("utf-8")
         return {
             "version": PUSH_SOURCE_FINGERPRINT_CACHE_VERSION,
+            "fingerprint_contract": PUSH_SOURCE_FINGERPRINT_CONTRACT,
             "fingerprint": hashlib.blake2b(encoded, digest_size=16).hexdigest(),
             "snapshot": snapshot,
         }
@@ -594,11 +596,46 @@ def _push_source_fingerprint_record(blend_path, dependency_paths=()):
 
 
 def push_source_fingerprint(blend_path, dependency_paths=()):
-    """Fingerprint the Blender export input and code that defines its contract."""
+    """Fingerprint the Blender export input and per-asset content contracts."""
     return _push_source_fingerprint_record(
         blend_path,
         dependency_paths,
     )["fingerprint"]
+
+
+def _legacy_push_source_snapshot_covers(legacy_snapshot, current_snapshot):
+    """Return whether a pre-v2 snapshot proves the current content-only set."""
+    if not isinstance(legacy_snapshot, dict):
+        return False
+    if legacy_snapshot.get("blend") != current_snapshot.get("blend"):
+        return False
+    legacy_dependencies = legacy_snapshot.get("dependencies")
+    current_dependencies = current_snapshot.get("dependencies")
+    if not isinstance(legacy_dependencies, list) or not isinstance(
+        current_dependencies, list
+    ):
+        return False
+    return all(
+        identity in legacy_dependencies for identity in current_dependencies
+    )
+
+
+def push_source_cache_matches_snapshot(cache, snapshot):
+    """Validate a current cache or a legacy code-inclusive cache safely."""
+    if not isinstance(cache, dict) or not isinstance(snapshot, dict):
+        return False
+    if cache.get("version") != PUSH_SOURCE_FINGERPRINT_CACHE_VERSION:
+        return False
+    fingerprint = cache.get("fingerprint")
+    if not isinstance(fingerprint, str) or not fingerprint:
+        return False
+    cached_snapshot = cache.get("snapshot")
+    if cached_snapshot == snapshot:
+        return True
+    return (
+        not cache.get("fingerprint_contract")
+        and _legacy_push_source_snapshot_covers(cached_snapshot, snapshot)
+    )
 
 
 def cached_push_source_fingerprint(blend_path, dependency_paths=(), cache=None):
@@ -608,14 +645,13 @@ def cached_push_source_fingerprint(blend_path, dependency_paths=(), cache=None):
     cache = cache if isinstance(cache, dict) else {}
     fingerprint = cache.get("fingerprint")
     cache_valid = (
-        cache.get("version") == PUSH_SOURCE_FINGERPRINT_CACHE_VERSION
-        and cache.get("snapshot") == snapshot
-        and isinstance(fingerprint, str)
+        push_source_cache_matches_snapshot(cache, snapshot)
         and re.fullmatch(r"[0-9a-f]{32}", fingerprint) is not None
     )
     if cache_valid:
         return fingerprint, {
             "version": PUSH_SOURCE_FINGERPRINT_CACHE_VERSION,
+            "fingerprint_contract": PUSH_SOURCE_FINGERPRINT_CONTRACT,
             "fingerprint": fingerprint,
             "snapshot": snapshot,
         }, True
@@ -624,14 +660,17 @@ def cached_push_source_fingerprint(blend_path, dependency_paths=(), cache=None):
 
 
 def manifest_item_files_match(item):
-    """Validate all cached source/export fingerprints referenced by one item."""
+    """Validate immutable cached export artifacts referenced by one item.
+
+    ``code_files`` remain in manifests for diagnostics and Unreal recovery, but
+    code edited after export cannot change an already-written FBX or handoff.
+    """
     if not isinstance(item, dict) or not item.get("fingerprint"):
         return False
     groups = (
         item.get("exported_files") or [],
         item.get("handoff_files") or [],
         [item["wind_file"]] if item.get("wind_file") else [],
-        item.get("code_files") or [],
     )
     for group in groups:
         for identity in group:

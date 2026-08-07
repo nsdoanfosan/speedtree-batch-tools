@@ -4462,11 +4462,13 @@ def build_cluster_assembly_contract(
         )
         normalized_delivery_blocked = False
         if current_live_pair_covered:
-            # The exact live export pair is sufficient delivery evidence. A
-            # missing or stale historical receipt remains diagnostic only.
-            decision = "pass_through"
-            normalized_variants_required = False
-            normalized_variants_missing = False
+            # A rendered material+mesh pair is positive evidence that this
+            # role participates in the target. It therefore requires an
+            # Assembly part; treating it as pass-through silently drops the
+            # role from headless Push.
+            decision = "normalize_part"
+            normalized_variants_required = True
+            normalized_variants_missing = not bool(normalized_variants)
         elif (
             normalized_variants
             and normalized_delivery_mode
@@ -4712,6 +4714,13 @@ def build_cluster_assembly_contract(
         handoff_status = "pass_through"
     issues = []
     for dependency in actual_dependencies:
+        if dependency.get("normalized_variants_missing"):
+            issues.append({
+                "code": "NORMALIZED_VARIANTS_REQUIRED",
+                "role": dependency["role"],
+                "spm": str(dependency["spm"]),
+                "reason": "current_live_pair_requires_assembly_part",
+            })
         tga_validation = dependency.get("tga_basename_validation") or {}
         if _concrete_texture_reference_missing(tga_validation):
             issues.append({

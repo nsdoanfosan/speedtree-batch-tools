@@ -1156,13 +1156,17 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             )
             self.assertEqual(
                 dependencies["SK_branch_elm_01"]["decision"],
-                "pass_through",
+                "normalize_part",
             )
-            self.assertFalse(
+            self.assertTrue(
                 dependencies["SK_branch_elm_01"]["normalized_variants_missing"]
             )
             self.assertTrue(
                 dependencies["SK_branch_elm_01"]["current_live_pair_covered"]
+            )
+            self.assertIn(
+                "NORMALIZED_VARIANTS_REQUIRED",
+                [row["code"] for row in contract["handoff"]["issues"]],
             )
             self.assertEqual(dependencies["SK_leaf_elm_01"]["decision"], "blocked")
             self.assertEqual(
@@ -3625,16 +3629,16 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 stale_primary["normalized_variants_stale"]["status"],
                 "needs_regeneration",
             )
-            self.assertNotIn(
-                "NORMALIZED_VARIANTS_STALE",
+            self.assertEqual(
+                stale_contract["handoff"]["status"],
+                "ready",
+            )
+            self.assertIn(
+                "NORMALIZED_VARIANTS_REQUIRED",
                 [
                     row["code"]
                     for row in stale_contract["handoff"]["issues"]
                 ],
-            )
-            self.assertEqual(
-                stale_contract["handoff"]["status"],
-                "pass_through",
             )
             self.assertEqual(
                 dependencies["SK_branch_elm_01"]["texture_contract_source"],
