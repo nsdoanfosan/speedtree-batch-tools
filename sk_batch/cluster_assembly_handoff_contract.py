@@ -27,6 +27,7 @@ ROLE_PREFIX_RE = re.compile(
     r"^(leaf_side|leaf(?:_[^_]+)*_side|branch|cluster|leaf)(?:_|$)",
     re.IGNORECASE,
 )
+BLENDER_DUPLICATE_SUFFIX_RE = re.compile(r"\.\d{3}$")
 
 
 def normalize_export_name(value):
@@ -35,6 +36,8 @@ def normalize_export_name(value):
     name = name.strip().replace("\\", "/").rsplit("/", 1)[-1]
     if "::" in name:
         name = name.rsplit("::", 1)[-1]
+    while BLENDER_DUPLICATE_SUFFIX_RE.search(name):
+        name = BLENDER_DUPLICATE_SUFFIX_RE.sub("", name)
     if name.casefold().endswith("_mat"):
         name = name[:-4]
     if name.casefold().startswith("m_"):
@@ -467,13 +470,31 @@ def resolve_cluster_receipt_path(
     return None
 
 
-def _role_receipt_rows(contract):
-    rows = {}
+def _role_receipt_entries(contract):
+    rows = []
     for row in (contract.get("handoff") or {}).get("roles") or []:
         role = str(row.get("role") or dependency_role(row.get("name")) or "").casefold()
         if role in ROLE_ORDER:
-            rows[role] = row
+            rows.append((role, row))
     return rows
+
+
+def _role_receipt_rows(contract):
+    """Return the first provider for legacy one-row-per-role consumers."""
+    rows = {}
+    for role, row in _role_receipt_entries(contract):
+        rows.setdefault(role, row)
+    return rows
+
+
+def _provider_key(role, receipt_row):
+    identity = str(
+        (receipt_row or {}).get("name")
+        or (receipt_row or {}).get("output_spm")
+        or (receipt_row or {}).get("spm")
+        or role
+    )
+    return f"{role}:{normalize_export_name(Path(identity).stem)}"
 
 
 def _contract_species(contract):
@@ -649,16 +670,18 @@ def _role_identity_aliases(role, receipt_row, contract, spm_path):
 
 
 def role_identity_aliases_from_contract(contract, spm_path):
-    rows = _role_receipt_rows(contract)
-    return {
-        role: _role_identity_aliases(
-            role,
-            rows.get(role),
-            contract,
-            spm_path,
-        )
-        for role in ROLE_ORDER
-    }
+    result = {role: [] for role in ROLE_ORDER}
+    for role, row in _role_receipt_entries(contract):
+        for identity in _role_identity_aliases(
+            role, row, contract, spm_path
+        ):
+            normalized = normalize_export_name(identity)
+            if normalized and not any(
+                normalize_export_name(value) == normalized
+                for value in result[role]
+            ):
+                result[role].append(identity)
+    return result
 
 
 def _target_for_spm(receipt_row, spm_path):
@@ -673,7 +696,7 @@ def _target_for_spm(receipt_row, spm_path):
 
 
 def _authoritative_spm_for_requested(contract, spm_path):
-    """Resolve an SK batch item to the exact general-tree source in PCG."""
+    """Resolve an SK batch item to the recorded general-tree source."""
     key = _normalized_path(spm_path)
     matches = []
     for row in contract.get("tree_source_identities") or []:
@@ -713,7 +736,7 @@ def assembly_source_fbx_resolution(contract, full_spm_path):
     pass-through instead of asking Blender to import a known-missing file.
     """
     paths = {}
-    role_rows = _role_receipt_rows(contract)
+    role_rows = _role_receipt_entries(contract)
     if not role_rows:
         return {
             "status": "not_applicable",
@@ -725,8 +748,16 @@ def assembly_source_fbx_resolution(contract, full_spm_path):
     authoritative_spm = _authoritative_spm_for_requested(
         contract, full_spm_path
     )
+    requested_spm = Path(full_spm_path)
+    if any(
+        _normalized_path(target.get("spm"))
+        == _normalized_path(requested_spm)
+        for _role, receipt_row in role_rows
+        for target in (receipt_row.get("targets") or [])
+    ):
+        authoritative_spm = requested_spm
     targets = []
-    for role, receipt_row in role_rows.items():
+    for role, receipt_row in role_rows:
         target = _target_for_spm(receipt_row, authoritative_spm)
         expected = ((target or {}).get("export_bundle") or {}).get("fbx") or {}
         path = expected.get("path")
@@ -866,7 +897,7 @@ def _export_artifact_validation(contract, role_rows, spm_path, inventory):
     validations = []
     seen = set()
     authoritative_spm = _authoritative_spm_for_requested(contract, spm_path)
-    for role, receipt_row in role_rows.items():
+    for role, receipt_row in role_rows:
         target = _target_for_spm(receipt_row, authoritative_spm)
         if not target:
             continue
@@ -1099,11 +1130,18 @@ def _validated_isolated_bark_capture(provider_spm, canonical_material):
 def build_assembly_handoff(receipt_path, spm_path, inventory):
     """Reconcile one PCG receipt with the exact imported FBX inventory."""
     _payload, contract = load_cluster_contract(receipt_path, spm_path)
-    role_rows = _role_receipt_rows(contract)
+    role_rows = _role_receipt_entries(contract)
     roles = []
     issues = []
-    for role in ROLE_ORDER:
-        receipt_row = role_rows.get(role)
+    receipt_roles = {role for role, _row in role_rows}
+    work_rows = list(role_rows) + [
+        (role, None) for role in ROLE_ORDER if role not in receipt_roles
+    ]
+    work_rows.sort(key=lambda item: (
+        ROLE_ORDER.index(item[0]),
+        _provider_key(item[0], item[1]),
+    ))
+    for role, receipt_row in work_rows:
         identities = _role_identity_aliases(
             role,
             receipt_row,
@@ -1135,10 +1173,18 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
             normalized_variants,
             spm_path=spm_path,
             contract=contract,
-            allow_actual_pair=actual.get("status") == "complete_pair",
+            allow_actual_pair=(
+                actual.get("status") == "complete_pair"
+                or bool(
+                    (receipt_row or {}).get(
+                        "rendered_provider_expansion_covered"
+                    )
+                )
+            ),
         )
         row = {
             **actual,
+            "provider_key": _provider_key(role, receipt_row),
             "decision": decision,
             "receipt_decision": (
                 str(receipt_row.get("decision") or "") if receipt_row else "absent"
@@ -1146,11 +1192,21 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
             "reconciliation": evidence,
             "normalized_variants": normalized_variants,
             "normalized_delivery_mode": delivery_mode or None,
+            "rendered_provider_expansion_covered": bool(
+                (receipt_row or {}).get(
+                    "rendered_provider_expansion_covered"
+                )
+            ),
         }
         if decision == "normalize_part" and normalized_ready:
             if delivery_mode != "render_connected":
                 row["reconciliation"] = (
-                    "current_fbx_pair_overrides_" + delivery_mode
+                    "current_spm_pair_and_normalized_topology_override_"
+                    + delivery_mode
+                    if (receipt_row or {}).get(
+                        "rendered_provider_expansion_covered"
+                    )
+                    else "current_fbx_pair_overrides_" + delivery_mode
                 )
                 evidence = row["reconciliation"]
         elif delivery_mode == "asset_registration_only":
@@ -1309,11 +1365,15 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
             "part_builder_inputs": [
                 {
                     "role": row["role"],
+                    "provider_key": row["provider_key"],
                     "role_identity": row["role_identity"],
                     "role_identity_aliases": deepcopy(
                         row.get("role_identity_aliases") or []
                     ),
                     "assignments": row["assignments"],
+                    "rendered_provider_expansion_covered": row.get(
+                        "rendered_provider_expansion_covered", False
+                    ),
                     "normalized_variants": row.get("normalized_variants"),
                 }
                 for row in normalize_roles

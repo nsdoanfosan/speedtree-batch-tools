@@ -1608,13 +1608,21 @@ class ClusterAssemblyContractTests(unittest.TestCase):
 
             original_fbx = source_fbx.read_bytes()
             source_fbx.write_bytes(original_fbx + b"-changed")
-            self.assertIsNone(
-                _atlas_normalized_variants(
-                    folder,
-                    "branch_elm_01",
-                    [target],
-                    audit=audit_module,
-                )
+            drifted_fbx = _atlas_normalized_variants(
+                folder,
+                "branch_elm_01",
+                [target],
+                audit=audit_module,
+            )
+            self.assertEqual(drifted_fbx["status"], "ready")
+            self.assertTrue(
+                drifted_fbx["source_3d_artifacts"]["source_fbx"][
+                    "raw_sha256_drift"
+                ]
+            )
+            self.assertEqual(
+                drifted_fbx["source_fbx_drift_validation"]["status"],
+                "deferred",
             )
             source_fbx.write_bytes(original_fbx)
 
@@ -3501,7 +3509,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                         fixture["production_spm"],
                     )
 
-    def test_same_role_secondary_is_not_bound_to_primary_receipt(self):
+    def test_same_role_secondary_keeps_its_own_normalized_provider(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary) / "Tree_elm"
             cluster_dir = folder / "Cluster"
@@ -3583,7 +3591,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             dependencies = {
                 row["name"]: row for row in contract["dependencies"]
             }
-            lookup.assert_called_once()
+            self.assertEqual(lookup.call_count, 2)
             self.assertIs(
                 dependencies["SK_branch_elm_01"]["normalized_variants"],
                 normalized,
@@ -3593,13 +3601,14 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             )
             self.assertEqual(
                 dependencies["SK_branch_elm_02"]["decision"],
-                "reference_only",
+                "normalize_part",
             )
             self.assertFalse(
                 dependencies["SK_branch_elm_02"]["primary_role_source"]
             )
-            self.assertIsNone(
-                dependencies["SK_branch_elm_02"]["normalized_variants"]
+            self.assertIs(
+                dependencies["SK_branch_elm_02"]["normalized_variants"],
+                normalized,
             )
 
             with mock.patch(
@@ -3654,7 +3663,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 dependencies["SK_branch_elm_02"][
                     "tga_basename_validation"
                 ]["status"],
-                "not_applicable",
+                "basename_mismatch",
             )
 
     def test_owner_folder_bark_identity_is_canonical_content(self):

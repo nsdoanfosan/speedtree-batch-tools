@@ -3533,7 +3533,14 @@ def referenced_cluster_spms(target_spms, clusters):
 
 
 def cluster_dependency_spms(target_spms):
-    """Return final targets plus their authoritative non-SK source SPMs."""
+    """Return dependency evidence plus the exact current Assembly targets.
+
+    A non-``SK_`` sibling remains useful lineage/dependency evidence, but it is
+    not the geometry that the current batch item exports.  Inspecting that
+    older sibling as the Assembly source can silently classify stale or
+    different Cluster materials.  The exact requested target is therefore the
+    only Assembly source; BWR exports it before the final handoff inspection.
+    """
     dependencies = []
     assembly_sources = []
     for target_spm in target_spms or ():
@@ -3544,7 +3551,6 @@ def cluster_dependency_spms(target_spms):
         if target_spm.name.lower().startswith("sk_"):
             source_spm = target_spm.with_name(target_spm.name[3:])
             if source_spm.is_file():
-                assembly_source_spm = source_spm
                 if source_spm not in dependencies:
                     dependencies.append(source_spm)
         if assembly_source_spm not in assembly_sources:
