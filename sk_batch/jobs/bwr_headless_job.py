@@ -2,7 +2,7 @@
 
 Run:
   blender.exe -b --python bwr_headless_job.py -- --spm X.spm --blend X.blend
-      --wind TREE|BUSH|GRASS|NONE --material-contract preflight.json
+      --wind TREE|BUSH|WEED|NONE --material-contract preflight.json
       --report result.json
 
 Runs with --factory-startup and enables only the junction-installed
@@ -100,7 +100,12 @@ def parse_args():
     parser.add_argument("--spm", required=True)
     parser.add_argument("--speedtree-spm", default="")
     parser.add_argument("--blend", required=True)
-    parser.add_argument("--wind", default="GRASS", choices=["TREE", "BUSH", "GRASS", "NONE"])
+    parser.add_argument(
+        "--wind",
+        default="WEED",
+        choices=["TREE", "BUSH", "WEED", "NONE", "GRASS"],
+        help="Immutable response preset ID (legacy GRASS is accepted as WEED)",
+    )
     parser.add_argument("--material-contract", required=True)
     parser.add_argument("--bark-normalization-manifest", default="")
     parser.add_argument("--cluster-source-build-only", action="store_true")
@@ -533,17 +538,9 @@ def main():
             if args.material_contract
             else ""
         )
-        if args.wind == "NONE":
-            # Dead vegetation: keep the JSON contract but zero all sway.
-            # flexibility=0.0 makes the add-on emit all-zero non-trunk groups
-            # and bIsEnabled=false (trunk groups would still rock in Unreal's
-            # shader regardless of influence, so the add-on avoids them).
-            settings.wind_preset = "CUSTOM"
-            settings.dynamic_wind_flexibility = 0.0
-            settings.dynamic_wind_gust_attenuation = 0.0
-            settings.dynamic_wind_ground_cover = False
-        else:
-            settings.wind_preset = args.wind
+        # The batch owns only the immutable category assignment. Numeric
+        # response values are shared per preset and edited centrally in Unreal.
+        settings.wind_preset = "WEED" if args.wind == "GRASS" else args.wind
         settings.write_unreal_json = True
         settings.write_dynamic_wind_json = True
         is_cluster_source = is_cluster_normalization_spm(canonical_spm)

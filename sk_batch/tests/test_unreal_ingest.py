@@ -250,6 +250,80 @@ class DynamicWindFinalSkeletonContractTests(unittest.TestCase):
                     }
                 )
 
+    def test_shared_none_preset_accepts_effective_state_from_unreal_profile(self):
+        result = json.dumps(
+            {
+                "success": True,
+                "skeleton_contract": "final_skeleton_v2",
+                "skeleton_hash": "1" * 40,
+                "final_bones": 1688,
+                "resolved_joints": 1688,
+                "response_preset_contract": "shared_response_v1",
+                "response_preset": "NONE",
+                "response_profile_applied": True,
+                "source_default_is_enabled": False,
+                "effective_is_enabled": True,
+                "is_enabled": True,
+                "disabled_coefficients_zeroed": False,
+            }
+        )
+        runner = self._runner_with_result(result)
+        with tempfile.TemporaryDirectory() as temporary:
+            wind_json = Path(temporary) / "wind.json"
+            wind_json.write_text(
+                json.dumps(
+                    {
+                        "bIsEnabled": False,
+                        "WindResponsePresetContract": {
+                            "SchemaVersion": 1,
+                            "Preset": "NONE",
+                            "SimulationGroupBases": [],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report = runner._apply_dynamic_wind(
+                {"wind_json": str(wind_json), "mesh_path": "/Game/Test/SK_Dead"}
+            )
+
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["result"]["response_preset"], "NONE")
+        self.assertIs(report["result"]["effective_is_enabled"], True)
+
+    def test_shared_response_contract_requires_importer_confirmation(self):
+        result = json.dumps(
+            {
+                "success": True,
+                "skeleton_contract": "final_skeleton_v2",
+                "skeleton_hash": "1" * 40,
+                "final_bones": 1688,
+                "resolved_joints": 1688,
+            }
+        )
+        runner = self._runner_with_result(result)
+        with tempfile.TemporaryDirectory() as temporary:
+            wind_json = Path(temporary) / "wind.json"
+            wind_json.write_text(
+                json.dumps(
+                    {
+                        "WindResponsePresetContract": {
+                            "SchemaVersion": 1,
+                            "Preset": "TREE",
+                            "SimulationGroupBases": [],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "shared_response_v1"):
+                runner._apply_dynamic_wind(
+                    {
+                        "wind_json": str(wind_json),
+                        "mesh_path": "/Game/Test/SK_Tree",
+                    }
+                )
+
     def test_normalized_cluster_prototype_skips_source_rig_wind(self):
         runner = load_runner()
         report = runner._apply_dynamic_wind(

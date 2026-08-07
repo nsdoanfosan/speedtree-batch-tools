@@ -1791,6 +1791,20 @@ def _apply_dynamic_wind(item):
         requested_enabled = wind_contract["bIsEnabled"]
         if not isinstance(requested_enabled, bool):
             raise RuntimeError("dynamic wind bIsEnabled must be a boolean")
+    response_contract = wind_contract.get("WindResponsePresetContract")
+    response_preset = None
+    if response_contract is not None:
+        if not isinstance(response_contract, dict):
+            raise RuntimeError("dynamic wind response preset contract must be an object")
+        if response_contract.get("SchemaVersion") != 1:
+            raise RuntimeError("dynamic wind response preset schema must be version 1")
+        response_preset = str(response_contract.get("Preset") or "").upper()
+        if response_preset == "GRASS":
+            response_preset = "WEED"
+        if response_preset not in {"TREE", "BUSH", "WEED", "NONE"}:
+            raise RuntimeError("dynamic wind response preset ID is invalid")
+        if not isinstance(response_contract.get("SimulationGroupBases"), list):
+            raise RuntimeError("dynamic wind response preset has no group basis array")
     mesh_path = item.get("mesh_path")
     mesh = unreal.EditorAssetLibrary.load_asset(mesh_path)
     if not mesh:
@@ -1819,7 +1833,24 @@ def _apply_dynamic_wind(item):
         )
     if not payload.get("skeleton_hash"):
         raise RuntimeError("dynamic wind importer returned no skeleton hash")
-    if requested_enabled is not None:
+    if response_contract is not None:
+        if payload.get("response_preset_contract") != "shared_response_v1":
+            raise RuntimeError(
+                "dynamic wind importer did not confirm shared_response_v1 contract"
+            )
+        if payload.get("response_preset") != response_preset:
+            raise RuntimeError(
+                "dynamic wind importer response preset differs from the JSON contract"
+            )
+        if payload.get("response_profile_applied") is not True:
+            raise RuntimeError(
+                "dynamic wind importer did not apply the shared response profile"
+            )
+        if not isinstance(payload.get("effective_is_enabled"), bool):
+            raise RuntimeError(
+                "dynamic wind importer did not report the effective shared response state"
+            )
+    elif requested_enabled is not None:
         imported_enabled = payload.get("is_enabled")
         if not isinstance(imported_enabled, bool):
             raise RuntimeError(
