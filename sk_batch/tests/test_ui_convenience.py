@@ -560,7 +560,7 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
             cases = (
                 ("Tree_elm", "branch_elm_01.spm", "TREE"),
                 ("bush_Silky_Dogwood", "cluster_Dogwood_01.spm", "BUSH"),
-                ("weed_ladyfern", "cluster_ladyfern_01.spm", "GRASS"),
+                ("weed_ladyfern", "cluster_ladyfern_01.spm", "WEED"),
             )
             for owner, name, expected_wind in cases:
                 spm = root / owner / "Cluster" / name
@@ -569,6 +569,12 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
                     gui.sk_batch_folder_chain(root, spm),
                     [root / owner, root / owner / "Cluster"],
                 )
+
+    def test_legacy_grass_wind_override_migrates_to_weed(self):
+        gui = load_gui_module()
+        self.assertEqual(gui.normalize_wind_override("GRASS"), "WEED")
+        self.assertEqual(gui.normalize_wind_override("WEED"), "WEED")
+        self.assertEqual(gui.normalize_wind_override("unknown"), "auto")
 
     def test_cluster_row_shows_only_canonical_output_name(self):
         gui = load_gui_module()
