@@ -181,6 +181,7 @@ from sk_common import (
     speedtree_output_spm_for,
     terminate_process_tree,
     unreal_remote_execution_settings,
+    normalize_wind_override,
     wind_preset_for_spm,
 )
 from spm_leaf_handoff_contract import (
@@ -274,7 +275,7 @@ WIND_OPTIONS = (
     ("자동 (식생 종류 기준)", "auto"),
     ("TREE", "TREE"),
     ("BUSH", "BUSH"),
-    ("GRASS", "GRASS"),
+    ("WEED", "WEED"),
     ("NONE", "NONE"),
 )
 BONE_MODE_OPTIONS = (("자동 계산", "auto"), ("수동 본 유지", "manual"))
@@ -3567,10 +3568,10 @@ class App:
                     calibration_cache["settings_signature"] = (
                         self.spm_calibration_signature
                     )
-            wind_override = entry.get("wind_override", "auto")
-            if wind_override not in {value for _label, value in WIND_OPTIONS}:
-                wind_override = "auto"
-                entry["wind_override"] = "auto"
+            saved_wind_override = entry.get("wind_override", "auto")
+            wind_override = normalize_wind_override(saved_wind_override)
+            if wind_override != saved_wind_override:
+                entry["wind_override"] = wind_override
             manual_bones_locked = is_manual_bones_locked(spm, entry)
             if manual_bones_locked:
                 entry["manual_bones_locked"] = True
