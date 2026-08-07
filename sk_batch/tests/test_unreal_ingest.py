@@ -168,6 +168,88 @@ class DynamicWindFinalSkeletonContractTests(unittest.TestCase):
             report["result"]["skeleton_contract"], "final_skeleton_v2"
         )
 
+    def test_disabled_wind_contract_requires_confirmed_disabled_asset_data(self):
+        result = json.dumps(
+            {
+                "success": True,
+                "skeleton_contract": "final_skeleton_v2",
+                "skeleton_hash": "1" * 40,
+                "final_bones": 1688,
+                "resolved_joints": 1688,
+                "is_enabled": False,
+                "disabled_coefficients_zeroed": True,
+            }
+        )
+        runner = self._runner_with_result(result)
+        with tempfile.TemporaryDirectory() as temporary:
+            wind_json = Path(temporary) / "wind.json"
+            wind_json.write_text(
+                json.dumps({"bIsEnabled": False}),
+                encoding="utf-8",
+            )
+            report = runner._apply_dynamic_wind(
+                {"wind_json": str(wind_json), "mesh_path": "/Game/Test/SK_Dead"}
+            )
+
+        self.assertEqual(report["status"], "ok")
+        self.assertIs(report["result"]["is_enabled"], False)
+        self.assertIs(
+            report["result"]["disabled_coefficients_zeroed"],
+            True,
+        )
+
+    def test_disabled_wind_contract_requires_zeroed_coefficient_proof(self):
+        result = json.dumps(
+            {
+                "success": True,
+                "skeleton_contract": "final_skeleton_v2",
+                "skeleton_hash": "1" * 40,
+                "final_bones": 1688,
+                "resolved_joints": 1688,
+                "is_enabled": False,
+            }
+        )
+        runner = self._runner_with_result(result)
+        with tempfile.TemporaryDirectory() as temporary:
+            wind_json = Path(temporary) / "wind.json"
+            wind_json.write_text(
+                json.dumps({"bIsEnabled": False}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "zeroed disabled coefficients"):
+                runner._apply_dynamic_wind(
+                    {
+                        "wind_json": str(wind_json),
+                        "mesh_path": "/Game/Test/SK_Dead",
+                    }
+                )
+
+    def test_disabled_wind_contract_rejects_reenabled_asset_data(self):
+        result = json.dumps(
+            {
+                "success": True,
+                "skeleton_contract": "final_skeleton_v2",
+                "skeleton_hash": "1" * 40,
+                "final_bones": 1688,
+                "resolved_joints": 1688,
+                "is_enabled": True,
+            }
+        )
+        runner = self._runner_with_result(result)
+        with tempfile.TemporaryDirectory() as temporary:
+            wind_json = Path(temporary) / "wind.json"
+            wind_json.write_text(
+                json.dumps({"bIsEnabled": False}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "enabled state differs"):
+                runner._apply_dynamic_wind(
+                    {
+                        "wind_json": str(wind_json),
+                        "mesh_path": "/Game/Test/SK_Dead",
+                    }
+                )
+
     def test_normalized_cluster_prototype_skips_source_rig_wind(self):
         runner = load_runner()
         report = runner._apply_dynamic_wind(
