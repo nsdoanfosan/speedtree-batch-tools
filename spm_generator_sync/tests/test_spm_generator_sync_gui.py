@@ -118,6 +118,37 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
         )
         self.assertFalse(app._start_job.call_args.kwargs["shared_queue"])
 
+    def test_fast_status_stays_nonblocking_without_running_analysis(self):
+        app = GUI.App.__new__(GUI.App)
+        app.cached_master_signature = mock.Mock(
+            side_effect=AssertionError("fast status ran precise analysis")
+        )
+        group = {
+            "master": "tree_01.spm",
+            "followers": [{
+                "file": "tree_02.spm",
+                "base_map_confirmed": False,
+                "last_sync": "2026-08-07T16:00:00",
+                "last_master_hash": "recorded-master",
+            }],
+        }
+
+        status, signature = app.master_status(
+            Path(r"D:\Trees"),
+            group,
+            fast=True,
+        )
+
+        self.assertEqual(status, "연결됨")
+        self.assertEqual(signature, "recorded-master")
+        app.cached_master_signature.assert_not_called()
+
+        source = (TOOL_DIR / "spm_generator_sync_gui.pyw").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("정밀 검사 대기", source)
+        self.assertNotIn("동기화 점검 필요", source)
+
     def test_gui_uses_full_sibling_engine_module(self):
         self.assertEqual(
             Path(GUI.engine.__file__).resolve(),
@@ -712,7 +743,7 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             "Cluster 관계 불일치",
         )
 
-    def test_connected_board_scope_uses_confirmed_followers_and_on_clusters(self):
+    def test_connected_board_scope_does_not_gate_on_confirmation_metadata(self):
         owner = Path(r"D:\Trees\Tree_elm")
         master = "SK_Tree_elm_01.spm"
         app = GUI.App.__new__(GUI.App)
@@ -786,17 +817,18 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
         self.assertEqual(len(scope["groups"]), 1)
         self.assertEqual(
             scope["groups"][0]["names"],
-            ["SK_Tree_elm_02.spm", "SK_Tree_elm_04.spm"],
+            [
+                "SK_Tree_elm_02.spm",
+                "SK_Tree_elm_03.spm",
+                "SK_Tree_elm_04.spm",
+            ],
         )
         self.assertEqual(len(scope["cluster_rows"]), 1)
         self.assertEqual(
             Path(scope["cluster_rows"][0]["blend"]).name,
             "SK_branch_elm_01.blend",
         )
-        self.assertEqual(
-            {entry["reason"] for entry in scope["skipped"]},
-            {"Base 매핑 미확정"},
-        )
+        self.assertEqual(scope["skipped"], [])
 
     def test_connected_board_batch_continues_to_cluster_after_sync_failure(self):
         owner = Path(r"D:\Trees\Tree_elm")

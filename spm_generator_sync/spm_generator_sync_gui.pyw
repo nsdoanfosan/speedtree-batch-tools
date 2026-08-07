@@ -931,7 +931,7 @@ class App:
                 units.append(("master", folder, master, group))
                 for follower in group.get("followers", []):
                     name = follower.get("file")
-                    if name and follower.get("base_map_confirmed"):
+                    if name:
                         units.append(
                             ("follower", folder, master, follower)
                         )
@@ -955,11 +955,6 @@ class App:
                     followers_in_group = row.get("followers", [])
                     if not followers_in_group:
                         status = "자식 없음"
-                    elif any(
-                        not item.get("base_map_confirmed")
-                        for item in followers_in_group
-                    ):
-                        status = "매핑 필요"
                     else:
                         hashes = {
                             item.get("last_master_hash")
@@ -1123,9 +1118,7 @@ class App:
             signature = next(iter(recorded)) if len(recorded) == 1 else None
             if not followers:
                 return "자식 없음", signature
-            if any(not item.get("base_map_confirmed") for item in followers):
-                return "매핑 필요", signature
-            return "정밀 검사 대기", signature
+            return "연결됨", signature
         try:
             master_path = folder / group["master"]
             signature = self.cached_master_signature(master_path, categories)
@@ -1133,8 +1126,6 @@ class App:
             return "검사 실패", str(exc)
         if not followers:
             return "자식 없음", signature
-        if any(not item.get("base_map_confirmed") for item in followers):
-            return "매핑 필요", signature
         hashes = {item.get("last_master_hash") for item in followers}
         if hashes == {signature}:
             return "최신", signature
@@ -1213,11 +1204,8 @@ class App:
                         "remove_details": [],
                     }
                     risk = {}
-                    if not follower.get("base_map_confirmed"):
-                        structure = "매핑 확인 필요"
-                        current_target_hash = None
-                    elif fast:
-                        structure = "정밀 검사 대기"
+                    if fast:
+                        structure = "연결됨"
                         current_target_hash = None
                     elif prepared_followers is not None:
                         prepared = prepared_followers.get(
@@ -1269,11 +1257,9 @@ class App:
                             structure = "검사 실패"
                             current_target_hash = None
                     last_hash = follower.get("last_master_hash")
-                    if not follower.get("base_map_confirmed"):
-                        follower_status = "매핑 필요"
-                    elif fast:
+                    if fast:
                         follower_status = (
-                            "정밀 검사 대기"
+                            "적용됨"
                             if follower.get("last_sync")
                             else "미실행"
                         )
@@ -1404,15 +1390,15 @@ class App:
                         tag = "cluster_pending"
                     elif refresh_deferred_count:
                         status_text = (
-                            f"폴더 SK {total_count}개 전체 ON · 정밀 검사 대기"
+                            f"폴더 SK {total_count}개 전체 ON"
                         )
-                        tag = "cluster_pending"
+                        tag = "cluster_on"
                     elif all_synced:
                         status_text = f"폴더 SK {total_count}개 메시 교체 완료 ✓"
                         tag = "cluster_on"
                     else:
-                        status_text = f"폴더 SK {total_count}개 전체 ON · 동기화 점검 필요"
-                        tag = "cluster_pending"
+                        status_text = f"폴더 SK {total_count}개 전체 ON"
+                        tag = "cluster_on"
                     relation_label = {
                         "on": "ON", "off": "OFF",
                         "partial": "PARTIAL", "empty": "—",
@@ -2396,15 +2382,6 @@ class App:
                     if follower_key in seen_followers:
                         continue
                     seen_followers.add(follower_key)
-                    if not follower.get("base_map_confirmed"):
-                        skipped.append({
-                            "stage": "generator_sync",
-                            "folder": str(folder),
-                            "master": master,
-                            "target": name,
-                            "reason": "Base 매핑 미확정",
-                        })
-                        continue
                     group_key = (follower_key[0], follower_key[1])
                     scope_group = grouped.setdefault(group_key, {
                         "folder": folder,

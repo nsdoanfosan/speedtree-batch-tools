@@ -72,6 +72,10 @@ class ClusterRelationJobContractTests(unittest.TestCase):
 
     def test_requested_live_slice_requires_one_explicit_binding_per_target(self):
         source = JOB_PATH.read_text(encoding="utf-8")
+        sync_source = source[
+            source.index("def sync_targets("):
+            source.index("\ndef remove_targets(")
+        ]
         self.assertIn("validate_recipe_registry_contract(", source)
         self.assertIn(
             "not set(effective).issubset(set(recipe_targets))",
@@ -82,8 +86,16 @@ class ClusterRelationJobContractTests(unittest.TestCase):
             source,
         )
         self.assertIn(
-            "for path in requested",
-            source[source.index("props.speedtree_spm_items.clear()"):],
+            "execute_external_target_transaction(",
+            sync_source,
+        )
+        self.assertIn(
+            '"atomic_exact_target_slice_v1"',
+            sync_source,
+        )
+        self.assertNotIn(
+            "export_or_update_speedtree_spm_targets",
+            sync_source,
         )
         self.assertNotIn(
             "save_spm_target_registry(props)",

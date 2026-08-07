@@ -2194,5 +2194,43 @@ class ClusterBlendSyncTests(unittest.TestCase):
             self.assertTrue(match["resolution"]["conflicting"])
 
 
+class AtlasWorkerConflictContractTests(unittest.TestCase):
+    def test_hash_bound_precommit_conflict_preserves_external_spm(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "tree.spm"
+            snapshot = root / "snapshot.spm"
+            snapshot.write_bytes(b"before")
+            target.write_bytes(b"external-edit")
+            report = {
+                "failure_contract": {
+                    "kind": "atlas_speedtree_transaction_failure",
+                    "version": 1,
+                    "reason": "production_changed_while_staging",
+                    "commit_started": False,
+                    "preserve_external_changes": True,
+                    "conflicts": [{
+                        "path": str(target),
+                        "expected_sha256": file_sha256(snapshot),
+                        "actual_sha256": file_sha256(target),
+                    }],
+                }
+            }
+
+            preserve = cluster_sync._worker_transaction_conflict_preserve_paths(
+                report,
+                [(target, snapshot)],
+            )
+            restored, failed = cluster_sync._restore_spm_files(
+                [(target, snapshot)],
+                preserve_paths=preserve,
+            )
+
+            self.assertEqual(preserve, [target])
+            self.assertEqual(target.read_bytes(), b"external-edit")
+            self.assertEqual(restored, [])
+            self.assertEqual(failed, [])
+
+
 if __name__ == "__main__":
     unittest.main()

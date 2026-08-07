@@ -689,14 +689,21 @@ def sync_targets(blend, requested, normalization_recipe=None):
         raise RuntimeError(
             f"Loaded blend differs from requested Cluster blend: {bpy.data.filepath}"
         )
-    from atlas_leaf_mesh_builder.props import (
-        sync_spm_target_registry,
+    from atlas_leaf_mesh_builder.integration_api import (
+        execute_external_target_transaction,
+        require_integration_contract,
     )
-    from atlas_leaf_mesh_builder.speedtree import (
-        export_or_update_speedtree_spm_targets,
-        extend_source_material_adoptions_for_targets,
-    )
+    from atlas_leaf_mesh_builder.props import sync_spm_target_registry
     from atlas_leaf_mesh_builder.target_registry import load_target_registry
+
+    integration_contract = require_integration_contract(
+        minimum_version=1,
+        capabilities=(
+            "atomic_exact_target_slice_v1",
+            "generator_adoption_reconciliation_v1",
+            "structured_transaction_conflict_v1",
+        ),
+    )
 
     normalization = normalize_cluster_blend(normalization_recipe)
     source_index = capture_normalization_source_index(
@@ -742,23 +749,6 @@ def sync_targets(blend, requested, normalization_recipe=None):
         for path in requested
         if bindings_by_key[key(path)].get("connect_generators") is True
     ]
-    if connection_targets:
-        mapping_update = extend_source_material_adoptions_for_targets(
-            props,
-            connection_targets,
-            blend_path=blend,
-        )
-    else:
-        mapping_update = {
-            "material_name": str(
-                getattr(props, "speedtree_atlas_asset_name", "") or ""
-            ),
-            "added": [],
-            "preserved": [],
-            "skipped_assets_only": [
-                str(path) for path in requested
-            ],
-        }
     # Normalize each requested relation in place. The previous manifest and
     # Generator bindings are the migration input; detaching a valid relation
     # first destroys that input and turns an idempotent refresh into a second,
@@ -767,24 +757,15 @@ def sync_targets(blend, requested, normalization_recipe=None):
     # The external registry remains the persistent ON/OFF authority. Stage only
     # this transaction's exact live relation targets in Blender so the addon
     # cannot widen execution back to unrelated registered rows.
-    props.speedtree_spm_items.clear()
-    for path in requested:
-        item = props.speedtree_spm_items.add()
-        item.path = str(path)
-    try:
-        results = export_or_update_speedtree_spm_targets(
-            props,
-            preserve_explicit_material_name=True,
-        )
-    finally:
-        props.speedtree_spm_items.clear()
-        for path in registered_paths:
-            item = props.speedtree_spm_items.add()
-            item.path = str(path)
-    completed = {key(result.get("spm_path")): result for result in results}
-    unresolved = [str(path) for path in requested if key(path) not in completed]
-    if unresolved:
-        raise RuntimeError("Atlas build returned no result for: " + ", ".join(unresolved))
+    transaction = execute_external_target_transaction(
+        props,
+        requested,
+        adoption_targets=connection_targets,
+        adoption_blend_path=blend,
+        preserve_explicit_material_name=True,
+    )
+    results = transaction["results"]
+    mapping_update = transaction["mapping_update"]
     # Both contracts must be verified before the receipt is advanced: the
     # producer's sealed delivery scope proves the generated output is valid,
     # then the content identity binds that verified publication to its source.
@@ -806,6 +787,8 @@ def sync_targets(blend, requested, normalization_recipe=None):
         "mode": "sync",
         "blend": str(blend),
         "target_spms": [str(path) for path in requested],
+        "atlas_integration_contract": integration_contract,
+        "atlas_transaction": transaction["transaction"],
         "normalization": normalization,
         "source_content_identity": source_content_identity,
         "cluster_export_configuration": export_configuration,
@@ -882,6 +865,9 @@ def main():
             "error": str(exc),
             "traceback": traceback_text,
         }
+        failure_contract = getattr(exc, "failure_contract", None)
+        if isinstance(failure_contract, dict):
+            report["failure_contract"] = failure_contract
         try:
             from cluster_blend_sync import (
                 _persist_cluster_relation_failure,

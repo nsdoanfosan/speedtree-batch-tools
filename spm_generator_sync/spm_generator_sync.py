@@ -1150,24 +1150,6 @@ class SPMDocument:
             elif link_guid in link_guids:
                 errors.append(f"중복 Link GUID: {link_guid}")
             link_guids.add(link_guid)
-            source_generator = self.by_guid.get(source)
-            target_generator = self.by_guid.get(target)
-            # Base generators are special template boundaries. Their own pass
-            # schedules Reference consumption and does not constrain the pass
-            # of generators authored inside the reusable Base template.
-            if (
-                source_generator is not None
-                and target_generator is not None
-                and self.generator_type(source_generator) != "Base"
-                and source in passes
-                and target in passes
-                and passes[target] < passes[source]
-            ):
-                errors.append(
-                    f"Generation Pass 조상 순서 오류: "
-                    f"{self.generator_name(source_generator)}({passes[source]}) > "
-                    f"{self.generator_name(target_generator)}({passes[target]})"
-                )
         for ref in self.base_refs():
             filter_name = self.base_ref_filter(ref)
             try:
@@ -1184,25 +1166,21 @@ class SPMDocument:
                     f"{filter_name or '<비어 있음>'}"
                 )
                 continue
-            ref_guid = self.generator_guid(ref)
-            if ref_guid not in passes:
-                continue
-            for base in bases:
-                base_guid = self.generator_guid(base)
-                if base_guid in passes and passes[ref_guid] >= passes[base_guid]:
-                    errors.append(
-                        f"Reference/Base Pass 순서 오류: {self.generator_name(ref)}"
-                        f"({passes[ref_guid]}) < {self.generator_name(base)}"
-                        f"({passes[base_guid]}) 이어야 합니다"
-                    )
+            # Generation Pass ordering is an optional repair concern, not an
+            # XML/link integrity failure. Existing authored SPM schedules must
+            # not block ordinary Generator Sync or Cluster refresh.
         return errors
 
     def validate(self, rendered_text: str | None = None) -> None:
+        """Validate only the bytes produced by an ordinary Sync operation."""
+        if rendered_text is not None:
+            validate_xml_text(rendered_text)
+
+    def validate_integrity(self) -> None:
+        """Run the optional full-document audit when explicitly requested."""
         errors = self.integrity_errors()
         if errors:
             raise SyncError(f"{self.path.name} 무결성 오류: " + " | ".join(errors))
-        if rendered_text is not None:
-            validate_xml_text(rendered_text)
 
     def render(self) -> str:
         if not self.full:
@@ -3355,8 +3333,6 @@ def build_group_sync_plans(
     target_specs = []
     for name in selected:
         entry = configured[name]
-        if not entry.get("base_map_confirmed"):
-            raise SyncError(f"Base 매핑을 먼저 확인해야 합니다: {name}")
         target_path = folder / name
         if not target_path.is_file():
             raise SyncError(f"자식 SPM이 없습니다: {target_path}")

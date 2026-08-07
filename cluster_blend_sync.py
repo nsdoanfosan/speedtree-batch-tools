@@ -280,11 +280,16 @@ def _snapshot_spm_files(paths, directory):
     return snapshots
 
 
-def _restore_spm_files(snapshots):
+def _restore_spm_files(snapshots, preserve_paths=()):
     """Undo partial SPM writes; keep a rescue copy of anything unrestorable."""
+    preserved_keys = {
+        normalized_path_key(path) for path in preserve_paths
+    }
     restored = []
     failed = []
     for path, copy in snapshots:
+        if normalized_path_key(path) in preserved_keys:
+            continue
         try:
             if path.is_file() and path.read_bytes() == copy.read_bytes():
                 continue
@@ -303,6 +308,46 @@ def _restore_spm_files(snapshots):
                 detail += f" (snapshot kept at {rescue})"
             failed.append(detail)
     return restored, failed
+
+
+def _worker_transaction_conflict_preserve_paths(report, snapshots):
+    """Trust only a fully hash-bound, pre-commit Atlas conflict contract."""
+    contract = (report or {}).get("failure_contract")
+    if not isinstance(contract, dict) or (
+        contract.get("kind") != "atlas_speedtree_transaction_failure"
+        or contract.get("version") != 1
+        or contract.get("reason") != "production_changed_while_staging"
+        or contract.get("commit_started") is not False
+        or contract.get("preserve_external_changes") is not True
+    ):
+        return []
+    snapshot_by_key = {
+        normalized_path_key(path): (Path(path), Path(copy))
+        for path, copy in snapshots
+    }
+    preserve = []
+    conflicts = contract.get("conflicts") or []
+    if not conflicts:
+        return []
+    for conflict in conflicts:
+        if not isinstance(conflict, dict):
+            return []
+        key = normalized_path_key(conflict.get("path") or "")
+        pair = snapshot_by_key.get(key)
+        if pair is None:
+            return []
+        path, snapshot = pair
+        if not path.is_file() or not snapshot.is_file():
+            return []
+        if (
+            _sha256_file(snapshot)
+            != str(conflict.get("expected_sha256") or "").casefold()
+            or _sha256_file(path)
+            != str(conflict.get("actual_sha256") or "").casefold()
+        ):
+            return []
+        preserve.append(path)
+    return preserve
 
 
 def _normalization_artifact_paths(recipe):
@@ -779,8 +824,14 @@ def _persist_cluster_relation_failure(
             if launch_error is not None
             else None
         ),
-        "failure_contract": _cluster_relation_failure_contract(
-            launch_error
+        "failure_contract": (
+            _cluster_relation_failure_contract(launch_error)
+            or (
+                report.get("failure_contract")
+                if isinstance(report, dict)
+                and isinstance(report.get("failure_contract"), dict)
+                else None
+            )
         ),
         "artifact_recipe": artifact_recipe,
     }
@@ -1939,8 +1990,11 @@ def run_cluster_relation_transaction(
                 preparation_error.args = (diagnostic_detail.lstrip(),)
             raise
 
-        def rollback():
-            restored, failed = _restore_spm_files(snapshots)
+        def rollback(*, preserve_spm_paths=()):
+            restored, failed = _restore_spm_files(
+                snapshots,
+                preserve_paths=preserve_spm_paths,
+            )
             capture_restored, capture_failed = (
                 _restore_normalization_artifacts(normalization_snapshots)
             )
@@ -1954,6 +2008,11 @@ def run_cluster_relation_transaction(
             except OSError as exc:
                 registry_failed.append(f"{registry_path}: {exc}")
             detail = _rollback_detail(restored, failed)
+            if preserve_spm_paths:
+                detail += (
+                    "\nPreserved concurrently modified SPM(s): "
+                    + ", ".join(str(path) for path in preserve_spm_paths)
+                )
             if registry_restored:
                 detail += (
                     "\nRestored Cluster target registry: "
@@ -2033,6 +2092,12 @@ def run_cluster_relation_transaction(
         report = _read_json(report_path) if report_path.is_file() else None
         if result.returncode != 0 or not report or report.get("status") != "ok":
             detail = (report or {}).get("error") or (result.stderr or result.stdout)[-1200:]
+            preserve_spm_paths = (
+                _worker_transaction_conflict_preserve_paths(
+                    report,
+                    snapshots,
+                )
+            )
             raise ClusterBlendSyncError(
                 f"Cluster relationship {'ON' if enabled else 'OFF'} apply failed: "
                 f"{detail}"
@@ -2041,7 +2106,7 @@ def run_cluster_relation_transaction(
                     report=report,
                     result=result,
                 )
-                + rollback()
+                + rollback(preserve_spm_paths=preserve_spm_paths)
             )
         if enabled and repair_runtime_config:
             try:
