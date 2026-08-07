@@ -1780,6 +1780,17 @@ def _apply_dynamic_wind(item):
         }
     if not Path(wind_json).is_file():
         raise RuntimeError(f"dynamic wind JSON missing: {wind_json}")
+    try:
+        wind_contract = json.loads(Path(wind_json).read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"dynamic wind JSON is invalid: {wind_json}") from exc
+    if not isinstance(wind_contract, dict):
+        raise RuntimeError("dynamic wind JSON root must be an object")
+    requested_enabled = None
+    if "bIsEnabled" in wind_contract:
+        requested_enabled = wind_contract["bIsEnabled"]
+        if not isinstance(requested_enabled, bool):
+            raise RuntimeError("dynamic wind bIsEnabled must be a boolean")
     mesh_path = item.get("mesh_path")
     mesh = unreal.EditorAssetLibrary.load_asset(mesh_path)
     if not mesh:
@@ -1808,6 +1819,23 @@ def _apply_dynamic_wind(item):
         )
     if not payload.get("skeleton_hash"):
         raise RuntimeError("dynamic wind importer returned no skeleton hash")
+    if requested_enabled is not None:
+        imported_enabled = payload.get("is_enabled")
+        if not isinstance(imported_enabled, bool):
+            raise RuntimeError(
+                "dynamic wind importer did not report the final enabled state"
+            )
+        if imported_enabled != requested_enabled:
+            raise RuntimeError(
+                "dynamic wind importer enabled state differs from the JSON contract"
+            )
+        if (
+            not requested_enabled
+            and payload.get("disabled_coefficients_zeroed") is not True
+        ):
+            raise RuntimeError(
+                "dynamic wind importer did not confirm zeroed disabled coefficients"
+            )
     expected = _expected_final_skeleton_contract(item)
     if expected and (
         str(payload.get("skeleton_hash")).casefold()
