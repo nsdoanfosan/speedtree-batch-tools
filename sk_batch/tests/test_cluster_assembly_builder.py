@@ -5,7 +5,7 @@ import math
 import sys
 import tempfile
 import unittest
-from collections import namedtuple
+from collections import Counter, namedtuple
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -47,6 +47,7 @@ from cluster_assembly_builder import (  # noqa: E402
     _strip_fbx_scene_textures,
     _validate_role_component_claims,
     _vertex_descriptors,
+    _weighted_vertex_attachment_tolerance,
     validate_binding_hierarchy,
     validate_manifest_artifacts,
     validate_normalized_prototype_unit_contract,
@@ -56,6 +57,20 @@ from cluster_assembly_builder import (  # noqa: E402
     validate_wind_json_against_skeleton,
     validate_persisted_residual_gate,
 )
+
+
+class WeightedVertexAttachmentToleranceTests(unittest.TestCase):
+    def test_large_tree_allows_one_percent_local_weight_lookup(self):
+        self.assertAlmostEqual(
+            _weighted_vertex_attachment_tolerance([1.2, 14.92359162, 0.8]),
+            0.1492359162,
+        )
+
+    def test_small_asset_keeps_one_centimeter_floor(self):
+        self.assertEqual(
+            _weighted_vertex_attachment_tolerance([0.2, 0.4, 0.1]),
+            0.01,
+        )
 
 
 def seam_split_test_mesh(split_second_face=False):
@@ -226,6 +241,57 @@ class ComponentTopologyTests(unittest.TestCase):
             [1, 2],
         )
 
+    def test_touching_duplicate_edge_cards_recover_as_two_plan_instances(self):
+        source = seam_split_test_mesh(False)
+        source_component = _component_groups(source, [0, 1])[0]
+        target = seam_split_test_mesh(False)
+        vertex_offset = len(target.vertices)
+        loop_offset = len(target.loops)
+        target.vertices.extend([
+            SimpleNamespace(co=tuple(vertex.co))
+            for vertex in target.vertices[:vertex_offset]
+        ])
+        target.loops.extend([
+            SimpleNamespace(vertex_index=loop.vertex_index + vertex_offset)
+            for loop in target.loops[:loop_offset]
+        ])
+        target.uv_layers.active.data.extend([
+            SimpleNamespace(
+                uv=SimpleNamespace(x=row.uv.x, y=row.uv.y)
+            )
+            for row in target.uv_layers.active.data[:loop_offset]
+        ])
+        target.polygons.extend([
+            SimpleNamespace(
+                index=polygon.index + 2,
+                vertices=tuple(
+                    value + vertex_offset for value in polygon.vertices
+                ),
+                loop_indices=tuple(
+                    value + loop_offset for value in polygon.loop_indices
+                ),
+            )
+            for polygon in target.polygons[:2]
+        ])
+        welded = _component_groups(target, [0, 1, 2, 3])
+        self.assertEqual(len(welded), 1)
+        prototype = {
+            "object": SimpleNamespace(data=source),
+            "component": source_component,
+        }
+
+        matched, preserved = _partition_normalized_render_components(
+            {_component_signature(source, source_component): prototype},
+            target,
+            welded,
+        )
+
+        self.assertEqual(preserved, [])
+        self.assertEqual(
+            sum(len(row["instances"]) for row in matched.values()),
+            2,
+        )
+
     def test_unique_uv_face_subset_uses_the_normalized_prototype(self):
         source = seam_split_test_mesh(False)
         target = seam_split_test_mesh(True)
@@ -249,6 +315,140 @@ class ComponentTopologyTests(unittest.TestCase):
         )
         self.assertEqual(len(source_indices), 3)
         self.assertEqual(len(target_indices), 3)
+
+    def test_speedtree_boundary_clipping_accepts_unique_twenty_percent_subset(self):
+        source_component = object()
+        target_component = object()
+        prototype = {
+            "object": SimpleNamespace(data=object()),
+            "component": source_component,
+        }
+        source_faces = Counter({("face", index): 1 for index in range(100)})
+
+        def select_counter(_mesh, component):
+            if component is source_component:
+                return source_faces
+            return Counter({("face", index): 1 for index in range(84)})
+
+        with mock.patch(
+            "cluster_assembly_builder._component_signature",
+            return_value="target",
+        ), mock.patch(
+            "cluster_assembly_builder._component_uv_face_counter",
+            side_effect=select_counter,
+        ):
+            selected = _normalized_prototype_for_component(
+                {"source": prototype}, object(), target_component
+            )
+        self.assertIs(selected, prototype)
+
+        def reject_counter(_mesh, component):
+            if component is source_component:
+                return source_faces
+            return Counter({("face", index): 1 for index in range(79)})
+
+        with mock.patch(
+            "cluster_assembly_builder._component_signature",
+            return_value="target",
+        ), mock.patch(
+            "cluster_assembly_builder._component_uv_face_counter",
+            side_effect=reject_counter,
+        ):
+            rejected = _normalized_prototype_for_component(
+                {"source": prototype}, object(), target_component
+            )
+        self.assertIsNone(rejected)
+
+    def test_speedtree_two_sided_render_matches_clipped_normalized_prototype(self):
+        source_component = object()
+        target_component = object()
+        prototype = {
+            "object": SimpleNamespace(data=object()),
+            "component": source_component,
+        }
+        source_faces = Counter({("face", index): 1 for index in range(63)})
+        rendered_faces = Counter({("face", index): 2 for index in range(52)})
+
+        def select_counter(_mesh, component):
+            return source_faces if component is source_component else rendered_faces
+
+        with mock.patch(
+            "cluster_assembly_builder._component_signature",
+            return_value="target",
+        ), mock.patch(
+            "cluster_assembly_builder._component_uv_face_counter",
+            side_effect=select_counter,
+        ):
+            selected = _normalized_prototype_for_component(
+                {"source": prototype}, object(), target_component
+            )
+        self.assertIs(selected, prototype)
+
+    def test_speedtree_face_triplication_is_not_a_card_conversion(self):
+        source_component = object()
+        target_component = object()
+        prototype = {
+            "object": SimpleNamespace(data=object()),
+            "component": source_component,
+        }
+        source_faces = Counter({("face", index): 1 for index in range(63)})
+        rendered_faces = Counter({("face", index): 3 for index in range(52)})
+
+        def select_counter(_mesh, component):
+            return source_faces if component is source_component else rendered_faces
+
+        with mock.patch(
+            "cluster_assembly_builder._component_signature",
+            return_value="target",
+        ), mock.patch(
+            "cluster_assembly_builder._component_uv_face_counter",
+            side_effect=select_counter,
+        ):
+            selected = _normalized_prototype_for_component(
+                {"source": prototype}, object(), target_component
+            )
+        self.assertIsNone(selected)
+
+    def test_two_sided_render_keeps_uv_vertex_correspondence(self):
+        source = seam_split_test_mesh(False)
+        target = seam_split_test_mesh(False)
+        originals = list(target.polygons)
+        for polygon in originals:
+            duplicated_loops = []
+            for loop_index in polygon.loop_indices:
+                source_loop = target.loops[loop_index]
+                source_uv = target.uv_layers.active.data[loop_index].uv
+                duplicated_loops.append(len(target.loops))
+                target.loops.append(SimpleNamespace(
+                    vertex_index=source_loop.vertex_index
+                ))
+                target.uv_layers.active.data.append(SimpleNamespace(
+                    uv=SimpleNamespace(x=source_uv.x, y=source_uv.y)
+                ))
+            target.polygons.append(SimpleNamespace(
+                index=len(target.polygons),
+                vertices=tuple(polygon.vertices),
+                loop_indices=tuple(duplicated_loops),
+            ))
+        source_component = _component_groups(source, [0, 1])[0]
+        target_component = _component_groups(target, [0, 1, 2, 3])[0]
+        prototype = {
+            "object": SimpleNamespace(data=source),
+            "component": source_component,
+        }
+
+        selected = _normalized_prototype_for_component(
+            {"source": prototype}, target, target_component
+        )
+        self.assertIs(selected, prototype)
+        source_indices, target_indices = _ordered_cross_object_correspondence(
+            SimpleNamespace(data=source),
+            source_component,
+            SimpleNamespace(data=target),
+            target_component,
+        )
+        self.assertEqual(len(source_indices), len(target_indices))
+        self.assertGreaterEqual(len(source_indices), 3)
 
     def test_duplicate_uv_uses_topology_not_first_vertex_iteration_order(self):
         target = stacked_uv_test_mesh()
@@ -1094,6 +1294,91 @@ class PhysicalProductionContractTests(unittest.TestCase):
         )
         self.assertEqual(report["instance_fit"], "uniform_similarity_3d")
         self.assertFalse(report["role_specific_scale_patch"])
+
+    def test_same_role_providers_keep_independent_variant_ordinals(self):
+        manifest = physical_production_manifest()
+        for row in manifest["parts"]:
+            if row["role"] == "branch":
+                row["provider_key"] = "branch:provider_a"
+        for row in manifest["registered_variants"]:
+            if row["role"] == "branch":
+                row["provider_key"] = "branch:provider_a"
+
+        source_receipt = next(
+            row["receipt"]
+            for row in manifest["normalized_variant_receipts"]
+            if row["role"] == "branch"
+        )
+        second_receipt = json.loads(json.dumps(source_receipt))
+        second_asset = "SK_branch_sample_02_01"
+        second_card = "branch_sample_02_01"
+        second_receipt["prototypes"] = [
+            second_receipt["prototypes"][0]
+        ]
+        second_receipt["prototypes"][0]["skeletal_asset"] = second_asset
+        second_receipt["variants"] = [second_receipt["variants"][0]]
+        second_receipt["variants"][0]["skeletal_asset"] = second_asset
+        second_receipt["variants"][0]["plan"] = second_card
+        capture = second_receipt["physical_capture_contract"]
+        capture["attachment_pivots"] = [capture["attachment_pivots"][0]]
+        capture["attachment_pivots"][0]["prototype_asset"] = second_asset
+        capture_payload = {
+            key: value
+            for key, value in capture.items()
+            if key != "contract_sha256"
+        }
+        capture["contract_sha256"] = __import__("hashlib").sha256(
+            json.dumps(
+                capture_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        second_receipt["physical_capture_contract_sha256"] = capture[
+            "contract_sha256"
+        ]
+        manifest["normalized_variant_receipts"].append({
+            "role": "branch",
+            "provider_key": "branch:provider_b",
+            "receipt": second_receipt,
+        })
+
+        second_part = json.loads(json.dumps(next(
+            row
+            for row in manifest["parts"]
+            if row["role"] == "branch"
+            and row["logical_subpart_index"] == 1
+        )))
+        second_part.update({
+            "provider_key": "branch:provider_b",
+            "prototype_id": "branch_provider_b_normalized_01",
+            "asset_name": second_asset,
+        })
+        manifest["parts"].append(second_part)
+        second_variant = json.loads(json.dumps(next(
+            row
+            for row in manifest["registered_variants"]
+            if row["role"] == "branch" and row["ordinal"] == 1
+        )))
+        second_variant.update({
+            "provider_key": "branch:provider_b",
+            "card_name": second_card,
+            "skeletal_asset_name": second_asset,
+        })
+        manifest["registered_variants"].append(second_variant)
+
+        report = validate_normalized_prototype_unit_contract(manifest)
+
+        self.assertEqual(report["roles"]["branch"], 3)
+        self.assertEqual(
+            report["provider_ordinals"]["branch:provider_a"],
+            [1, 2],
+        )
+        self.assertEqual(
+            report["provider_ordinals"]["branch:provider_b"],
+            [1],
+        )
 
     def test_registered_variants_must_be_unique_and_exactly_match_parts(self):
         manifest = physical_production_manifest()
