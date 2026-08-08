@@ -15,6 +15,7 @@ if str(BATCH_TOOLS_DIR) not in sys.path:
 
 from cluster_assembly_handoff_contract import (  # noqa: E402
     _compare_artifact,
+    _reconcile_role,
     assembly_source_fbx_from_contract,
     assembly_source_fbx_resolution,
     build_assembly_handoff,
@@ -25,6 +26,20 @@ from cluster_assembly_handoff_contract import (  # noqa: E402
     resolve_cluster_receipt_path,
     role_identity_aliases_from_contract,
 )
+
+
+class CurrentFbxRoleAuthorityTests(unittest.TestCase):
+    def test_rendered_expansion_does_not_invent_absent_fbx_geometry(self):
+        decision, evidence = _reconcile_role(
+            {
+                "decision": "normalize_part",
+                "rendered_provider_expansion_covered": True,
+            },
+            {"decision": "pass_through"},
+        )
+
+        self.assertEqual(decision, "pass_through")
+        self.assertEqual(evidence, "current_fbx_overrides_receipt_decision")
 from pcg_st9_texture_batch.pcg_cluster_assembly_contract import (  # noqa: E402
     ClusterAssemblyReceiptAmbiguityError,
 )
@@ -372,6 +387,12 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
     def test_export_name_normalization_keeps_role_identity(self):
         self.assertEqual(
             normalize_export_name("Material::M_branch_elm_01_Mat"),
+            "branch_elm_01",
+        )
+        self.assertEqual(
+            normalize_export_name(
+                "Material::M_branch_elm_01_Mat.001.001"
+            ),
             "branch_elm_01",
         )
 
