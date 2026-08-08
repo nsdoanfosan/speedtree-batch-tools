@@ -496,6 +496,10 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         INFORMATIONAL, "sk_batch/cluster_assembly_handoff_contract.py",
         "cluster_handoff_diagnostic",
     ),
+    "asset_registration_only_provider_name_mismatch": ReasonRow(
+        INFORMATIONAL, "sk_batch/cluster_assembly_handoff_contract.py",
+        "cluster_handoff_diagnostic",
+    ),
     "asset_texture_source_path_missing": ReasonRow(
         UNCLASSIFIED, "sk_batch/spm_leaf_handoff_contract.py", "",
     ),
@@ -905,6 +909,11 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         "sk_batch/cluster_assembly_handoff_contract.py",
         "cluster_handoff_diagnostic",
     ),
+    "connection_incomplete_provider_name_mismatch": ReasonRow(
+        INFORMATIONAL,
+        "sk_batch/cluster_assembly_handoff_contract.py",
+        "cluster_handoff_diagnostic",
+    ),
     "generator_connection_incomplete": ReasonRow(
         UNCLASSIFIED, "atlas_manifest_resolver.py", "",
     ),
@@ -1205,6 +1214,10 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         UNSUPPORTED, "speedtree_texture_contract.py",
         "texture_scope_integrity",
     ),
+    "prototype_has_no_active_uv": ReasonRow(
+        INFORMATIONAL, "sk_batch/cluster_assembly_builder.py",
+        "cluster_handoff_diagnostic",
+    ),
     "protected_manual": ReasonRow(
         UNCLASSIFIED, "sk_batch/atlas_consumer_integrity.py", "",
     ),
@@ -1380,6 +1393,10 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     ),
     "target_material_lineage_missing": ReasonRow(
         UNCLASSIFIED, "pcg_st9_texture_batch/pcg_texture_audit.py", "",
+    ),
+    "target_has_no_active_uv": ReasonRow(
+        INFORMATIONAL, "sk_batch/cluster_assembly_builder.py",
+        "cluster_handoff_diagnostic",
     ),
     "target_mesh_asset_missing": ReasonRow(
         UNCLASSIFIED, "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py", "",

@@ -1239,24 +1239,24 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
                 evidence = row["reconciliation"]
         elif delivery_mode == "asset_registration_only":
             row["decision"] = "pass_through"
-            row["reconciliation"] = (
-                "asset_registration_only_provider_name_mismatch"
-                if actual.get("status") == "complete_pair"
+            evidence = "asset_registration_only"
+            if (
+                actual.get("status") == "complete_pair"
                 and not provider_identity_matches_actual
-                else "asset_registration_only"
-            )
+            ):
+                evidence = "asset_registration_only_provider_name_mismatch"
+            row["reconciliation"] = evidence
             decision = "pass_through"
-            evidence = row["reconciliation"]
         elif delivery_mode == "connection_incomplete" and decision != "blocked":
             row["decision"] = "pass_through"
-            row["reconciliation"] = (
-                "connection_incomplete_provider_name_mismatch"
-                if actual.get("status") == "complete_pair"
+            evidence = "generator_connection_metadata_incomplete_nonblocking"
+            if (
+                actual.get("status") == "complete_pair"
                 and not provider_identity_matches_actual
-                else "generator_connection_metadata_incomplete_nonblocking"
-            )
+            ):
+                evidence = "connection_incomplete_provider_name_mismatch"
+            row["reconciliation"] = evidence
             decision = "pass_through"
-            evidence = row["reconciliation"]
         elif decision == "normalize_part" and not normalized_ready:
             row["decision"] = "pass_through"
             row["reconciliation"] = (
