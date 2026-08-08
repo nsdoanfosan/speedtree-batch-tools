@@ -235,6 +235,57 @@ class MaterialPreflightCacheTests(unittest.TestCase):
 
             self.assertEqual(one, two)
 
+    def test_gui_code_edit_does_not_invalidate_material_export_cache(self):
+        gui = load_gui_module()
+        app = gui.App.__new__(gui.App)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fbx_ini = root / "Options_MA_Fbx.ini"
+            speedtree_cli = root / "speedtree_cli.py"
+            speedtree_exe = root / "SpeedTree_Modeler.exe"
+            fbx_ini.write_text("[Export]\nTextureSkipWriting=true\n", encoding="utf-8")
+            speedtree_cli.write_text("# implementation v1\n", encoding="utf-8")
+            speedtree_exe.write_bytes(b"speedtree-binary-fixture")
+            app.cfg = {
+                "speedtree_exe": str(speedtree_exe),
+                "material_preflight_cache_dir": str(root / "cache"),
+            }
+
+            first = app._material_preflight_cache_context(
+                fbx_ini,
+                speedtree_cli,
+            )["runtime_signature"]
+            app.__dict__.pop(
+                "_material_preflight_cache_context_value",
+                None,
+            )
+            speedtree_cli.write_text(
+                "# implementation v2\n",
+                encoding="utf-8",
+            )
+            after_code_edit = app._material_preflight_cache_context(
+                fbx_ini,
+                speedtree_cli,
+            )["runtime_signature"]
+
+            app.__dict__.pop(
+                "_material_preflight_cache_context_value",
+                None,
+            )
+            fbx_ini.write_text(
+                "[Export]\nTextureSkipWriting=false\n",
+                encoding="utf-8",
+            )
+            after_export_setting_edit = (
+                app._material_preflight_cache_context(
+                    fbx_ini,
+                    speedtree_cli,
+                )["runtime_signature"]
+            )
+
+        self.assertEqual(first, after_code_edit)
+        self.assertNotEqual(first, after_export_setting_edit)
+
     def test_gui_cache_hit_does_not_launch_material_preflight_child(self):
         gui = load_gui_module()
         app = gui.App.__new__(gui.App)

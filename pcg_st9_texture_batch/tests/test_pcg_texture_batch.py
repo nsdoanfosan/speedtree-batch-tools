@@ -399,6 +399,32 @@ class TargetCollectionTests(unittest.TestCase):
                 [folder],
             )
 
+    def test_explicit_mesh_target_narrows_pcg_candidate_folders(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            elm = root / "tree_elm"
+            pine = root / "tree_pine"
+            elm.mkdir()
+            pine.mkdir()
+            (elm / "SK_tree_elm_01.spm").write_bytes(b"SPM")
+            (pine / "SK_tree_pine_01.spm").write_bytes(b"SPM")
+            cfg = {"tree_root": str(root)}
+            pcg_targets = {
+                "meshes": [
+                    {"static_mesh": "/Game/st9/tree_elm_01.tree_elm_01"},
+                    {"static_mesh": "/Game/st9/tree_pine_01.tree_pine_01"},
+                ],
+                "data_assets": [],
+            }
+
+            actual = pcg_texture_audit.candidate_folders(
+                cfg,
+                pcg_targets=pcg_targets,
+                target_mesh_names=["tree_elm_01"],
+            )
+
+        self.assertEqual(actual, [elm])
+
     def test_unknown_target_is_reported_instead_of_auditing_nothing(self):
         with tempfile.TemporaryDirectory() as temporary:
             cfg = {"tree_root": temporary}
@@ -448,6 +474,91 @@ class TargetCollectionTests(unittest.TestCase):
         self.assertEqual(
             [row["mesh_name"] for row in report["items"][0]["target_spm_statuses"]],
             local_names,
+        )
+
+    def test_explicit_mesh_targets_override_broader_pcg_inventory(self):
+        folder = Path(r"D:\Trees\tree_nothofagussolandri")
+        requested_names = [
+            "tree_nothofagussolandri_22",
+            "tree_nothofagussolandri_31",
+        ]
+        pcg_targets = {
+            "meshes": [
+                {
+                    "static_mesh": (
+                        "/Game/st9/tree_nothofagussolandri_01."
+                        "tree_nothofagussolandri_01"
+                    ),
+                    "data_assets": [],
+                    "level_instances": [],
+                },
+                {
+                    "static_mesh": (
+                        "/Game/st9/tree_nothofagussolandri_22."
+                        "tree_nothofagussolandri_22"
+                    ),
+                    "data_assets": [],
+                    "level_instances": [],
+                },
+                {
+                    "static_mesh": (
+                        "/Game/st9/tree_nothofagussolandri_31."
+                        "tree_nothofagussolandri_31"
+                    ),
+                    "data_assets": [],
+                    "level_instances": [],
+                },
+            ],
+            "data_assets": [],
+        }
+        audit_item = {
+            "folder": str(folder),
+            "name": folder.name,
+            "status": "ready",
+            "actions": [],
+        }
+
+        with mock.patch.object(
+                pcg_texture_audit, "ensure_blend_source_index"), \
+                mock.patch.object(
+                    pcg_texture_audit, "candidate_folders",
+                    return_value=[folder]), \
+                mock.patch.object(
+                    pcg_texture_audit, "folder_match_tokens",
+                    return_value=["tree_nothofagussolandri"]), \
+                mock.patch.object(
+                    pcg_texture_audit, "audit_folder",
+                    return_value=audit_item) as audit, \
+                mock.patch.object(
+                    pcg_texture_audit, "attach_global_m_graphs"), \
+                mock.patch.object(
+                    pcg_texture_audit, "resolve_shared_atlas_entries"), \
+                mock.patch.object(
+                    pcg_texture_audit, "target_spm_status",
+                    side_effect=lambda _folder, name: {
+                        "mesh_name": name,
+                        "status": "ready",
+                        "actions": [],
+                    }):
+            report = pcg_texture_audit.make_report(
+                {
+                    "pcg_focus_data_assets": [],
+                    "pcg_positive_weight_only": True,
+                },
+                pcg_targets=pcg_targets,
+                target_mesh_names=requested_names,
+            )
+
+        self.assertEqual(
+            audit.call_args.kwargs["target_mesh_names"],
+            requested_names,
+        )
+        self.assertEqual(
+            [
+                row["mesh_name"]
+                for row in report["items"][0]["target_spm_statuses"]
+            ],
+            requested_names,
         )
 
     def test_pcg_and_level_provenance_stay_separate(self):

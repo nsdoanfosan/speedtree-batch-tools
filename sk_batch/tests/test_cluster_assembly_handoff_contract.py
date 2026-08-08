@@ -837,6 +837,57 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                 "current_fbx_pair_overrides_asset_registration_only",
             )
 
+    def test_target_alias_does_not_override_unconnected_provider_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_Tree_elm_01.spm"
+            fbx = root / "tree.fbx"
+            receipt = root / "receipt.json"
+            spm.write_bytes(b"spm")
+            fbx.write_bytes(b"fbx")
+            write_receipt(
+                receipt,
+                spm,
+                fbx,
+                [("cluster", "cluster_provider_03", "pending_export")],
+                normalized_by_role={
+                    "cluster": {
+                        "status": "ready",
+                        "material": "M_cluster_provider_03",
+                        "variants": [{"ordinal": 1}],
+                        "delivery_mode": "asset_registration_only",
+                        "target_deliveries": [{
+                            "schema_version": 1,
+                            "spm": str(spm),
+                            "delivery_mode": "asset_registration_only",
+                            "generator_bindings": [],
+                        }],
+                    },
+                },
+                target_material_by_role={
+                    "cluster": "M_cluster_target_01",
+                },
+            )
+            inventory = build_blender_fbx_inventory(
+                [role_object(fbx, material="M_cluster_target_01")],
+                fbx,
+                {"cluster": "M_cluster_target_01"},
+            )
+
+            handoff = build_assembly_handoff(receipt, spm, inventory)
+
+            cluster = next(
+                row for row in handoff["roles"]
+                if row["role"] == "cluster"
+            )
+            self.assertEqual(handoff["status"], "pass_through")
+            self.assertEqual(cluster["decision"], "pass_through")
+            self.assertFalse(cluster["provider_identity_matches_actual"])
+            self.assertEqual(
+                cluster["reconciliation"],
+                "asset_registration_only_provider_name_mismatch",
+            )
+
     def test_actual_pair_overrides_incomplete_connection_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -881,6 +932,54 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                 "current_fbx_pair_overrides_connection_incomplete",
             )
             self.assertEqual(handoff["issues"], [])
+
+    def test_target_alias_does_not_override_incomplete_provider_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_Tree_elm_01.spm"
+            fbx = root / "tree.fbx"
+            receipt = root / "receipt.json"
+            spm.write_bytes(b"spm")
+            fbx.write_bytes(b"fbx")
+            write_receipt(
+                receipt,
+                spm,
+                fbx,
+                [("leaf", "cluster_provider_07", "pending_export")],
+                normalized_by_role={
+                    "leaf": {
+                        "status": "ready",
+                        "material": "M_cluster_provider_07",
+                        "variants": [{"ordinal": 1}],
+                        "delivery_mode": "connection_incomplete",
+                        "target_deliveries": [{
+                            "schema_version": 1,
+                            "spm": str(spm),
+                            "delivery_mode": "connection_incomplete",
+                            "generator_bindings": [],
+                        }],
+                    },
+                },
+                target_material_by_role={"leaf": "M_leaf_target_05"},
+            )
+            inventory = build_blender_fbx_inventory(
+                [role_object(fbx, material="M_leaf_target_05")],
+                fbx,
+                {"leaf": "M_leaf_target_05"},
+            )
+
+            handoff = build_assembly_handoff(receipt, spm, inventory)
+
+            leaf = next(
+                row for row in handoff["roles"] if row["role"] == "leaf"
+            )
+            self.assertEqual(handoff["status"], "pass_through")
+            self.assertEqual(leaf["decision"], "pass_through")
+            self.assertFalse(leaf["provider_identity_matches_actual"])
+            self.assertEqual(
+                leaf["reconciliation"],
+                "connection_incomplete_provider_name_mismatch",
+            )
 
     def test_bark_normalization_metadata_does_not_block_live_pair(self):
         with tempfile.TemporaryDirectory() as tmp:

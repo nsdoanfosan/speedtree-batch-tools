@@ -566,6 +566,40 @@ class ComponentTopologyTests(unittest.TestCase):
                 [0.0, 0.0],
             )
 
+    def test_fbx_float_noise_keeps_one_attachment_correspondence(self):
+        source = seam_split_test_mesh(False)
+        target = seam_split_test_mesh(True)
+        for mesh in (source, target):
+            for vertex in mesh.vertices:
+                vertex.co = tuple(float(value) * 0.01 for value in vertex.co)
+        # One float32-scale round trip at meter-space coordinates can split a
+        # seam vertex by ~1e-7 m.  It remains the same authored attachment.
+        target.vertices[4].co = (1.2e-7, 0.0, 0.0)
+        source_component = _component_groups(source, [0, 1])[0]
+        target_component = {
+            "vertices": list(range(len(target.vertices))),
+            "polygons": [0, 1],
+        }
+
+        attachment = _attachment_point_correspondence(
+            SimpleNamespace(data=source),
+            source_component,
+            SimpleNamespace(data=target),
+            target_component,
+            [0.0, 0.0],
+        )
+        source_indices, target_indices = _ordered_cross_object_correspondence(
+            SimpleNamespace(data=source),
+            source_component,
+            SimpleNamespace(data=target),
+            target_component,
+        )
+
+        self.assertEqual(attachment["source_index"], 0)
+        self.assertEqual(attachment["target_index"], 0)
+        self.assertEqual(len(source_indices), len(target_indices))
+        self.assertGreaterEqual(len(source_indices), 3)
+
     def test_loose_attachment_vertex_recovers_from_matching_uv_edges(self):
         source = edge_attachment_test_mesh()
         target = edge_attachment_test_mesh(y_offset=5.0)
@@ -1064,91 +1098,42 @@ class ContentDecisionTests(unittest.TestCase):
         ):
             _validate_role_component_claims(role_build_plans)
 
-    def test_topology_fallback_zero_match_fails_before_publishing_outputs(self):
-        handoff = ready_handoff()
-        for role in handoff["assembly"]["part_builder_inputs"]:
-            role["assignments"][0]["used_polygon_count"] = 1
-        merged = SimpleNamespace(
-            type="MESH",
-            data=SimpleNamespace(
-                materials=[
-                    SimpleNamespace(name="M_branch_elm_01"),
-                    SimpleNamespace(name="M_Bark_elm_01"),
-                ],
-                polygons=[
-                    SimpleNamespace(index=0, material_index=0),
-                    SimpleNamespace(index=1, material_index=1),
-                ],
-            ),
-        )
-        fake_bpy = SimpleNamespace(
-            context=SimpleNamespace(
-                scene=SimpleNamespace(
-                    unit_settings=SimpleNamespace(
-                        system="METRIC",
-                        scale_length=1.0,
-                    )
-                )
-            ),
-            data=SimpleNamespace(
-                objects={},
-                armatures={},
-                meshes={},
-            ),
-        )
+    def test_unmatched_provider_topology_stays_in_base_when_other_part_matches(self):
+        preserved = {
+            "topology_signature": "rendered-only",
+            "instance_count": 3,
+            "polygon_count": 104,
+        }
+        role_build_plans = {
+            "branch:branch_elm_01": {
+                "matched": {
+                    "branch_signature": {
+                        "instances": [{"polygons": [4, 5]}],
+                    }
+                },
+                "preserved": [],
+            },
+            "leaf:cluster_elm_07": {
+                "matched": {},
+                "preserved": [preserved],
+            },
+        }
 
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            full = root / "SK_tree_elm_01.fbx"
-            full.write_bytes(b"full")
-            output = root / "assembly"
-            partition_results = [
-                (
-                    {
-                        "branch_signature": {
-                            "prototype": {},
-                            "instances": [{"polygons": [0]}],
-                        }
-                    },
-                    [],
-                ),
-                ({}, [{"polygons": [1]}]),
-            ]
+        claimed = _validate_role_component_claims(role_build_plans)
 
-            with mock.patch.dict(sys.modules, {"bpy": fake_bpy}), \
-                    mock.patch(
-                        "cluster_assembly_builder.snapshot_blender_armature",
-                        return_value=skeleton_snapshot(),
-                    ), mock.patch(
-                        "cluster_assembly_builder.validate_file_fingerprint",
-                        return_value={},
-                    ), mock.patch(
-                        "cluster_assembly_builder._import_normalized_plan_prototypes",
-                        return_value=([{}], []),
-                    ), mock.patch(
-                        "cluster_assembly_builder._component_groups",
-                        side_effect=lambda _mesh, polygons: [
-                            {"polygons": list(polygons)}
-                        ],
-                    ), mock.patch(
-                        "cluster_assembly_builder._partition_normalized_render_components",
-                        side_effect=partition_results,
-                    ):
-                with self.assertRaisesRegex(
-                    ClusterAssemblyBuildError,
-                    "matched zero normalized prototype components: leaf",
-                ):
-                    build_blender_assembly_inputs(
-                        handoff,
-                        SimpleNamespace(),
-                        merged,
-                        output,
-                        full,
-                        root / "wind.json",
-                    )
+        self.assertEqual(set(claimed), {(id(None), 4), (id(None), 5)})
 
-            self.assertFalse(output.exists())
-            self.assertFalse(list(root.glob("**/*cluster_assembly_bindings.json")))
+    def test_zero_match_without_preserved_geometry_still_fails(self):
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "matched zero normalized prototype components: leaf",
+        ):
+            _validate_role_component_claims({
+                "leaf": {
+                    "matched": {},
+                    "preserved": [],
+                },
+            })
 
     def test_ready_is_automatic_content_driven_build(self):
         self.assertEqual(content_build_decision(ready_handoff()), "build")
