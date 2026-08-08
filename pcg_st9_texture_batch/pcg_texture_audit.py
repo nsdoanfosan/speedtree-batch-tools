@@ -4631,7 +4631,7 @@ def ensure_blend_source_index(
             reason="blend_source_index_root_exit",
         )
         child_finalized = True
-        if child.returncode != 0 or not report_path.is_file():
+        if not report_path.is_file():
             detail = (stderr or stdout or "").strip()[-1000:]
             raise BlendSourceIndexError(
                 "Blender source indexing failed"
@@ -4639,6 +4639,11 @@ def ensure_blend_source_index(
             )
         payload = json.loads(report_path.read_text(encoding="utf-8"))
         indexed = session.install_report(payload, requests)
+        if child.returncode != 0:
+            raise BlendSourceIndexError(
+                "Blender source indexing returned a successful report "
+                f"but exited with code {child.returncode}"
+            )
         if indexed:
             _PERSISTENT_BLEND_IMAGES_DIRTY = True
         result = {"indexed": indexed, "pending": len(requests)}
