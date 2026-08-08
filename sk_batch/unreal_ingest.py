@@ -147,20 +147,76 @@ def _material_pipeline_checkouts():
     return sorted(paths)
 
 
+def _pcg_provider_binding_checkout(item):
+    wind_json = item.get("wind_json")
+    if not wind_json or not Path(str(wind_json)).is_file():
+        return None
+    try:
+        wind_contract = json.loads(Path(str(wind_json)).read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"cannot read DynamicWind contract before provider checkout: {wind_json}"
+        ) from exc
+    if not isinstance(wind_contract, dict):
+        raise RuntimeError("dynamic wind JSON root must be an object")
+    if wind_contract.get("WindResponsePresetContract") is None:
+        return None
+
+    library = getattr(unreal, "CodexDynamicWindResponseLibrary", None)
+    preview = getattr(
+        library,
+        "get_pcg_provider_binding_targets_for_mesh_path",
+        None,
+    )
+    if not callable(preview):
+        raise RuntimeError(
+            "CodexDynamicWindResponseLibrary provider-binding preview is required "
+            "for the shared response contract"
+        )
+    try:
+        payload = json.loads(str(preview(str(item.get("mesh_path") or ""))))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("provider-binding checkout preview returned invalid JSON") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("success") is not True
+        or payload.get("contract") != "shared_provider_v1"
+        or not payload.get("provider")
+        or not isinstance(payload.get("target_assets"), list)
+    ):
+        raise RuntimeError(
+            "provider-binding checkout preview did not confirm shared_provider_v1: "
+            + str(payload)
+        )
+    return payload
+
+
 def _checkout_existing_assets(item):
     candidates = list(item.get("checkout_asset_paths") or [])
+    provider_binding = _pcg_provider_binding_checkout(item)
+    if provider_binding:
+        item["_pcg_provider_binding_checkout"] = provider_binding
+        candidates.extend(provider_binding["target_assets"])
     existing = [
         path
-        for path in candidates
+        for path in dict.fromkeys(candidates)
         if path and unreal.EditorAssetLibrary.does_asset_exist(path)
     ]
     if not existing:
-        return {"existing": [], "checked_out": []}
+        return {
+            "existing": [],
+            "checked_out": [],
+            "provider_binding": provider_binding,
+        }
     subsystem = unreal.get_editor_subsystem(unreal.EditorAssetSubsystem)
     failed = [path for path in existing if not subsystem.checkout_asset(path)]
     if failed:
         raise RuntimeError("source-control checkout failed: " + ", ".join(failed))
-    return {"existing": existing, "checked_out": existing}
+    return {
+        "existing": existing,
+        "checked_out": existing,
+        "provider_binding": provider_binding,
+    }
 
 
 @contextmanager
@@ -1850,6 +1906,41 @@ def _apply_dynamic_wind(item):
             raise RuntimeError(
                 "dynamic wind importer did not report the effective shared response state"
             )
+        if payload.get("production_provider_contract") != "shared_provider_v1":
+            raise RuntimeError(
+                "dynamic wind importer did not confirm shared_provider_v1 contract"
+            )
+        production_provider = str(payload.get("production_provider") or "")
+        provider_sync = payload.get("pcg_provider_sync")
+        if (
+            not production_provider
+            or not isinstance(provider_sync, dict)
+            or provider_sync.get("success") is not True
+            or provider_sync.get("contract") != "shared_provider_v1"
+            or provider_sync.get("provider") != production_provider
+            or not isinstance(provider_sync.get("matched_rows"), int)
+            or not isinstance(provider_sync.get("changed_rows"), int)
+            or not isinstance(provider_sync.get("target_assets"), list)
+            or not isinstance(provider_sync.get("changed_assets"), list)
+        ):
+            raise RuntimeError(
+                "dynamic wind importer did not synchronize the canonical "
+                "production provider: "
+                + str(provider_sync)
+            )
+        checkout_preview = item.get("_pcg_provider_binding_checkout")
+        if checkout_preview:
+            preview_targets = set(checkout_preview.get("target_assets") or [])
+            changed_targets = set(provider_sync.get("changed_assets") or [])
+            if checkout_preview.get("provider") != production_provider:
+                raise RuntimeError(
+                    "production provider changed between checkout and import"
+                )
+            if not changed_targets.issubset(preview_targets):
+                raise RuntimeError(
+                    "provider synchronization changed a PCG asset that was not "
+                    "declared by the checkout preview"
+                )
     elif requested_enabled is not None:
         imported_enabled = payload.get("is_enabled")
         if not isinstance(imported_enabled, bool):
@@ -2444,6 +2535,14 @@ def ingest_item(item):
         dict.fromkeys(list(checkout["checked_out"]) + material_checkouts)
     )
     wind = _apply_dynamic_wind(item)
+    provider_sync = (wind.get("result") or {}).get("pcg_provider_sync") or {}
+    imported_assets.extend(
+        {
+            "asset_path": asset_path,
+            "asset_type": "PCGDynamicWindProviderBinding",
+        }
+        for asset_path in provider_sync.get("changed_assets") or []
+    )
     final_skeleton_saved = {}
     if (
         wind.get("status") == "ok"
