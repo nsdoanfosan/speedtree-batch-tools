@@ -360,13 +360,14 @@ def _role_contract(blend):
     tokens = {token for token in base.casefold().split("_") if token}
     if "leaf" in tokens and "side" in tokens:
         role = "leaf_side"
-        plane = "YZ"
     elif "leaf" in tokens:
         role = "leaf"
-        plane = "XY"
     else:
         role = "branch"
-        plane = "XY"
+    # Asset role selects the Atlas collection, while the exact ``side`` token
+    # independently selects capture orientation.  Coupling these decisions
+    # made branch-side assets fall through to the top-facing XY capture.
+    plane = "YZ" if "side" in tokens else "XY"
     return {
         "role": role,
         "capture_plane": plane,
