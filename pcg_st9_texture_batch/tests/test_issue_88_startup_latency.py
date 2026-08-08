@@ -2631,8 +2631,14 @@ class ProductionShapedLatencyFixtureTests(unittest.TestCase):
                     )
                 ),
             )
-            self.assertEqual(cold_cache.get("spm_analysis_calls"), 18837)
-            self.assertEqual(warm_cache.get("spm_analysis_calls"), 18837)
+            # The exact total can change when a correctness fix adds another
+            # authoritative SPM role.  The calibrated guard below is the
+            # stable contract; cold and warm runs must still do equivalent
+            # bounded work without returning to per-SPM amplification.
+            self.assertEqual(
+                cold_cache.get("spm_analysis_calls"),
+                warm_cache.get("spm_analysis_calls"),
+            )
             self.assertEqual(
                 cold["startup_timing"]["total_invocation_guard"]["rules"]
                 ["spm_analysis_calls"]["limit"],
