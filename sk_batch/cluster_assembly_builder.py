@@ -62,6 +62,13 @@ MAX_NORMALIZED_PLAN_FACE_LOSS_RATIO = 0.20
 MAX_SPEEDTREE_RENDER_FACE_MULTIPLICITY = 2
 MAX_WEIGHT_BINDING_DISTANCE_SPAN_RATIO = 1.0e-2
 MIN_WEIGHT_BINDING_DISTANCE_METERS = 1.0e-2
+# Blender stores imported FBX coordinates as 32-bit floats.  At the meter-scale
+# positions used by this pipeline, one exporter round-trip can separate an
+# authored coincident vertex by roughly 1e-7 m.  Every topology/correspondence
+# stage must share the same floor; deriving a smaller tolerance from one tiny
+# card after the role-level weld makes the same vertex coincident in one stage
+# and ambiguous in the next.
+MIN_FBX_COORDINATE_TOLERANCE_METERS = 1.0e-6
 PASS_THROUGH_PROVENANCE_SCHEMA_VERSION = 1
 PASS_THROUGH_PROVENANCE_REASON = (
     "selected_target_contract_handoff_pass_through"
@@ -3163,6 +3170,21 @@ def _rotation_matrix_to_quaternion(matrix):
     return [x / length, y / length, z / length, w / length]
 
 
+def _fbx_coordinate_tolerance(coordinates):
+    points = [tuple(float(value) for value in point) for point in coordinates]
+    if not points:
+        return MIN_FBX_COORDINATE_TOLERANCE_METERS
+    spans = [
+        max(point[axis] for point in points)
+        - min(point[axis] for point in points)
+        for axis in range(3)
+    ]
+    return max(
+        max(spans) * 2.0e-6,
+        MIN_FBX_COORDINATE_TOLERANCE_METERS,
+    )
+
+
 def _component_groups(mesh, polygon_indices):
     polygon_indices = sorted(set(int(value) for value in polygon_indices))
     if not polygon_indices:
@@ -3190,15 +3212,10 @@ def _component_groups(mesh, polygon_indices):
         index: tuple(float(mesh.vertices[index].co[axis]) for axis in range(3))
         for index in used_vertices
     }
-    spans = [
-        max(value[axis] for value in coordinates.values())
-        - min(value[axis] for value in coordinates.values())
-        for axis in range(3)
-    ]
     # Relative to the current role extent, not a species-specific world size.
     # This reconnects seam-split FBX/BWR vertices whose skinning differs only
     # by float noise while remaining far below authored card edge lengths.
-    weld_tolerance = max(max(spans) * 2.0e-6, 1.0e-9)
+    weld_tolerance = _fbx_coordinate_tolerance(coordinates.values())
     weld_tolerance_sq = weld_tolerance * weld_tolerance
     vertex_parent = {index: index for index in used_vertices}
 
@@ -3424,12 +3441,7 @@ def _coincident_candidate_groups(obj, component, candidates):
         tuple(float(value) for value in obj.data.vertices[index].co)
         for index in component["vertices"]
     ]
-    spans = [
-        max(point[axis] for point in component_coordinates)
-        - min(point[axis] for point in component_coordinates)
-        for axis in range(3)
-    ]
-    tolerance = max(max(spans) * 2.0e-6, 1.0e-9)
+    tolerance = _fbx_coordinate_tolerance(component_coordinates)
     groups = []
     for index in sorted(candidates):
         group = next((
@@ -3575,12 +3587,7 @@ def _coincident_uv_vertex_index(obj, component, key):
         tuple(float(value) for value in obj.data.vertices[index].co)
         for index in component["vertices"]
     ]
-    spans = [
-        max(point[axis] for point in component_coordinates)
-        - min(point[axis] for point in component_coordinates)
-        for axis in range(3)
-    ]
-    tolerance = max(max(spans) * 2.0e-6, 1.0e-9)
+    tolerance = _fbx_coordinate_tolerance(component_coordinates)
     ordered = sorted(indices)
     reference = tuple(
         float(value) for value in obj.data.vertices[ordered[0]].co
@@ -3707,12 +3714,7 @@ def _attachment_uv_edge_point(obj, component, attachment_uv):
         tuple(float(value) for value in obj.data.vertices[index].co)
         for index in component["vertices"]
     ]
-    spans = [
-        max(point[axis] for point in coordinates)
-        - min(point[axis] for point in coordinates)
-        for axis in range(3)
-    ]
-    coordinate_tolerance = max(max(spans) * 2.0e-6, 1.0e-9)
+    coordinate_tolerance = _fbx_coordinate_tolerance(coordinates)
     groups = []
     for candidate in sorted(
         candidates,
@@ -4154,12 +4156,7 @@ def _vertex_descriptors(obj, component):
         tuple(float(value) for value in mesh.vertices[index].co)
         for index in component["vertices"]
     ]
-    spans = [
-        max(point[axis] for point in component_coordinates)
-        - min(point[axis] for point in component_coordinates)
-        for axis in range(3)
-    ]
-    tolerance = max(max(spans) * 2.0e-6, 1.0e-9)
+    tolerance = _fbx_coordinate_tolerance(component_coordinates)
     resolved_representatives = {}
     for logical_vertex, indices in representative.items():
         ordered = sorted(indices)
@@ -5363,7 +5360,14 @@ def _validate_role_component_claims(role_build_plans):
                             f"polygon={polygon}, roles={owner},{provider_key}"
                         )
                     claimed_polygons[claim_key] = provider_key
-        if matched_component_count == 0:
+        # A normalized provider can legitimately cover only a subset of the
+        # rendered variants.  `_partition_normalized_render_components`
+        # deliberately leaves unknown topologies in the Full-SK Base so no
+        # geometry is invented or discarded.  Do not turn that preservation
+        # result back into a provider-wide failure here.  A role with neither
+        # a matched nor a preserved component is still invalid, and the final
+        # builder also rejects a handoff where no provider produced any part.
+        if matched_component_count == 0 and not plan.get("preserved"):
             unmatched_roles.append({
                 "provider_key": str(provider_key),
                 "preserved": deepcopy(plan.get("preserved") or []),

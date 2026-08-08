@@ -4637,7 +4637,7 @@ def ensure_blend_source_index(
             reason="blend_source_index_root_exit",
         )
         child_finalized = True
-        if child.returncode != 0 or not report_path.is_file():
+        if not report_path.is_file():
             detail = (stderr or stdout or "").strip()[-1000:]
             raise BlendSourceIndexError(
                 "Blender source indexing failed"
@@ -4645,6 +4645,11 @@ def ensure_blend_source_index(
             )
         payload = json.loads(report_path.read_text(encoding="utf-8"))
         indexed = session.install_report(payload, requests)
+        if child.returncode != 0:
+            raise BlendSourceIndexError(
+                "Blender source indexing returned a successful report "
+                f"but exited with code {child.returncode}"
+            )
         if indexed:
             _PERSISTENT_BLEND_IMAGES_DIRTY = True
         result = {"indexed": indexed, "pending": len(requests)}
@@ -7610,7 +7615,8 @@ def folder_target_mesh_names(folder, target_mesh_names):
     return sorted(matches)
 
 
-def candidate_folders(cfg, targets=None, pcg_targets=None):
+def candidate_folders(
+        cfg, targets=None, pcg_targets=None, target_mesh_names=None):
     root = Path(cfg["tree_root"])
     if targets:
         # A bare folder name is the documented --target form, but an unresolved
@@ -7631,7 +7637,14 @@ def candidate_folders(cfg, targets=None, pcg_targets=None):
             resolved.append(path)
         return resolved
     folders = []
-    target_mesh_names = target_mesh_names_from_pcg_targets(pcg_targets)
+    effective_target_mesh_names = (
+        sorted({
+            normalize_local_asset_stem(name)
+            for name in target_mesh_names or []
+            if normalize_local_asset_stem(name)
+        })
+        or target_mesh_names_from_pcg_targets(pcg_targets)
+    )
     if not root.exists():
         return folders
     skip = {"atlas", "mesh", "st9", "trunk"}
@@ -7647,7 +7660,13 @@ def candidate_folders(cfg, targets=None, pcg_targets=None):
             p.is_file() and not is_backup_path(p)
             for p in (folder / "texture").glob("*.sbs")
         )
-        if (has_spm or has_cluster or has_sbs) and folder_matches_target_meshes(folder, target_mesh_names):
+        if (
+            (has_spm or has_cluster or has_sbs)
+            and folder_matches_target_meshes(
+                folder,
+                effective_target_mesh_names,
+            )
+        ):
             folders.append(folder)
     return folders
 
@@ -8269,7 +8288,17 @@ def make_report(
         cfg.get("pcg_focus_data_assets"),
         cfg.get("pcg_positive_weight_only", True),
     )
-    folders = candidate_folders(cfg, targets, pcg_targets=pcg_targets)
+    requested_target_mesh_names = sorted({
+        normalize_local_asset_stem(name)
+        for name in target_mesh_names or []
+        if normalize_local_asset_stem(name)
+    })
+    folders = candidate_folders(
+        cfg,
+        targets,
+        pcg_targets=pcg_targets,
+        target_mesh_names=requested_target_mesh_names,
+    )
     finish_phase("candidate_discovery", folder_count=len(folders))
     blend_source_session = BlendSourceIndexSession(
         {} if mutation_authority else _persistent_blend_images()
@@ -8294,14 +8323,15 @@ def make_report(
     )
     finish_phase("spm_content_identity_prefetch", **spm_prefetch_metrics)
     require_not_cancelled()
-    requested_target_mesh_names = sorted({
-        normalize_local_asset_stem(name)
-        for name in target_mesh_names or []
-        if normalize_local_asset_stem(name)
-    })
+    # An explicit --target-mesh is the run's mutation/audit boundary.  PCG
+    # discovery is useful when no target was requested, but letting that
+    # broader inventory win here folds every sibling variant in a species
+    # folder into one Assembly receipt.  BWR can then resolve the requested
+    # SK item through an unrelated general-tree sibling whose export is still
+    # pending.  Keep the caller's exact selection authoritative.
     report_target_mesh_names = (
-        target_mesh_names_from_pcg_targets(pcg_targets)
-        or requested_target_mesh_names
+        requested_target_mesh_names
+        or target_mesh_names_from_pcg_targets(pcg_targets)
     )
     def audit_one(folder):
         with use_blend_source_index(
@@ -8419,13 +8449,13 @@ def make_report(
         )
         if folder_matches is True:
             folder_matches = []
-        if folder_matches:
-            workflow_mesh_names = folder_matches
-        elif requested_target_mesh_names:
+        if requested_target_mesh_names:
             workflow_mesh_names = folder_target_mesh_names(
                 item["folder"],
                 requested_target_mesh_names,
             )
+        elif folder_matches:
+            workflow_mesh_names = folder_matches
         else:
             workflow_mesh_names = local_target_mesh_names(item["folder"])
         matched_target_names.update(folder_matches)

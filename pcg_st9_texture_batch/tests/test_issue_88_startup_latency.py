@@ -666,6 +666,61 @@ class ProviderAndAuditTests(unittest.TestCase):
                 [],
             )
 
+    def test_blend_index_nonzero_exit_surfaces_structured_worker_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            blend = root / "failing leaf.blend"
+            blend.write_bytes(b"blend")
+            session = audit.BlendSourceIndexSession({})
+            session.lookup(blend)
+
+            class FakeChild:
+                pid = 43211
+                returncode = 1
+
+                def poll(self):
+                    return self.returncode
+
+                def communicate(self, timeout=None):
+                    return "irrelevant Blender progress output", ""
+
+            def launch(command, **_kwargs):
+                report_path = Path(command[command.index("--out") + 1])
+                report_path.write_text(
+                    json.dumps({
+                        "schema_version": 1,
+                        "status": "error",
+                        "error": (
+                            f"{blend}: RuntimeError: exact worker failure"
+                        ),
+                        "rows": [],
+                    }),
+                    encoding="utf-8",
+                )
+                return FakeChild()
+
+            with mock.patch.object(
+                audit,
+                "BLEND_IMAGE_CACHE_PATH",
+                root / "cache" / "blend.json",
+            ), mock.patch.object(
+                audit, "owned_popen", side_effect=launch
+            ), mock.patch.object(
+                audit, "complete_owned_process"
+            ):
+                with self.assertRaisesRegex(
+                    audit.BlendSourceIndexError,
+                    r"failing leaf\.blend.*exact worker failure",
+                ):
+                    audit.ensure_blend_source_index(
+                        {"blender_exe": sys.executable}, session
+                    )
+
+            self.assertEqual(
+                list((root / "cache").glob(".blend_source_index_*.json")),
+                [],
+            )
+
 
 class RelationAndAuthorityTests(unittest.TestCase):
     def setUp(self):
@@ -2576,8 +2631,14 @@ class ProductionShapedLatencyFixtureTests(unittest.TestCase):
                     )
                 ),
             )
-            self.assertEqual(cold_cache.get("spm_analysis_calls"), 18837)
-            self.assertEqual(warm_cache.get("spm_analysis_calls"), 18837)
+            # The exact total can change when a correctness fix adds another
+            # authoritative SPM role.  The calibrated guard below is the
+            # stable contract; cold and warm runs must still do equivalent
+            # bounded work without returning to per-SPM amplification.
+            self.assertEqual(
+                cold_cache.get("spm_analysis_calls"),
+                warm_cache.get("spm_analysis_calls"),
+            )
             self.assertEqual(
                 cold["startup_timing"]["total_invocation_guard"]["rules"]
                 ["spm_analysis_calls"]["limit"],

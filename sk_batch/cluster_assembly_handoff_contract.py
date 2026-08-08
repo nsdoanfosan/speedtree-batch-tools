@@ -621,6 +621,27 @@ def _normalized_variants_ready(
     return True
 
 
+def _actual_assignment_matches_provider_identity(actual, provider_identity):
+    """Require a live provider name before overriding incomplete delivery.
+
+    A target material can reuse a provider's textures without containing that
+    provider's generated card geometry.  ``asset_registration_only`` and
+    ``connection_incomplete`` therefore cannot be upgraded from an arbitrary
+    target alias alone.  The current Blender import must retain the provider
+    name on its material, object, or mesh.
+    """
+    expected = normalize_export_name(provider_identity)
+    if not expected:
+        return False
+    for assignment in (actual or {}).get("assignments") or []:
+        if any(
+            normalize_export_name(assignment.get(field)) == expected
+            for field in ("material", "object", "mesh")
+        ):
+            return True
+    return False
+
+
 def role_identities_from_contract(contract):
     """Return the exact role identities authored by the selected PCG receipt."""
     rows = _role_receipt_rows(contract)
@@ -1169,17 +1190,20 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
         delivery_mode = str(
             (delivery or {}).get("delivery_mode") or ""
         )
+        provider_identity = _role_identity(role, receipt_row, contract)
+        provider_identity_matches_actual = (
+            _actual_assignment_matches_provider_identity(
+                actual,
+                provider_identity,
+            )
+        )
         normalized_ready = _normalized_variants_ready(
             normalized_variants,
             spm_path=spm_path,
             contract=contract,
             allow_actual_pair=(
                 actual.get("status") == "complete_pair"
-                or bool(
-                    (receipt_row or {}).get(
-                        "rendered_provider_expansion_covered"
-                    )
-                )
+                and provider_identity_matches_actual
             ),
         )
         row = {
@@ -1192,6 +1216,10 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
             "reconciliation": evidence,
             "normalized_variants": normalized_variants,
             "normalized_delivery_mode": delivery_mode or None,
+            "provider_identity": provider_identity or None,
+            "provider_identity_matches_actual": (
+                provider_identity_matches_actual
+            ),
             "rendered_provider_expansion_covered": bool(
                 (receipt_row or {}).get(
                     "rendered_provider_expansion_covered"
@@ -1211,16 +1239,24 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
                 evidence = row["reconciliation"]
         elif delivery_mode == "asset_registration_only":
             row["decision"] = "pass_through"
-            row["reconciliation"] = "asset_registration_only"
+            row["reconciliation"] = (
+                "asset_registration_only_provider_name_mismatch"
+                if actual.get("status") == "complete_pair"
+                and not provider_identity_matches_actual
+                else "asset_registration_only"
+            )
             decision = "pass_through"
-            evidence = "asset_registration_only"
+            evidence = row["reconciliation"]
         elif delivery_mode == "connection_incomplete" and decision != "blocked":
             row["decision"] = "pass_through"
             row["reconciliation"] = (
-                "generator_connection_metadata_incomplete_nonblocking"
+                "connection_incomplete_provider_name_mismatch"
+                if actual.get("status") == "complete_pair"
+                and not provider_identity_matches_actual
+                else "generator_connection_metadata_incomplete_nonblocking"
             )
             decision = "pass_through"
-            evidence = "generator_connection_metadata_incomplete_nonblocking"
+            evidence = row["reconciliation"]
         elif decision == "normalize_part" and not normalized_ready:
             row["decision"] = "pass_through"
             row["reconciliation"] = (

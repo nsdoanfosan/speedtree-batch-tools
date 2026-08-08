@@ -48,6 +48,35 @@ def _load_requests(path):
     return requests
 
 
+def _load_source_index_function():
+    """Import the pure index function, then remove add-on side effects."""
+    enabled = addon_utils.enable(
+        "atlas_leaf_mesh_builder", default_set=False, persistent=False
+    )
+    if enabled is None:
+        raise RuntimeError("atlas_leaf_mesh_builder add-on could not be enabled")
+    try:
+        from atlas_leaf_mesh_builder.source_index import (
+            current_blend_source_index,
+        )
+
+        # Enabling the add-on makes its package importable, but this worker
+        # must not retain the UI add-on's load handlers or delayed scene
+        # initialization while it opens unrelated source files.
+        addon_module = sys.modules.get("atlas_leaf_mesh_builder")
+        initialize_scene_items = getattr(
+            addon_module, "initialize_scene_items", None
+        )
+        if (
+            initialize_scene_items is not None
+            and bpy.app.timers.is_registered(initialize_scene_items)
+        ):
+            bpy.app.timers.unregister(initialize_scene_items)
+        return current_blend_source_index
+    finally:
+        addon_utils.disable("atlas_leaf_mesh_builder", default_set=False)
+
+
 def main():
     argv = sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else []
     parser = argparse.ArgumentParser()
@@ -59,20 +88,15 @@ def main():
     report = {"schema_version": SCHEMA_VERSION, "status": "error", "rows": []}
     try:
         addon_started = time.perf_counter()
-        enabled = addon_utils.enable(
-            "atlas_leaf_mesh_builder", default_set=False, persistent=False
-        )
-        if enabled is None:
-            raise RuntimeError("atlas_leaf_mesh_builder add-on could not be enabled")
-        from atlas_leaf_mesh_builder.source_index import (
-            current_blend_source_index,
-        )
+        current_blend_source_index = _load_source_index_function()
         addon_seconds = time.perf_counter() - addon_started
 
         rows = []
         request_timings = []
+        active_blend = None
         for request in _load_requests(args.request):
             blend = request["blend"]
+            active_blend = blend
             expected_sha256 = request["blend_sha256"]
             open_started = time.perf_counter()
             bpy.ops.wm.open_mainfile(filepath=str(blend), load_ui=False)
@@ -92,6 +116,7 @@ def main():
                 "open_seconds": round(open_seconds, 6),
                 "index_seconds": round(index_seconds, 6),
             })
+            active_blend = None
         report = {
             "schema_version": SCHEMA_VERSION,
             "status": "ok",
@@ -105,10 +130,13 @@ def main():
             },
         }
     except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        if locals().get("active_blend") is not None:
+            error = f"{active_blend}: {error}"
         report = {
             "schema_version": SCHEMA_VERSION,
             "status": "error",
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": error,
             "rows": [],
         }
     _write_report(args.out, report)
