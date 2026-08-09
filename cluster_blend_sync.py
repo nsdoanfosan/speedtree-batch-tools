@@ -46,13 +46,8 @@ from cluster_spm_pair_contract import (
 from cluster_normalization_sync import (
     ClusterNormalizationSyncError,
     ClusterSourceBuildRequiredError,
-    capture_plane_for_blend,
     inspect_normalization_source_identity,
     resolve_normalization_recipe,
-)
-from cluster_physical_capture_contract import (
-    PhysicalCaptureValidationError,
-    validate_physical_capture_manifest,
 )
 from cluster_source_prepare import (
     ClusterSourcePreparationError,
@@ -79,11 +74,6 @@ CLUSTER_RELATION_HEARTBEAT_SECONDS = 5.0
 CAPTURE_TEXTURE_REFRESH_REASONS = {
     "physical_capture_manifest_missing",
     "physical_capture_changed",
-    "physical_capture_coverage_invalid",
-    "physical_capture_extent_invalid",
-    "physical_capture_fingerprint_mismatch",
-    "physical_capture_orientation_mismatch",
-    "physical_capture_schema_invalid",
 }
 
 
@@ -996,36 +986,24 @@ def _physical_capture_manifest_for_blend(blend, validation_cache=None):
     )
     if not payload:
         return {"path": path, "active": False, "contract_sha256": None}
-    expected_plane = capture_plane_for_blend(blend)
-    try:
-        validation = _validation_cache_value(
-            validation_cache,
-            (
-                "capture_manifest_validation",
-                normalized_path_key(path),
-                expected_plane,
-            ),
-            lambda: validate_physical_capture_manifest(
-                path,
-                expected_blend=blend,
-                expected_plane=expected_plane,
-            ),
-        )
-    except PhysicalCaptureValidationError as exc:
-        return {
-            "path": path,
-            "active": False,
-            "contract_sha256": None,
-            "validation_reason": exc.code,
-            "validation_error": str(exc),
-            "expected_plane": expected_plane,
-        }
+    active = (
+        payload.get("workflow_mode") == "PHYSICAL_DIRECT_CAPTURE"
+        and payload.get("direct_uv_source")
+        == "same_blender_physical_capture_projection"
+    )
     return {
         "path": path,
-        "active": True,
-        "contract_sha256": validation["contract_sha256"],
-        "validation": validation,
-        "expected_plane": expected_plane,
+        "active": active,
+        "contract_sha256": (
+            str(payload.get("physical_capture_contract_sha256") or "")
+            or str(
+                (payload.get("physical_capture_contract") or {}).get(
+                    "contract_sha256"
+                )
+                or ""
+            )
+            or None
+        ),
     }
 
 
@@ -1222,20 +1200,7 @@ def _physical_refresh_state(
         receipt.get("physical_capture_contract_sha256") or ""
     ) or None
     if not capture["active"] or not capture["contract_sha256"]:
-        validation_reason = str(capture.get("validation_reason") or "")
-        if validation_reason == "coverage_invalid":
-            reason = "physical_capture_coverage_invalid"
-        elif validation_reason == "extent_invalid":
-            reason = "physical_capture_extent_invalid"
-        elif validation_reason == "fingerprint_mismatch":
-            reason = "physical_capture_fingerprint_mismatch"
-        elif validation_reason == "orientation_mismatch":
-            reason = "physical_capture_orientation_mismatch"
-        elif validation_reason:
-            reason = "physical_capture_schema_invalid"
-        else:
-            reason = "physical_capture_manifest_missing"
-        reasons.append(reason)
+        reasons.append("physical_capture_manifest_missing")
     elif (
         recorded_capture_sha256
         and capture["contract_sha256"] != recorded_capture_sha256

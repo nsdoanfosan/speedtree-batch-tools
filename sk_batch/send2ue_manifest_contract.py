@@ -337,7 +337,6 @@ def normalize_manifest_handoff_sidecars(
     *,
     sidecar_descriptor_builder,
     authoritative_pipeline_contract=None,
-    normalize_mesh_file=True,
 ):
     """Align each manifest destination with its authored Export Empty identity.
 
@@ -498,14 +497,10 @@ def normalize_manifest_handoff_sidecars(
             normalized_path.read_bytes()
         ).hexdigest()
         asset_data["asset_path"] = target_asset_path
-        exported_mesh = (
-            _normalize_exported_mesh_file(
-                asset_data,
-                export_root,
-                authored_name,
-            )
-            if normalize_mesh_file
-            else None
+        exported_mesh = _normalize_exported_mesh_file(
+            asset_data,
+            export_root,
+            authored_name,
         )
         asset_data[MATERIAL_PIPELINE_JSON_PATH_KEY] = str(
             normalized_path.resolve()
