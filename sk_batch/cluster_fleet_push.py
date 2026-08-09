@@ -24,6 +24,7 @@ from exact_push import (
     merge_unreal_result,
     run_headless_manifest,
 )
+from process_lifecycle import owned_run
 
 
 DEFAULT_ROOT = Path(r"D:\OneDrive\Forestportfolio\02_nature\Tree")
@@ -50,7 +51,7 @@ def discover_current_cluster_targets(root: Path) -> tuple[list[dict], list[dict]
             missing.append({
                 "manifest": str(manifest_path),
                 "stem": stem,
-                "reason": "ready_build_manifest_has_no_parts_or_stem",
+                "diagnostic": "ready_build_manifest_has_no_parts_or_stem",
             })
             continue
         spm = manifest_path.parents[1] / f"{stem}.spm"
@@ -66,7 +67,7 @@ def discover_current_cluster_targets(root: Path) -> tuple[list[dict], list[dict]
             missing.append({
                 "manifest": str(manifest_path),
                 "stem": stem,
-                "reason": "missing_required_current_data",
+                "diagnostic": "missing_required_current_data",
                 "missing": absent,
                 "paths": {name: str(path) for name, path in required.items()},
             })
@@ -187,7 +188,12 @@ def main(argv=None):
                 run_id=f"fleet_{run_id}_{index:03d}",
                 unreal_project=args.unreal_project,
             )
-            completed = subprocess.run(command, check=False)
+            completed = owned_run(
+                command,
+                source="sk_batch.cluster_fleet_push.blender_export",
+                run_factory=subprocess.run,
+                check=False,
+            )
             result["returncode"] = completed.returncode
             result["report"] = str(outputs["report"])
             if completed.returncode:

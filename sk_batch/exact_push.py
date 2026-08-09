@@ -17,6 +17,12 @@ from datetime import datetime
 from pathlib import Path
 
 SK_BATCH_DIR = Path(__file__).resolve().parent
+REPO_DIR = SK_BATCH_DIR.parent
+if str(REPO_DIR) not in sys.path:
+    sys.path.insert(0, str(REPO_DIR))
+
+from process_lifecycle import owned_run  # noqa: E402
+
 LOG_DIR = SK_BATCH_DIR / "logs"
 PUSH_JOB = SK_BATCH_DIR / "jobs" / "send2ue_push_job.py"
 UNREAL_INGEST = SK_BATCH_DIR / "unreal_ingest.py"
@@ -194,7 +200,13 @@ def run_headless_manifest(
             f"({attempt + 1}/{max(0, int(max_restarts)) + 1})",
             flush=True,
         )
-        completed = subprocess.run(command, check=False, env=environment)
+        completed = owned_run(
+            command,
+            source="sk_batch.exact_push.unreal_ingest",
+            run_factory=subprocess.run,
+            check=False,
+            env=environment,
+        )
         last_returncode = completed.returncode
         try:
             checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
@@ -289,7 +301,12 @@ def main(argv=None):
     if args.dry_run:
         return 0
 
-    completed = subprocess.run(command, check=False)
+    completed = owned_run(
+        command,
+        source="sk_batch.exact_push.blender_export",
+        run_factory=subprocess.run,
+        check=False,
+    )
     if completed.returncode != 0:
         print(
             "SK Exact Push failed; production report: "
