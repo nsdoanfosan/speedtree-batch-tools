@@ -2367,6 +2367,49 @@ def _ingest_cluster_assembly(send2ue_unreal, item, full_wind):
     }
 
 
+def _ensure_nanite_voxel_material_usage(base_material):
+    """Persist every usage flag required by UE 5.8 voxelized Nanite SKs."""
+    material_path = base_material.get_path_name()
+    properties = (
+        "used_with_skeletal_mesh",
+        "used_with_nanite",
+        "used_with_voxels",
+    )
+    before = {
+        name: bool(base_material.get_editor_property(name))
+        for name in properties
+    }
+    missing = [name for name, enabled in before.items() if not enabled]
+    checked_out = False
+    if missing:
+        subsystem = unreal.get_editor_subsystem(unreal.EditorAssetSubsystem)
+        if not subsystem.checkout_asset(material_path):
+            raise RuntimeError(
+                "source-control checkout failed for Nanite voxel material: "
+                + material_path
+            )
+        checked_out = True
+        for name in missing:
+            base_material.set_editor_property(name, True)
+    after = {
+        name: bool(base_material.get_editor_property(name))
+        for name in properties
+    }
+    if not all(after.values()):
+        raise RuntimeError(
+            "Nanite voxel material usage postcondition failed: "
+            + material_path
+        )
+    return {
+        "material": material_path,
+        "before": before,
+        "after": after,
+        "changed": bool(missing),
+        "checked_out": checked_out,
+        "saved": False,
+    }
+
+
 def _material_compile_and_slot_validation(mesh_path):
     mesh = unreal.EditorAssetLibrary.load_asset(mesh_path)
     if not mesh:
@@ -2378,6 +2421,7 @@ def _material_compile_and_slot_validation(mesh_path):
     details = []
     missing = []
     compiled_base_materials = set()
+    usage_validation = []
     compile_errors = []
     for index, slot in enumerate(slots):
         slot_name = str(slot.get_editor_property("material_slot_name"))
@@ -2397,8 +2441,20 @@ def _material_compile_and_slot_validation(mesh_path):
         if base_path in compiled_base_materials:
             continue
         compiled_base_materials.add(base_path)
+        usage = _ensure_nanite_voxel_material_usage(base_material)
         errors = unreal.MaterialEditingLibrary.recompile_material(base_material) or []
         compile_errors.extend(f"{base_path}: {error}" for error in errors)
+        if usage["changed"]:
+            if not unreal.EditorAssetLibrary.save_asset(
+                base_path,
+                only_if_is_dirty=False,
+            ):
+                raise RuntimeError(
+                    "failed to persist Nanite voxel material usage: "
+                    + base_path
+                )
+            usage["saved"] = True
+        usage_validation.append(usage)
 
     if missing:
         raise RuntimeError("unassigned material slots: " + ", ".join(missing))
@@ -2413,6 +2469,7 @@ def _material_compile_and_slot_validation(mesh_path):
         "mesh": mesh_path,
         "slots": details,
         "compiled_base_materials": sorted(compiled_base_materials),
+        "nanite_voxel_material_usage": usage_validation,
         "section_material_validation": section_validation,
     }
 

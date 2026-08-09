@@ -1178,6 +1178,56 @@ def test_matching_terminal_fingerprint_is_not_reimported(tmp_path, monkeypatch):
     assert result["items"]["cached"]["status"] == "imported_ok"
 
 
+class NaniteVoxelMaterialUsageTests(unittest.TestCase):
+    class FakeMaterial:
+        def __init__(self, values):
+            self.values = dict(values)
+
+        def get_path_name(self):
+            return "/Game/Material/M_TreeMaster.M_TreeMaster"
+
+        def get_editor_property(self, name):
+            return self.values[name]
+
+        def set_editor_property(self, name, value):
+            self.values[name] = value
+
+    def test_missing_voxel_usage_is_checked_out_and_set(self):
+        runner = load_runner()
+        material = self.FakeMaterial({
+            "used_with_skeletal_mesh": True,
+            "used_with_nanite": True,
+            "used_with_voxels": False,
+        })
+        checkouts = []
+        runner.unreal.EditorAssetSubsystem = object()
+        runner.unreal.get_editor_subsystem = lambda _type: types.SimpleNamespace(
+            checkout_asset=lambda path: checkouts.append(path) or True
+        )
+
+        result = runner._ensure_nanite_voxel_material_usage(material)
+
+        self.assertTrue(material.values["used_with_voxels"])
+        self.assertEqual(checkouts, [material.get_path_name()])
+        self.assertTrue(result["changed"])
+
+    def test_current_usage_is_read_only(self):
+        runner = load_runner()
+        material = self.FakeMaterial({
+            "used_with_skeletal_mesh": True,
+            "used_with_nanite": True,
+            "used_with_voxels": True,
+        })
+        runner.unreal.EditorAssetSubsystem = object()
+        runner.unreal.get_editor_subsystem = lambda _type: self.fail(
+            "current material must not be checked out"
+        )
+
+        result = runner._ensure_nanite_voxel_material_usage(material)
+
+        self.assertFalse(result["changed"])
+
+
 class UnrealIngestSaveTests(unittest.TestCase):
     @staticmethod
     def _configure_ingest_runner(runner, events, mesh_path):
