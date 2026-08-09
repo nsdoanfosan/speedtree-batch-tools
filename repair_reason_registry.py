@@ -506,6 +506,21 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "asset_texture_source_undeclared": ReasonRow(
         UNCLASSIFIED, "sk_batch/spm_leaf_handoff_contract.py", "",
     ),
+    "blender_addon_enable_failed": ReasonRow(
+        UNSUPPORTED, "blender_addon_gateway.py", "worker_runtime",
+    ),
+    "blender_addon_negotiation_failed": ReasonRow(
+        UNSUPPORTED, "blender_addon_gateway.py", "worker_runtime",
+    ),
+    "blender_addon_operation_not_granted": ReasonRow(
+        UNSUPPORTED, "blender_addon_gateway.py", "worker_runtime",
+    ),
+    "blender_addon_public_api_missing": ReasonRow(
+        UNSUPPORTED, "blender_addon_gateway.py", "worker_runtime",
+    ),
+    "blender_addon_source_mismatch": ReasonRow(
+        UNSUPPORTED, "blender_addon_gateway.py", "worker_runtime",
+    ),
     "atlas_blend_missing": ReasonRow(
         UNCLASSIFIED, "pcg_st9_texture_batch/pcg_texture_audit.py", "",
     ),

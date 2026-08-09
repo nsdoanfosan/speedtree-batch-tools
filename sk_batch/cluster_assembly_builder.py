@@ -4897,6 +4897,7 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
             "generated Assembly coordinates must preserve the Full SK meter "
             "scene-unit contract"
         )
+    addon_runtime = None
     try:
         if not hasattr(bpy, "app"):
             # Lightweight unit-test mocks exercise the stock operator call
@@ -4934,16 +4935,15 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
             # handoff contract; the stock Blender exporter writes a 100x
             # armature-object root even when all visible world transforms are
             # identical.
-            import addon_utils
+            from blender_addon_gateway import prepare_runtime
 
-            _default, loaded = addon_utils.check("send2ue")
-            if not loaded:
-                addon_utils.enable(
-                    "send2ue",
-                    default_set=False,
-                    persistent=False,
-                )
-            from send2ue.core.io import fbx_b4 as send2ue_fbx
+            addon_runtime = prepare_runtime(
+                "sk_batch.cluster_assembly_builder.fbx_export",
+                {"send2ue": ("fbx_export_v1",)},
+            )
+            send2ue_fbx_export = addon_runtime.operation(
+                "send2ue", "fbx_export"
+            )
 
             bpy.context.scene.send2ue.export_object_name_as_root = True
             bpy.context.scene.send2ue.export_custom_root_name = ""
@@ -4954,7 +4954,7 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
             previous_flag = bpy.app.driver_namespace.get(textureless_flag)
             bpy.app.driver_namespace[textureless_flag] = True
             try:
-                send2ue_fbx.export(
+                send2ue_fbx_export(
                     filepath=str(path),
                     use_selection=True,
                     object_types={"ARMATURE", "MESH", "EMPTY"},
@@ -4997,11 +4997,14 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
             obj.hide_set(hidden)
     if not path.is_file():
         raise ClusterAssemblyBuildError(f"FBX export produced no file: {path}")
-    return _validate_textureless_fbx(
+    validation = _validate_textureless_fbx(
         bpy,
         path,
         full_skeleton_root=full_skeleton_root,
     )
+    if addon_runtime is not None:
+        validation["blender_addon_runtime"] = addon_runtime.receipt
+    return validation
 
 
 def _write_assembly_source_blend(bpy, path, objects, contract):

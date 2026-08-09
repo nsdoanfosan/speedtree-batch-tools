@@ -35,17 +35,39 @@ class BlendSourceIndexWorkerTests(unittest.TestCase):
 
         source_index.current_blend_source_index = current_blend_source_index
 
-        addon_utils = types.ModuleType("addon_utils")
+        gateway = types.ModuleType("blender_addon_gateway")
 
-        def enable(*_args, **_kwargs):
+        class Runtime:
+            receipt = {"status": "ready", "addons": []}
+
+            def operation(self, addon_id, operation_name):
+                self.assert_contract(addon_id, operation_name)
+                return current_blend_source_index
+
+            def assert_contract(self, addon_id, operation_name):
+                if addon_id != "atlas_leaf_mesh_builder":
+                    raise AssertionError(addon_id)
+                if operation_name != "current_blend_source_index":
+                    raise AssertionError(operation_name)
+
+            def detach_timer(self, addon_id, callback_name):
+                self.assert_contract(
+                    addon_id, "current_blend_source_index"
+                )
+                if callback_name != "initialize_scene_items":
+                    raise AssertionError(callback_name)
+                events.append(("unregister", initialize_scene_items))
+
+            def disable(self, addon_id):
+                if addon_id != "atlas_leaf_mesh_builder":
+                    raise AssertionError(addon_id)
+                events.append(("disable", None))
+
+        def prepare_runtime(*_args, **_kwargs):
             events.append(("enable", None))
-            return addon
+            return Runtime()
 
-        def disable(*_args, **_kwargs):
-            events.append(("disable", None))
-
-        addon_utils.enable = enable
-        addon_utils.disable = disable
+        gateway.prepare_runtime = prepare_runtime
 
         timers = types.SimpleNamespace(
             is_registered=lambda callback: callback is initialize_scene_items,
@@ -80,7 +102,7 @@ class BlendSourceIndexWorkerTests(unittest.TestCase):
             )
             report = root / "report.json"
             modules = {
-                "addon_utils": addon_utils,
+                "blender_addon_gateway": gateway,
                 "bpy": bpy,
                 "atlas_leaf_mesh_builder": addon,
                 "atlas_leaf_mesh_builder.source_index": source_index,

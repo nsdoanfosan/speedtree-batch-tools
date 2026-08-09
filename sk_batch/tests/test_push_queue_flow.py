@@ -3319,7 +3319,7 @@ class PushQueueFlowTests(unittest.TestCase):
             '"push_mutators_skipped": True',
             push_source,
         )
-        sync_call = push_source.index("utilities.sync_unreal_mesh_folder_path()")
+        sync_call = push_source.index("sync_unreal_mesh_folder_path()")
         folder_read = push_source.index(
             "folder = scene_props.unreal_mesh_folder_path", sync_call
         )
@@ -4482,7 +4482,7 @@ class PushQueueFlowTests(unittest.TestCase):
         configure = source.index(
             'report["rpc_configuration"] = configure_send2ue_rpc_preferences(args)'
         )
-        discover = source.index("if not utilities.is_unreal_connected():")
+        discover = source.index("if not is_unreal_connected():")
         self.assertLess(configure, discover)
         self.assertIn(
             'preferences.command_endpoint = f"{bind_address}:{int(port_text)}"',

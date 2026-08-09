@@ -16,6 +16,8 @@ import re
 import struct
 from pathlib import Path
 
+from blender_addon_gateway import prepare_runtime
+
 
 SOURCE_INDEX_KIND = "speedtree_cluster_atlas_blender_source_index"
 SOURCE_INDEX_VERSION = 1
@@ -351,15 +353,23 @@ def build_current_atlas_source_index(
     atlas_asset_name=None,
     expected_scope_id=None,
     bpy_module=None,
+    addon_runtime=None,
 ):
     """Build the exact Atlas collection index for Blender's saved main file."""
     if bpy_module is None:
         import bpy as bpy_module  # type: ignore
 
-    from atlas_leaf_mesh_builder.source_index import (
-        current_blend_source_index,
+    if addon_runtime is None:
+        addon_runtime = prepare_runtime(
+            "cluster_atlas_source_index.build_current_atlas_source_index",
+            {"atlas_leaf_mesh_builder": ("source_index_v1",)},
+        )
+    current_blend_source_index = addon_runtime.operation(
+        "atlas_leaf_mesh_builder", "current_blend_source_index"
     )
-    from atlas_leaf_mesh_builder.speedtree import grouped_source_objects
+    grouped_source_objects = addon_runtime.operation(
+        "atlas_leaf_mesh_builder", "grouped_source_objects"
+    )
 
     blend = Path(blend).expanduser().absolute()
     atlas_index = current_blend_source_index(

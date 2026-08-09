@@ -88,8 +88,19 @@ class AtlasBlendJobTests(unittest.TestCase):
                 "atlas_leaf_mesh_builder": package,
                 "atlas_leaf_mesh_builder.speedtree": speedtree,
             }):
+                runtime = mock.Mock()
+                runtime.operation.return_value = export_target
                 with self.assertRaisesRegex(RuntimeError, "Generator 연결 검증 실패"):
-                    self.job.apply_mapped_targets(object(), [target], "M_leaf_test_atlas_01")
+                    self.job.apply_mapped_targets(
+                        object(),
+                        [target],
+                        "M_leaf_test_atlas_01",
+                        runtime,
+                    )
+                runtime.operation.assert_called_once_with(
+                    "atlas_leaf_mesh_builder",
+                    "export_or_update_speedtree_spm_path",
+                )
 
 
 if __name__ == "__main__":

@@ -111,6 +111,12 @@ GitHub/
 [ISSUE_107_RETRY_PROGRESS_EVIDENCE.md](ISSUE_107_RETRY_PROGRESS_EVIDENCE.md)를
 참조하세요.
 
+## Blender 애드온 API 경계
+
+BAT/GUI, Blender worker, 외부 애드온의 책임과 capability/source-identity
+협상 규칙은 [BLENDER_ADDON_API.md](BLENDER_ADDON_API.md)에 정의되어 있습니다.
+모든 외부 애드온 활성화와 구현 operation 해석은 공용 gateway만 수행합니다.
+
 ## 테스트
 
 통합 GUI와 SK Batch 직접 GUI는 실제 창을 import하기 전에 다음 빠른 코드·계약

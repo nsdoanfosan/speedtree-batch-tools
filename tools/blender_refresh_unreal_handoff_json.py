@@ -13,8 +13,14 @@ import sys
 import traceback
 from pathlib import Path
 
-import addon_utils
 import bpy
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from blender_addon_gateway import prepare_runtime
 
 
 def _parse_args():
@@ -43,17 +49,19 @@ def main():
     }
     exit_code = 1
     try:
-        addon_utils.enable(
-            "ue_unique_export_names_addon",
-            default_set=False,
-            persistent=False,
+        addon_runtime = prepare_runtime(
+            "tools.blender_refresh_unreal_handoff_json",
+            {
+                "ue_unique_export_names_addon": (
+                    "unreal_handoff_json_v1",
+                ),
+            },
         )
-        enabled = addon_utils.check("ue_unique_export_names_addon")[1]
-        if not enabled:
-            raise RuntimeError("ue_unique_export_names_addon enable failed")
-        from ue_unique_export_names_addon import api
-
-        refreshed = api.refresh_handoff_json(bpy.context)
+        refresh_handoff_json = addon_runtime.operation(
+            "ue_unique_export_names_addon", "refresh_handoff_json"
+        )
+        refreshed = refresh_handoff_json(bpy.context)
+        result["blender_addon_runtime"] = addon_runtime.receipt
         result["errors"] = list(refreshed.get("errors") or [])
         result["json_paths"] = list(refreshed.get("json_paths") or [])
         result["export_dir"] = str(refreshed.get("export_dir") or "")

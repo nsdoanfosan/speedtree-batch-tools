@@ -42,13 +42,19 @@ from process_lifecycle import (
     owned_popen,
     terminate_owned_process,
 )
+from blender_addon_contract import discover_installed_addon_source
 
 
 def _default_addon_dir():
-    """Locate the separately checked-out Blender add-on repository."""
+    """Use the same BWR source that the newest Blender install will load."""
     override = os.environ.get("SPEEDTREE_BWR_ADDON_DIR")
     if override:
         return Path(override).expanduser()
+    installed = discover_installed_addon_source(
+        "speedtree_bone_weight_repair"
+    )
+    if installed is not None:
+        return installed
     return (
         REPO_ROOT.parent
         / "speedtree-bone-weight-repair-addon"

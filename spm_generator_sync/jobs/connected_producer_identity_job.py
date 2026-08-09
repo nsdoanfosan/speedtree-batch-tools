@@ -2,15 +2,20 @@
 
 import argparse
 import hashlib
-import importlib
 import json
 import os
 import sys
 import uuid
 from pathlib import Path
 
-import addon_utils
 import bpy
+
+
+REPO_DIR = Path(__file__).resolve().parents[2]
+if str(REPO_DIR) not in sys.path:
+    sys.path.insert(0, str(REPO_DIR))
+
+from blender_addon_gateway import prepare_runtime
 
 
 ADDONS = (
@@ -88,12 +93,8 @@ def stable_file_hash(path):
     return {"size": states[0][0], "sha256": digests[0]}
 
 
-def addon_identity(name):
-    enabled = addon_utils.enable(name, default_set=False, persistent=False)
-    if enabled is None:
-        raise RuntimeError(f"could not enable required Blender add-on: {name}")
-    module = sys.modules.get(name) or importlib.import_module(name)
-    module_path = Path(module.__file__).resolve()
+def addon_identity(name, runtime_row):
+    module_path = Path(runtime_row["module_file"]).resolve()
     root = module_path.parent if module_path.name == "__init__.py" else module_path
     before = inventory(root.parent if root.is_file() else root)
     manifest = []
@@ -139,15 +140,28 @@ def main():
     args = parse_args()
     addons = []
     errors = []
-    for name in ADDONS:
-        try:
-            addons.append(addon_identity(name))
-        except Exception as exc:
-            errors.append({
-                "module": name,
-                "error_type": type(exc).__name__,
-                "error": str(exc),
-            })
+    addon_runtime = None
+    try:
+        addon_runtime = prepare_runtime(
+            "spm_generator_sync.jobs.connected_producer_identity_job",
+            {
+                "atlas_leaf_mesh_builder": ("source_index_v1",),
+                "speedtree_cluster_normalizer": (
+                    "cluster_normalization_v1",
+                ),
+            },
+        )
+        runtime_rows = {
+            row["id"]: row for row in addon_runtime.receipt["addons"]
+        }
+        for name in ADDONS:
+            addons.append(addon_identity(name, runtime_rows[name]))
+    except Exception as exc:
+        errors.append({
+            "module": "blender_addon_gateway",
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        })
     payload = {
         "schema_version": 1,
         "kind": "connected_cluster_producer_identity",
@@ -158,6 +172,8 @@ def main():
         "stable": not errors and all(addon["stable"] for addon in addons),
         "errors": errors,
     }
+    if addon_runtime is not None:
+        payload["blender_addon_runtime"] = addon_runtime.receipt
     payload["producer_manifest_sha256"] = json_digest({
         "blender_version": payload["blender_version"],
         "python_version": payload["python_version"],
