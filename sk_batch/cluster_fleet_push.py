@@ -14,7 +14,13 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from exact_push import DEFAULT_BLENDER, LOG_DIR, ExactPushError, build_exact_push_command
+from exact_push import (
+    DEFAULT_BLENDER,
+    DEFAULT_UNREAL_PROJECT,
+    LOG_DIR,
+    ExactPushError,
+    build_exact_push_command,
+)
 
 
 DEFAULT_ROOT = Path(r"D:\OneDrive\Forestportfolio\02_nature\Tree")
@@ -118,6 +124,7 @@ def parse_args(argv=None):
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--blender", type=Path, default=DEFAULT_BLENDER)
     parser.add_argument("--log-dir", type=Path, default=LOG_DIR)
+    parser.add_argument("--unreal-project", type=Path, default=DEFAULT_UNREAL_PROJECT)
     parser.add_argument("--only", action="append", default=[])
     parser.add_argument("--skip-birch", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -168,6 +175,7 @@ def main(argv=None):
                 blender=args.blender,
                 log_dir=args.log_dir,
                 run_id=f"fleet_{run_id}_{index:03d}",
+                unreal_project=args.unreal_project,
             )
             completed = subprocess.run(command, check=False)
             result["returncode"] = completed.returncode
