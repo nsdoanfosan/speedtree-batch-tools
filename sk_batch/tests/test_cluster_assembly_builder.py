@@ -2786,6 +2786,38 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
         with self.assertRaisesRegex(ClusterAssemblyBuildError, "Y/Z-swapped"):
             validate_unreal_bounds_contract(full, sideways_base)
 
+    def test_normalized_replacement_base_defers_shape_axis_inference(self):
+        full = {
+            "origin": [0.0, 0.0, 0.0],
+            "size": [744.7081298828125, 643.5247802734375, 779.087890625],
+        }
+        replacement_only_base = {
+            "origin": [0.0, 0.0, 0.0],
+            "size": [581.3819580078125, 639.5263671875, 460.2229919433594],
+        }
+
+        with self.assertRaisesRegex(ClusterAssemblyBuildError, "Y/Z-swapped"):
+            validate_unreal_bounds_contract(full, replacement_only_base)
+
+        pending = validate_unreal_bounds_contract(
+            full,
+            replacement_only_base,
+            allow_normalized_prototype_dominance=True,
+        )
+        self.assertEqual(pending["status"], "base_axis_ok")
+        self.assertEqual(
+            pending["base_axis_shape_validation"],
+            "deferred_to_final_assembly",
+        )
+
+        complete = validate_unreal_bounds_contract(
+            full,
+            replacement_only_base,
+            full,
+            allow_normalized_prototype_dominance=True,
+        )
+        self.assertEqual(complete["status"], "complete")
+
     def test_bounds_gate_reports_observed_100x_error_as_absolute_unit_mismatch(self):
         full = {
             "origin": [0.0, 0.0, 0.0],

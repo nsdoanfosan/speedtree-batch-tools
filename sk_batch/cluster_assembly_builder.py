@@ -7582,8 +7582,14 @@ def validate_unreal_bounds_contract(
         + abs(full_normalized[1] - base_normalized[2])
         + abs(full_normalized[2] - base_normalized[1])
     )
+    base_axis_shape_validation = (
+        "deferred_to_final_assembly"
+        if allow_normalized_prototype_dominance
+        else "full_base_shape"
+    )
     if (
-        not base_scale_outside_limit
+        not allow_normalized_prototype_dominance
+        and not base_scale_outside_limit
         and yz_swapped_error + 0.05 < direct_error
     ):
         raise ClusterAssemblyBuildError(
@@ -7597,6 +7603,7 @@ def validate_unreal_bounds_contract(
         "base": base_bounds,
         "base_direct_shape_error": direct_error,
         "base_yz_swapped_shape_error": yz_swapped_error,
+        "base_axis_shape_validation": base_axis_shape_validation,
         "base_axis_scale_ratios": axis_scale_ratios,
         "base_absolute_scale_ratio": absolute_scale_ratio,
         "base_absolute_scale_ratio_limit": ratio_limit,
