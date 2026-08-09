@@ -1,5 +1,6 @@
 import ast
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -15,12 +16,14 @@ from code_compile_gate import (  # noqa: E402
     GUI_PATH,
     PUSH_JOB_PATH,
     PRODUCTION_SOURCE_MANIFEST_VERSION,
+    _compile_repository_sources,
     compile_repository_sources,
     production_source_manifest,
     production_source_revision_state,
     run_gate,
     validate_gui_contracts,
     validate_push_job_contracts,
+    validate_production_source_manifest,
     validate_production_source_revision_report,
 )
 
@@ -125,6 +128,95 @@ class CodeCompileGateTests(unittest.TestCase):
             self.assertNotEqual(first.content_hash, second.content_hash)
             self.assertNotEqual(first.files[0].sha256, second.files[0].sha256)
 
+    def test_nested_worktree_and_git_ignored_sources_are_not_production(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            try:
+                subprocess.run(
+                    ["git", "init", "--quiet", str(root)],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except (OSError, subprocess.CalledProcessError) as exc:
+                self.skipTest(f"Git fixture setup unavailable: {exc}")
+
+            app = root / "app.py"
+            app.write_text("answer = 42\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(root), "add", "app.py"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            claude_worktree = (
+                root
+                / ".claude"
+                / "worktrees"
+                / "sanitized-ephemeral"
+            )
+            claude_worktree.mkdir(parents=True)
+            claude_source = claude_worktree / "worker.py"
+            claude_source.write_text("answer = 1\n", encoding="utf-8")
+
+            nested_vcs_root = root / "tool-cache" / "sanitized-worktree"
+            nested_vcs_root.mkdir(parents=True)
+            (nested_vcs_root / ".git").write_text(
+                "gitdir: sanitized-git-dir\n",
+                encoding="utf-8",
+            )
+            nested_source = nested_vcs_root / "helper.pyw"
+            nested_source.write_text("answer = 2\n", encoding="utf-8")
+
+            ignored_root = root / "ignored-helper-root"
+            ignored_root.mkdir()
+            ignored_source = ignored_root / "ignored.py"
+            ignored_source.write_text("answer = 3\n", encoding="utf-8")
+            exclude = root / ".git" / "info" / "exclude"
+            with exclude.open("a", encoding="utf-8") as handle:
+                handle.write("\nignored-helper-root/\n")
+
+            started = production_source_manifest(root)
+            compiled = _compile_repository_sources(root)
+            self.assertEqual(started, compiled)
+            self.assertEqual(started.source_count, 1)
+            self.assertEqual(
+                [record.path for record in started.files],
+                ["app.py"],
+            )
+
+            claude_source.write_text("def broken(:\n", encoding="utf-8")
+            nested_source.write_text("def broken(:\n", encoding="utf-8")
+            ignored_source.write_text("def broken(:\n", encoding="utf-8")
+            after_nested_mutation = production_source_manifest(root)
+            self.assertEqual(started, after_nested_mutation)
+            self.assertEqual(compile_repository_sources(root), 1)
+            self.assertEqual(
+                validate_production_source_manifest(
+                    started,
+                    after_nested_mutation,
+                    label="Parent production source",
+                ),
+                started,
+            )
+
+            app.write_text("answer = 43\n", encoding="utf-8")
+            changed_production = production_source_manifest(root)
+            self.assertNotEqual(
+                started.content_hash,
+                changed_production.content_hash,
+            )
+            with self.assertRaisesRegex(
+                CompileGateError,
+                "Parent production source revision mismatch",
+            ):
+                validate_production_source_manifest(
+                    started,
+                    changed_production,
+                    label="Parent production source",
+                )
+
     def test_production_source_revision_report_requires_exact_hash(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -163,6 +255,148 @@ class CodeCompileGateTests(unittest.TestCase):
                     report,
                     started,
                 )
+
+    def test_false_child_revision_assertions_report_full_restart_details(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "app.py"
+            source.write_text("answer = 42\n", encoding="utf-8")
+            expected = production_source_manifest(root)
+            state = production_source_revision_state(
+                expected.content_hash,
+                expected,
+                expected,
+            )
+            state["matches_expected"] = False
+            state["stable"] = False
+
+            with self.assertRaises(CompileGateError) as raised:
+                validate_production_source_revision_report(
+                    {"production_source_revision": state},
+                    expected,
+                )
+
+            details = raised.exception.details
+            self.assertEqual(details["route"], "code_revision_restart_required")
+            self.assertEqual(details["status"], "revision_assertion_mismatch")
+            self.assertEqual(details["expected_revision"], expected.content_hash)
+            self.assertEqual(details["actual_revision"], expected.content_hash)
+            self.assertEqual(details["changed_paths"], [])
+            self.assertEqual(
+                details["assertion_deltas"],
+                {
+                    "matches_expected": {"expected": True, "actual": False},
+                    "stable": {"expected": True, "actual": False},
+                },
+            )
+            message = str(raised.exception)
+            self.assertIn("exact changed paths", message)
+            self.assertIn(expected.content_hash, message)
+
+    def test_child_metadata_mismatch_preserves_reported_actual_revision(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "app.py"
+            source.write_text("answer = 42\n", encoding="utf-8")
+            expected = production_source_manifest(root)
+            reported_revision = "f" * 64
+            state = production_source_revision_state(
+                expected.content_hash,
+                expected,
+                expected,
+            )
+            state["expected_content_hash"] = reported_revision
+
+            with self.assertRaises(CompileGateError) as raised:
+                validate_production_source_revision_report(
+                    {"production_source_revision": state},
+                    expected,
+                )
+
+            details = raised.exception.details
+            self.assertEqual(details["route"], "code_revision_restart_required")
+            self.assertEqual(details["status"], "revision_metadata_mismatch")
+            self.assertEqual(details["expected_revision"], expected.content_hash)
+            self.assertEqual(details["actual_revision"], reported_revision)
+            self.assertEqual(
+                details["reported_expected_revision"],
+                reported_revision,
+            )
+            self.assertEqual(
+                details["reported_started_revision"],
+                expected.content_hash,
+            )
+            message = str(raised.exception)
+            self.assertIn(f"actual {reported_revision}", message)
+            self.assertNotIn(
+                f"expected {expected.content_hash}, actual {expected.content_hash}",
+                message,
+            )
+
+    def test_revision_mismatch_reports_every_exact_path_and_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = [root / f"source_{index}.py" for index in range(7)]
+            for index, path in enumerate(paths):
+                path.write_text(
+                    f"revision = {index}\n",
+                    encoding="utf-8",
+                )
+            expected = production_source_manifest(root)
+
+            paths[0].unlink()
+            for index, path in enumerate(paths[1:6], start=1):
+                path.write_text(
+                    f"revision = {index + 100}\n",
+                    encoding="utf-8",
+                )
+            added = root / "source_7.py"
+            added.write_text("revision = 7\n", encoding="utf-8")
+            actual = production_source_manifest(root)
+
+            with self.assertRaises(CompileGateError) as raised:
+                validate_production_source_manifest(
+                    expected,
+                    actual,
+                    label="Intentional production source",
+                )
+
+            details = raised.exception.details
+            self.assertEqual(
+                details["route"],
+                "code_revision_restart_required",
+            )
+            self.assertEqual(
+                details["expected_revision"],
+                expected.content_hash,
+            )
+            self.assertEqual(
+                details["actual_revision"],
+                actual.content_hash,
+            )
+            self.assertEqual(len(details["changed_paths"]), 7)
+            by_path = {
+                row["path"]: row for row in details["changed_paths"]
+            }
+            self.assertEqual(by_path["source_0.py"]["status"], "removed")
+            self.assertIsNotNone(by_path["source_0.py"]["expected"])
+            self.assertIsNone(by_path["source_0.py"]["actual"])
+            self.assertEqual(by_path["source_7.py"]["status"], "added")
+            self.assertIsNone(by_path["source_7.py"]["expected"])
+            self.assertIsNotNone(by_path["source_7.py"]["actual"])
+            for index in range(1, 6):
+                row = by_path[f"source_{index}.py"]
+                self.assertEqual(row["status"], "modified")
+                self.assertEqual(row["expected"]["path"], row["path"])
+                self.assertEqual(row["actual"]["path"], row["path"])
+                self.assertNotEqual(
+                    row["expected"]["sha256"],
+                    row["actual"]["sha256"],
+                )
+            rendered = str(raised.exception)
+            for path in by_path:
+                self.assertIn(path, rendered)
+            self.assertNotIn(" more", rendered)
 
     def test_owner_atlas_guard_regression_fails_at_compile_gate(self):
         source = gui_source()

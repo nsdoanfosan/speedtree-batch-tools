@@ -13,6 +13,14 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
+from atlas_manifest_resolver import (
+    AtlasManifestResolutionError,
+    atlas_manifest_mirror_repair_plan,
+    proven_cluster_pair_identity,
+    resolution_evidence,
+    resolve_atlas_manifests,
+)
+
 
 MANIFEST_NAME = "pcg_st9_canonical_outputs.json"
 MANIFEST_KIND = "pcg_st9_canonical_output_manifest"
@@ -38,6 +46,10 @@ FORBIDDEN_OUTPUT_DIR_NAMES = {
 
 class CanonicalOutputManifestError(RuntimeError):
     """The asset-local PCG output contract is incomplete or unsafe."""
+
+    def __init__(self, message, *, report=None):
+        super().__init__(message)
+        self.report = dict(report or {})
 
 
 def canonical_texture_root(asset_root):
@@ -108,16 +120,9 @@ def _path_key(path):
 
 
 def _atlas_manifest_candidates(target_spm):
-    target = Path(target_spm).expanduser().resolve(strict=False)
-    candidates = [target.parent / "speedtree_import_manifest.json"]
-    scope_dir = target.parent / ".atlas_leaf_speedtree_scopes"
-    if scope_dir.is_dir():
-        candidates.extend(sorted(
-            path
-            for path in scope_dir.glob("*.json")
-            if path.is_file()
-        ))
-    return candidates
+    """Compatibility wrapper around the shared fail-closed resolver."""
+    resolution = resolve_atlas_manifests(target_spm)
+    return [Path(row["path"]) for row in resolution["selected"]]
 
 
 def _canonical_atlas_output_row(
@@ -186,6 +191,7 @@ def _promote_atlas_manifest_payload(
     path,
     target_spm,
     canonical_manifest,
+    equivalent_target_spms=(),
 ):
     """Return a canonical Atlas payload only when every group resolves."""
     from speedtree_texture_contract import resolve_manifest_material_output
@@ -215,6 +221,7 @@ def _promote_atlas_manifest_payload(
             target_spm,
             material_id,
             material_name,
+            equivalent_spms=equivalent_target_spms,
         )
         if output is None:
             unresolved.append({
@@ -309,6 +316,19 @@ def refresh_atlas_manifests_for_spm(
     )
 
     target = Path(target_spm).expanduser().resolve(strict=False)
+    pair_identity = proven_cluster_pair_identity(target)
+    equivalent_target_spms = (
+        [pair_identity["counterpart_spm"]] if pair_identity else []
+    )
+    pair_evidence = (
+        {
+            "pair_id": pair_identity["pair_id"],
+            "input_role": pair_identity["input_role"],
+            "counterpart_spm": str(pair_identity["counterpart_spm"]),
+            "receipt_path": str(pair_identity["receipt_path"]),
+        }
+        if pair_identity else None
+    )
     if manifest_path is None:
         canonical_candidates = canonical_output_manifest_candidates(target)
         manifest_path = next(
@@ -341,24 +361,28 @@ def refresh_atlas_manifests_for_spm(
     pending = []
     matched = []
     planned = []
-    for path in _atlas_manifest_candidates(target):
-        if not path.is_file():
-            continue
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise CanonicalOutputManifestError(
-                f"Atlas manifest is unreadable: {path}: {exc}"
-            ) from exc
-        if not isinstance(payload, dict):
-            raise CanonicalOutputManifestError(
-                f"Atlas manifest root must be an object: {path}"
-            )
+    try:
+        atlas_resolution = resolve_atlas_manifests(target)
+    except AtlasManifestResolutionError as exc:
+        repair = atlas_manifest_mirror_repair_plan(target, exc.resolution)
+        raise CanonicalOutputManifestError(
+            str(exc),
+            report={
+                "schema_version": 1,
+                "stage": "atlas_manifest_resolution",
+                "reason_token": str(repair.get("reason_code") or ""),
+                "evidence": repair,
+            },
+        ) from exc
+    for selected in atlas_resolution["selected"]:
+        path = Path(selected["path"])
+        payload = selected["payload"]
         promoted, issue = _promote_atlas_manifest_payload(
             payload,
             path,
             target,
             canonical,
+            equivalent_target_spms,
         )
         if issue == "different_target" or issue == "no_material_groups":
             continue
@@ -381,7 +405,16 @@ def refresh_atlas_manifests_for_spm(
         )
         raise CanonicalOutputManifestError(
             "Canonical PCG outputs cannot fully regenerate the Atlas "
-            f"material contract for {target.name}: {details}"
+            f"material contract for {target.name}: {details}",
+            report={
+                "schema_version": 1,
+                "stage": "canonical_material_mapping",
+                "reason_token": "canonical_material_mapping_incomplete",
+                "target_spm": str(target),
+                "canonical_manifest": str(manifest_path),
+                "pending": pending,
+                "cluster_pair_identity": pair_evidence,
+            },
         )
     if pending:
         planned = []
@@ -417,6 +450,8 @@ def refresh_atlas_manifests_for_spm(
         "updated": updated,
         "current": current,
         "pending": pending,
+        "cluster_pair_identity": pair_evidence,
+        "atlas_manifest_resolution": resolution_evidence(atlas_resolution),
     }
 
 

@@ -1,6 +1,6 @@
-"""Synchronize canonical SpeedTree TGA outputs into Unreal without P4 churn.
+"""Synchronize canonical SpeedTree texture outputs into Unreal without P4 churn.
 
-The source TGA MD5 is compared with Unreal's saved ``AssetImportData.FileMD5``.
+The source file MD5 is compared with Unreal's saved ``AssetImportData.FileMD5``.
 An identical texture is never checked out, reimported, or saved.  New assets are
 explicitly marked for add, while only checkouts owned by the current run are
 eligible for ``revert unchanged`` cleanup.
@@ -19,6 +19,12 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+
+REPO_DIR = Path(__file__).resolve().parent.parent
+if str(REPO_DIR) not in sys.path:
+    sys.path.insert(0, str(REPO_DIR))
+
+from process_lifecycle import owned_run
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -290,7 +296,7 @@ def validate_unreal_texture_name(asset_name):
 
 def _asset_path_for_source(path, destination="/Game/Textures"):
     path = Path(path)
-    if path.suffix.lower() != ".tga" or not path.stem.lower().startswith("t_"):
+    if not path.stem.lower().startswith("t_"):
         return None
     if texture_role(path) is None:
         return None
@@ -355,7 +361,7 @@ def _emit_progress(progress, phase, current, total, message):
 
 
 def canonical_texture_entries(files, destination="/Game/Textures", progress=None):
-    """Return de-duplicated canonical T_ TGA entries with content hashes."""
+    """Return de-duplicated canonical T_ texture entries with content hashes."""
     destination = "/" + str(destination or "/Game/Textures").strip("/")
     entries = []
     candidates = []
@@ -368,7 +374,7 @@ def canonical_texture_entries(files, destination="/Game/Textures", progress=None
         if key in seen:
             continue
         seen.add(key)
-        if path.suffix.lower() != ".tga" or not path.stem.lower().startswith("t_"):
+        if not path.stem.lower().startswith("t_"):
             continue
         if role is None or not path.is_file() or path.stat().st_size <= 0:
             continue
@@ -661,8 +667,10 @@ def _editor_is_running():
     if os.name != "nt":
         return False
     try:
-        result = subprocess.run(
+        result = owned_run(
             ["tasklist", "/FI", "IMAGENAME eq UnrealEditor.exe", "/FO", "CSV", "/NH"],
+            source="pcg_st9_texture_batch.unreal_texture_sync.tasklist_observation",
+            run_factory=subprocess.run,
             capture_output=True,
             text=True,
             timeout=10,
@@ -769,8 +777,10 @@ def _run_commandlet(script_path, cfg):
         "-unattended", "-nosplash", "-nullrhi", "-DDC-ForceMemoryCache",
         "-stdout", "-FullStdOutLogOutput", "-log",
     ]
-    result = subprocess.run(
+    result = owned_run(
         command,
+        source="pcg_st9_texture_batch.unreal_texture_sync.commandlet",
+        run_factory=subprocess.run,
         capture_output=True,
         text=True,
         encoding="utf-8",

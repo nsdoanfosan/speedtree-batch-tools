@@ -47,14 +47,23 @@ def _write_sbs(path, index):
     )
 
 
-def _build_fixture(root, *, folder_count, sync_file_count):
+def _build_fixture(
+        root, *, folder_count, sync_file_count, spm_count=None):
     tree = root / "Tree"
     tree.mkdir()
+    spm_count = max(folder_count, int(spm_count or folder_count))
+    per_folder, remainder = divmod(spm_count, folder_count)
     for index in range(folder_count):
         folder = tree / f"tree_fixture_{index:02d}"
         texture = folder / "texture"
         texture.mkdir(parents=True)
-        _write_spm(folder / f"SK_tree_fixture_{index:02d}.spm", index)
+        count = per_folder + (1 if index < remainder else 0)
+        for spm_index in range(count):
+            _write_spm(
+                folder
+                / f"SK_tree_fixture_{index:02d}_{spm_index:02d}.spm",
+                index * max(1, per_folder + 1) + spm_index,
+            )
         _write_sbs(texture / f"fixture_{index:02d}.sbs", index)
 
     reports = root / "reports"
@@ -85,7 +94,9 @@ def _measure(callable_):
     return value, time.perf_counter() - started
 
 
-def run_benchmark(output_path, *, folder_count=24, sync_file_count=144):
+def run_benchmark(
+        output_path, *, folder_count=24, sync_file_count=144,
+        spm_count=None):
     with tempfile.TemporaryDirectory() as temporary:
         fixture = Path(temporary)
         cache = fixture / "cache"
@@ -97,6 +108,7 @@ def run_benchmark(output_path, *, folder_count=24, sync_file_count=144):
             fixture,
             folder_count=folder_count,
             sync_file_count=sync_file_count,
+            spm_count=spm_count,
         )
         import pcg_texture_audit as audit
         import pcg_board_snapshot as board
@@ -129,20 +141,36 @@ def run_benchmark(output_path, *, folder_count=24, sync_file_count=144):
             )
         )
 
-        cold_report, cold_primary = _measure(lambda: audit.make_report(cfg))
+        cold_evidence = {}
+        cold_report, cold_primary = _measure(
+            lambda: audit.make_report(
+                cfg, session_evidence=cold_evidence
+            )
+        )
         audit.save_spm_analysis_cache()
-        warm_report, warm_primary = _measure(lambda: audit.make_report(cfg))
+        warm_evidence = {}
+        warm_report, warm_primary = _measure(
+            lambda: audit.make_report(
+                cfg, session_evidence=warm_evidence
+            )
+        )
 
         relation_cold_metrics = {}
         _value, cold_relations = _measure(
             lambda: gui.cache_blender_connection_rows(
-                cold_report, metrics=relation_cold_metrics
+                cold_report,
+                metrics=relation_cold_metrics,
+                session_evidence=cold_evidence,
+                verify_physical=False,
             )
         )
         relation_warm_metrics = {}
         _value, warm_relations = _measure(
             lambda: gui.cache_blender_connection_rows(
-                warm_report, metrics=relation_warm_metrics
+                warm_report,
+                metrics=relation_warm_metrics,
+                session_evidence=warm_evidence,
+                verify_physical=False,
             )
         )
 
@@ -177,6 +205,12 @@ def run_benchmark(output_path, *, folder_count=24, sync_file_count=144):
             < budgets["cached_board_paint"],
             "cold_total": cold_total < budgets["cold_total"],
             "warm_total": warm_total < budgets["warm_total"],
+            "cold_usable_ready_under_30s": (
+                cold_total <= latency.USABLE_READY_ACCEPTANCE_CAP_SECONDS
+            ),
+            "warm_usable_ready_under_30s": (
+                warm_total <= latency.USABLE_READY_ACCEPTANCE_CAP_SECONDS
+            ),
             "warm_provider_cache_hit": (
                 warm_report["startup_timing"]["provider_metrics"]["cache_hit"]
                 is True
@@ -202,11 +236,24 @@ def run_benchmark(output_path, *, folder_count=24, sync_file_count=144):
             ),
             "fixture": {
                 "folder_count": folder_count,
+                "spm_count": max(
+                    folder_count, int(spm_count or folder_count)
+                ),
                 "sbs_count": folder_count,
                 "sync_file_count": sync_file_count,
                 "production_assets_touched": False,
+                "workload_equivalence": "cardinality_only",
+                "limitations": [
+                    "synthetic tiny local files, not production byte sizes",
+                    "no OneDrive/network/provider latency",
+                    "warm pass is same-process cache reuse",
+                    "no live Blender, Substance, Unreal, or D: writes",
+                ],
             },
             "budgets_seconds": dict(budgets),
+            "usable_ready_acceptance_cap_seconds": (
+                latency.USABLE_READY_ACCEPTANCE_CAP_SECONDS
+            ),
             "cold": {
                 "cached_board_paint": round(cached_board_paint, 6),
                 "primary_live_audit": round(cold_primary, 6),
@@ -251,11 +298,13 @@ def main():
     parser.add_argument("--out", required=True)
     parser.add_argument("--folders", type=int, default=24)
     parser.add_argument("--sync-files", type=int, default=144)
+    parser.add_argument("--spms", type=int)
     args = parser.parse_args()
     receipt = run_benchmark(
         args.out,
         folder_count=max(1, args.folders),
         sync_file_count=max(1, args.sync_files),
+        spm_count=(max(1, args.spms) if args.spms is not None else None),
     )
     print(json.dumps({
         "passed": receipt["passed"],

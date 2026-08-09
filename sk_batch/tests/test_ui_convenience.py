@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -559,7 +560,7 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
             cases = (
                 ("Tree_elm", "branch_elm_01.spm", "TREE"),
                 ("bush_Silky_Dogwood", "cluster_Dogwood_01.spm", "BUSH"),
-                ("weed_ladyfern", "cluster_ladyfern_01.spm", "GRASS"),
+                ("weed_ladyfern", "cluster_ladyfern_01.spm", "WEED"),
             )
             for owner, name, expected_wind in cases:
                 spm = root / owner / "Cluster" / name
@@ -568,6 +569,12 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
                     gui.sk_batch_folder_chain(root, spm),
                     [root / owner, root / owner / "Cluster"],
                 )
+
+    def test_legacy_grass_wind_override_migrates_to_weed(self):
+        gui = load_gui_module()
+        self.assertEqual(gui.normalize_wind_override("GRASS"), "WEED")
+        self.assertEqual(gui.normalize_wind_override("WEED"), "WEED")
+        self.assertEqual(gui.normalize_wind_override("unknown"), "auto")
 
     def test_cluster_row_shows_only_canonical_output_name(self):
         gui = load_gui_module()
@@ -667,6 +674,277 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
         )
         refresh.assert_not_called()
         app.log.assert_not_called()
+
+    def test_canonical_atlas_conflict_repairs_in_same_owned_lease(self):
+        gui = load_gui_module()
+        app = gui.App.__new__(gui.App)
+        app.log = mock.Mock()
+        app.ui_queue = mock.Mock()
+        app.stop_flag = threading.Event()
+        app._retry_transition = mock.Mock()
+        lease = mock.Mock(finished=False)
+        app._active_shared_queue_lease = lease
+        app.active_batch_job = {
+            "id": 7,
+            "shared_queue_job_id": "shared-job-7",
+        }
+        app._active_retry_metadata = {"progress_run_id": "retry-run-7"}
+        spm = Path("Tree_elm/Cluster/SK_branch_elm_01.spm")
+        report = {
+            "stage": "atlas_manifest_resolution",
+            "reason_token": "atlas_manifest_mirror_conflict_repairable",
+            "evidence": {
+                "status": "repairable",
+                "authority": "authority.json",
+                "mirrors": ["stale.json"],
+            },
+        }
+        failure = gui.CanonicalOutputManifestError(
+            "ownership conflict",
+            report=report,
+        )
+
+        terminal = {
+            "status": "completed",
+            "terminal_status": "completed",
+            "result": {
+                "canonical_refresh": {
+                    "status": "updated",
+                    "updated": ["stale.json"],
+                },
+            },
+        }
+        with mock.patch.object(
+            gui,
+            "refresh_atlas_manifests_for_spm",
+            side_effect=failure,
+        ), mock.patch.object(
+            gui,
+            "run_exact_target_request",
+            return_value=terminal,
+        ) as exact, mock.patch.object(
+            gui,
+            "atlas_manifest_mirror_repair_plan",
+            return_value={"status": "not_needed"},
+        ):
+            actual = app._refresh_canonical_atlas_manifests(spm)
+            repeated = app._refresh_canonical_atlas_manifests(spm)
+
+        self.assertEqual(actual["status"], "updated")
+        self.assertEqual(actual["updated"], ["stale.json"])
+        self.assertEqual(repeated, actual)
+        self.assertEqual(exact.call_count, 1)
+        kwargs = exact.call_args.kwargs
+        self.assertIs(kwargs["inherited_lease"], lease)
+        self.assertIs(kwargs["cancel_event"], app.stop_flag)
+        request = exact.call_args.args[0]
+        self.assertEqual(
+            request["repair_action"],
+            gui.ATLAS_MANIFEST_MIRROR_REPAIR,
+        )
+        self.assertEqual(request["target_spms"], [str(spm.absolute())])
+        self.assertIn("자동 복구 완료", app.log.call_args.args[0])
+
+    def test_canonical_atlas_conflict_without_lease_is_pending_with_evidence(self):
+        gui = load_gui_module()
+        app = gui.App.__new__(gui.App)
+        app.log = mock.Mock()
+        spm = Path("Tree_elm/Cluster/SK_branch_elm_01.spm")
+        report = {
+            "stage": "atlas_manifest_resolution",
+            "reason_token": "atlas_manifest_mirror_conflict_repairable",
+            "evidence": {
+                "status": "repairable",
+                "authority": "authority.json",
+                "mirrors": ["stale.json"],
+            },
+        }
+        failure = gui.CanonicalOutputManifestError(
+            "ownership conflict",
+            report=report,
+        )
+
+        with mock.patch.object(
+            gui,
+            "refresh_atlas_manifests_for_spm",
+            side_effect=failure,
+        ):
+            with self.assertRaises(gui.BatchItemError) as caught:
+                app._refresh_canonical_atlas_manifests(spm)
+
+        self.assertEqual(caught.exception.kind, "automatic_repair_pending")
+        self.assertEqual(
+            caught.exception.report["reason_token"],
+            "atlas_manifest_mirror_conflict_repairable",
+        )
+        self.assertEqual(
+            caught.exception.report["evidence"]["status"], "repairable"
+        )
+
+    def test_canonical_atlas_provider_disagreement_skips_only_metadata_write(self):
+        gui = load_gui_module()
+        app = gui.App.__new__(gui.App)
+        app.log = mock.Mock()
+        spm = Path("Tree_elm/Cluster/SK_branch_elm_01.spm")
+        failure = gui.CanonicalOutputManifestError(
+            "ownership conflict",
+            report={
+                "stage": "atlas_manifest_resolution",
+                "reason_token": "atlas_manifest_ownership_conflict",
+                "evidence": {
+                    "status": "unrepairable",
+                    "reason": "different source identity",
+                },
+            },
+        )
+
+        with mock.patch.object(
+            gui,
+            "refresh_atlas_manifests_for_spm",
+            side_effect=failure,
+        ):
+            actual = app._refresh_canonical_atlas_manifests(spm)
+
+        self.assertEqual(actual["status"], "diagnostic_only")
+        self.assertFalse(actual["mutation_authorized"])
+        self.assertEqual(actual["updated"], [])
+        self.assertEqual(
+            actual["atlas_manifest_diagnostic"]["reason_token"],
+            "atlas_manifest_ownership_conflict",
+        )
+
+    def test_canonical_material_mapping_runs_exact_pcg_then_fresh_audit(self):
+        gui = load_gui_module()
+        app = gui.App.__new__(gui.App)
+        app.log = mock.Mock()
+        app.ui_queue = mock.Mock()
+        app.stop_flag = threading.Event()
+        app._retry_transition = mock.Mock()
+        lease = mock.Mock(finished=False)
+        app._active_shared_queue_lease = lease
+        app.active_batch_job = {
+            "id": 8,
+            "shared_queue_job_id": "shared-job-8",
+        }
+        app._active_retry_metadata = {"progress_run_id": "retry-run-8"}
+        with tempfile.TemporaryDirectory() as temporary:
+            spm = Path(temporary) / "Cluster" / "SK_cluster_test.spm"
+            spm.parent.mkdir()
+            spm.write_bytes(b"spm")
+            report = {
+                "stage": "canonical_material_mapping",
+                "reason_token": "canonical_material_mapping_incomplete",
+                "target_spm": str(spm),
+                "pending": [{"materials": [{"material_id": "5"}]}],
+            }
+            failure = gui.CanonicalOutputManifestError(
+                "mapping incomplete",
+                report=report,
+            )
+            refreshed = {
+                "status": "updated",
+                "updated": ["scope.json"],
+                "current": [],
+                "pending": [],
+            }
+            terminal = {
+                "status": "completed",
+                "terminal_status": "completed",
+                "result": {"shared_queue_success": True},
+            }
+            with mock.patch.object(
+                gui,
+                "refresh_atlas_manifests_for_spm",
+                side_effect=[failure, refreshed],
+            ) as refresh, mock.patch.object(
+                gui,
+                "run_exact_target_request",
+                return_value=terminal,
+            ) as exact:
+                actual = app._refresh_canonical_atlas_manifests(spm)
+
+        self.assertEqual(actual, refreshed)
+        self.assertEqual(refresh.call_count, 2)
+        request = exact.call_args.args[0]
+        self.assertEqual(request["repair_action"], gui.STEP3_STANDARD)
+        self.assertEqual(request["repair_stage"], "pcg_texture")
+        self.assertEqual(request["target_spms"], [str(spm.absolute())])
+        self.assertIs(exact.call_args.kwargs["inherited_lease"], lease)
+
+    def test_unresolved_mapping_after_exact_pcg_is_diagnostic_not_asset_failure(self):
+        gui = load_gui_module()
+        app = gui.App.__new__(gui.App)
+        app.log = mock.Mock()
+        app.ui_queue = mock.Mock()
+        app.stop_flag = threading.Event()
+        app._retry_transition = mock.Mock()
+        app._active_shared_queue_lease = mock.Mock(finished=False)
+        app.active_batch_job = {"id": 9}
+        with tempfile.TemporaryDirectory() as temporary:
+            spm = Path(temporary) / "Cluster" / "SK_cluster_test.spm"
+            spm.parent.mkdir()
+            spm.write_bytes(b"spm")
+            report = {
+                "stage": "canonical_material_mapping",
+                "reason_token": "canonical_material_mapping_incomplete",
+                "target_spm": str(spm),
+            }
+            failure = gui.CanonicalOutputManifestError(
+                "mapping incomplete",
+                report=report,
+            )
+            terminal = {
+                "status": "completed",
+                "terminal_status": "completed",
+                "result": {"shared_queue_success": True},
+            }
+            with mock.patch.object(
+                gui,
+                "refresh_atlas_manifests_for_spm",
+                side_effect=[failure, failure],
+            ), mock.patch.object(
+                gui,
+                "run_exact_target_request",
+                return_value=terminal,
+            ):
+                actual = app._refresh_canonical_atlas_manifests(spm)
+
+        self.assertEqual(actual["status"], "diagnostic_only")
+        self.assertFalse(actual["mutation_authorized"])
+        self.assertEqual(
+            actual["repair_attempt"]["status"],
+            "completed_but_reaudit_unresolved",
+        )
+        self.assertEqual(
+            actual["fresh_reaudit"]["reason_token"],
+            "canonical_material_mapping_incomplete",
+        )
+
+    def test_canonical_texture_failure_remains_concrete_error(self):
+        gui = load_gui_module()
+        app = gui.App.__new__(gui.App)
+        app.log = mock.Mock()
+        spm = Path("Tree_elm/Cluster/SK_branch_elm_01.spm")
+        failure = gui.CanonicalOutputManifestError(
+            "canonical texture output is missing",
+            report={
+                "stage": "canonical_texture_output",
+                "reason_token": "canonical_texture_output_missing",
+            },
+        )
+
+        with mock.patch.object(
+            gui,
+            "refresh_atlas_manifests_for_spm",
+            side_effect=failure,
+        ), self.assertRaises(gui.BatchItemError) as caught:
+            app._refresh_canonical_atlas_manifests(spm)
+
+        self.assertEqual(caught.exception.kind, "data_error")
+        self.assertEqual(
+            caught.exception.report["reason_token"],
+            "canonical_texture_output_missing",
+        )
 
     def test_cluster_job_normalizes_once_and_never_republishes_legacy_name(self):
         gui = load_gui_module()

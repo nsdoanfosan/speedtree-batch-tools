@@ -94,55 +94,53 @@ def _load_state_pause_after_prune(
 
 
 class SkCommonOptimizationTests(unittest.TestCase):
-    def test_job_assignment_failure_keeps_tree_cleanup_fallback_available(self):
+    def test_job_attachment_shim_only_accepts_preassigned_shared_job(self):
         proc = mock.Mock()
-        with mock.patch(
-            "sk_common._create_kill_on_close_job",
-            side_effect=OSError("job assignment denied"),
-        ):
-            self.assertFalse(attach_process_kill_job(proc))
+        proc.speedtree_lifecycle_tree_job = None
+        self.assertFalse(attach_process_kill_job(proc))
+        self.assertIsNone(proc.sk_job_handle)
+        proc.speedtree_lifecycle_tree_job = shared_job = object()
+        self.assertTrue(attach_process_kill_job(proc))
+        self.assertIs(proc.sk_job_handle, shared_job)
 
+    def test_job_finalization_routes_through_shared_receipt_contract(self):
+        proc = mock.Mock()
+        proc.speedtree_lifecycle_launch_id = "launch-1"
+        with mock.patch(
+            "sk_common.complete_owned_process", return_value="process_tree_clean"
+        ) as complete:
+            self.assertTrue(close_process_kill_job(proc))
+        complete.assert_called_once_with(proc, reason="sk_worker_complete")
         self.assertIsNone(proc.sk_job_handle)
 
-    def test_job_handle_is_closed_at_most_once(self):
-        proc = mock.Mock()
-        proc.sk_job_handle = 123
-        with mock.patch("sk_common.os.name", "nt"), mock.patch(
-            "sk_common._close_windows_handle", return_value=True
-        ) as close_handle:
-            self.assertTrue(close_process_kill_job(proc))
-            self.assertFalse(close_process_kill_job(proc))
-
-        close_handle.assert_called_once_with(123)
-
-    def test_windows_tree_termination_uses_taskkill_for_descendants(self):
+    def test_tree_termination_uses_registered_exact_owned_tree(self):
         proc = mock.Mock()
         proc.pid = 1234
-        proc.poll.side_effect = [None, None, 1]
-        proc.wait.return_value = 1
-
-        with mock.patch("sk_common.os.name", "nt"):
-            with mock.patch("sk_common.subprocess.run") as run_mock:
-                run_mock.return_value.returncode = 0
-                self.assertTrue(terminate_process_tree(proc, wait_seconds=0.1))
-
-        self.assertEqual(
-            run_mock.call_args.args[0],
-            ["taskkill", "/PID", "1234", "/T", "/F"],
+        proc.speedtree_lifecycle_launch_id = "launch-1"
+        proc.poll.return_value = 1
+        with mock.patch(
+            "sk_common.terminate_owned_process", return_value="sk_stop_forced"
+        ) as terminate, mock.patch("sk_common.subprocess.run") as run_mock:
+            self.assertTrue(terminate_process_tree(proc, wait_seconds=0.1))
+        terminate.assert_called_once_with(
+            proc,
+            reason="sk_stop",
+            terminate_grace=0.1,
+            kill_grace=0.1,
         )
-        proc.kill.assert_not_called()
+        run_mock.assert_not_called()
 
-    def test_tree_termination_falls_back_to_parent_kill_when_taskkill_fails(self):
+    def test_unregistered_fallback_signals_only_retained_parent_handle(self):
         proc = mock.Mock()
         proc.pid = 5678
-        proc.poll.side_effect = [None, None, None, 1]
+        proc.speedtree_lifecycle_launch_id = None
+        proc.poll.side_effect = [None, None]
         proc.wait.side_effect = [subprocess.TimeoutExpired("wait", 0.1), 1]
 
-        with mock.patch("sk_common.os.name", "nt"):
-            with mock.patch("sk_common.subprocess.run") as run_mock:
-                run_mock.return_value.returncode = 1
-                self.assertFalse(terminate_process_tree(proc, wait_seconds=0.1))
-
+        with mock.patch("sk_common.subprocess.run") as run_mock:
+            self.assertFalse(terminate_process_tree(proc, wait_seconds=0.1))
+        run_mock.assert_not_called()
+        proc.terminate.assert_called_once_with()
         proc.kill.assert_called_once_with()
 
     def test_scan_prunes_backup_directories_without_losing_live_spms(self):
@@ -527,6 +525,65 @@ class SkCommonOptimizationTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertNotEqual(second, changed)
 
+    def test_legacy_code_inclusive_cache_migrates_without_new_fingerprint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            blend = root / "large.blend"
+            content_contract = root / "repair_report.json"
+            exporter_code = root / "exporter.py"
+            blend.write_bytes(b"blend-content")
+            content_contract.write_text("content-v1", encoding="utf-8")
+            exporter_code.write_text("code-v1", encoding="utf-8")
+            old_fingerprint, legacy_cache, _hit = (
+                cached_push_source_fingerprint(
+                    blend, [content_contract, exporter_code]
+                )
+            )
+            legacy_cache.pop("fingerprint_contract")
+
+            exporter_code.write_text("code-v2", encoding="utf-8")
+            migrated, migrated_cache, cache_hit = (
+                cached_push_source_fingerprint(
+                    blend, [content_contract], cache=legacy_cache
+                )
+            )
+
+        self.assertTrue(cache_hit)
+        self.assertEqual(migrated, old_fingerprint)
+        self.assertEqual(
+            migrated_cache["fingerprint_contract"], "content_only_v2"
+        )
+        self.assertEqual(
+            migrated_cache["snapshot"]["dependencies"],
+            [legacy_cache["snapshot"]["dependencies"][0]],
+        )
+
+    def test_legacy_cache_does_not_migrate_after_content_contract_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            blend = root / "large.blend"
+            content_contract = root / "repair_report.json"
+            exporter_code = root / "exporter.py"
+            blend.write_bytes(b"blend-content")
+            content_contract.write_text("content-v1", encoding="utf-8")
+            exporter_code.write_text("code-v1", encoding="utf-8")
+            old_fingerprint, legacy_cache, _hit = (
+                cached_push_source_fingerprint(
+                    blend, [content_contract, exporter_code]
+                )
+            )
+            legacy_cache.pop("fingerprint_contract")
+
+            content_contract.write_text("content-v2", encoding="utf-8")
+            changed, _changed_cache, cache_hit = (
+                cached_push_source_fingerprint(
+                    blend, [content_contract], cache=legacy_cache
+                )
+            )
+
+        self.assertFalse(cache_hit)
+        self.assertNotEqual(changed, old_fingerprint)
+
     def test_file_snapshot_reuses_unchanged_stat_cache(self):
         with tempfile.TemporaryDirectory() as tmp:
             spm = Path(tmp) / "SK_tree.spm"
@@ -560,6 +617,32 @@ class SkCommonOptimizationTests(unittest.TestCase):
                 side_effect=AssertionError("unchanged export was rehashed"),
             ):
                 self.assertTrue(manifest_item_files_match(item))
+
+    def test_manifest_code_drift_does_not_invalidate_immutable_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            exported = root / "mesh.fbx"
+            code = root / "exporter.py"
+            exported.write_bytes(b"fbx")
+            code.write_text("version = 2", encoding="utf-8")
+            export_stat = exported.stat()
+            item = {
+                "fingerprint": "manifest",
+                "exported_files": [{
+                    "path": str(exported),
+                    "size": export_stat.st_size,
+                    "mtime_ns": export_stat.st_mtime_ns,
+                    "fingerprint": "not-needed",
+                }],
+                "code_files": [{
+                    "path": str(code),
+                    "size": 1,
+                    "mtime_ns": 1,
+                    "fingerprint": "old-code",
+                }],
+            }
+
+            self.assertTrue(manifest_item_files_match(item))
 
 
 if __name__ == "__main__":

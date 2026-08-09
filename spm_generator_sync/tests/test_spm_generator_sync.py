@@ -1670,15 +1670,15 @@ class GeneratorSyncTests(unittest.TestCase):
         with self.assertRaises(sync.SearchSyntaxError):
             sync.speedtree_search_matches("Leaf", "Leaf |")
 
-    def test_integrity_detects_and_repairs_reference_pass_regression(self):
+    def test_integrity_does_not_block_optional_reference_pass_repair(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "target.spm"
             write_spm(path, make_pass_target(base_pass=2, ref_pass=2, parent_pass=3))
             document = sync.SPMDocument.from_path(path, full=True)
 
             errors = document.integrity_errors()
-            self.assertTrue(any("Generation Pass 조상 순서 오류" in item for item in errors))
-            self.assertTrue(any("Reference/Base Pass 순서 오류" in item for item in errors))
+            self.assertFalse(any("Generation Pass 조상 순서 오류" in item for item in errors))
+            self.assertFalse(any("Reference/Base Pass 순서 오류" in item for item in errors))
 
             adjustments = sync.repair_generation_passes(document)
             by_name = {item["name"]: item for item in adjustments}
@@ -1757,7 +1757,7 @@ class GeneratorSyncTests(unittest.TestCase):
         ))
         document.validate(document.render())
 
-    def test_invalid_generation_pass_is_a_hard_integrity_error(self):
+    def test_invalid_generation_pass_is_only_an_explicit_integrity_error(self):
         root = ET.fromstring(make_pass_target())
         ref = next(
             item for item in root.find("Generators")
@@ -1770,8 +1770,9 @@ class GeneratorSyncTests(unittest.TestCase):
         document = sync.SPMDocument(
             Path("bad-pass.spm"), ET.tostring(root, encoding="unicode"), True, full=True
         )
+        document.validate()
         with self.assertRaisesRegex(sync.SyncError, "정수가 아닙니다"):
-            document.validate()
+            document.validate_integrity()
 
     def test_pass_only_repair_transaction_backs_up_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -2020,6 +2021,53 @@ class GeneratorSyncTests(unittest.TestCase):
             self.assertEqual(follower["base_map"]["Leaf 2"], "Leaf")
             self.assertEqual(follower["base_map"]["BranchBig"], "Branch")
             self.assertEqual(follower["base_map"]["End 2"], "End")
+
+    def test_explicit_sync_ignores_confirmation_metadata_and_full_audit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            master = folder / "tree_01.spm"
+            target = folder / "tree_02.spm"
+            write_spm(master, make_master())
+            write_spm(target, make_target())
+            manifest = sync.default_manifest()
+            sync.set_master(manifest, master.name)
+            group = sync.find_group(manifest, master.name)
+            group["base_categories"] = {
+                "Leaf": "leaf",
+                "Branch": "branch",
+                "End": "end",
+            }
+            mapping = {
+                "Leaf 2": "Leaf",
+                "BranchBig": "Branch",
+                "BranchSmall": None,
+                "End 2": "End",
+            }
+            sync.assign_follower(
+                manifest,
+                master.name,
+                target.name,
+                mapping,
+                confirmed=False,
+            )
+            sync.save_manifest(folder, manifest)
+
+            with mock.patch.object(
+                sync.SPMDocument,
+                "integrity_errors",
+                side_effect=AssertionError("ordinary sync ran the full audit"),
+            ):
+                result = sync.apply_group_transaction(
+                    folder,
+                    master.name,
+                    verify_speedtree=False,
+                )
+
+            self.assertEqual(result["status"], "applied")
+            current = sync.load_manifest(folder)
+            follower = sync.find_group(current, master.name)["followers"][0]
+            self.assertFalse(follower["base_map_confirmed"])
+            self.assertTrue(follower["last_sync"])
 
     def test_up_to_date_transaction_rechecks_sources_before_manifest_save(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -2287,6 +2335,100 @@ class GeneratorSyncTests(unittest.TestCase):
                 sync.load_manifest(folder)["independent"],
                 ["external_edit.spm"],
             )
+
+    def test_provider_disagreement_does_not_abort_generator_document_load(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "SK_tree_01.spm"
+            target.write_bytes(b"spm")
+            authority = {
+                "atlas_manifest_schema_version": 1,
+                "spm": str(target),
+                "blend_file": str(root / "provider_a.blend"),
+                "source_collection": "Provider A",
+                "export_scope_id": "provider-a",
+                "material_groups": [{
+                    "material": "M_shared",
+                    "material_id": 7,
+                    "mesh_ids": [20],
+                }],
+                "generator_connection": {
+                    "complete": True,
+                    "bindings": [{
+                        "generator_guid": "guid-leaf-2",
+                        "slot_prefix": "Leaf Mesh 1",
+                        "created_slot": True,
+                        "material_id": 7,
+                    }],
+                },
+            }
+            target_dir = root / ".atlas_leaf_speedtree_targets"
+            target_dir.mkdir()
+            (target_dir / f"{target.stem}.json").write_text(
+                json.dumps(authority), encoding="utf-8"
+            )
+            competing = json.loads(json.dumps(authority))
+            competing["blend_file"] = str(root / "provider_b.blend")
+            competing["source_collection"] = "Provider B"
+            competing["export_scope_id"] = "provider-b"
+            competing["material_groups"][0]["mesh_ids"] = [99]
+            (root / "speedtree_import_manifest.json").write_text(
+                json.dumps(competing), encoding="utf-8"
+            )
+
+            selected = sync._atlas_target_relation_manifest(target)
+
+            self.assertFalse(selected["_atlas_relation_mutation_authorized"])
+            self.assertEqual(
+                selected["generator_connection"]["bindings"],
+                [],
+            )
+            self.assertEqual(
+                len(selected["_atlas_relation_protection_bindings"]),
+                1,
+            )
+            document = sync.SPMDocument(
+                target,
+                make_target(),
+                compressed=False,
+                full=True,
+            )
+            key = ("guid-leaf-2", "Leaf Mesh 1")
+            self.assertNotIn(key, document.atlas_relation_bindings)
+            self.assertIn(key, document.atlas_relation_protection_bindings)
+
+    def test_conflicting_metadata_binding_is_ignored_not_a_sync_gate(self):
+        first = {
+            "generator_guid": "guid-leaf-2",
+            "slot_prefix": "Leaf Mesh 1",
+            "created_slot": True,
+            "material_id": 7,
+        }
+        competing = dict(first, material_id=8)
+        manifest = {
+            "generator_connection": {
+                "complete": True,
+                "bindings": [first, competing],
+            },
+        }
+        with mock.patch.object(
+            sync,
+            "_atlas_target_relation_manifest",
+            return_value=manifest,
+        ):
+            document = sync.SPMDocument(
+                Path("SK_tree_01.spm"),
+                make_target(),
+                compressed=False,
+                full=True,
+            )
+
+        key = ("guid-leaf-2", "Leaf Mesh 1")
+        self.assertNotIn(key, document.atlas_relation_bindings)
+        self.assertIn(
+            key,
+            document.atlas_relation_ambiguous_binding_keys,
+        )
 
 
 if __name__ == "__main__":

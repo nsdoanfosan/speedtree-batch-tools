@@ -20,7 +20,7 @@ def test_failure_revokes_preflight_push_readiness():
     assert report["handoff_preflight"] == {"status": "ok"}
 
 
-def test_ambiguous_speedtree_default_bark_is_classified_as_asset_issue():
+def test_legacy_default_bark_error_does_not_create_asset_authority():
     report = {
         "speedtree_pipeline_contract": {
             "material_intents": [
@@ -56,16 +56,7 @@ def test_ambiguous_speedtree_default_bark_is_classified_as_asset_issue():
 
     mark_job_failed(report, error, "traceback")
 
-    assert report["failure_classification"] == (
-        "asset_speedtree_default_material_assignment_ambiguous"
-    )
-    issue = report["asset_issue"]
-    assert issue["code"] == "SPM_VISIBLE_DEFAULT_MATERIAL_AMBIGUOUS"
-    assert issue["automatic_repair_safe"] is False
-    assert [
-        row["texture_base"] for row in issue["candidates"]
-    ] == [
-        "T_bark_black_locast_02",
-        "T_bark_common_end_01",
-    ]
-    assert "SpeedTree Modeler" in issue["remediation"]
+    assert report["status"] == "failed"
+    assert report["error"] == str(error)
+    assert "failure_classification" not in report
+    assert "asset_issue" not in report

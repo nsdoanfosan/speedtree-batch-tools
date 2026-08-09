@@ -177,10 +177,10 @@ Cluster Assembly 영수증이 현재 산출물 해시보다 오래된 경우에�
 한 번 자동 재실행하고, 새 영수증이 실제 현재 해시로 검증된 뒤에만 Blender를
 시작한다. 오래된 영수증을 무시하거나 완화해서 통과시키지는 않는다.
 
-**③ Unreal Push** — 시작 전에 **준비 검사부터 전부** 수행:
-새 Atlas 재질과 Generator 연결, SpeedTree `.stmat` 재질, 텍스처 정규화 보고서,
-blend 존재+최신, wind JSON 존재, 언리얼 에디터 실행 여부. 준비 안 된 항목은
-이유를 표에 남기고 건너뛰고, 준비된 것만 헤드리스 send2ue로 push한다
+**③ Unreal Push** — 시작 전에 구조 준비 검사를 수행한다:
+새 Atlas 재질과 Generator 연결, SpeedTree `.stmat` 재질 정체성, blend 존재+최신,
+wind JSON 존재, 언리얼 에디터 실행 여부를 확인한다. 텍스처는 입장 조건이 아니다.
+확정된 파일만 전달하고 부분·누락·불일치 후보는 비운 채 헤드리스 send2ue로 push한다
 (임포트 시 머티리얼 파이프라인이 wind JSON 연결까지 자동 수행 + 디스크 저장).
 headless transport의 Blender export도 기본 2개씩 처리하며 Unreal import는 한 세션에서
 안전하게 순차 실행한다. Blender 오브젝트 이름에 충돌 방지 숫자가 붙더라도 wind
@@ -210,6 +210,27 @@ DynamicWind 적용을 유예한다. 일반 나무와 최종 Assembly의 wind JSO
 ①/②/③ 버튼만 체크된 항목을 대상으로 한다. 개별 실패·수동 처리 항목은 상태와 로그에
 남기고 다른 파일은 계속 진행한다. 중지 버튼은 현재 단계의 자식 프로세스까지 종료한다.
 
+## 전체 실패 이력 자동 복구
+
+`↻ 전체 실패 이력 재시도`는 체크 상태와 무관하게 current inventory 전체의 durable
+실패 evidence를 다시 분류한다. 공식 reason code가 PCG texture 또는 Generator/Cluster
+repair에 해당하면 즉시 최종 실패 목록에서 빼고 `자동 복구 대기 → PCG 텍스처 복구 중
+→ Generator Sync 중 → Cluster 갱신 중 → 재검증 중 → Blender-Unreal 재시도 중`으로
+표시한다. SK는 BAT를 하위 프로세스로 띄우지 않고 각 도구의 같은 exact job builder를
+현재 shared queue lease 아래에서 직접 호출한다.
+
+각 BAT 단계 직후 exact SPM을 fresh audit한다. 모든 repair와 audit를 통과한 항목만 기존
+Blender/Send2UE/Unreal partition으로 복귀한다. 지원 불가 authoring/exporter 오류 또는
+terminal repair/re-audit 실패만 최종 `실패`로 승격하며, 그때 파일명·친화적 원인·시도한
+단계·남은 조치를 표시한다. 원래 raw reason code와 내부 오류는 state/receipt detail에만
+보존한다. 취소된 항목은 최종 실패가 아니며 다음 전체 재시도에서 durable evidence로
+재계획할 수 있다.
+
+queue/phase 결과는 공용 terminal 계약이 정규화한 `completed`, `pending_unreal`,
+`cancelled`, `failed`, `blocked`, `owner_lost` outcome만 소비한다. 따라서 성공·Unreal
+대기·사용자 취소 행은 최종 실패 count/token/detail에 들어가지 않으며, 이 기능이 raw
+phase 상태를 다시 해석하지 않는다.
+
 ## 옵션 설명 (GUI 툴팁과 동일)
 
 - **가지당 목표 본 수** — 작은 식물의 목표. 총 본 수를 대략 `가지 수 × 이 값`으로
@@ -225,8 +246,12 @@ DynamicWind 적용을 유예한다. 일반 나무와 최종 Assembly의 wind JSO
 
 ## 주의
 
-- 각 행의 Wind `현재값 ▼`을 눌러 자동(파일명 기준) 또는 TREE/BUSH/GRASS/NONE을
+- 각 행의 Wind `현재값 ▼`을 눌러 자동(파일명 기준) 또는 TREE/BUSH/WEED/NONE을
   명시적으로 선택한다. 더블클릭 순환 방식은 사용하지 않는다.
+- 이 값은 변경 불가능한 에셋 반응 프리셋 ID다. 수치 조정은 Unreal의
+  `Project Settings > MyProject2 > Dynamic Wind Response Presets`에서 프리셋별로 한 번만 하며,
+  레벨/날씨 Wind Source의 속도·진폭·방향 설정과는 별개다. `NONE`도 같은
+  조정 창에 표시되고 기본 수치만 0이다.
 - 백업은 각 폴더의 `_spm_backups\` 하위 폴더에만 쌓인다 (작업 폴더 오염 없음)
 - 기존 UE 에셋을 다시 push할 때 .uasset이 Perforce read-only면 임포트가
   조용히 실패한다 → 먼저 p4 edit로 체크아웃할 것
@@ -261,6 +286,6 @@ DynamicWind 적용을 유예한다. 일반 나무와 최종 Assembly의 wind JSO
 - `Cluster\branch_elm_01.spm` 같은 무접두사 레거시 입력은 한 번
   `SK_branch_elm_01.spm`으로 정규화한다. 이후 SPM/FBX/STMAT/JSON/Blend는 모두
   `SK_branch_elm_01` stem을 사용한다.
-- 원본에 선언된 텍스처 경로 또는 실제 FBX material slot이 완전하지 않아도, 검증된 raw Cluster 보존 계약이면 ② Blender 생성은 완료할 수 있다. 이때 보고서는 `handoff_preflight.status=source_review`, `source_review_required=true`, `unreal_push_ready=false`를 기록한다.
-- GUI 행은 이 상태를 `Blend 완료 · 원본 검토 필요 · Unreal Push 차단`으로 표시한다. Blend 열기와 경로 복사는 허용하지만 ③ Unreal Push 준비 목록에서는 제외한다.
-- `source_review`는 최신 receipt가 없거나 Blender Repair가 실패했다는 뜻이 아니다. 현재 원본의 결손을 그대로 보존했다는 뜻이며, 원본 SPM/TGA를 자동 수정하거나 이름을 바꾸지 않는다.
+- 원본에 선언된 텍스처 경로가 부분적이거나 전혀 없어도 ② Blender 생성과 ③ Unreal Push를 계속한다. 보고서의 texture availability는 진단 정보이며 `unreal_push_ready`를 바꾸지 않는다.
+- 안전하게 확인된 역할만 연결한다. 누락 후보는 비워 두고, 모호하거나 작업 범위를 벗어난 후보는 선택하지 않는다. 이 상태는 `source_review`나 자동 PCG 복구를 만들지 않는다.
+- 실제 FBX material slot 부재, 재질 ID/슬롯 모호성, 메시·버텍스 payload 오류 같은 비텍스처 구조 문제만 `source_review` 또는 `blocked`가 될 수 있다.

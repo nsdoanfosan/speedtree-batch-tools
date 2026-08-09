@@ -1,0 +1,37 @@
+{
+  "kind": "issue138_sanitized_observed_reason_tokens",
+  "source": "GitHub PR 148 comments 5162631576 and 5163298420 plus issue 178 runtime comments; token names and counts only",
+  "captured_target_count": 92,
+  "tokens": {
+    "data_error": 25,
+    "shared_dependency_failed": 19,
+    "imported_ok": 19,
+    "generator_connection_contract_incomplete": 10,
+    "normalized_variants_required": 1,
+    "normalized_variants_stale": 1,
+    "stale_target_mesh_scope_missing": 6,
+    "unreal_unavailable": 5,
+    "ready": 5,
+    "automatic_repair_reaudit_failed": 5,
+    "recovery_blocked": 3,
+    "preflight_skip": 3,
+    "operator_cancelled": 3,
+    "internal_error": 3,
+    "exported_pending_unreal": 3,
+    "unreal_parent_evidence_invalid_full_rebuild": 1,
+    "unreal_parent_evidence_incomplete_full_rebuild": 1,
+    "target_recovery_scope_empty": 1,
+    "structured_send2ue_export_failure": 1,
+    "structured_blender_failure": 1,
+    "blender_output_not_current": 1,
+    "operator_release_requested": 1
+  },
+  "standalone_terminal_failure_tokens": {
+    "data_error": 24,
+    "unreal_unavailable": 4,
+    "internal_error": 3
+  },
+  "dependency_wrapper_tokens": {
+    "shared_dependency_failed": 19
+  }
+}

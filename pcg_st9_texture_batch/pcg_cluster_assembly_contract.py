@@ -31,7 +31,23 @@ from atlas_target_registry import (
     TargetRegistryError,
     load_target_registry,
 )
-from artifact_content_key import sampled_file_content_snapshot
+from atlas_manifest_resolver import (
+    AtlasManifestResolutionError,
+    resolution_evidence,
+    resolve_atlas_manifests,
+)
+from artifact_content_key import (
+    ArtifactContentKeyChangedError,
+    SHA256_ALGORITHM,
+    file_content_key_snapshot,
+    sampled_file_content_snapshot,
+)
+from generator_delivery_scope import (
+    GeneratorDeliveryScopeError,
+    canonical_sha256,
+    canonical_slot_identity,
+    validate_resolved_delivery_scope,
+)
 from speedtree_pipeline_contract import (
     SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
     generator_guid_key,
@@ -119,6 +135,16 @@ def _sha256_cached(path_text, size, mtime_ns):
     return digest.hexdigest()
 
 
+def _report_file_sha256_memo():
+    """Find the active audit's refresh-local exact digest memo, if any."""
+    audit = (
+        sys.modules.get("pcg_texture_audit")
+        or sys.modules.get("pcg_st9_texture_batch.pcg_texture_audit")
+    )
+    reader = getattr(audit, "report_file_sha256_cache", None)
+    return reader() if callable(reader) else None
+
+
 def file_fingerprint(path, hash_content=True):
     candidate = Path(path)
     if not hash_content:
@@ -152,12 +178,45 @@ def file_fingerprint(path, hash_content=True):
             "sha256": None,
         }
     absolute = os.path.abspath(str(candidate))
+    cache_key = (
+        absolute.casefold(), stat.st_size, stat.st_mtime_ns
+    )
+    memo = _report_file_sha256_memo()
+    def compute():
+        try:
+            snapshot = file_content_key_snapshot(
+                candidate, SHA256_ALGORITHM
+            )
+        except ArtifactContentKeyChangedError as exc:
+            raise OSError(str(exc)) from exc
+        if (
+            snapshot["size"], snapshot["mtime_ns"]
+        ) != (
+            stat.st_size, stat.st_mtime_ns
+        ):
+            raise OSError(
+                "Artifact identity changed before its digest was captured: "
+                + str(candidate)
+            )
+        return snapshot["digest"]
+
+    single_flight = getattr(memo, "get_or_compute_verified", None)
+    try:
+        sha256 = (
+            single_flight(cache_key, compute)
+            if callable(single_flight) else compute()
+        )
+    except ValueError as exc:
+        raise OSError(
+            "Artifact content changed without an identity change: "
+            + str(candidate)
+        ) from exc
     return {
         "path": str(candidate),
         "exists": True,
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
-        "sha256": _sha256_cached(absolute, stat.st_size, stat.st_mtime_ns),
+        "sha256": sha256,
     }
 
 
@@ -190,12 +249,21 @@ def _fresh_file_fingerprint(path):
             and (before.st_size, before.st_mtime_ns)
             == (after.st_size, after.st_mtime_ns)
         ):
+            sha256 = digest.hexdigest()
+            memo = _report_file_sha256_memo()
+            seed = getattr(memo, "seed", None)
+            if callable(seed):
+                seed((
+                    os.path.abspath(str(candidate)).casefold(),
+                    after.st_size,
+                    after.st_mtime_ns,
+                ), sha256)
             return {
                 "path": str(candidate),
                 "exists": True,
                 "size": after.st_size,
                 "mtime_ns": after.st_mtime_ns,
-                "sha256": digest.hexdigest(),
+                "sha256": sha256,
             }
     raise ClusterAssemblyReceiptStaleError(
         "Artifact changed while its content fingerprint was calculated: "
@@ -541,6 +609,21 @@ def classify_fbx_role(
     }
 
 
+def _current_live_pair_covered(targets):
+    """Return true when every live target already carries the exact role pair."""
+    if not targets:
+        return False
+    for target in targets:
+        gate = target.get("fbx_material_mesh_pair") or {}
+        if (
+            gate.get("status") != "complete_pair"
+            or int(gate.get("complete_pair_count") or 0) < 1
+            or gate.get("error")
+        ):
+            return False
+    return True
+
+
 def _asset_species(folder):
     value = Path(folder).name
     value = re.sub(
@@ -707,7 +790,9 @@ def _material_rows(audit, spm):
     return rows
 
 
-def _canonical_bark_contract(audit, folder, target_spms, dependencies):
+def _canonical_bark_contract(
+        audit, folder, target_spms, dependencies,
+        mutation_requested=False):
     expected = f"bark_{_asset_species(folder)}_01"
     species = _asset_species(folder)
     # Older authored trees can retain the owner-folder token in the rendered
@@ -825,28 +910,25 @@ def _canonical_bark_contract(audit, folder, target_spms, dependencies):
                 ),
             })
     canonical_conflicts = []
-    if not canonical and sources:
-        provider_groups = {}
-        for row in sources:
-            authority = normalize_export_name(row.get("material_name"))
-            authored_refs = [
-                str(value).strip()
-                for value in row.get("texture_refs") or []
-                if str(value).strip()
-            ]
-            # Provider-label aliasing is safe only for the exact same physical
-            # texture sequence.  Basenames alone are insufficient because two
-            # libraries can contain different files with the same names.
-            texture_signature = tuple(
-                _normalized_identity_path(
-                    _resolve_ref(Path(row["cluster_spm"]), value)
-                )
-                for value in authored_refs
+    provider_groups = {}
+    for row in sources:
+        authority = normalize_export_name(row.get("material_name"))
+        authored_refs = [
+            str(value).strip()
+            for value in row.get("texture_refs") or []
+            if str(value).strip()
+        ]
+        texture_signature = tuple(
+            _normalized_identity_path(
+                _resolve_ref(Path(row["cluster_spm"]), value)
             )
-            provider_groups.setdefault(
-                (authority, texture_signature),
-                [],
-            ).append(row)
+            for value in authored_refs
+        )
+        provider_groups.setdefault(
+            (authority, texture_signature),
+            [],
+        ).append(row)
+    if not canonical and sources:
         live_signatures = {
             signature
             for _authority, signature in provider_groups
@@ -896,7 +978,7 @@ def _canonical_bark_contract(audit, folder, target_spms, dependencies):
                     != provider_identity
                 ):
                     row["canonical_alias_of"] = provider_identity
-        else:
+        elif mutation_requested:
             canonical_conflicts = [
                 {
                     "material_identity": identity,
@@ -912,8 +994,51 @@ def _canonical_bark_contract(audit, folder, target_spms, dependencies):
                 for (identity, texture_signature), rows
                 in sorted(provider_groups.items())
             ]
+    live_variants = [
+        {
+            "material_identity": identity,
+            "texture_basenames": [
+                Path(value).name.casefold()
+                for value in (rows[0].get("texture_refs") or [])
+            ],
+            "texture_identities": list(texture_signature),
+            "providers": sorted({
+                row["cluster_spm"] for row in rows
+            }),
+        }
+        for (identity, texture_signature), rows
+        in sorted(provider_groups.items())
+    ]
+    live_texture_signatures = {
+        signature for _identity, signature in provider_groups
+    }
+
+    # This builder is a read-only delivery audit.  Different live bark slots,
+    # labels, and texture sets are valid SpeedTree authoring and are preserved
+    # unless an exact merge/replacement mutation was explicitly requested.
+    # A historical canonical convention is evidence, not authority to rewrite
+    # or strand the current render geometry.
+    live_variant_mismatch = any(
+        row.get("replacement") == "required" for row in sources
+    )
+    if not mutation_requested:
+        for row in sources:
+            if row.get("replacement") == "required":
+                row["replacement"] = "not_required"
+                row["normalization_evidence"] = None
+        canonical_conflicts = []
+
     if not canonical and not sources:
         status = "not_applicable"
+    elif (
+        not mutation_requested
+        and (
+            not canonical
+            or live_variant_mismatch
+            or len(live_texture_signatures) > 1
+        )
+    ):
+        status = "preserved_live_variants"
     elif canonical_conflicts:
         status = "blocked_canonical_ambiguous"
     elif not canonical:
@@ -927,11 +1052,14 @@ def _canonical_bark_contract(audit, folder, target_spms, dependencies):
         "canonical_material": (
             display_export_name(canonical[0]["material_name"])
             if canonical
-            else f"M_{expected}" if sources else None
+            else display_export_name(sources[0]["material_name"])
+            if sources else None
         ),
         "canonical_sources": canonical,
         "canonical_conflicts": canonical_conflicts,
+        "live_variants": live_variants,
         "cluster_bark_sources": sources,
+        "mutation_requested": bool(mutation_requested),
         "mutation_applied": False,
     }
 
@@ -1235,10 +1363,12 @@ def _tga_basename_validation(
     else:
         refs = [Path(value) for value in resolved_refs]
     missing = [str(path) for path in refs if not path.is_file()]
+    # SpeedTree's live reference is authoritative; the texture extension is
+    # not an export contract.  Only diagnose whether the referenced texture
+    # belongs to the expected output basename family.
     invalid = [
         str(path) for path in refs
-        if path.suffix.casefold() != ".tga"
-        or not any(
+        if not any(
             path.stem.casefold() == base
             or path.stem.casefold().startswith(base + "_")
             for base in accepted
@@ -1255,7 +1385,7 @@ def _tga_basename_validation(
     ]
     if invalid:
         status = "basename_mismatch"
-        diagnostic = "basename_or_suffix_mismatch"
+        diagnostic = "basename_mismatch"
     elif missing or unresolved_aliases:
         status = "missing"
         diagnostic = "path_alias_missing"
@@ -1282,6 +1412,20 @@ def _tga_basename_validation(
         "unresolved_aliases": unresolved_aliases,
         "alias_resolution": alias_resolution or {},
     }
+
+
+def _concrete_texture_reference_missing(validation):
+    """Return true only when the current referenced file itself is absent."""
+    validation = validation or {}
+    if not validation.get("missing"):
+        return False
+    # Missing/ambiguous provenance for a relocated alias is metadata evidence,
+    # not proof that the live texture is absent. A direct path_alias_missing
+    # row is the bounded file-absence case.
+    return all(
+        row.get("status") == "path_alias_missing"
+        for row in validation.get("unresolved_aliases") or []
+    )
 
 
 def _normalized_capture_texture_refs(normalized_variants):
@@ -1319,27 +1463,14 @@ def _normalized_capture_texture_refs(normalized_variants):
 
 
 def _atlas_manifest_candidates(folder, target_spms):
-    """Return stable per-scope/per-target receipts before the rolling global file."""
+    """Return only shared-resolver-selected Atlas operational receipts."""
     paths = []
     for target in target_spms or []:
-        target = Path(target)
-        scope_dir = target.parent / ".atlas_leaf_speedtree_scopes"
-        if scope_dir.is_dir():
-            paths.extend(sorted(scope_dir.glob(f"*__{target.stem}.json")))
-        target_receipt = (
-            target.parent
-            / ".atlas_leaf_speedtree_targets"
-            / f"{target.stem}.json"
-        )
-        if target_receipt.is_file():
-            paths.append(target_receipt)
-    # A stable receipt set is authoritative.  The legacy global file is a
-    # rolling last-export snapshot, so it may only be consulted when no
-    # target/scope receipt exists at all.
-    if not paths:
-        global_manifest = Path(folder) / "speedtree_import_manifest.json"
-        if global_manifest.is_file():
-            paths.append(global_manifest)
+        try:
+            resolution = resolve_atlas_manifests(target)
+        except AtlasManifestResolutionError as exc:
+            raise ClusterAssemblyReceiptError(str(exc)) from exc
+        paths.extend(Path(row["path"]) for row in resolution["selected"])
     unique = []
     seen = set()
     for path in paths:
@@ -1380,7 +1511,12 @@ def _normalized_bounds_contract(value, label, required=False):
     return result
 
 
-def _physical_source_3d_artifacts(receipt):
+def _physical_source_3d_artifacts(
+    receipt,
+    spm_semantic_reader=None,
+    validation_cache=None,
+    allow_source_fbx_drift=False,
+):
     """Validate the exact SPM/FBX inputs shared by every physical variant."""
     artifacts = None
     identity = None
@@ -1389,6 +1525,41 @@ def _physical_source_3d_artifacts(receipt):
         raise ClusterAssemblyReceiptError(
             "Atlas physical normalization receipt has no variants"
         )
+    source_contracts = [
+        (row.get("plan_uv_transfer") or {}).get("source_3d_contract")
+        for row in variants
+        if isinstance(row, dict)
+    ]
+    source_cache_key = "source-3d:" + hashlib.sha256(json.dumps(
+        {
+            "source_contracts": source_contracts,
+            "allow_source_fbx_drift": bool(allow_source_fbx_drift),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    single_flight = getattr(
+        validation_cache, "get_or_compute_verified", None
+    )
+    if callable(single_flight):
+        try:
+            return copy.deepcopy(single_flight(
+                source_cache_key,
+                lambda: _physical_source_3d_artifacts(
+                    receipt,
+                    spm_semantic_reader=spm_semantic_reader,
+                    validation_cache=None,
+                    allow_source_fbx_drift=allow_source_fbx_drift,
+                ),
+            ))
+        except ValueError as exc:
+            raise ClusterAssemblyReceiptStaleError(
+                "Atlas physical source content changed without an identity "
+                "change"
+            ) from exc
+    if validation_cache is not None and source_cache_key in validation_cache:
+        return copy.deepcopy(validation_cache[source_cache_key])
     for index, row in enumerate(variants, 1):
         transfer = row.get("plan_uv_transfer")
         source = (
@@ -1453,9 +1624,16 @@ def _physical_source_3d_artifacts(receipt):
                     current_semantic = (
                         recorded_semantic
                         if raw_hash_matches and recorded_semantic
-                        else spm_file_structural_semantic_fingerprint(
-                            path,
-                            raw_sha256=fingerprint["sha256"],
+                        else (
+                            spm_semantic_reader(
+                                path,
+                                raw_sha256=fingerprint["sha256"],
+                            )
+                            if callable(spm_semantic_reader)
+                            else spm_file_structural_semantic_fingerprint(
+                                path,
+                                raw_sha256=fingerprint["sha256"],
+                            )
                         )
                     )
                 except (OSError, ValueError, ET.ParseError) as exc:
@@ -1519,7 +1697,10 @@ def _physical_source_3d_artifacts(receipt):
                     )
                 )
                 continue
-            if fingerprint["sha256"].casefold() != recorded_hash:
+            if (
+                fingerprint["sha256"].casefold() != recorded_hash
+                and not allow_source_fbx_drift
+            ):
                 raise ClusterAssemblyReceiptStaleError(
                     f"Atlas physical source {label} artifact hash is stale: "
                     + path
@@ -1527,13 +1708,19 @@ def _physical_source_3d_artifacts(receipt):
             current[artifact] = {
                 **fingerprint,
                 "recorded_sha256": recorded_hash,
-                "raw_sha256_drift": False,
+                "raw_sha256_drift": (
+                    fingerprint["sha256"].casefold() != recorded_hash
+                ),
             }
+            if current[artifact]["raw_sha256_drift"]:
+                current[artifact]["validation"] = (
+                    "deferred_to_exact_target_geometry_correspondence"
+                )
             identity_rows.append(
                 (
                     artifact,
                     _normalized_identity_path(path),
-                    recorded_hash,
+                    fingerprint["sha256"].casefold(),
                 )
             )
         row_identity = tuple(identity_rows)
@@ -1544,10 +1731,17 @@ def _physical_source_3d_artifacts(receipt):
             raise ClusterAssemblyReceiptError(
                 "Atlas physical variants have conflicting source 3D contracts"
             )
+    if validation_cache is not None:
+        validation_cache[source_cache_key] = copy.deepcopy(artifacts)
     return artifacts
 
 
-def _physical_normalization_receipt(payload, validation_cache=None):
+def _physical_normalization_receipt(
+    payload,
+    validation_cache=None,
+    spm_semantic_reader=None,
+    allow_source_fbx_drift=False,
+):
     receipt = (payload or {}).get("normalized_prototype_receipt")
     if receipt is None:
         return None
@@ -1577,12 +1771,32 @@ def _physical_normalization_receipt(payload, validation_cache=None):
             {
                 "receipt": receipt,
                 "unit_probe_contract": unit_probe,
+                "allow_source_fbx_drift": bool(allow_source_fbx_drift),
             },
             sort_keys=True,
             ensure_ascii=False,
             separators=(",", ":"),
         ).encode("utf-8")
         cache_key = hashlib.sha256(cache_payload).hexdigest()
+        single_flight = getattr(
+            validation_cache, "get_or_compute_verified", None
+        )
+        if callable(single_flight):
+            try:
+                return copy.deepcopy(single_flight(
+                    cache_key,
+                    lambda: _physical_normalization_receipt(
+                        payload,
+                        validation_cache=None,
+                        spm_semantic_reader=spm_semantic_reader,
+                        allow_source_fbx_drift=allow_source_fbx_drift,
+                    ),
+                ))
+            except ValueError as exc:
+                raise ClusterAssemblyReceiptStaleError(
+                    "Atlas physical receipt inputs changed without an "
+                    "identity change"
+                ) from exc
         cached = validation_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -1607,7 +1821,12 @@ def _physical_normalization_receipt(payload, validation_cache=None):
         raise ClusterAssemblyReceiptError(
             "Atlas physical normalization receipt has no prototypes"
         )
-    source_3d_artifacts = _physical_source_3d_artifacts(receipt)
+    source_3d_artifacts = _physical_source_3d_artifacts(
+        receipt,
+        spm_semantic_reader=spm_semantic_reader,
+        validation_cache=validation_cache,
+        allow_source_fbx_drift=allow_source_fbx_drift,
+    )
     if (
         not isinstance(unit_probe, dict)
         or unit_probe.get("kind") != "speedtree_fbx_spm_unit_probe"
@@ -1749,11 +1968,18 @@ def _normalized_variant_contract(
     payload,
     group,
     physical_receipt_cache=None,
+    spm_semantic_reader=None,
+    allow_source_fbx_drift=False,
 ):
-    physical = _physical_normalization_receipt(
-        payload,
-        validation_cache=physical_receipt_cache,
-    )
+    try:
+        physical = _physical_normalization_receipt(
+            payload,
+            validation_cache=physical_receipt_cache,
+            spm_semantic_reader=spm_semantic_reader,
+            allow_source_fbx_drift=allow_source_fbx_drift,
+        )
+    except ClusterAssemblyReceiptError as exc:
+        raise type(exc)(f"{exc}: {manifest_path}") from exc
     receipt_variants = {}
     if physical is not None:
         for row in physical["receipt"].get("variants") or []:
@@ -1953,6 +2179,16 @@ def _normalized_variant_contract(
         result["production_normalization"] = physical["receipt"]
         result["unit_probe_contract"] = physical["unit_probe_contract"]
         result["source_3d_artifacts"] = physical["source_3d_artifacts"]
+        source_fbx = physical["source_3d_artifacts"].get("source_fbx") or {}
+        if source_fbx.get("raw_sha256_drift"):
+            result["source_fbx_drift_validation"] = {
+                "status": "deferred",
+                "policy": (
+                    "exact_target_geometry_correspondence_required_before_"
+                    "assembly_emit"
+                ),
+                "source_fbx": copy.deepcopy(source_fbx),
+            }
     return result
 
 
@@ -1965,28 +2201,91 @@ def _positive_asset_id(value):
 
 
 def _delivery_binding_slot_identity(binding):
-    """Use authored Generator identity, never XML array position."""
-    prefix = str(
-        binding.get("slot_prefix")
-        or str(binding.get("material_property") or "").rsplit(":", 1)[0]
-    ).strip().casefold()
-    # One GUID has two observed SpeedTree serialization spellings (24-character
-    # RFC base64 and the 23-character Modeler dialect), so the raw string is not
-    # the identity.  Compare the canonical form; the raw value stays in the
-    # evidence rows for provenance.
-    guid = generator_guid_key(binding.get("generator_guid"))
+    """Return the compatibility identity for historical live audit rows.
+
+    New sealed delivery receipts hash exact opaque GUID and slot-prefix text.
+    Older live snapshots predate that contract and may use the alternate
+    Modeler GUID spelling or case variants, so this read-only join retains the
+    established semantic comparison without changing sealed receipt hashes.
+    """
+    if isinstance(binding, dict):
+        prefix = str(
+            binding.get("slot_prefix")
+            or str(binding.get("material_property") or "").rsplit(":", 1)[0]
+        ).strip().casefold()
+        guid = generator_guid_key(binding.get("generator_guid"))
+        generator_type = str(
+            binding.get("generator_type") or ""
+        ).strip().casefold()
+        generator_name = str(
+            binding.get("generator_name") or ""
+        ).strip().casefold()
+    elif isinstance(binding, (list, tuple)):
+        parts = tuple(str(part or "").strip() for part in binding)
+        kind = parts[0].casefold() if parts else ""
+        if kind == "guid" and len(parts) == 3:
+            guid = generator_guid_key(parts[1])
+            prefix = parts[2].casefold()
+            generator_type = ""
+            generator_name = ""
+        elif kind == "named" and len(parts) == 4:
+            guid = ""
+            generator_type = parts[1].casefold()
+            generator_name = parts[2].casefold()
+            prefix = parts[3].casefold()
+        else:
+            raise GeneratorDeliveryScopeError(
+                "Generator delivery slot identity is incomplete"
+            )
+    else:
+        raise GeneratorDeliveryScopeError(
+            "Generator delivery slot identity must be an object or list"
+        )
     if guid and prefix:
-        return "guid", guid, prefix
-    # A missing GUID is already weaker evidence.  Keep the semantic
-    # type/name/prefix tuple so reordering Generator XML cannot silently turn
-    # one authored slot into another.  Duplicate named identities fail closed
-    # as an ambiguous live slot below.
-    return (
+        return ("guid", guid, prefix)
+    identity = (
         "named",
-        str(binding.get("generator_type") or "").strip().casefold(),
-        str(binding.get("generator_name") or "").strip().casefold(),
+        generator_type,
+        generator_name,
         prefix,
     )
+    if not prefix:
+        raise GeneratorDeliveryScopeError(
+            "Generator delivery slot identity has no semantic prefix"
+        )
+    return identity
+
+
+def _historical_semantic_delivery_connection(connection):
+    """Project a pre-exact receipt onto its historical semantic identities.
+
+    #163 producer receipts now seal opaque GUID/prefix text.  Older receipts
+    were legitimately sealed with the case-folded Modeler join used by this
+    consumer at the time.  Replaying that projection is compatibility
+    validation of the existing hashes, not a rewrite or a weaker new seal.
+    """
+
+    projected = copy.deepcopy(connection)
+    field = "authored_bindings" if "authored_bindings" in projected else "bindings"
+    rows = projected.get(field)
+    if not isinstance(rows, list) or not rows:
+        raise GeneratorDeliveryScopeError(
+            "historical delivery bindings are missing"
+        )
+    projected[field] = [
+        {
+            "slot_identity": list(_delivery_binding_slot_identity(row)),
+            "target_material_id": row.get("target_material_id"),
+            "target_mesh_id": row.get("target_mesh_id"),
+        }
+        for row in rows
+        if isinstance(row, dict)
+    ]
+    if len(projected[field]) != len(rows):
+        raise GeneratorDeliveryScopeError(
+            "historical delivery bindings contain a non-object row"
+        )
+    return projected
 
 
 def _stale_node_table_evidence(binding):
@@ -2003,33 +2302,52 @@ def _stale_node_table_evidence(binding):
 INACTIVE_CAUSAL_PATH_REASON = (
     "generator_causal_path_inactive_unused_base"
 )
+INACTIVE_ANCESTOR_CAUSAL_PATH_REASON = (
+    "generator_causal_path_inactive_ancestor"
+)
+HIDDEN_ANCESTOR_CAUSAL_PATH_REASON = (
+    "generator_causal_path_hidden_ancestor"
+)
+UNCONNECTED_CAUSAL_PATH_REASON = "generator_causal_path_unconnected"
 
 
 def _inactive_causal_path_evidence(binding):
-    """True only for a coherent live path below an unused SpeedTree Base."""
+    """True for a coherent authored explanation of zero live geometry."""
     if not isinstance(binding, dict):
         return False
-    return (
+    reason = str(binding.get("causal_path_reason") or "")
+    if not (
         binding.get("causal_path_active") is False
-        and str(binding.get("causal_path_reason") or "")
-        == INACTIVE_CAUSAL_PATH_REASON
         and binding.get("node_table_stale") is False
-        and binding.get("graph_visible") is True
         and not int(binding.get("generated_node_count") or 0)
-        and isinstance(binding.get("inactive_base"), dict)
-        and str(
-            (binding.get("inactive_base") or {}).get("generator_type") or ""
-        ).strip().casefold() == "base"
-        and not int(
-            (binding.get("inactive_base") or {}).get(
-                "generated_node_count"
-            ) or 0
+    ):
+        return False
+    if reason == UNCONNECTED_CAUSAL_PATH_REASON:
+        return (
+            binding.get("graph_visible") is True
+            and not (binding.get("causal_path") or [])
         )
+    ancestor = binding.get("inactive_ancestor")
+    if not isinstance(ancestor, dict):
+        # Existing snapshots used only the Base-specific compatibility field.
+        ancestor = binding.get("inactive_base")
+    if not isinstance(ancestor, dict):
+        return False
+    if reason == HIDDEN_ANCESTOR_CAUSAL_PATH_REASON:
+        return ancestor.get("own_hidden") is True
+    if reason == INACTIVE_ANCESTOR_CAUSAL_PATH_REASON:
+        return not int(ancestor.get("generated_node_count") or 0)
+    return bool(
+        reason == INACTIVE_CAUSAL_PATH_REASON
+        and binding.get("graph_visible") is True
+        and str(ancestor.get("generator_type") or "").strip().casefold()
+        == "base"
+        and not int(ancestor.get("generated_node_count") or 0)
     )
 
 
 STALE_NODE_TABLE_REASON = "live_export_evidence_unavailable_stale_node_table"
-STALE_NODE_TABLE_RECOVERY_MODE = "interactive_modeler_save_watch"
+STALE_NODE_TABLE_RECOVERY_MODE = "owned_semantic_uia_modeler_save_watch"
 STALE_NODE_TABLE_REMEDY = (
     "대상 SPM의 저장된 <Node> 테이블이 현재 Generator 그래프와 맞지 않습니다"
     " (없는 Generator에 노드가 남아 있음). Generator 연결 자체는 정상이며 export"
@@ -2039,17 +2357,25 @@ STALE_NODE_TABLE_REMEDY = (
 
 
 def _stale_node_table_recovery_contract():
-    """Describe the safe recovery boundary without claiming unattended save."""
+    """Describe the gated exact-PID semantic Modeler recovery boundary."""
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "mode": STALE_NODE_TABLE_RECOVERY_MODE,
         "cli_module": "pcg_st9_texture_batch.stale_node_table_recovery",
-        "modeler_auto_save": False,
+        "modeler_auto_save": True,
+        "modeler_auto_save_mode": "exact_owned_pid_document_menu_uia_invoke",
         "modeler_process_kill": False,
         "direct_spm_xml_edit": False,
         "ui_input_simulation": False,
         "automatic_rollback": False,
-        "requires_user_save": True,
+        "requires_user_save": False,
+        "requires_node_table_stale": True,
+        "requires_nonzero_orphan_owners": True,
+        "requires_nonzero_orphan_nodes": True,
+        "requires_complete_sealed_scope": True,
+        "closes_exact_document_after_valid_reaudit": True,
+        "keeps_owned_modeler_session_alive": True,
+        "unrelated_modeler_session_adoption": False,
         "requires_exact_preimage_backup": True,
         "requires_immutable_preimage_receipt": True,
         "authoring_graph_projection_version": 1,
@@ -2247,7 +2573,7 @@ def _normalized_generator_delivery(
         if _positive_asset_id(row.get("target_mesh_id")) is not None
     })
     evidence = {
-        "schema_version": 2,
+        "schema_version": 3,
         "spm": str(Path(production_spm).resolve(strict=False)),
         "delivery_mode": DELIVERY_MODE_CONNECTION_INCOMPLETE,
         "delivery_decision": "blocked",
@@ -2261,6 +2587,16 @@ def _normalized_generator_delivery(
             "fresh_live_export_delivery"
         ),
         "generator_variant_policy": variant_policy or None,
+        "delivery_scope_mode": "legacy_strict",
+        "delivery_scope_identity_mode": None,
+        "delivery_scope_intent_sha256": None,
+        "delivery_scope_required_live_slot_count": len(bindings),
+        "delivery_scope_continuity_only_slot_count": 0,
+        # Populated only from a fully validated explicit delivery intent.
+        # Recovery callers must not reconstruct intent from live observations.
+        "recovery_target_scope": None,
+        "mutation_authorized": True,
+        "metadata_diagnostics": [],
         "target_material_id": expected_material_id,
         "normalized_target_mesh_ids": normalized_mesh_ids,
         "declared_target_mesh_ids": declared_mesh_ids,
@@ -2287,6 +2623,8 @@ def _normalized_generator_delivery(
         "declared_binding_count": len(bindings),
         "active_required_binding_count": len(bindings),
         "planned_inactive_binding_count": 0,
+        "current_admission_relevant_binding_count": 0,
+        "current_admission_excluded_binding_count": 0,
         "current_required_target_mesh_ids": list(normalized_mesh_ids),
         "binding_outcomes": [],
         "missing_live_bindings": [],
@@ -2326,7 +2664,14 @@ def _normalized_generator_delivery(
         evidence["errors"].append("production_spm_live_audit_unavailable")
         return _finalize_normalized_generator_delivery(evidence)
 
+    # A board audit owns one immutable, full-SHA-bound SPM generation and may
+    # reuse its compact projection.  Consumers without that generation API
+    # retain the uncached live reader used after external writers.
     snapshot_reader = getattr(
+        audit,
+        "report_generator_delivery_snapshot",
+        None,
+    ) or getattr(
         audit,
         "live_generator_delivery_snapshot",
         None,
@@ -2416,6 +2761,91 @@ def _normalized_generator_delivery(
         dict(live_node_table) if isinstance(live_node_table, dict) else None
     )
     slot_identity = _delivery_binding_slot_identity
+    explicit_scope = connection.get("delivery_scope") is not None
+    invalid_scope_diagnostic = False
+    scope_contract = None
+    if explicit_scope:
+        provider_blend = str(payload.get("blend_file") or "").strip()
+        try:
+            if not provider_blend:
+                raise GeneratorDeliveryScopeError(
+                    "explicit delivery scope manifest has no provider blend"
+                )
+            scope_contract = validate_resolved_delivery_scope(
+                connection,
+                target_spm=production_spm,
+                material_id=expected_material_id,
+                provider_blend=provider_blend,
+                target_spm_postwrite_sha256=snapshot_sha256,
+            )
+            evidence["delivery_scope_identity_mode"] = "exact_opaque_v1"
+        except GeneratorDeliveryScopeError as exact_error:
+            try:
+                if not provider_blend:
+                    raise exact_error
+                scope_contract = validate_resolved_delivery_scope(
+                    _historical_semantic_delivery_connection(connection),
+                    target_spm=production_spm,
+                    material_id=expected_material_id,
+                    provider_blend=provider_blend,
+                    target_spm_postwrite_sha256=snapshot_sha256,
+                )
+                evidence["delivery_scope_identity_mode"] = (
+                    "historical_semantic_compatibility"
+                )
+            except GeneratorDeliveryScopeError as compatibility_error:
+                invalid_scope_diagnostic = True
+                explicit_scope = False
+                scope_contract = None
+                evidence["delivery_scope_mode"] = (
+                    "explicit_invalid_diagnostic"
+                )
+                evidence["mutation_authorized"] = False
+                evidence["metadata_diagnostics"].append({
+                    "code": "generator_delivery_scope_invalid",
+                    "exact_validation_error": str(exact_error),
+                    "historical_validation_error": str(
+                        compatibility_error
+                    ),
+                    "asset_failure": False,
+                })
+        evidence["delivery_scope_mode"] = "explicit_sealed_v1"
+        if scope_contract is None:
+            evidence["delivery_scope_mode"] = "explicit_invalid_diagnostic"
+        else:
+            evidence["delivery_scope_intent_sha256"] = scope_contract[
+                "intent_sha256"
+            ]
+    if scope_contract is not None:
+        evidence["delivery_scope_required_live_slot_count"] = len(
+            scope_contract["required_live_slot_identities"]
+        )
+        evidence["delivery_scope_continuity_only_slot_count"] = len(
+            scope_contract["continuity_only_slot_identities"]
+        )
+        exact_required_slot_identities = scope_contract[
+            "required_live_slot_identities"
+        ]
+        recovery_target_scope = {
+            "contract": "speedtree_stale_node_recovery_target_scope",
+            "schema_version": 1,
+            "policy": "explicit_sealed_scopes_v1",
+            "delivery_scope_intent_sha256": scope_contract["intent_sha256"],
+            "authoring_mesh_ids": sorted({
+                row["target_mesh_id"]
+                for row in scope_contract["authored_slots"]
+            }),
+            "required_live_mesh_ids": sorted({
+                row["target_mesh_id"]
+                for row in scope_contract["authored_slots"]
+                if tuple(row["slot_identity"])
+                in exact_required_slot_identities
+            }),
+        }
+        recovery_target_scope["scope_sha256"] = canonical_sha256(
+            recovery_target_scope
+        )
+        evidence["recovery_target_scope"] = recovery_target_scope
 
     def export_participates(row):
         return bool(
@@ -2444,12 +2874,50 @@ def _normalized_generator_delivery(
     evidence[
         "live_export_participating_target_mesh_ids"
     ] = live_mesh_ids
-    if normalized_mesh_ids != declared_mesh_ids:
+    if invalid_scope_diagnostic:
+        # The contradictory metadata cannot define legacy authority.  Rebuild
+        # the inspection rows from this SHA-bound live document and use them
+        # only for content admission.  No recovery/mutation scope is emitted.
+        live_fallback_bindings = []
+        for row in live_bindings:
+            material_id = _positive_asset_id(row.get("material_id"))
+            mesh_id = _positive_asset_id(row.get("mesh_id"))
+            incomplete_visible_pair = bool(
+                export_participates(row)
+                and (material_id is None or mesh_id is None)
+            )
+            if not (
+                material_id == expected_material_id
+                or mesh_id in set(normalized_mesh_ids)
+                or incomplete_visible_pair
+            ):
+                continue
+            projected = dict(row)
+            projected["target_material_id"] = material_id
+            projected["target_mesh_id"] = mesh_id
+            live_fallback_bindings.append(projected)
+        bindings = live_fallback_bindings
+        declared_mesh_ids = sorted({
+            _positive_asset_id(row.get("target_mesh_id"))
+            for row in bindings
+            if _positive_asset_id(row.get("target_mesh_id")) is not None
+        })
+        evidence["generator_bindings"] = [dict(row) for row in bindings]
+        evidence["declared_target_mesh_ids"] = declared_mesh_ids
+        evidence["declared_binding_count"] = len(bindings)
+        evidence["delivery_scope_required_live_slot_count"] = len(bindings)
+    if (
+        not invalid_scope_diagnostic
+        and normalized_mesh_ids != declared_mesh_ids
+    ):
         evidence["errors"].append(
             "normalized_and_declared_target_mesh_sets_differ"
         )
+    asset_required_mesh_ids = (
+        declared_mesh_ids if invalid_scope_diagnostic else normalized_mesh_ids
+    )
     missing_assets = sorted(
-        set(normalized_mesh_ids).difference(live_asset_mesh_ids)
+        set(asset_required_mesh_ids).difference(live_asset_mesh_ids)
     )
     if missing_assets:
         evidence["errors"].append("target_mesh_asset_missing")
@@ -2500,7 +2968,8 @@ def _normalized_generator_delivery(
         current_material_id = _positive_asset_id(current.get("material_id"))
         current_mesh_id = _positive_asset_id(current.get("mesh_id"))
         if (
-            _inactive_causal_path_evidence(current)
+            not explicit_scope
+            and _inactive_causal_path_evidence(current)
             and target_material_id == expected_material_id
             and current_material_id == target_material_id
             and target_mesh_id in set(normalized_mesh_ids)
@@ -2509,19 +2978,55 @@ def _normalized_generator_delivery(
         ):
             planned_inactive_slots.add(declared_slot)
 
-    required_bindings = [
-        row for row in bindings
-        if tuple(slot_identity(row)) not in planned_inactive_slots
-    ]
+    if explicit_scope:
+        required_slot_identities = {
+            tuple(_delivery_binding_slot_identity(row))
+            for row in scope_contract["required_live_slot_identities"]
+        }
+        continuity_only_slot_identities = {
+            tuple(_delivery_binding_slot_identity(row))
+            for row in scope_contract["continuity_only_slot_identities"]
+        }
+        required_bindings = [
+            row for row in bindings
+            if tuple(slot_identity(row)) in required_slot_identities
+        ]
+    else:
+        required_slot_identities = {
+            tuple(slot_identity(row))
+            for row in bindings
+            if tuple(slot_identity(row)) not in planned_inactive_slots
+        }
+        continuity_only_slot_identities = set()
+        required_bindings = [
+            row for row in bindings
+            if tuple(slot_identity(row)) in required_slot_identities
+        ]
+    admission_required_bindings = []
+    admission_excluded_bindings = []
+    for declared in required_bindings:
+        current_rows = live_by_slot.get(tuple(slot_identity(declared))) or []
+        if (
+            len(current_rows) == 1
+            and current_rows[0].get("export_admission_relevant") is False
+        ):
+            admission_excluded_bindings.append(declared)
+        else:
+            # Missing, ambiguous, and pre-admission-schema rows remain strict.
+            admission_required_bindings.append(declared)
     current_required_mesh_ids = sorted({
         _positive_asset_id(row.get("target_mesh_id"))
-        for row in required_bindings
+        for row in admission_required_bindings
         if _positive_asset_id(row.get("target_mesh_id")) is not None
     })
     evidence["active_required_binding_count"] = len(required_bindings)
-    evidence["planned_inactive_binding_count"] = (
-        len(bindings) - len(required_bindings)
+    evidence["current_admission_relevant_binding_count"] = len(
+        admission_required_bindings
     )
+    evidence["current_admission_excluded_binding_count"] = len(
+        admission_excluded_bindings
+    )
+    evidence["planned_inactive_binding_count"] = len(planned_inactive_slots)
     evidence["current_required_target_mesh_ids"] = (
         current_required_mesh_ids
     )
@@ -2548,6 +3053,8 @@ def _normalized_generator_delivery(
         if tuple(slot_identity(row)) in planned_inactive_slots
     ]
 
+    # Strict authored topology still validates every declared slot. Current
+    # export admission narrows only the mesh-set comparison above.
     for declared in bindings:
         errors = []
         outcome_reason = None
@@ -2556,6 +3063,7 @@ def _normalized_generator_delivery(
         )
         target_mesh_id = _positive_asset_id(declared.get("target_mesh_id"))
         declared_slot = tuple(slot_identity(declared))
+        continuity_only = declared_slot in continuity_only_slot_identities
         current_rows = live_by_slot.get(declared_slot) or []
         current = current_rows[0] if len(current_rows) == 1 else None
         if target_material_id != expected_material_id:
@@ -2580,12 +3088,26 @@ def _normalized_generator_delivery(
                 errors.append("visible_generator_material_mismatch")
             if current_mesh_id != target_mesh_id:
                 errors.append("visible_generator_mesh_mismatch")
-            if not export_participates(current):
+            if continuity_only and export_participates(current):
+                errors.append(
+                    "continuity_only_generator_export_participating"
+                )
+            elif not export_participates(current):
                 # Fail closed either way, but never report a correct Generator
                 # connection as disconnected: a zero node count read out of a
                 # stale <Node> table is missing evidence, not proof.
-                if declared_slot in planned_inactive_slots:
-                    outcome_reason = INACTIVE_CAUSAL_PATH_REASON
+                if continuity_only:
+                    outcome_reason = "relationship_continuity_only"
+                elif declared_slot in planned_inactive_slots:
+                    outcome_reason = str(
+                        current.get("causal_path_reason")
+                        or INACTIVE_CAUSAL_PATH_REASON
+                    )
+                elif current.get("export_admission_relevant") is False:
+                    outcome_reason = str(
+                        current.get("export_admission_reason")
+                        or "current_export_trustworthy_zero_geometry"
+                    )
                 elif _stale_node_table_evidence(current):
                     errors.append(
                         "generator_export_evidence_stale_node_table"
@@ -2600,8 +3122,16 @@ def _normalized_generator_delivery(
             "errors": errors,
             "complete": not errors,
             "status": (
-                "planned_inactive"
-                if outcome_reason and not errors
+                "continuity_only"
+                if continuity_only and not errors
+                else "planned_inactive"
+                if declared_slot in planned_inactive_slots and not errors
+                else "not_currently_admitted"
+                if (
+                    current is not None
+                    and current.get("export_admission_relevant") is False
+                    and not errors
+                )
                 else "completed" if not errors else "failed"
             ),
             "reason": outcome_reason,
@@ -2632,7 +3162,7 @@ def _normalized_generator_delivery(
     _classify_stale_node_table_block(
         evidence,
         declared_live_bindings,
-        normalized_mesh_ids,
+        current_required_mesh_ids,
         live_mesh_ids,
     )
     all_bindings_planned_inactive = bool(
@@ -2647,12 +3177,46 @@ def _normalized_generator_delivery(
             for row in evidence["binding_outcomes"]
         )
     )
-    if all_bindings_planned_inactive:
+    all_required_bindings_not_currently_admitted = bool(
+        required_bindings
+        and not evidence["errors"]
+        and not admission_required_bindings
+        and len(admission_excluded_bindings) == len(required_bindings)
+        and evidence["current_admission_relevant_binding_count"] == 0
+        and evidence["current_admission_excluded_binding_count"]
+        == len(required_bindings)
+    )
+    if invalid_scope_diagnostic and not bindings and not evidence["errors"]:
+        evidence["delivery_mode"] = DELIVERY_MODE_ASSET_REGISTRATION_ONLY
+        evidence["delivery_decision"] = "pass_through"
+        evidence["delivery_reason"] = (
+            "invalid_scope_metadata_live_content_unbound"
+        )
+    elif all_bindings_planned_inactive:
         evidence["delivery_mode"] = DELIVERY_MODE_ASSET_REGISTRATION_ONLY
         evidence["delivery_decision"] = "pass_through"
         evidence["delivery_reason"] = (
             "generator_connection_all_bindings_planned_inactive"
         )
+    elif all_required_bindings_not_currently_admitted:
+        evidence["delivery_mode"] = DELIVERY_MODE_ASSET_REGISTRATION_ONLY
+        evidence["delivery_decision"] = "pass_through"
+        evidence["delivery_reason"] = (
+            "current_export_trustworthy_zero_geometry"
+        )
+    elif (
+        explicit_scope
+        and bindings
+        and not required_bindings
+        and not evidence["errors"]
+        and all(
+            row.get("status") == "continuity_only"
+            for row in evidence["binding_outcomes"]
+        )
+    ):
+        evidence["delivery_mode"] = DELIVERY_MODE_ASSET_REGISTRATION_ONLY
+        evidence["delivery_decision"] = "pass_through"
+        evidence["delivery_reason"] = "relationship_continuity_only"
     elif bindings and not evidence["errors"]:
         evidence["delivery_mode"] = DELIVERY_MODE_RENDER_CONNECTED
         evidence["delivery_decision"] = "normalize_part"
@@ -2742,6 +3306,7 @@ def _atlas_normalized_variants(
     target_spms,
     audit=None,
     physical_receipt_cache=None,
+    atlas_resolution_reader=None,
 ):
     """Read one current role contract from stable Atlas target/scope receipts."""
     allowed_spms = {
@@ -2749,19 +3314,98 @@ def _atlas_normalized_variants(
     }
     if not allowed_spms:
         return None
+    resolution_reader = atlas_resolution_reader or resolve_atlas_manifests
+    atlas_resolutions = []
+    for target in target_spms or []:
+        try:
+            atlas_resolutions.append(resolution_reader(target))
+        except AtlasManifestResolutionError as exc:
+            raise ClusterAssemblyReceiptError(str(exc)) from exc
     candidates = []
     stale = []
-    for manifest_path in _atlas_manifest_candidates(folder, target_spms):
+    selected_records = []
+    seen_selected_paths = set()
+    for resolution in atlas_resolutions:
+        for row in resolution["selected"]:
+            path = Path(row["path"])
+            key = _normalized_identity_path(path)
+            if key not in seen_selected_paths:
+                seen_selected_paths.add(key)
+                selected_records.append((
+                    row,
+                    Path(resolution["target_spm"]).resolve(strict=False),
+                ))
+    delivery_records = list(selected_records)
+
+    # Normalized prototypes belong to the Cluster provider, not to one tree
+    # target.  A later, successful provider refresh rewrites the shared plan
+    # FBXs and publishes a current receipt for the target being processed at
+    # that moment.  Older per-target scope receipts then retain valid delivery
+    # evidence but (correctly) fail the shared source-FBX hash check.  Requiring
+    # every registered tree to be re-extracted merely to copy that provider
+    # receipt made code/data refreshes fan out across the whole folder.
+    #
+    # Discover current normalization receipts from every explicitly registered
+    # target of the same provider.  Delivery is still evaluated only against
+    # the requested target records below, so this cannot manufacture an ON
+    # relationship for an unrelated tree.
+    normalization_records = list(selected_records)
+    known_spms = dict(allowed_spms)
+    seen_resolution_targets = {
+        _normalized_identity_path(row.get("target_spm"))
+        for row in atlas_resolutions
+    }
+    for selected_record, _manifest_spm in delivery_records:
+        payload = selected_record["payload"]
+        groups = [
+            row for row in payload.get("material_groups") or []
+            if normalize_export_name(row.get("material"))
+            == normalize_export_name(role_identity)
+        ]
+        if not groups:
+            continue
+        blend_file = payload.get("blend_file")
+        if not blend_file:
+            continue
         try:
-            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise ClusterAssemblyReceiptError(
-                f"Atlas normalized variant manifest is unreadable: {manifest_path}: {exc}"
-            ) from exc
-        manifest_spm = Path(
-            str(payload.get("spm") or "")
-        ).resolve(strict=False)
-        if manifest_spm not in allowed_spms:
+            registry = _physical_target_registry_contract(blend_file)
+        except ClusterAssemblyReceiptError:
+            # Legacy/non-physical receipts are handled by the original target
+            # path.  If they require a registry, normal validation below emits
+            # the authoritative error.
+            continue
+        for peer_spm in registry.get("target_spms") or []:
+            peer_path = Path(peer_spm).resolve(strict=False)
+            peer_key = _normalized_identity_path(peer_path)
+            known_spms[peer_path] = Path(peer_spm)
+            if peer_key in seen_resolution_targets:
+                continue
+            seen_resolution_targets.add(peer_key)
+            try:
+                peer_resolution = resolution_reader(peer_spm)
+            except AtlasManifestResolutionError:
+                continue
+            atlas_resolutions.append(peer_resolution)
+            for row in peer_resolution["selected"]:
+                path = Path(row["path"])
+                key = _normalized_identity_path(path)
+                if key in seen_selected_paths:
+                    continue
+                peer_groups = [
+                    group
+                    for group in (row["payload"].get("material_groups") or [])
+                    if normalize_export_name(group.get("material"))
+                    == normalize_export_name(role_identity)
+                ]
+                if not peer_groups:
+                    continue
+                seen_selected_paths.add(key)
+                normalization_records.append((row, peer_path))
+
+    for selected_record, manifest_spm in normalization_records:
+        manifest_path = Path(selected_record["path"])
+        payload = selected_record["payload"]
+        if manifest_spm not in known_spms:
             continue
         groups = [
             row for row in payload.get("material_groups") or []
@@ -2792,7 +3436,7 @@ def _atlas_normalized_variants(
             current_matches = [
                 row
                 for row in audit.extract_material_image_refs(
-                    allowed_spms[manifest_spm]
+                    known_spms[manifest_spm]
                 )
                 if normalize_export_name(row.get("material_name"))
                  == normalize_export_name(role_identity)
@@ -2810,13 +3454,12 @@ def _atlas_normalized_variants(
                 payload,
                 group,
                 physical_receipt_cache=physical_receipt_cache,
-            )
-            delivery = _normalized_generator_delivery(
-                audit,
-                allowed_spms[manifest_spm],
-                payload,
-                group,
-                contract["variants"],
+                spm_semantic_reader=getattr(
+                    audit,
+                    "report_spm_structural_semantic_fingerprint",
+                    None,
+                ),
+                allow_source_fbx_drift=True,
             )
         except ClusterAssemblyReceiptStaleError:
             # A normalized receipt is a cache of a previously validated
@@ -2890,8 +3533,6 @@ def _atlas_normalized_variants(
                 str(manifest_path),
                 identity,
                 contract,
-                _normalized_identity_path(manifest_spm),
-                delivery,
             )
         )
     distinct = {}
@@ -2899,19 +3540,13 @@ def _atlas_normalized_variants(
         _manifest,
         identity,
         contract,
-        target_key,
-        delivery,
     ) in sorted(candidates):
         selected = distinct.setdefault(
             identity,
             {
                 "contract": contract,
-                "delivered_target_keys": set(),
-                "target_deliveries": {},
             },
         )
-        selected["delivered_target_keys"].add(target_key)
-        selected["target_deliveries"][target_key] = delivery
     if len(distinct) > 1:
         raise ClusterAssemblyReceiptError(
             "Atlas normalized role has multiple current receipts: "
@@ -2920,11 +3555,34 @@ def _atlas_normalized_variants(
     if distinct:
         selected = next(iter(distinct.values()))
         contract = selected["contract"]
+        target_deliveries_by_key = {}
+        for selected_record, manifest_spm in delivery_records:
+            payload = selected_record["payload"]
+            groups = [
+                row for row in payload.get("material_groups") or []
+                if normalize_export_name(row.get("material"))
+                == normalize_export_name(role_identity)
+            ]
+            if len(groups) != 1 or manifest_spm not in allowed_spms:
+                continue
+            target_key = _normalized_identity_path(manifest_spm)
+            target_deliveries_by_key[target_key] = (
+                _normalized_generator_delivery(
+                    audit,
+                    allowed_spms[manifest_spm],
+                    payload,
+                    groups[0],
+                    contract["variants"],
+                )
+            )
         target_deliveries = [
-            selected["target_deliveries"][key]
-            for key in sorted(selected["target_deliveries"])
+            target_deliveries_by_key[key]
+            for key in sorted(target_deliveries_by_key)
         ]
         contract["target_deliveries"] = target_deliveries
+        contract["atlas_manifest_resolutions"] = [
+            resolution_evidence(row) for row in atlas_resolutions
+        ]
         contract["delivery_mode"] = _aggregate_target_deliveries(
             target_deliveries
         )
@@ -2969,7 +3627,7 @@ def _atlas_normalized_variants(
             required_keys = set(registered).intersection(allowed_keys)
             missing = sorted(
                 required_keys.difference(
-                    selected["delivered_target_keys"]
+                    target_deliveries_by_key
                 )
             )
             if missing:
@@ -3690,7 +4348,7 @@ def _validate_normalized_source_dependency(normalized_variants, output_spm):
 
 def build_cluster_assembly_contract(
         folder, target_spms, clusters, cluster_usage=None,
-        assembly_source_spms=None):
+        assembly_source_spms=None, atlas_resolution_reader=None):
     """Build hierarchy and downstream handoff from actual SPM dependencies."""
     try:
         from . import pcg_texture_audit as audit
@@ -3726,6 +4384,60 @@ def build_cluster_assembly_contract(
     if usage is None:
         usage = audit.cluster_material_usage(
             assembly_source_spms, clusters)
+    else:
+        usage = copy.deepcopy(usage)
+
+    # Managed Atlas outputs intentionally do not trace their textures back to
+    # Cluster producers, otherwise ordinary texture audits would recursively
+    # reopen completed providers. Assembly dependency discovery is different:
+    # an exact current material identity plus an explicit provider/target
+    # relation is positive placement evidence. Recover that evidence here and
+    # let the later current-FBX material+mesh gate prove actual geometry.
+    visible_material_reader = getattr(audit, "visible_material_names", None)
+    if callable(visible_material_reader):
+        visible_by_spm = {
+            str(spm): list(visible_material_reader(spm) or [])
+            for spm in assembly_source_spms
+        }
+        for pair_row in cluster_pairs:
+            if _usage_for_cluster(usage, pair_row) is not None:
+                continue
+            identities = {
+                normalize_export_name(path.stem)
+                for path in (
+                    pair_row["source_spm"],
+                    pair_row["authoring_spm"],
+                    pair_row["output_spm"],
+                )
+                if path
+            }
+            material_names_by_spm = {}
+            for spm_text, material_names in visible_by_spm.items():
+                matched = [
+                    name for name in material_names
+                    if normalize_export_name(name) in identities
+                ]
+                if matched:
+                    material_names_by_spm[spm_text] = matched
+            if not material_names_by_spm:
+                continue
+            names = list(dict.fromkeys(
+                name
+                for matched in material_names_by_spm.values()
+                for name in matched
+            ))
+            usage[str(pair_row["output_spm"]).casefold()] = {
+                "spms": list(material_names_by_spm),
+                "material_names": names,
+                "material_names_by_spm": material_names_by_spm,
+                "source_refs": [],
+                "connected_refs": [],
+                "missing_source_refs": [],
+                "source_albedo": [],
+                "source_alpha": [],
+                "material_ids_by_spm": {},
+                "evidence": "current_exact_material_identity",
+            }
 
     for pair_row in cluster_pairs:
         dependency_usage = _usage_for_cluster(usage, pair_row)
@@ -3789,7 +4501,15 @@ def build_cluster_assembly_contract(
     # Target/scope receipts for one Atlas relationship repeat the same large
     # physical-normalization payload with target-local material IDs. Validate
     # that shared payload once per live contract build.
-    physical_receipt_cache = {}
+    physical_receipt_cache_reader = getattr(
+        audit,
+        "report_physical_receipt_cache",
+        None,
+    )
+    physical_receipt_cache = (
+        physical_receipt_cache_reader()
+        if callable(physical_receipt_cache_reader) else {}
+    )
     for pair_row in relevant_clusters:
         cluster = pair_row["source_spm"]
         authoring_spm = pair_row["authoring_spm"]
@@ -3797,23 +4517,64 @@ def build_cluster_assembly_contract(
         role = pair_row["content_role"]
         dependency_usage = _usage_for_cluster(usage, pair_row)
         primary_provider = primary_provider_by_role[role]
-        expected_identity = primary_provider["output_spm"].stem
+        expected_identity = output_spm.stem
         primary_role_source = (
             _normalized_identity_path(output_spm)
             == _normalized_identity_path(primary_provider["output_spm"])
         )
-        # One normalized plan set belongs to the exact canonical provider for a
-        # role.  Same-role siblings are provenance/reference-only inputs and
-        # must never be validated against the canonical provider's receipt.
         normalized_variants = None
         normalized_variants_stale = None
-        if primary_role_source:
+        usage_roles = set(pair_row.get("usage_roles") or [])
+        role_conflict = len(usage_roles) > 1
+        material_names_by_spm = dependency_usage.get(
+            "material_names_by_spm") or {}
+        targets = []
+        for spm in assembly_source_spms:
+            material_names = list(
+                material_names_by_spm.get(str(spm), [])
+                or material_names_by_spm.get(str(spm).casefold(), [])
+            )
+            if not material_names:
+                material_names = list(dependency_usage.get("material_names") or [])
+            role_identity = expected_identity
+            fbx_gate = classify_fbx_role(
+                export_bundles[str(spm).casefold()]["fbx_contract"],
+                role_identity,
+                material_names,
+            )
+            targets.append({
+                "spm": str(spm),
+                "material_names": material_names,
+                "spm_material_mesh_pair": _spm_material_mesh_pair(
+                    audit, spm, material_names or [role_identity]),
+                "export_bundle": export_bundles[str(spm).casefold()]["paths"],
+                "fbx_material_mesh_pair": fbx_gate,
+            })
+        decisions = {
+            target["fbx_material_mesh_pair"]["decision"] for target in targets
+        }
+        current_live_pair_covered = bool(
+            _current_live_pair_covered(targets)
+        )
+        current_spm_pair_covered = any(
+            (target.get("spm_material_mesh_pair") or {}).get("status")
+            == "complete_pair"
+            for target in targets
+        )
+        if (
+            current_live_pair_covered
+            or current_spm_pair_covered
+            or primary_role_source
+        ):
+            # Each live same-role provider owns a distinct normalization
+            # receipt. Never bind a sibling to the primary provider's plans.
             normalized_variants = _atlas_normalized_variants(
                 folder,
                 expected_identity,
                 full_target_spms,
                 audit=audit,
                 physical_receipt_cache=physical_receipt_cache,
+                atlas_resolution_reader=atlas_resolution_reader,
             )
             try:
                 _validate_normalized_source_dependency(
@@ -3834,52 +4595,7 @@ def build_cluster_assembly_contract(
                         f"{output_spm.name}"
                     ),
                 }
-        usage_roles = set(pair_row.get("usage_roles") or [])
-        role_conflict = len(usage_roles) > 1
-        material_names_by_spm = dependency_usage.get(
-            "material_names_by_spm") or {}
-        targets = []
-        for spm in assembly_source_spms:
-            material_names = list(
-                material_names_by_spm.get(str(spm), [])
-                or material_names_by_spm.get(str(spm).casefold(), [])
-            )
-            if not material_names:
-                material_names = list(dependency_usage.get("material_names") or [])
-            role_identity = expected_identity
-            if primary_role_source:
-                fbx_gate = classify_fbx_role(
-                    export_bundles[str(spm).casefold()]["fbx_contract"],
-                    role_identity,
-                    material_names,
-                )
-            else:
-                fbx_gate = {
-                    "status": "reference_only",
-                    "decision": "reference_only",
-                    "role_identity": role_identity,
-                    "role_identity_aliases": material_names,
-                    "material_matches": [],
-                    "mesh_name_matches": [],
-                    "complete_pairs": [],
-                    "complete_pair_count": 0,
-                    "complete_pair_evidence_truncated": False,
-                    "error": None,
-                }
-            targets.append({
-                "spm": str(spm),
-                "material_names": material_names,
-                "spm_material_mesh_pair": _spm_material_mesh_pair(
-                    audit, spm, material_names or [role_identity]),
-                "export_bundle": export_bundles[str(spm).casefold()]["paths"],
-                "fbx_material_mesh_pair": fbx_gate,
-            })
-        decisions = {
-            target["fbx_material_mesh_pair"]["decision"] for target in targets
-        }
-        if role_conflict:
-            decision = "blocked"
-        elif not primary_role_source:
+        if not primary_role_source and not current_live_pair_covered:
             decision = "reference_only"
         elif "blocked" in decisions:
             decision = "blocked"
@@ -3890,7 +4606,22 @@ def build_cluster_assembly_contract(
         elif decisions == {"pass_through"}:
             decision = "pass_through"
         else:
-            decision = "blocked"
+            decision = "pass_through"
+        rendered_provider_expansion_covered = bool(
+            normalized_variants
+            and current_spm_pair_covered
+            and pair_row["target_relation"].get("allowed")
+            and not current_live_pair_covered
+            and decisions == {"pass_through"}
+        )
+        if rendered_provider_expansion_covered:
+            # SpeedTree may render a registered Cluster through the resulting
+            # leaf/branch material instead of preserving the provider material
+            # name in FBX.  The current SPM material+mesh pair proves the
+            # provider is present; the Assembly builder's exact normalized
+            # topology correspondence proves which rendered components belong
+            # to it before any base polygons are removed.
+            decision = "normalize_part"
         normalized_variants_required = decision == "normalize_part"
         normalized_variants_missing = bool(
             normalized_variants_required and not normalized_variants
@@ -3899,7 +4630,19 @@ def build_cluster_assembly_contract(
             (normalized_variants or {}).get("delivery_mode") or ""
         )
         normalized_delivery_blocked = False
-        if (
+        if current_live_pair_covered:
+            # A rendered material+mesh pair is positive evidence that this
+            # role participates in the target. It therefore requires an
+            # Assembly part; treating it as pass-through silently drops the
+            # role from headless Push.
+            decision = "normalize_part"
+            normalized_variants_required = True
+            normalized_variants_missing = not bool(normalized_variants)
+        elif rendered_provider_expansion_covered:
+            decision = "normalize_part"
+            normalized_variants_required = True
+            normalized_variants_missing = False
+        elif (
             normalized_variants
             and normalized_delivery_mode
             == DELIVERY_MODE_ASSET_REGISTRATION_ONLY
@@ -3912,17 +4655,15 @@ def build_cluster_assembly_contract(
             and normalized_delivery_mode
             == DELIVERY_MODE_CONNECTION_INCOMPLETE
         ):
-            decision = "blocked"
             normalized_delivery_blocked = True
         elif (
             normalized_variants
             and normalized_delivery_mode
             not in {DELIVERY_MODE_RENDER_CONNECTED}
         ):
-            decision = "blocked"
             normalized_delivery_blocked = True
-        elif normalized_variants_missing:
-            decision = "blocked"
+        if rendered_provider_expansion_covered:
+            normalized_delivery_blocked = False
         capture_texture_refs = _normalized_capture_texture_refs(
             normalized_variants
         )
@@ -4045,6 +4786,11 @@ def build_cluster_assembly_contract(
             "normalized_variants_stale": normalized_variants_stale,
             "normalized_variants_required": normalized_variants_required,
             "normalized_variants_missing": normalized_variants_missing,
+            "current_live_pair_covered": current_live_pair_covered,
+            "current_spm_pair_covered": current_spm_pair_covered,
+            "rendered_provider_expansion_covered": (
+                rendered_provider_expansion_covered
+            ),
             "normalized_delivery_mode": normalized_delivery_mode or None,
             "normalized_delivery_blocked": normalized_delivery_blocked,
             "target_relation": copy.deepcopy(pair_row["target_relation"]),
@@ -4109,7 +4855,10 @@ def build_cluster_assembly_contract(
                 f"M_bark_{_asset_species(folder)}_01"
             ),
             "canonical_sources": [],
+            "canonical_conflicts": [],
+            "live_variants": [],
             "cluster_bark_sources": [],
+            "mutation_requested": False,
             "mutation_applied": False,
         }
     decisions = {
@@ -4120,11 +4869,19 @@ def build_cluster_assembly_contract(
         row.get("pair_status") != "canonical_pair"
         for row in actual_dependencies
     )
-    if (
-        canonical_pair_missing
-        or "blocked" in decisions
-        or bark["status"].startswith("blocked")
-    ):
+    concrete_fbx_partial = any(
+        (target.get("fbx_material_mesh_pair") or {}).get("decision")
+        == "blocked"
+        for dependency in actual_dependencies
+        for target in dependency.get("targets") or []
+    )
+    concrete_texture_missing = any(
+        _concrete_texture_reference_missing(
+            dependency.get("tga_basename_validation")
+        )
+        for dependency in actual_dependencies
+    )
+    if concrete_fbx_partial or concrete_texture_missing:
         handoff_status = "blocked"
     elif "pending_export" in decisions:
         handoff_status = "pending_export"
@@ -4136,40 +4893,17 @@ def build_cluster_assembly_contract(
         handoff_status = "pass_through"
     issues = []
     for dependency in actual_dependencies:
-        if dependency.get("pair_status") != "canonical_pair":
-            issues.append({
-                "code": "CLUSTER_CANONICAL_SPM_MISSING",
-                "role": dependency["role"],
-                "spm": dependency["authoring_spm"],
-                "output_spm": dependency["output_spm"],
-            })
-        if dependency.get("role_conflict"):
-            issues.append({
-                "code": "CLUSTER_ROLE_CONFLICT",
-                "role": dependency["role"],
-                "spm": str(dependency["spm"]),
-                "usage_roles": dependency.get("usage_roles") or [],
-            })
         if dependency.get("normalized_variants_missing"):
             issues.append({
                 "code": "NORMALIZED_VARIANTS_REQUIRED",
                 "role": dependency["role"],
                 "spm": str(dependency["spm"]),
-                "reason": "actionable_role_has_no_current_atlas_normalized_variants",
+                "reason": "current_live_pair_requires_assembly_part",
             })
-        if dependency.get("normalized_variants_stale"):
-            issues.append({
-                "code": "NORMALIZED_VARIANTS_STALE",
-                "role": dependency["role"],
-                "spm": str(dependency["spm"]),
-                **dependency["normalized_variants_stale"],
-            })
-        if dependency.get("normalized_delivery_blocked"):
-            issues.append(_normalized_delivery_blocked_issue(dependency))
         tga_validation = dependency.get("tga_basename_validation") or {}
-        if tga_validation.get("status") not in {"ok", "not_applicable"}:
+        if _concrete_texture_reference_missing(tga_validation):
             issues.append({
-                "code": "CLUSTER_TGA_BASENAME_INVALID",
+                "code": "CLUSTER_TEXTURE_REFERENCE_MISSING",
                 "role": dependency["role"],
                 "spm": str(dependency["spm"]),
                 "details": tga_validation,
@@ -4192,7 +4926,11 @@ def build_cluster_assembly_contract(
 
     role_receipts = []
     for row in actual_dependencies:
-        if not row.get("primary_role_source"):
+        if not (
+            row.get("primary_role_source")
+            or row.get("current_live_pair_covered")
+            or row.get("rendered_provider_expansion_covered")
+        ):
             continue
         child = next(
             (value for value in children if value["role"] == row["role"]),
@@ -4213,6 +4951,12 @@ def build_cluster_assembly_contract(
                 "reference_dependencies": list(child.get("references") or []),
             },
             "normalized_variants": row.get("normalized_variants"),
+            "current_spm_pair_covered": row.get(
+                "current_spm_pair_covered", False
+            ),
+            "rendered_provider_expansion_covered": row.get(
+                "rendered_provider_expansion_covered", False
+            ),
             "targets": row["targets"],
         })
     dependency_receipts = [
@@ -4252,9 +4996,23 @@ def build_cluster_assembly_contract(
             "normalized_delivery_blocked": row.get(
                 "normalized_delivery_blocked", False
             ),
+            "current_spm_pair_covered": row.get(
+                "current_spm_pair_covered", False
+            ),
+            "rendered_provider_expansion_covered": row.get(
+                "rendered_provider_expansion_covered", False
+            ),
             "target_relation": row.get("target_relation"),
         }
         for row in actual_dependencies
+    ]
+    blocking_errors = [
+        issue for issue in issues
+        if issue.get("code") == "FBX_ROLE_MATERIAL_MESH_PARTIAL"
+        or (
+            issue.get("code") == "CLUSTER_TEXTURE_REFERENCE_MISSING"
+            and _concrete_texture_reference_missing(issue.get("details"))
+        )
     ]
     handoff = {
         "receipt_kind": "pcg_cluster_assembly_handoff",
@@ -4278,7 +5036,7 @@ def build_cluster_assembly_contract(
             "excluded_cluster_sources": excluded_unregistered_clusters,
         },
         "issues": issues,
-        "errors": issues,
+        "errors": blocking_errors,
     }
 
     return {
@@ -4312,6 +5070,16 @@ def _tree_identity_paths(contract):
             if path:
                 paths.append(_normalized_identity_path(path))
     return sorted(set(paths))
+
+
+def _tree_target_identity_paths(contract):
+    """Return only production target identities, excluding source aliases."""
+    return sorted({
+        _normalized_identity_path(path)
+        for row in contract.get("tree_source_identities") or []
+        for path in [(row.get("target_spm") or {}).get("path")]
+        if path
+    })
 
 
 def source_path_identity(contract):
@@ -4590,7 +5358,10 @@ def _upgrade_legacy_texture_alias_receipt(contract):
                 for issue in issues
                 if not (
                     isinstance(issue, dict)
-                    and issue.get("code") == "CLUSTER_TGA_BASENAME_INVALID"
+                    and issue.get("code") in {
+                        "CLUSTER_TEXTURE_REFERENCE_MISSING",
+                        "CLUSTER_TGA_BASENAME_INVALID",
+                    }
                     and (
                         str(issue.get("role") or "").casefold(),
                         _normalized_identity_path(issue.get("spm") or ""),
@@ -4691,7 +5462,10 @@ def validate_cluster_assembly_receipt(payload, requested_spm=None):
             if production.get("workflow_mode") == "PHYSICAL_DIRECT_CAPTURE":
                 try:
                     nested_artifacts = _physical_source_3d_artifacts(
-                        production
+                        production,
+                        allow_source_fbx_drift=bool(
+                            variants.get("source_fbx_drift_validation")
+                        ),
                     )
                 except ClusterAssemblyReceiptStaleError:
                     raise
@@ -4858,9 +5632,11 @@ def cluster_assembly_receipt_resolution(spm_path, receipt_dir=None):
     """Resolve one semantically unambiguous hash-current receipt.
 
     Persisted receipts are cache evidence, so filesystem time and discovery
-    order cannot make one current contract authoritative over another.  Exact
-    full-contract duplicates may share one deterministic I/O representative;
-    divergent current contracts require a new live audit.
+    order cannot make one current contract authoritative over another. The
+    narrowest target scope is authoritative for one requested SPM because
+    wider live audits contain dependency unions for unrelated targets. Exact
+    full-contract duplicates at that scope may share one deterministic I/O
+    representative; divergent equally narrow contracts fail closed.
     """
     requested = _normalized_identity_path(spm_path)
     directory = Path(receipt_dir) if receipt_dir else DEFAULT_RECEIPT_DIR
@@ -4891,6 +5667,7 @@ def cluster_assembly_receipt_resolution(spm_path, receipt_dir=None):
         current.append({
             "path": path,
             "contract_sha256": _cluster_assembly_contract_digest(contract),
+            "target_scope_count": len(_tree_target_identity_paths(contract)),
         })
 
     if not current:
@@ -4912,36 +5689,53 @@ def cluster_assembly_receipt_resolution(spm_path, receipt_dir=None):
         {
             "path": str(row["path"]),
             "contract_sha256": row["contract_sha256"],
+            "target_scope_count": row["target_scope_count"],
         }
         for row in current
     ]
-    digests = {row["contract_sha256"] for row in current}
+    minimum_scope = min(row["target_scope_count"] for row in current)
+    scoped = [
+        row for row in current
+        if row["target_scope_count"] == minimum_scope
+    ]
+    scoped_rows = [
+        row for row in current_rows
+        if row["target_scope_count"] == minimum_scope
+    ]
+    superseded_rows = [
+        row for row in current_rows
+        if row["target_scope_count"] > minimum_scope
+    ]
+    digests = {row["contract_sha256"] for row in scoped}
     if len(digests) != 1:
         details = "; ".join(
             f"{Path(row['path']).name}={row['contract_sha256'][:16]}"
-            for row in current_rows
+            for row in scoped_rows
         )
         raise ClusterAssemblyReceiptAmbiguityError(
-            "hash-current Cluster Assembly receipts disagree for "
+            "equally narrow hash-current Cluster Assembly receipts disagree for "
             f"{spm_path}: {details}; run a live Cluster Assembly audit"
         )
 
-    selected = current[0]
+    selected = scoped[0]
     equivalent_paths = [
-        row["path"] for row in current_rows[1:]
+        row["path"] for row in scoped_rows[1:]
     ]
     return {
         "policy": (
-            "unique_hash_current_receipt"
-            if len(current) == 1
+            "narrowest_hash_current_receipt_scope"
+            if superseded_rows
+            else "unique_hash_current_receipt"
+            if len(scoped) == 1
             else "equivalent_hash_current_receipts"
         ),
         "requested_spm": str(spm_path),
         "selected_receipt": str(selected["path"]),
         "contract_sha256": selected["contract_sha256"],
+        "selected_target_scope_count": minimum_scope,
         "current_candidates": current_rows,
         "equivalent_current_receipts": equivalent_paths,
-        "superseded_current_receipts": [],
+        "superseded_current_receipts": superseded_rows,
         "ignored_stale_candidates": stale,
     }
 

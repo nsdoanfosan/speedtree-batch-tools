@@ -169,10 +169,8 @@ def _canonical_texture_destination(source, canonical_spm, isolated_tree_root,
     canonical_tree_root = Path(canonical_spm).resolve().parent
     try:
         relative = source.relative_to(canonical_tree_root)
-    except ValueError as exc:
-        raise BarkNormalizationError(
-            "canonical bark texture is outside the Tree folder; an explicit "
-            f"isolated texture mapping is required: {source}") from exc
+    except ValueError:
+        return None
     return (Path(isolated_tree_root).resolve() / relative).resolve()
 
 
@@ -180,9 +178,10 @@ def _rebased_canonical_maps(canonical_block, canonical_spm, isolated_spm,
                             isolated_tree_root, explicit_map):
     map_matches = list(MAP_BLOCK_RE.finditer(canonical_block))
     if not map_matches:
-        raise BarkNormalizationError("canonical bark material has no Map blocks")
+        return [], [], [{"reason": "canonical_material_has_no_maps"}]
     rewritten = []
     texture_evidence = []
+    omitted = []
     for map_match in map_matches:
         block = map_match.group(0)
         tex_match = TEX_FILENAME_RE.search(block)
@@ -195,21 +194,75 @@ def _rebased_canonical_maps(canonical_block, canonical_spm, isolated_spm,
             )
             source = _resolve_ref(canonical_spm, authored)
             if not source.is_file():
-                raise BarkNormalizationError(
-                    f"canonical bark texture is missing: {source}")
-            destination = _canonical_texture_destination(
-                source, canonical_spm, isolated_tree_root, explicit_map)
+                omitted.append({
+                    "map": map_match.group(1),
+                    "authored_ref": authored,
+                    "reason": "source_missing",
+                })
+                block = TEX_FILENAME_RE.sub(
+                    lambda match: match.group(1) + match.group(3),
+                    block,
+                    count=1,
+                )
+                rewritten.append(block)
+                continue
+            try:
+                destination = _canonical_texture_destination(
+                    source, canonical_spm, isolated_tree_root, explicit_map)
+            except (OSError, ValueError) as exc:
+                omitted.append({
+                    "map": map_match.group(1),
+                    "authored_ref": authored,
+                    "reason": "destination_unavailable",
+                    "detail": str(exc)[:320],
+                })
+                block = TEX_FILENAME_RE.sub(
+                    lambda match: match.group(1) + match.group(3),
+                    block,
+                    count=1,
+                )
+                rewritten.append(block)
+                continue
+            if destination is None:
+                omitted.append({
+                    "map": map_match.group(1),
+                    "authored_ref": authored,
+                    "reason": "destination_unavailable",
+                })
+                block = TEX_FILENAME_RE.sub(
+                    lambda match: match.group(1) + match.group(3),
+                    block,
+                    count=1,
+                )
+                rewritten.append(block)
+                continue
+            reason = ""
             if not _is_within(destination, isolated_tree_root):
-                raise BarkNormalizationError(
-                    f"isolated bark texture escapes the Tree copy: {destination}")
-            if not destination.is_file():
-                raise BarkNormalizationError(
-                    f"isolated canonical bark texture is missing: {destination}")
-            source_hash = _sha256_file(source)
-            destination_hash = _sha256_file(destination)
-            if source_hash != destination_hash:
-                raise BarkNormalizationError(
-                    f"isolated canonical bark texture hash mismatch: {destination}")
+                reason = "destination_outside_isolation"
+            elif not destination.is_file():
+                reason = "isolated_copy_missing"
+            else:
+                try:
+                    source_hash = _sha256_file(source)
+                    destination_hash = _sha256_file(destination)
+                except OSError:
+                    reason = "texture_unreadable"
+                else:
+                    if source_hash != destination_hash:
+                        reason = "content_mismatch"
+            if reason:
+                omitted.append({
+                    "map": map_match.group(1),
+                    "authored_ref": authored,
+                    "reason": reason,
+                })
+                block = TEX_FILENAME_RE.sub(
+                    lambda match: match.group(1) + match.group(3),
+                    block,
+                    count=1,
+                )
+                rewritten.append(block)
+                continue
             relative = os.path.relpath(destination, Path(isolated_spm).parent)
             relative = relative.replace("\\", "/")
             block = TEX_FILENAME_RE.sub(
@@ -226,13 +279,27 @@ def _rebased_canonical_maps(canonical_block, canonical_spm, isolated_spm,
                 "export_enabled": export_enabled,
             })
         rewritten.append(block)
-    return rewritten, texture_evidence
+    return rewritten, texture_evidence, omitted
 
 
 def _replace_material_maps(target_block, canonical_maps, canonical_name):
     target_maps = list(MAP_BLOCK_RE.finditer(target_block))
     if not target_maps:
-        raise BarkNormalizationError("Cluster bark material has no Map blocks")
+        return MATERIAL_RE.sub(
+            lambda match: match.group(1) + canonical_name + match.group(3),
+            target_block,
+            count=1,
+        )
+    if not canonical_maps:
+        patched = TEX_FILENAME_RE.sub(
+            lambda match: match.group(1) + match.group(3),
+            target_block,
+        )
+        return MATERIAL_RE.sub(
+            lambda match: match.group(1) + canonical_name + match.group(3),
+            patched,
+            count=1,
+        )
     separator = (
         target_block[target_maps[0].end():target_maps[1].start()]
         if len(target_maps) > 1 else "\n"
@@ -290,20 +357,11 @@ def _canonical_source(receipt):
         })
     if not candidates:
         raise BarkNormalizationError("handoff receipt has no canonical bark source")
-    # Multiple selected SK targets are acceptable only when their bark slot is
-    # materially identical.  Paths are compared by resolved texture content.
+    # Multiple selected SK targets are acceptable when their bark slot is
+    # structurally identical. Texture paths and bytes are runtime candidates,
+    # not authority over whether material normalization may proceed.
     signatures = []
     for candidate in candidates:
-        rows = extract_material_image_refs(candidate["spm"])
-        row = next(
-            (value for value in rows
-             if str(value.get("material_id")) == candidate["material_id"]),
-            None,
-        )
-        refs = []
-        for value in (row or {}).get("refs") or []:
-            path = _resolve_ref(candidate["spm"], value)
-            refs.append((path.name.casefold(), _sha256_file(path) if path.is_file() else None))
         structural = TEX_FILENAME_RE.sub(
             lambda match: match.group(1) + "<TEXTURE>" + match.group(3),
             candidate["block"],
@@ -313,7 +371,7 @@ def _canonical_source(receipt):
             structural,
             count=1,
         )
-        signatures.append((_sha256_bytes(structural.encode("utf-8")), tuple(refs)))
+        signatures.append(_sha256_bytes(structural.encode("utf-8")))
     if len(set(signatures)) != 1:
         raise BarkNormalizationError(
             "selected final-SK targets disagree on the canonical bark slot")
@@ -399,7 +457,7 @@ def build_isolated_bark_normalization_plan(
             [],
         )
         tree_root = _tree_root_for_cluster_copy(isolated_spm)
-        canonical_maps, textures = _rebased_canonical_maps(
+        canonical_maps, textures, omitted_textures = _rebased_canonical_maps(
             canonical["block"], canonical["spm"], isolated_spm,
             tree_root, explicit_textures,
         )
@@ -456,6 +514,12 @@ def build_isolated_bark_normalization_plan(
             "mesh_asset_ids": before_meshes,
             "cutout_mesh_ids": list(cutout_before),
             "canonical_textures": textures,
+            "omitted_textures": omitted_textures,
+            "texture_availability": (
+                "complete" if textures and not omitted_textures else
+                "partial" if textures else
+                "textureless"
+            ),
             "uv_mesh_generator_payload_preserved": True,
             "_patched_text": after,
         })
@@ -567,8 +631,30 @@ def apply_isolated_bark_normalization(plan):
                 for item in patch["canonical_textures"]
             }
             if refs != expected:
-                raise BarkNormalizationError(
-                    f"canonical bark texture set verification failed: {path}")
+                material_match, material_block = blocks[0]
+                blanked_block = TEX_FILENAME_RE.sub(
+                    lambda match: match.group(1) + match.group(3),
+                    material_block,
+                )
+                blanked_text = (
+                    text[:material_match.start()]
+                    + blanked_block
+                    + text[material_match.end():]
+                )
+                temporary = path.with_name(
+                    path.name + ".texture-quarantine.tmp"
+                )
+                temporary.write_bytes(_encoded_spm(
+                    blanked_text,
+                    patch["input_compressed"],
+                ))
+                temps.append(temporary)
+                os.replace(temporary, path)
+                patch["omitted_textures"] = list(
+                    patch.get("omitted_textures") or []
+                ) + [{"reason": "write_verification_mismatch"}]
+                patch["canonical_textures"] = []
+                patch["texture_availability"] = "textureless"
             outputs.append({
                 key: value for key, value in patch.items()
                 if not key.startswith("_")
@@ -667,6 +753,7 @@ def normalize_isolated_canonical_bark_name(
         raise BarkNormalizationError("non-bark final SK payload changed")
     payload = _encoded_spm(after, before_bytes.startswith(b"\x1f\x8b"))
     temporary = target.with_name(target.name + ".canonical-name.tmp")
+    texture_references_preserved = True
     try:
         temporary.write_bytes(payload)
         os.replace(temporary, target)
@@ -681,7 +768,32 @@ def normalize_isolated_canonical_bark_name(
             value.replace("\\", "/") for value in final[0].get("refs") or []
         )
         if refs_after != refs_before:
-            raise BarkNormalizationError("final SK bark texture references changed")
+            text = read_maybe_gzip_text(target)
+            final_blocks = _material_blocks(
+                text,
+                canonical,
+                material_id,
+            )
+            if len(final_blocks) != 1:
+                raise BarkNormalizationError(
+                    "canonical final SK bark name write failed"
+                )
+            final_match, final_block = final_blocks[0]
+            blanked = TEX_FILENAME_RE.sub(
+                lambda value: value.group(1) + value.group(3),
+                final_block,
+            )
+            text = (
+                text[:final_match.start()]
+                + blanked
+                + text[final_match.end():]
+            )
+            temporary.write_bytes(_encoded_spm(
+                text,
+                before_bytes.startswith(b"\x1f\x8b"),
+            ))
+            os.replace(temporary, target)
+            texture_references_preserved = False
     except Exception:
         target.write_bytes(before_bytes)
         raise
@@ -697,7 +809,7 @@ def normalize_isolated_canonical_bark_name(
         "material_id": material_id,
         "input_sha256": _sha256_bytes(before_bytes),
         "output_sha256": _sha256_file(target),
-        "texture_references_preserved": True,
+        "texture_references_preserved": texture_references_preserved,
         "production_sources_mutated": False,
     }
 
@@ -707,7 +819,7 @@ def _receipt_export_materials(normalization_report):
     outputs = normalization_report.get("outputs")
     if not canonical or not isinstance(outputs, list) or not outputs:
         raise BarkNormalizationError(
-            "normalization report has no canonical material/texture evidence")
+            "normalization report has no canonical material evidence")
 
     declared = []
     material_ids = set()
@@ -742,15 +854,13 @@ def _receipt_export_materials(normalization_report):
                 f"{output_material}")
 
         textures = output.get("canonical_textures")
-        if not isinstance(textures, list) or not textures:
-            raise BarkNormalizationError(
-                "normalization report has no canonical texture rows for "
-                f"{output_material}")
+        if not isinstance(textures, list):
+            textures = []
         maps = {}
+        ambiguous_maps = set()
         for texture in textures:
             if not isinstance(texture, dict):
-                raise BarkNormalizationError(
-                    "normalization report has an invalid canonical texture row")
+                continue
             map_name = str(texture.get("map") or "").strip()
             expected_path = str(texture.get("isolated") or "").strip()
             expected_hash = str(texture.get("sha256") or "").strip().casefold()
@@ -759,17 +869,20 @@ def _receipt_export_materials(normalization_report):
                 not map_name
                 or not expected_path
                 or not re.fullmatch(r"[0-9a-f]{64}", expected_hash)
-                or map_key in maps
             ):
-                raise BarkNormalizationError(
-                    "normalization report canonical texture roles, paths, or "
-                    f"hashes are invalid for {output_material}")
+                continue
+            if map_key in maps:
+                ambiguous_maps.add(map_key)
+                maps.pop(map_key, None)
+                continue
             maps[map_key] = {
                 "map": map_name,
                 "path": Path(expected_path),
                 "path_key": _path_key(expected_path),
                 "sha256": expected_hash,
             }
+        for map_key in ambiguous_maps:
+            maps.pop(map_key, None)
         declared.append({
             "material_id": material_id,
             "output_material": output_material,
@@ -790,24 +903,25 @@ def _metadata_source_path(metadata_path, source):
 
 
 def _validated_metadata_sources(path, material, textures, exported_name):
-    sources = []
+    sources = {}
     source_maps = set()
+    ambiguous_maps = set()
     for element in material.iter():
         authored_source = str(element.attrib.get("Source") or "").strip()
         if not authored_source:
             continue
         map_name = str(element.attrib.get("Name") or "").strip()
         map_key = map_name.casefold()
-        if not map_name or map_key in source_maps:
-            raise BarkNormalizationError(
-                f"source-bearing texture roles are missing or duplicated "
-                f"for {exported_name} in {path.name}")
+        if not map_name:
+            continue
+        if map_key in source_maps:
+            ambiguous_maps.add(map_key)
+            sources.pop(map_key, None)
+            continue
         source_maps.add(map_key)
         expected = textures.get(map_key)
         if expected is None:
-            raise BarkNormalizationError(
-                f"source-bearing role {map_name} for {exported_name} in "
-                f"{path.name} is outside the normalization receipt")
+            continue
         candidates = expected if isinstance(expected, list) else [expected]
         source_path = _metadata_source_path(path, authored_source)
         matching = next(
@@ -818,31 +932,26 @@ def _validated_metadata_sources(path, material, textures, exported_name):
             None,
         )
         if matching is None:
-            raise BarkNormalizationError(
-                f"source-bearing role {map_name} for {exported_name} in "
-                f"{path.name} does not match its receipt path: "
-                f"{source_path}")
+            continue
         if not source_path.is_file():
-            raise BarkNormalizationError(
-                f"receipt-authorized export texture is missing: "
-                f"{source_path}")
-        actual_hash = _sha256_file(source_path)
+            continue
+        try:
+            actual_hash = _sha256_file(source_path)
+        except OSError:
+            continue
         if actual_hash.casefold() != matching["sha256"]:
-            raise BarkNormalizationError(
-                f"receipt-authorized export texture hash changed: "
-                f"{source_path}")
-        sources.append({
+            continue
+        sources[map_key] = {
             "map": map_name,
             "source": authored_source,
             "resolved_path": str(source_path),
             "sha256": actual_hash,
-        })
-    if not sources:
-        raise BarkNormalizationError(
-            f"receipt material has no source-bearing textures in "
-            f"{path.name}: {exported_name}")
+        }
     return sorted(
-        sources,
+        (
+            row for key, row in sources.items()
+            if key not in ambiguous_maps
+        ),
         key=lambda row: (row["map"].casefold(), row["resolved_path"]),
     )
 
@@ -904,12 +1013,19 @@ def _xml_material_evidence(path, canonical, declared_outputs):
             output["textures"],
             exported_name,
         )
+        authored_source_count = sum(
+            1
+            for element in material.iter()
+            if str(element.attrib.get("Source") or "").strip()
+        )
         rows.append({
             "material": material.attrib.get("Name"),
             "material_id": output["material_id"],
             "preserved_alias": output["preserved_alias"],
             "receipt_scope": "normalization_output",
             "source_maps": sources,
+            "authored_source_count": authored_source_count,
+            "omitted_source_count": authored_source_count - len(sources),
             "texture_basenames": sorted({
                 Path(row["resolved_path"]).name.casefold() for row in sources
             }),
@@ -939,12 +1055,19 @@ def _xml_material_evidence(path, canonical, declared_outputs):
                 canonical_textures,
                 exported_name,
             )
+            authored_source_count = sum(
+                1
+                for element in material.iter()
+                if str(element.attrib.get("Source") or "").strip()
+            )
             rows.append({
                 "material": material.attrib.get("Name"),
                 "material_id": canonical_id,
                 "preserved_alias": False,
                 "receipt_scope": "canonical_material",
                 "source_maps": sources,
+                "authored_source_count": authored_source_count,
+                "omitted_source_count": authored_source_count - len(sources),
                 "texture_basenames": sorted({
                     Path(row["resolved_path"]).name.casefold()
                     for row in sources
@@ -972,6 +1095,12 @@ def _xml_material_evidence(path, canonical, declared_outputs):
         "path": str(path),
         "materials": rows,
         "material_count": len(rows),
+        "authored_source_count": sum(
+            row["authored_source_count"] for row in rows
+        ),
+        "omitted_source_count": sum(
+            row["omitted_source_count"] for row in rows
+        ),
         "texture_basenames": sorted({
             value for row in rows for value in row["texture_basenames"]
         }),
@@ -980,12 +1109,12 @@ def _xml_material_evidence(path, canonical, declared_outputs):
 
 def validate_canonical_bark_export_bundle(
         fbx, stmat, xml, normalization_report):
-    """Fail closed unless FBX, STMAT and XML all carry the canonical bark.
+    """Validate structural bark export evidence without gating on textures.
 
     The FBX must contain a canonical material-to-mesh connection and UV data.
-    Each source-bearing STMAT/XML map must match the current normalization
-    receipt's material ID, preserved alias, role, exact path, and content hash.
-    Receipt roles that SpeedTree does not emit are not invented as evidence.
+    Safe source-bearing STMAT/XML maps are retained as evidence. Missing,
+    stale, ambiguous, or unrelated texture sources are omitted; they never
+    prevent the structurally valid material/mesh/UV bundle from continuing.
     """
     if normalization_report.get("status") != "normalized":
         raise BarkNormalizationError(
@@ -1048,10 +1177,21 @@ def validate_canonical_bark_export_bundle(
         for material in xml_report["materials"]
         for source in material["source_maps"]
     }
-    if stmat_signature != xml_signature:
-        raise BarkNormalizationError(
-            "STMat/XML receipt-authorized source-bearing texture evidence "
-            "does not match")
+    shared_texture_signature = stmat_signature & xml_signature
+    declared_texture_count = sum(
+        len(output["textures"]) for output in declared_outputs
+    )
+    if (
+        shared_texture_signature
+        and stmat_signature == xml_signature
+        and not stmat_report["omitted_source_count"]
+        and not xml_report["omitted_source_count"]
+    ):
+        texture_availability = "complete"
+    elif shared_texture_signature:
+        texture_availability = "partial"
+    else:
+        texture_availability = "textureless"
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "ready_for_downstream_blender_mapping",
@@ -1066,7 +1206,14 @@ def validate_canonical_bark_export_bundle(
         "stmat": stmat_report,
         "xml": xml_report,
         "material_slot_propagated": True,
-        "texture_set_propagated": True,
+        "texture_set_propagated": texture_availability == "complete",
+        "texture_availability": texture_availability,
+        "texture_telemetry": {
+            "declared_role_count": declared_texture_count,
+            "stmat_safe_source_count": len(stmat_signature),
+            "xml_safe_source_count": len(xml_signature),
+            "shared_safe_source_count": len(shared_texture_signature),
+        },
         "uv_preserved": True,
         "production_sources_mutated": False,
     }

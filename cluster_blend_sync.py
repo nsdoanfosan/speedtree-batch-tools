@@ -26,11 +26,18 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
+from process_lifecycle import owned_run
+
 from atlas_target_registry import (
     TargetRegistryError,
     load_target_registry,
     registry_path_for_blend,
     save_target_registry,
+)
+from atlas_manifest_resolver import (
+    AtlasManifestResolutionError,
+    resolution_evidence,
+    resolve_atlas_manifests,
 )
 from cluster_spm_pair_contract import (
     ClusterSpmPairPathError,
@@ -39,6 +46,7 @@ from cluster_spm_pair_contract import (
 from cluster_normalization_sync import (
     ClusterNormalizationSyncError,
     ClusterSourceBuildRequiredError,
+    inspect_normalization_source_identity,
     resolve_normalization_recipe,
 )
 from cluster_source_prepare import (
@@ -63,9 +71,53 @@ BACKUP_NAME_TOKENS = (
 
 CLUSTER_RELATION_HEARTBEAT_SECONDS = 5.0
 
+CAPTURE_TEXTURE_REFRESH_REASONS = {
+    "physical_capture_manifest_missing",
+    "physical_capture_changed",
+}
+
 
 class ClusterBlendSyncError(RuntimeError):
     """Actionable Cluster blend relationship or apply failure."""
+
+
+class RelationValidationCache:
+    """One relation generation's thread-safe exact validation memo."""
+
+    def __init__(self):
+        self._values = {}
+        self._guard = threading.RLock()
+        self._key_locks = {}
+
+    def get_or_compute(self, key, factory):
+        with self._guard:
+            if key in self._values:
+                return self._values[key]
+            key_lock = self._key_locks.setdefault(key, threading.RLock())
+        with key_lock:
+            with self._guard:
+                if key in self._values:
+                    return self._values[key]
+            value = factory()
+            with self._guard:
+                self._values[key] = value
+            return value
+
+    def seed(self, key, value):
+        """Install exact evidence produced earlier in the same refresh."""
+        with self._guard:
+            self._values.setdefault(key, value)
+
+
+def _validation_cache_value(validation_cache, key, factory):
+    if validation_cache is None:
+        return factory()
+    get_or_compute = getattr(validation_cache, "get_or_compute", None)
+    if callable(get_or_compute):
+        return get_or_compute(key, factory)
+    if key not in validation_cache:
+        validation_cache[key] = factory()
+    return validation_cache[key]
 
 
 def normalized_path_key(path):
@@ -228,11 +280,16 @@ def _snapshot_spm_files(paths, directory):
     return snapshots
 
 
-def _restore_spm_files(snapshots):
+def _restore_spm_files(snapshots, preserve_paths=()):
     """Undo partial SPM writes; keep a rescue copy of anything unrestorable."""
+    preserved_keys = {
+        normalized_path_key(path) for path in preserve_paths
+    }
     restored = []
     failed = []
     for path, copy in snapshots:
+        if normalized_path_key(path) in preserved_keys:
+            continue
         try:
             if path.is_file() and path.read_bytes() == copy.read_bytes():
                 continue
@@ -253,12 +310,52 @@ def _restore_spm_files(snapshots):
     return restored, failed
 
 
+def _worker_transaction_conflict_preserve_paths(report, snapshots):
+    """Trust only a fully hash-bound, pre-commit Atlas conflict contract."""
+    contract = (report or {}).get("failure_contract")
+    if not isinstance(contract, dict) or (
+        contract.get("kind") != "atlas_speedtree_transaction_failure"
+        or contract.get("version") != 1
+        or contract.get("reason") != "production_changed_while_staging"
+        or contract.get("commit_started") is not False
+        or contract.get("preserve_external_changes") is not True
+    ):
+        return []
+    snapshot_by_key = {
+        normalized_path_key(path): (Path(path), Path(copy))
+        for path, copy in snapshots
+    }
+    preserve = []
+    conflicts = contract.get("conflicts") or []
+    if not conflicts:
+        return []
+    for conflict in conflicts:
+        if not isinstance(conflict, dict):
+            return []
+        key = normalized_path_key(conflict.get("path") or "")
+        pair = snapshot_by_key.get(key)
+        if pair is None:
+            return []
+        path, snapshot = pair
+        if not path.is_file() or not snapshot.is_file():
+            return []
+        if (
+            _sha256_file(snapshot)
+            != str(conflict.get("expected_sha256") or "").casefold()
+            or _sha256_file(path)
+            != str(conflict.get("actual_sha256") or "").casefold()
+        ):
+            return []
+        preserve.append(path)
+    return preserve
+
+
 def _normalization_artifact_paths(recipe):
     """Files the Blender/Atlas stages may overwrite before Sync commits."""
     if not recipe:
         return []
     paths = []
-    if recipe.get("normalization_required"):
+    if recipe.get("capture_output_dir") and recipe.get("capture_prefix"):
         output_dir = Path(
             recipe["capture_output_dir"]
         ).expanduser().absolute()
@@ -280,13 +377,18 @@ def _normalization_artifact_paths(recipe):
         paths.append(
             output_dir / f"{prefix}_auto_capture_manifest.json"
         )
+    if recipe.get("normalization_required"):
         # Normalizer saves both the rebuilt blend and its current-content
         # receipt before Atlas starts writing owner SPMs.
-        paths.extend(
-            [
-                Path(recipe["blend"]).expanduser().absolute(),
-                Path(recipe["receipt_path"]).expanduser().absolute(),
-            ]
+        paths.append(
+            Path(recipe["blend"]).expanduser().absolute()
+        )
+    # A current Normalizer can still advance its persisted Blender source
+    # index after Atlas publication.  Snapshot that receipt on every Sync, not
+    # only when the capture itself rebuilds.
+    if recipe.get("receipt_path"):
+        paths.append(
+            Path(recipe["receipt_path"]).expanduser().absolute()
         )
 
     blend = Path(recipe["blend"]).expanduser().absolute()
@@ -417,7 +519,10 @@ def _atlas_transaction_artifact_recipe(
     }
     for target in targets:
         match = _matching_scope_manifest(blend, target)
-        if match is None:
+        if (
+            match is None
+            or match.get("mutation_authorized") is False
+        ):
             continue
         payload = match["payload"]
         adoption = payload.get("source_material_adoption") or {}
@@ -588,25 +693,24 @@ def _spm_failure_inventory(path):
 
 
 def _scope_failure_diagnostics(blend, target):
-    scope_dir = Path(target).parent / ".atlas_leaf_speedtree_scopes"
-    if not scope_dir.is_dir():
-        return []
+    try:
+        resolution = resolve_atlas_manifests(
+            target,
+            expected_blend=blend,
+        )
+    except AtlasManifestResolutionError as exc:
+        return [{
+            "error": str(exc),
+            "atlas_manifest_resolution": exc.resolution,
+        }]
     rows = []
-    for path in sorted(scope_dir.glob(f"*__{Path(target).stem}.json")):
-        payload = _read_json(path)
-        if not payload:
-            rows.append({"path": str(path), "read_error": "invalid JSON"})
-            continue
-        payload_blend = str(payload.get("blend_file") or "")
-        if payload_blend and (
-            normalized_path_key(payload_blend)
-            != normalized_path_key(blend)
-        ):
-            continue
+    for selected in resolution["selected"]:
+        payload = selected["payload"]
         adoption = payload.get("source_material_adoption") or {}
         connection = payload.get("generator_connection") or {}
         rows.append({
-            "path": str(path),
+            "path": selected["path"],
+            "kind": selected["kind"],
             "export_scope_id": payload.get("export_scope_id"),
             "spm": payload.get("spm"),
             "material_groups": (
@@ -639,6 +743,7 @@ def _scope_failure_diagnostics(blend, target):
                 "complete": connection.get("complete"),
                 "bindings": connection.get("bindings") or [],
             },
+            "atlas_manifest_resolution": resolution_evidence(resolution),
         })
     return rows
 
@@ -719,8 +824,14 @@ def _persist_cluster_relation_failure(
             if launch_error is not None
             else None
         ),
-        "failure_contract": _cluster_relation_failure_contract(
-            launch_error
+        "failure_contract": (
+            _cluster_relation_failure_contract(launch_error)
+            or (
+                report.get("failure_contract")
+                if isinstance(report, dict)
+                and isinstance(report.get("failure_contract"), dict)
+                else None
+            )
         ),
         "artifact_recipe": artifact_recipe,
     }
@@ -861,13 +972,18 @@ def _sha256_file(path):
     )
 
 
-def _physical_capture_manifest_for_blend(blend):
+def _physical_capture_manifest_for_blend(blend, validation_cache=None):
     blend = Path(blend).expanduser().absolute()
     stem = blend.stem
     if stem.casefold().startswith("sk_"):
         stem = stem[3:]
     path = blend.with_name(f"{stem}_auto_capture_manifest.json")
-    payload = _read_json(path)
+    cache_key = ("capture_manifest", normalized_path_key(path))
+    payload = _validation_cache_value(
+        validation_cache,
+        cache_key,
+        lambda: _read_json(path),
+    )
     if not payload:
         return {"path": path, "active": False, "contract_sha256": None}
     active = (
@@ -986,7 +1102,9 @@ def _target_scope_refresh_reasons(payload, target_spm):
     return reasons
 
 
-def _physical_refresh_state(payload, canonical_spm, blend):
+def _physical_refresh_state(
+    payload, canonical_spm, blend, *, validation_cache=None,
+):
     receipt = payload.get("normalized_prototype_receipt")
     if not isinstance(receipt, dict):
         return {
@@ -1002,20 +1120,42 @@ def _physical_refresh_state(payload, canonical_spm, blend):
         }
 
     reasons = []
+    source_content_identity = inspect_normalization_source_identity(blend)
+    reasons.extend(source_content_identity.get("refresh_reasons") or ())
     canonical = Path(canonical_spm).expanduser().absolute()
     recorded_source_rows = _recorded_source_spm_rows(receipt, canonical)
-    current_source_sha256 = _sha256_file(canonical) if canonical.is_file() else None
+    def current_sha256(path):
+        candidate = Path(path).expanduser().absolute()
+        if not candidate.is_file():
+            return None
+        cache_key = ("sha256", normalized_path_key(candidate))
+        return _validation_cache_value(
+            validation_cache,
+            cache_key,
+            lambda: _sha256_file(candidate),
+        )
+
+    current_source_sha256 = current_sha256(canonical)
     current_source_semantic = None
     legacy_semantic_migration = None
     if not current_source_sha256:
         reasons.append("canonical_source_missing")
     else:
         try:
-            current_source_semantic = (
-                spm_file_structural_semantic_fingerprint(
-                    canonical,
-                    raw_sha256=current_source_sha256,
-                )
+            semantic_key = (
+                "spm_structural_semantic",
+                normalized_path_key(canonical),
+                current_source_sha256,
+            )
+            current_source_semantic = _validation_cache_value(
+                validation_cache,
+                semantic_key,
+                lambda: (
+                    spm_file_structural_semantic_fingerprint(
+                        canonical,
+                        raw_sha256=current_source_sha256,
+                    )
+                ),
             )
         except (OSError, ValueError, ET.ParseError):
             reasons.append("canonical_source_semantic_unavailable")
@@ -1046,15 +1186,16 @@ def _physical_refresh_state(payload, canonical_spm, blend):
     recorded_fbx_rows = _recorded_source_fbx_rows(receipt)
     for recorded in recorded_fbx_rows:
         source_fbx = Path(recorded["path"])
-        current_fbx_sha256 = (
-            _sha256_file(source_fbx) if source_fbx.is_file() else None
-        )
+        current_fbx_sha256 = current_sha256(source_fbx)
         if not current_fbx_sha256:
             reasons.append("source_fbx_missing")
         elif current_fbx_sha256.casefold() != recorded["sha256"]:
             reasons.append("source_fbx_changed")
 
-    capture = _physical_capture_manifest_for_blend(blend)
+    capture = _physical_capture_manifest_for_blend(
+        blend,
+        validation_cache=validation_cache,
+    )
     recorded_capture_sha256 = str(
         receipt.get("physical_capture_contract_sha256") or ""
     ) or None
@@ -1089,32 +1230,73 @@ def _physical_refresh_state(payload, canonical_spm, blend):
         "capture_contract_sha256": capture["contract_sha256"],
         "recorded_capture_contract_sha256": recorded_capture_sha256,
         "source_fbx_artifacts": recorded_fbx_rows,
+        "source_content_identity": source_content_identity,
+    }
+
+
+def _refresh_reason_summary(reasons):
+    unique = sorted(set(reasons or ()))
+    capture_texture = [
+        reason for reason in unique
+        if reason in CAPTURE_TEXTURE_REFRESH_REASONS
+    ]
+    geometry_ownership = [
+        reason for reason in unique
+        if reason not in CAPTURE_TEXTURE_REFRESH_REASONS
+    ]
+    categories = []
+    if geometry_ownership:
+        categories.append("geometry_ownership")
+    if capture_texture:
+        categories.append("capture_texture")
+    return {
+        "refresh_reasons": unique,
+        "refresh_reason_categories": categories,
+        "geometry_ownership_refresh_reasons": geometry_ownership,
+        "capture_texture_refresh_reasons": capture_texture,
     }
 
 
 def _matching_scope_manifest(blend, target_spm):
-    """Return the newest Atlas scope manifest for this exact blend/target."""
+    """Return read-only Atlas evidence for this blend/target.
+
+    Provider metadata disagreement can revoke authority to rewrite a manifest,
+    but it cannot veto inspection of an already-live Cluster relationship.  A
+    projected diagnostic selection also prevents a disagreement in an
+    unrelated Provider claim from hiding this exact target's disjoint claims.
+    """
     blend = Path(blend).expanduser().absolute()
     target = Path(target_spm).expanduser().absolute()
-    scope_dir = target.parent / ".atlas_leaf_speedtree_scopes"
-    if not scope_dir.is_dir():
+    try:
+        # Resolve ownership before applying the caller's Provider filter.  The
+        # filter is useful for selecting the exact live payload to inspect, but
+        # it must not hide another claimant and thereby recreate write
+        # authority for the preferred Provider.
+        ownership_resolution = resolve_atlas_manifests(
+            target,
+            diagnostic_only=True,
+        )
+        resolution = resolve_atlas_manifests(
+            target,
+            expected_blend=blend,
+            diagnostic_only=True,
+        )
+    except AtlasManifestResolutionError as exc:
+        raise ClusterBlendSyncError(str(exc)) from exc
+    selected = resolution["selected"]
+    if not selected:
         return None
-    matches = []
-    for path in scope_dir.glob(f"*__{target.stem}.json"):
-        payload = _read_json(path)
-        if payload is None:
-            continue
-        payload_blend = str(payload.get("blend_file") or "").strip()
-        payload_spm = str(payload.get("spm") or "").strip()
-        if not payload_blend or normalized_path_key(payload_blend) != normalized_path_key(blend):
-            continue
-        if payload_spm and normalized_path_key(payload_spm) != normalized_path_key(target):
-            continue
-        matches.append((path.stat().st_mtime_ns, path, payload))
-    if not matches:
-        return None
-    _mtime, path, payload = max(matches, key=lambda row: row[0])
-    return {"path": str(path), "payload": payload}
+    match = selected[0]
+    return {
+        "path": match["path"],
+        "payload": match["payload"],
+        "resolution": resolution_evidence(ownership_resolution),
+        "selection_resolution": resolution_evidence(resolution),
+        "mutation_authorized": bool(
+            ownership_resolution.get("mutation_authorized", True)
+            and resolution.get("mutation_authorized", True)
+        ),
+    }
 
 
 def inspect_cluster_target(
@@ -1124,6 +1306,7 @@ def inspect_cluster_target(
     *,
     canonical_spm=None,
     verify_physical=True,
+    validation_cache=None,
 ):
     target = Path(target_spm).expanduser().absolute()
     if not relation_on:
@@ -1160,7 +1343,12 @@ def inspect_cluster_target(
         else Path(blend).expanduser().absolute().with_suffix(".spm")
     )
     if verify_physical:
-        refresh = _physical_refresh_state(payload, canonical, blend)
+        refresh = _physical_refresh_state(
+            payload,
+            canonical,
+            blend,
+            validation_cache=validation_cache,
+        )
         for reason in _target_scope_refresh_reasons(payload, target):
             if reason not in refresh["refresh_reasons"]:
                 refresh["refresh_reasons"].append(reason)
@@ -1178,6 +1366,7 @@ def inspect_cluster_target(
             "refresh_deferred": True,
         }
     refresh_required = satisfied and refresh["refresh_required"]
+    refresh.update(_refresh_reason_summary(refresh["refresh_reasons"]))
     return {
         "status": (
             "refresh_required"
@@ -1200,6 +1389,7 @@ def inspect_cluster_target(
             or payload.get("material_id")
         ),
         "manifest": match["path"],
+        "atlas_manifest_resolution": match["resolution"],
         "mesh_ids": list(payload.get("mesh_ids") or ()),
         **refresh,
     }
@@ -1209,6 +1399,7 @@ def discover_cluster_blend_relations(
     owner_folder,
     *,
     verify_physical=True,
+    validation_cache=None,
 ):
     """Discover normalized Cluster blends and their owner-folder ON/OFF state.
 
@@ -1217,6 +1408,8 @@ def discover_cluster_blend_relations(
     owner-folder ``SK_*.spm`` files.
     """
     owner = Path(owner_folder).expanduser().absolute()
+    if validation_cache is None:
+        validation_cache = RelationValidationCache()
     targets = owner_sk_spms(owner)
     rows = []
     for source in cluster_authoring_sources(owner):
@@ -1255,6 +1448,7 @@ def discover_cluster_blend_relations(
                 relation_on,
                 canonical_spm=canonical,
                 verify_physical=verify_physical,
+                validation_cache=validation_cache,
             )
             relation_rows.append({
                 "target_spm": target,
@@ -1308,6 +1502,27 @@ def discover_cluster_blend_relations(
                 for relation in owner_relations
                 for reason in relation.get("refresh_reasons") or ()
             }),
+            "refresh_reason_categories": sorted({
+                category
+                for relation in owner_relations
+                for category in (
+                    relation.get("refresh_reason_categories") or ()
+                )
+            }),
+            "geometry_ownership_refresh_reasons": sorted({
+                reason
+                for relation in owner_relations
+                for reason in (
+                    relation.get("geometry_ownership_refresh_reasons") or ()
+                )
+            }),
+            "capture_texture_refresh_reasons": sorted({
+                reason
+                for relation in owner_relations
+                for reason in (
+                    relation.get("capture_texture_refresh_reasons") or ()
+                )
+            }),
             "targets": sorted(
                 relation_rows,
                 key=lambda row: (
@@ -1319,8 +1534,8 @@ def discover_cluster_blend_relations(
     return sorted(rows, key=lambda row: row["blend"].name.casefold())
 
 
-def _current_on_relation_evidence(blend, targets):
-    """Return current physical proof, or ``None`` when a refresh is required.
+def _current_on_relation_state(blend, targets):
+    """Return current physical proof plus fail-closed refresh diagnostics.
 
     The registry alone is not enough to skip work.  A no-op is safe only when
     every effective target is local, still has an exact synced scope, and that
@@ -1329,14 +1544,20 @@ def _current_on_relation_evidence(blend, targets):
     blend = Path(blend).expanduser().absolute()
     owner = blend.parent.parent
     canonical = blend.with_suffix(".spm")
+    reasons = []
+    target_states = []
     if not canonical.is_file():
-        return None
+        reasons.append("canonical_source_missing")
 
     evidence = []
     for target in targets:
         target = Path(target).expanduser().absolute()
-        if target.parent != owner or not target.is_file():
-            return None
+        if target.parent != owner:
+            reasons.append("target_outside_owner")
+            continue
+        if not target.is_file():
+            reasons.append("target_missing")
+            continue
         state = inspect_cluster_target(
             blend,
             target,
@@ -1344,21 +1565,49 @@ def _current_on_relation_evidence(blend, targets):
             canonical_spm=canonical,
             verify_physical=True,
         )
-        if not (
+        target_states.append({
+            "target_spm": str(target),
+            "status": state.get("status"),
+            "refresh_reasons": list(state.get("refresh_reasons") or ()),
+            "refresh_reason_categories": list(
+                state.get("refresh_reason_categories") or ()
+            ),
+            "source_content_identity": state.get(
+                "source_content_identity"
+            ),
+        })
+        reasons.extend(state.get("refresh_reasons") or ())
+        is_current = (
             state.get("status") == "synced"
             and state.get("connection_satisfied") is True
             and state.get("physical") is True
             and state.get("refresh_required") is False
             and state.get("refresh_deferred") is not True
-        ):
-            return None
+        )
+        if not is_current and not state.get("refresh_reasons"):
+            reasons.append("relation_physical_proof_incomplete")
         evidence.append({
             "target_spm": str(target),
             "manifest": state.get("manifest"),
             "material": state.get("material"),
             "material_id": state.get("material_id"),
+            "source_content_identity": state.get(
+                "source_content_identity"
+            ),
         })
-    return evidence
+    summary = _refresh_reason_summary(reasons)
+    return {
+        "current": not summary["refresh_reasons"],
+        "verification": evidence,
+        "targets": target_states,
+        **summary,
+    }
+
+
+def _current_on_relation_evidence(blend, targets):
+    """Compatibility wrapper returning proof only for a strict current state."""
+    state = _current_on_relation_state(blend, targets)
+    return state["verification"] if state["current"] else None
 
 
 def _emit_cluster_relation_progress(callback, stage, message):
@@ -1468,6 +1717,7 @@ def run_cluster_relation_transaction(
     registered_keys = {
         normalized_path_key(path) for path in registered_before
     }
+    preflight_state = None
     if (
         enabled
         and not force_refresh
@@ -1478,11 +1728,11 @@ def run_cluster_relation_transaction(
             "verify_existing_relation",
             "Verifying the existing Cluster ON relationship...",
         )
-        current_evidence = _current_on_relation_evidence(
+        preflight_state = _current_on_relation_state(
             blend,
             effective_targets,
         )
-        if current_evidence is not None:
+        if preflight_state["current"]:
             report = {
                 "status": "ok",
                 "mode": "sync",
@@ -1494,7 +1744,16 @@ def run_cluster_relation_transaction(
                 "no_change": True,
                 "already_on": True,
                 "skip_reason": "already_on_up_to_date",
-                "verification": current_evidence,
+                "verification": preflight_state["verification"],
+                "refresh_reasons": [],
+                "refresh_reason_categories": [],
+                "source_content_identity": (
+                    preflight_state["targets"][0].get(
+                        "source_content_identity"
+                    )
+                    if preflight_state["targets"]
+                    else None
+                ),
             }
             try:
                 runtime_receipt = _write_shared_repair_runtime_receipt(
@@ -1537,6 +1796,12 @@ def run_cluster_relation_transaction(
                 "Blender bake/export was skipped.",
             )
             return report
+        _emit_cluster_relation_progress(
+            progress_callback,
+            "existing_relation_refresh_required",
+            "Existing Cluster relationship requires refresh: "
+            + ", ".join(preflight_state["refresh_reasons"]),
+        )
 
     blender = Path(blender_exe).expanduser().absolute()
     if not blender.is_file():
@@ -1708,6 +1973,13 @@ def run_cluster_relation_transaction(
                         f"{restore_error}"
                         + diagnostic_detail
                     ) from preparation_error
+                retry_contract = getattr(
+                    preparation_error,
+                    "connected_retry_contract",
+                    None,
+                )
+                if isinstance(retry_contract, dict):
+                    retry_contract["rollback_succeeded"] = True
             original_args = tuple(preparation_error.args)
             if original_args:
                 preparation_error.args = (
@@ -1718,8 +1990,11 @@ def run_cluster_relation_transaction(
                 preparation_error.args = (diagnostic_detail.lstrip(),)
             raise
 
-        def rollback():
-            restored, failed = _restore_spm_files(snapshots)
+        def rollback(*, preserve_spm_paths=()):
+            restored, failed = _restore_spm_files(
+                snapshots,
+                preserve_paths=preserve_spm_paths,
+            )
             capture_restored, capture_failed = (
                 _restore_normalization_artifacts(normalization_snapshots)
             )
@@ -1733,6 +2008,11 @@ def run_cluster_relation_transaction(
             except OSError as exc:
                 registry_failed.append(f"{registry_path}: {exc}")
             detail = _rollback_detail(restored, failed)
+            if preserve_spm_paths:
+                detail += (
+                    "\nPreserved concurrently modified SPM(s): "
+                    + ", ".join(str(path) for path in preserve_spm_paths)
+                )
             if registry_restored:
                 detail += (
                     "\nRestored Cluster target registry: "
@@ -1784,8 +2064,10 @@ def run_cluster_relation_transaction(
         )
         heartbeat_thread.start()
         try:
-            result = subprocess.run(
+            result = owned_run(
                 command,
+                source="cluster_blend_sync.apply_cluster_relationship",
+                run_factory=subprocess.run,
                 capture_output=True,
                 text=True,
                 timeout=int(timeout),
@@ -1810,6 +2092,12 @@ def run_cluster_relation_transaction(
         report = _read_json(report_path) if report_path.is_file() else None
         if result.returncode != 0 or not report or report.get("status") != "ok":
             detail = (report or {}).get("error") or (result.stderr or result.stdout)[-1200:]
+            preserve_spm_paths = (
+                _worker_transaction_conflict_preserve_paths(
+                    report,
+                    snapshots,
+                )
+            )
             raise ClusterBlendSyncError(
                 f"Cluster relationship {'ON' if enabled else 'OFF'} apply failed: "
                 f"{detail}"
@@ -1818,7 +2106,7 @@ def run_cluster_relation_transaction(
                     report=report,
                     result=result,
                 )
-                + rollback()
+                + rollback(preserve_spm_paths=preserve_spm_paths)
             )
         if enabled and repair_runtime_config:
             try:
@@ -1841,6 +2129,21 @@ def run_cluster_relation_transaction(
                 report["repair_runtime_receipt"] = str(runtime_receipt)
         if source_preparation is not None:
             report["source_preparation"] = source_preparation
+        if preflight_state is not None and not preflight_state["current"]:
+            report["preflight_refresh_required"] = True
+            report["preflight_refresh_reasons"] = preflight_state[
+                "refresh_reasons"
+            ]
+            report["preflight_refresh_reason_categories"] = (
+                preflight_state["refresh_reason_categories"]
+            )
+            report["refresh_reasons"] = list(
+                preflight_state["refresh_reasons"]
+            )
+            report["refresh_reason_categories"] = list(
+                preflight_state["refresh_reason_categories"]
+            )
+            report["preflight_target_states"] = preflight_state["targets"]
         return report
 
 

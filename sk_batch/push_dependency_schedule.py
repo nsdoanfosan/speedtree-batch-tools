@@ -23,6 +23,19 @@ from speedtree_pipeline_contract import is_live_spm
 class PushDependencyError(RuntimeError):
     """The saved Blender Repair dependency contract cannot be scheduled."""
 
+    def __init__(
+        self,
+        message,
+        *,
+        concrete_missing=False,
+        dependency_path=None,
+    ):
+        super().__init__(message)
+        self.concrete_missing = bool(concrete_missing)
+        self.dependency_path = (
+            str(dependency_path) if dependency_path is not None else None
+        )
+
 
 STAGE_DEPENDENCY_CONTRACT_KIND = "sk_batch_verified_push_dependencies"
 STAGE_DEPENDENCY_CONTRACT_VERSION = 1
@@ -127,7 +140,9 @@ def _dependency_spms_from_manifest(manifest):
             )
         if not dependency.is_file():
             raise PushDependencyError(
-                "Cluster dependency SPM is missing: " + str(dependency)
+                "Cluster dependency SPM is missing: " + str(dependency),
+                concrete_missing=True,
+                dependency_path=dependency,
             )
         key = normalized_path_key(dependency)
         if key not in seen:
@@ -223,7 +238,9 @@ def _stage_dependency_spms(root_spm, contract):
         if not dependency.is_file():
             raise PushDependencyError(
                 "verified Cluster dependency SPM is missing: "
-                + str(dependency)
+                + str(dependency),
+                concrete_missing=True,
+                dependency_path=dependency,
             )
         key = normalized_path_key(dependency)
         if key not in seen:
@@ -283,7 +300,9 @@ def _relation_dependency_spms(root_spm, relation_cache=None):
             )
         if not dependency.is_file():
             raise PushDependencyError(
-                "Cluster relation source SPM is missing: " + str(dependency)
+                "Cluster relation source SPM is missing: " + str(dependency),
+                concrete_missing=True,
+                dependency_path=dependency,
             )
         key = normalized_path_key(dependency)
         if key not in seen:
@@ -339,16 +358,20 @@ def _item_path_lookup(all_items):
     return lookup
 
 
-def expand_push_targets(
+def partition_push_targets(
     selected_targets,
     all_items,
     stage_dependency_contracts=None,
 ):
-    """Add exact Cluster dependencies and return them before downstream roots.
+    """Plan exact dependencies while isolating discovery issues per root.
 
-    Returns ``(ordered_targets, dependencies_by_root, auto_added_ids)``.
-    Explicitly selected Cluster rows are preserved and duplicate dependencies
-    shared by multiple Trees are scheduled only once.
+    Metadata-only discovery issues keep a preflight-ready root runnable with no
+    inferred dependencies.  A proven missing exact dependency excludes only
+    the root that requires it.  The caller receives every issue so it can
+    preserve exact evidence without copying one exception to the whole batch.
+
+    Returns ``(ordered_targets, dependencies_by_root, auto_added_ids,
+    issues_by_root)``.
     """
     selected_targets = [
         item
@@ -361,6 +384,7 @@ def expand_push_targets(
     explicit_cluster_items = []
     downstream_items = []
     dependencies_by_root = {}
+    issues_by_root = {}
     auto_added_ids = set()
     relation_cache = {}
     stage_dependency_contracts = (
@@ -383,26 +407,39 @@ def expand_push_targets(
         if is_cluster_source_spm(spm):
             explicit_cluster_items.append(item)
             continue
-        downstream_items.append(item)
         dependency_ids = []
+        root_dependency_items = []
+        root_auto_added_ids = set()
         stage_contract = stage_contracts_by_root.get(normalized_path_key(spm))
-        for dependency_spm in cluster_dependency_spms(
-            spm,
-            relation_cache=relation_cache,
-            stage_dependency_contract=stage_contract,
-        ):
-            dependency = lookup.get(normalized_path_key(dependency_spm))
-            if dependency is None:
-                raise PushDependencyError(
-                    "Cluster dependency exists but is not present in the current "
-                    "SK Batch scan; rescan the asset root: "
-                    + str(dependency_spm)
-                )
-            dependency_iid = str(dependency["spm"])
-            dependency_ids.append(dependency_iid)
-            dependency_items.append(dependency)
-            if normalized_path_key(dependency["spm"]) not in selected_ids:
-                auto_added_ids.add(dependency_iid)
+        try:
+            dependency_spms = cluster_dependency_spms(
+                spm,
+                relation_cache=relation_cache,
+                stage_dependency_contract=stage_contract,
+            )
+            for dependency_spm in dependency_spms:
+                dependency = lookup.get(normalized_path_key(dependency_spm))
+                if dependency is None:
+                    raise PushDependencyError(
+                        "Cluster dependency exists but is not present in the "
+                        "current SK Batch scan; rescan the asset root: "
+                        + str(dependency_spm),
+                        dependency_path=dependency_spm,
+                    )
+                dependency_iid = str(dependency["spm"])
+                dependency_ids.append(dependency_iid)
+                root_dependency_items.append(dependency)
+                if normalized_path_key(dependency["spm"]) not in selected_ids:
+                    root_auto_added_ids.add(dependency_iid)
+        except PushDependencyError as exc:
+            issues_by_root[str(spm)] = exc
+            dependencies_by_root[str(spm)] = ()
+            if not exc.concrete_missing:
+                downstream_items.append(item)
+            continue
+        dependency_items.extend(root_dependency_items)
+        auto_added_ids.update(root_auto_added_ids)
+        downstream_items.append(item)
         dependencies_by_root[str(spm)] = tuple(dict.fromkeys(dependency_ids))
 
     ordered = []
@@ -413,4 +450,20 @@ def expand_push_targets(
             continue
         seen.add(key)
         ordered.append(item)
-    return ordered, dependencies_by_root, auto_added_ids
+    return ordered, dependencies_by_root, auto_added_ids, issues_by_root
+
+
+def expand_push_targets(
+    selected_targets,
+    all_items,
+    stage_dependency_contracts=None,
+):
+    """Fail-fast compatibility wrapper around the root-partitioned planner."""
+    ordered, dependencies, auto_added, issues = partition_push_targets(
+        selected_targets,
+        all_items,
+        stage_dependency_contracts=stage_dependency_contracts,
+    )
+    if issues:
+        raise next(iter(issues.values()))
+    return ordered, dependencies, auto_added

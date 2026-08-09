@@ -214,7 +214,14 @@ def reconcile_transient_cluster_export_root(
 
     moved = sorted(connected, key=lambda obj: obj.name.casefold())
     for obj in moved:
-        if obj not in source_collection.objects:
+        source_objects = source_collection.objects
+        lookup = getattr(source_objects, "get", None)
+        already_linked = (
+            lookup(obj.name) is not None
+            if callable(lookup)
+            else obj in source_objects
+        )
+        if not already_linked:
             source_collection.objects.link(obj)
         export_collection.objects.unlink(obj)
     base_report.update(
@@ -311,6 +318,7 @@ def finalize_cluster_pipeline_payload(
     export_issues,
     expected_source_object=None,
     export_postcondition=None,
+    source_blend_identity=None,
 ):
     """Promote a valid pending report only after final Export verification.
 
@@ -326,6 +334,15 @@ def finalize_cluster_pipeline_payload(
         )
 
     result = copy.deepcopy(payload)
+    identity_changed = False
+    if source_blend_identity is not None:
+        if not isinstance(source_blend_identity, dict):
+            raise ValueError("Cluster source Blend identity is invalid")
+        if result.get("source_blend_identity") != source_blend_identity:
+            result["source_blend_identity"] = copy.deepcopy(
+                source_blend_identity
+            )
+            identity_changed = True
     handoff = result.get("handoff_preflight") or {}
     status = str(handoff.get("status") or "")
     if status in FINAL_HANDOFF_STATUSES or not status:
@@ -338,7 +355,7 @@ def finalize_cluster_pipeline_payload(
                 export_postcondition
             )
             return result, True
-        return result, False
+        return result, identity_changed
     if status != PENDING_HANDOFF_STATUS:
         raise ValueError(
             f"Cluster source handoff cannot be finalized from status={status}"

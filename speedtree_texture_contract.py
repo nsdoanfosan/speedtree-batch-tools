@@ -18,6 +18,11 @@ import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from artifact_content_key import (
+    ArtifactContentKeyChangedError,
+    SHA256_ALGORITHM,
+    file_content_key_snapshot,
+)
 from speedtree_preview_texture_contract import (
     PREVIEW_FALLBACK_CAPABILITY,
     PREVIEW_FALLBACK_SCHEMA_FIELD,
@@ -82,6 +87,11 @@ _MAP_BLOCK_RE = re.compile(
 _TEX_FILENAME_RE = re.compile(
     r"(<TexFilename\b(?![^>]*?/\s*>)[^>]*>)(.*?)"
     r"(</TexFilename>|<\\TexFilename>)",
+    re.IGNORECASE | re.DOTALL,
+)
+_TEX_ENABLED_RE = re.compile(
+    r"(<TexEnabled\b(?![^>]*?/\s*>)[^>]*>)(.*?)"
+    r"(</TexEnabled>|<\\TexEnabled>)",
     re.IGNORECASE | re.DOTALL,
 )
 _GENERATOR_BLOCK_RE = re.compile(
@@ -300,12 +310,85 @@ def _forbidden_derived_segment(path):
     return ""
 
 
-def _file_sha256(path):
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def _file_sha256(path, memo=None):
+    candidate = Path(path)
+    stat = candidate.stat()
+    cache_key = (
+        os.path.abspath(str(candidate)).casefold(),
+        stat.st_size,
+        stat.st_mtime_ns,
+    )
+    def compute():
+        try:
+            snapshot = file_content_key_snapshot(
+                candidate, SHA256_ALGORITHM
+            )
+        except ArtifactContentKeyChangedError as exc:
+            raise OSError(str(exc)) from exc
+        if (
+            snapshot["size"], snapshot["mtime_ns"]
+        ) != (
+            stat.st_size, stat.st_mtime_ns
+        ):
+            raise OSError(
+                "File identity changed before its exact digest was captured: "
+                + str(candidate)
+            )
+        return snapshot["digest"]
+
+    single_flight = getattr(memo, "get_or_compute_verified", None)
+    if callable(single_flight):
+        try:
+            return single_flight(cache_key, compute)
+        except ValueError as exc:
+            raise OSError(
+                "File content changed without an identity change: "
+                + str(candidate)
+            ) from exc
+    if memo is not None and cache_key in memo:
+        result = compute()
+        if memo[cache_key] != result:
+            raise OSError(
+                "File content changed without an identity change: "
+                + str(candidate)
+            )
+        return result
+    result = compute()
+    if memo is not None:
+        memo[cache_key] = result
+    return result
+
+
+def _json_document(
+        path, *, file_sha256_memo=None, json_document_memo=None):
+    """Parse one exact content-bound JSON document per live report."""
+    candidate = Path(path)
+    before = candidate.stat()
+    digest = _file_sha256(candidate, memo=file_sha256_memo)
+    cache_key = (
+        os.path.abspath(str(candidate)).casefold(),
+        before.st_size,
+        before.st_mtime_ns,
+        digest,
+    )
+    if json_document_memo is not None and cache_key in json_document_memo:
+        return json_document_memo[cache_key]
+    raw = candidate.read_bytes()
+    after = candidate.stat()
+    if (
+        (before.st_size, before.st_mtime_ns)
+        != (after.st_size, after.st_mtime_ns)
+        or len(raw) != after.st_size
+        or hashlib.sha256(raw).hexdigest() != digest
+    ):
+        raise OSError(
+            "JSON document changed while its exact identity was captured: "
+            + str(candidate)
+        )
+    payload = json.loads(raw.decode("utf-8"))
+    if json_document_memo is not None:
+        json_document_memo[cache_key] = payload
+    return payload
 
 
 def _blender_bake_map_role(value):
@@ -327,6 +410,8 @@ def validate_blender_cluster_bake_receipt_for_consumption(
     asset_root,
     *,
     consumption_context=BLENDER_BAKE_CONSUMPTION_STRICT,
+    file_sha256_memo=None,
+    json_document_memo=None,
 ):
     """Validate preview capability/schema plus live manifest-owned bytes."""
     if not receipt_declares_preview_fallback(receipt):
@@ -362,7 +447,11 @@ def validate_blender_cluster_bake_receipt_for_consumption(
     ):
         return "blender_cluster_bake_capture_boundary_mismatch"
     try:
-        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        payload = _json_document(
+            manifest_path,
+            file_sha256_memo=file_sha256_memo,
+            json_document_memo=json_document_memo,
+        )
     except (OSError, ValueError, json.JSONDecodeError):
         return "blender_cluster_bake_capture_manifest_invalid"
     if not isinstance(payload, dict):
@@ -420,7 +509,9 @@ def validate_blender_cluster_bake_receipt_for_consumption(
         try:
             if path.stat().st_size <= 0:
                 return "blender_cluster_bake_file_fingerprint_mismatch"
-            actual_sha256 = _file_sha256(path).casefold()
+            actual_sha256 = _file_sha256(
+                path, memo=file_sha256_memo
+            ).casefold()
         except OSError:
             return "blender_cluster_bake_file_fingerprint_mismatch"
         if actual_sha256 != sha256:
@@ -479,6 +570,8 @@ def resolve_blender_cluster_bake_origin(
     asset_root,
     *,
     consumption_context=BLENDER_BAKE_CONSUMPTION_STRICT,
+    file_sha256_memo=None,
+    json_document_memo=None,
 ):
     """Return one normalized, live-proven Blender bake origin receipt.
 
@@ -523,7 +616,7 @@ def resolve_blender_cluster_bake_origin(
     if not slot_files:
         return {}, "blender_cluster_bake_slot_contract_incomplete"
     parents = {
-        _path_key(Path(row["path"]).parent)
+        os.path.normcase(str(Path(row["path"]).parent))
         for row in slot_files
     }
     capture_dir = Path(slot_files[0]["path"]).parent
@@ -550,6 +643,8 @@ def resolve_blender_cluster_bake_origin(
                 stored,
                 asset_root,
                 consumption_context=consumption_context,
+                file_sha256_memo=file_sha256_memo,
+                json_document_memo=json_document_memo,
             )
         )
         if stored_issue:
@@ -580,7 +675,11 @@ def resolve_blender_cluster_bake_origin(
     ):
         return {}, "blender_cluster_bake_capture_boundary_mismatch"
     try:
-        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        payload = _json_document(
+            manifest_path,
+            file_sha256_memo=file_sha256_memo,
+            json_document_memo=json_document_memo,
+        )
     except (OSError, ValueError, json.JSONDecodeError):
         return {}, "blender_cluster_bake_capture_manifest_invalid"
     if (
@@ -632,6 +731,9 @@ def resolve_blender_cluster_bake_origin(
             "path": _absolute_path(path_text, manifest_path.parent),
             "sha256": sha256,
         }
+        declared_row["path_key"] = os.path.normcase(
+            str(declared_row["path"])
+        )
         declared.append(declared_row)
     if not declared:
         return {}, "blender_cluster_bake_map_role_mismatch"
@@ -643,11 +745,11 @@ def resolve_blender_cluster_bake_origin(
     for row in slot_files:
         expected_role = _blender_bake_map_role(row["map"])
         expected_path = _absolute_path(row["path"])
+        expected_path_key = os.path.normcase(str(expected_path))
         selected_entries = [
             declared_row
             for declared_row in declared
-            if _path_key(declared_row["path"])
-            == _path_key(expected_path)
+            if declared_row["path_key"] == expected_path_key
         ]
         exact_matches = [
             declared_row
@@ -697,7 +799,9 @@ def resolve_blender_cluster_bake_origin(
         ):
             return {}, "blender_cluster_bake_capture_boundary_mismatch"
         try:
-            actual_sha256 = _file_sha256(expected_path).casefold()
+            actual_sha256 = _file_sha256(
+                expected_path, memo=file_sha256_memo
+            ).casefold()
         except OSError:
             return {}, "blender_cluster_bake_file_fingerprint_mismatch"
         if actual_sha256 != match["sha256"]:
@@ -731,7 +835,11 @@ def resolve_blender_cluster_bake_origin(
         except (TypeError, ValueError):
             return {}, "blender_cluster_bake_receipt_contract_invalid"
     issue = validate_blender_cluster_bake_receipt_for_consumption(
-        receipt, asset_root, consumption_context=consumption_context,
+        receipt,
+        asset_root,
+        consumption_context=consumption_context,
+        file_sha256_memo=file_sha256_memo,
+        json_document_memo=json_document_memo,
     )
     return ({}, issue) if issue else (receipt, "")
 
@@ -794,6 +902,18 @@ def inspect_spm_texture_slots(spm_path):
     """Return non-empty material-owned TexFilename slots from one SPM."""
     spm = _absolute_path(spm_path)
     text = _read_spm_text(spm)
+    return inspect_spm_texture_slots_from_text(spm, text)
+
+
+def inspect_spm_texture_slots_from_text(spm_path, text):
+    """Inspect caller-owned decoded SPM text without reading it again.
+
+    The caller must bind ``text`` to a stable current file identity.  This
+    helper removes duplicate gzip decode/I/O only; it does not authorize a
+    cache hit or any mutation.
+    """
+    spm = _absolute_path(spm_path)
+    text = str(text)
     materials = []
     for material_index, material_match in enumerate(
         _MATERIAL_BLOCK_RE.finditer(text)
@@ -1275,16 +1395,26 @@ def resolve_manifest_material_output(
     production_spm,
     material_id="",
     material_name="",
+    *,
+    equivalent_spms=(),
 ):
-    """Resolve one manifest output, preferring exact material ID."""
-    spm_key = _path_key(production_spm)
+    """Resolve one manifest output, preferring exact material ID.
+
+    ``equivalent_spms`` is deliberately proof-fed by the caller.  Naming
+    similarity alone never expands a target; a receipt-validated Cluster
+    canonical/legacy pair may supply the only additional identity.
+    """
+    spm_keys = {_path_key(production_spm)}
+    spm_keys.update(
+        _path_key(value) for value in equivalent_spms if str(value).strip()
+    )
     material_id = str(material_id or "").strip()
     material_name_key = str(material_name or "").strip().casefold()
     id_matches = []
     name_matches = []
     for output in manifest.get("outputs") or []:
         for target in output.get("material_targets") or []:
-            if _path_key(target.get("spm") or "") != spm_key:
+            if _path_key(target.get("spm") or "") not in spm_keys:
                 continue
             target_id = str(target.get("material_id") or "").strip()
             target_name = str(target.get("material_name") or "").strip()
@@ -1742,15 +1872,37 @@ def inspect_production_spm_texture_contract(
     }
 
 
-def rebase_spm_copy_to_canonical_outputs(isolated_spm, production_spm, plan):
-    """Rewrite only an isolated copy to its production manifest T_* paths."""
+def rebase_spm_copy_to_canonical_outputs(
+    isolated_spm,
+    production_spm,
+    plan,
+    *,
+    texture_policy="strict",
+):
+    """Rewrite only an isolated copy to safe canonical texture candidates.
+
+    ``strict`` preserves the publication/audit behavior.  The runtime-tolerant
+    handoff rewrites proven live roles and clears every unavailable or unsafe
+    role so texture availability can never become a pipeline admission gate.
+    """
     isolated = _absolute_path(isolated_spm)
     production = _absolute_path(production_spm)
+    tolerant = str(texture_policy or "strict") == "runtime_tolerant"
+    if str(texture_policy or "strict") not in {"strict", "runtime_tolerant"}:
+        raise ValueError(f"unsupported texture policy: {texture_policy!r}")
     if _path_key(isolated) == _path_key(production):
         raise CanonicalTextureContractError(
             f"production SPM cannot be a canonical rebase target: {production}"
         )
-    if plan.get("status") != "ok":
+    if tolerant and (plan.get("generator_material_scope") or {}).get(
+        "status"
+    ) not in {None, "ok"}:
+        issues = list(plan.get("issues") or [])
+        raise CanonicalTextureContractError(
+            f"{production.name}: material scope is not safe to rebase",
+            issues,
+        )
+    if not tolerant and plan.get("status") != "ok":
         issues = list(plan.get("issues") or [])
         raise CanonicalTextureContractError(
             f"{production.name}: canonical texture rebase is blocked. "
@@ -1767,11 +1919,53 @@ def rebase_spm_copy_to_canonical_outputs(isolated_spm, production_spm, plan):
         by_name.setdefault(
             str(row.get("material_name") or "").casefold(), []
         ).append(row)
+    if tolerant:
+        # A missing texture manifest can yield no binding rows at all. The
+        # Generator/material identity is still sufficient to clear those
+        # referenced texture slots without guessing any replacement file.
+        inspection = inspect_spm_texture_slots(production)
+        consumed_ids = set(
+            (plan.get("generator_material_scope") or {}).get(
+                "consumed_material_ids"
+            )
+            or []
+        )
+        for material in inspection.get("materials") or []:
+            material_id = str(material.get("material_id") or "")
+            if (
+                material.get("slots")
+                and _positive_material_id_key(material_id) in consumed_ids
+                and material_id not in by_id
+            ):
+                binding = {
+                    "material_id": material_id,
+                    "material_name": material.get("material_name") or "",
+                    "files": {},
+                    "slots": [],
+                    "origin_kind": "pcg_sbs",
+                }
+                by_id[material_id] = binding
+                by_name.setdefault(
+                    str(binding["material_name"]).casefold(), []
+                ).append(binding)
     before_bytes = isolated.read_bytes()
     compressed = before_bytes.startswith(b"\x1f\x8b")
     before = _read_spm_text(isolated)
     rewritten = []
     issues = []
+    omitted = []
+
+    def clear_texture(map_block):
+        cleared = _TEX_FILENAME_RE.sub(
+            lambda match: match.group(1) + match.group(3),
+            map_block,
+            count=1,
+        )
+        return _TEX_ENABLED_RE.sub(
+            lambda match: match.group(1) + "false" + match.group(3),
+            cleared,
+            count=1,
+        )
 
     def replace_material(material_match):
         block = material_match.group(0)
@@ -1798,10 +1992,32 @@ def rebase_spm_copy_to_canonical_outputs(isolated_spm, production_spm, plan):
             if texture_match is None:
                 return map_block
             authored = html.unescape(" ".join(texture_match.group(2).split()))
-            if not authored:
+            if not authored and not tolerant:
                 return map_block
             role = texture_role_for_slot(map_match.group(1), authored)
-            if binding.get("origin_kind") == "blender_cluster_bake":
+            if tolerant:
+                slot_matches = [
+                    row
+                    for row in binding.get("slots") or []
+                    if (
+                        int(row.get("map_index", -1)) == map_index
+                        and str(row.get("map") or "")
+                        == html.unescape(map_match.group(1))
+                    )
+                ]
+                expected = (
+                    str(slot_matches[0].get("expected_output") or "")
+                    if len(slot_matches) == 1
+                    else ""
+                )
+                expected_path = _absolute_path(expected) if expected else None
+                if (
+                    expected_path is None
+                    or not expected_path.is_file()
+                    or _forbidden_derived_segment(expected_path)
+                ):
+                    expected = ""
+            elif binding.get("origin_kind") == "blender_cluster_bake":
                 slot_matches = [
                     row
                     for row in binding.get("slot_files") or []
@@ -1824,7 +2040,7 @@ def rebase_spm_copy_to_canonical_outputs(isolated_spm, production_spm, plan):
                 (not role and binding.get("origin_kind") != "blender_cluster_bake")
                 or not expected
             ):
-                issues.append(_manifest_issue(
+                issue = _manifest_issue(
                     "isolated_texture_role_unmapped",
                     spm=str(production),
                     material=material_name,
@@ -1842,7 +2058,11 @@ def rebase_spm_copy_to_canonical_outputs(isolated_spm, production_spm, plan):
                     ),
                     map=map_match.group(1),
                     authored_ref=authored,
-                ))
+                )
+                if tolerant:
+                    omitted.append(issue)
+                    return clear_texture(map_block)
+                issues.append(issue)
                 return map_block
             relative = os.path.relpath(expected, isolated.parent).replace(
                 "\\", "/"
@@ -1869,7 +2089,7 @@ def rebase_spm_copy_to_canonical_outputs(isolated_spm, production_spm, plan):
         return _MAP_BLOCK_RE.sub(replace_map, block)
 
     after = _MATERIAL_BLOCK_RE.sub(replace_material, before)
-    if issues:
+    if issues and not tolerant:
         raise CanonicalTextureContractError(
             f"{production.name}: isolated canonical texture rebase is "
             f"incomplete. {PCG_ST9_REMEDIATION}",
@@ -1918,6 +2138,8 @@ def rebase_spm_copy_to_canonical_outputs(isolated_spm, production_spm, plan):
                 _forbidden_derived_segment(slot["authored_ref"])
                 or _forbidden_derived_segment(resolved)
             )
+            if tolerant and not str(slot.get("authored_ref") or "").strip():
+                continue
             if (
                 not expected
                 or forbidden
@@ -1934,7 +2156,7 @@ def rebase_spm_copy_to_canonical_outputs(isolated_spm, production_spm, plan):
                     resolved_ref=str(resolved),
                     forbidden_segment=forbidden,
                 ))
-    if verification_issues:
+    if verification_issues and not tolerant:
         _write_spm_text(isolated, before, compressed)
         raise CanonicalTextureContractError(
             f"{production.name}: isolated canonical texture verification "
@@ -1945,7 +2167,16 @@ def rebase_spm_copy_to_canonical_outputs(isolated_spm, production_spm, plan):
         "status": "rebased",
         "isolated_spm": str(isolated),
         "production_spm": str(production),
-        "manifest": plan["manifest"],
+        "manifest": plan.get("manifest") or "",
+        "texture_policy": str(texture_policy or "strict"),
+        "texture_availability": (
+            "complete" if rewritten and not omitted else
+            "partial" if rewritten else
+            "textureless"
+        ),
+        "omitted_reference_count": len(omitted),
+        "omitted_references": omitted,
+        "verification_diagnostics": verification_issues,
         "rewritten_reference_count": len(rewritten),
         "references": rewritten,
         "generator_material_scope": dict(
@@ -2198,7 +2429,10 @@ def _resolve_indexed_texture_set(
         "texture_base": requested_base,
         "texture_dir": "",
         "files": {},
+        "available_roles": [],
         "missing_roles": list(roles),
+        "ambiguous_bases": False,
+        "binding_disposition": "leave_unassigned",
     }
     # This API resolves a literal managed T_ base.  Refusing M_/material names
     # prevents Green/Yellow or other authoring labels from becoming implicit
@@ -2238,23 +2472,39 @@ def _resolve_indexed_texture_set(
 
     candidate, missing_roles = min(candidates, key=candidate_rank)
     complete = not missing_roles and not candidate["ambiguous_bases"]
+    files = {
+        role: candidate["files"][role]
+        for role in roles
+        if role in candidate["files"]
+    }
     return {
-        "status": "ok" if complete else "incomplete_texture_set",
+        "status": "ok" if complete else "partial",
         "set_key": set_key,
         # Prefer the on-disk canonical spelling so a differently cased STMAT
         # reference cannot leak into downstream asset naming.
         "texture_base": candidate["texture_base"] or requested_base,
         "texture_dir": candidate["directory"],
-        "files": {
-            role: candidate["files"][role]
-            for role in roles
-            if role in candidate["files"]
-        },
+        "files": files if not candidate["ambiguous_bases"] else {},
+        "available_roles": (
+            list(files) if not candidate["ambiguous_bases"] else []
+        ),
         "missing_roles": list(missing_roles),
+        "ambiguous_bases": bool(candidate["ambiguous_bases"]),
+        "binding_disposition": (
+            "bind_available"
+            if files and not candidate["ambiguous_bases"]
+            else "leave_unassigned"
+        ),
     }
 
 
-def resolve_texture_set(texture_dirs, texture_base, required_roles=None):
+def resolve_texture_set(
+    texture_dirs,
+    texture_base,
+    required_roles=None,
+    *,
+    texture_index=None,
+):
     """Resolve one literal ``T_`` texture base across candidate directories.
 
     A directory containing every configured role always wins over an earlier
@@ -2263,7 +2513,8 @@ def resolve_texture_set(texture_dirs, texture_base, required_roles=None):
     Material names are intentionally rejected; callers must provide the actual
     managed texture base.
     """
-    texture_index = index_texture_sets(texture_dirs)
+    if texture_index is None:
+        texture_index = index_texture_sets(texture_dirs)
     return _resolve_indexed_texture_set(
         texture_index,
         texture_base,
@@ -2283,18 +2534,22 @@ def _missing_binding(material, reason, set_keys, missing_roles):
         "texture_dir": "",
         "stmat_roles": [],
         "files": {},
+        "available_roles": [],
         "referenced_set_keys": list(set_keys),
         "missing_roles": list(missing_roles),
+        "binding_disposition": "leave_unassigned",
     }
 
 
 def resolve_texture_bindings(stmat_path, texture_dirs=None):
-    """Resolve every STMAT material to one complete managed texture set.
+    """Resolve safe texture candidates without making them an admission gate.
 
     Source paths supply the authoritative set keys.  ``texture_dirs`` may add
     alternate managed-output locations; a complete candidate is selected even
-    if an earlier/directly referenced candidate is partial.  Bindings remain
-    one row per STMAT material, so two slots sharing a set are never collapsed.
+    if an earlier/directly referenced candidate is partial.  A unique partial
+    set keeps only its proven live roles.  Missing or ambiguous sets remain
+    explicitly unassigned.  Bindings remain one row per STMAT material, so two
+    slots sharing a set are never collapsed.
     """
     parsed_stmat = read_stmat_material_sources(stmat_path)
     result = {
@@ -2304,6 +2559,8 @@ def resolve_texture_bindings(stmat_path, texture_dirs=None):
         "sets": [],
         "bindings": [],
         "missing": [],
+        "texture_admission_mode": "runtime_tolerant",
+        "affects_pipeline_outcome": False,
     }
     if parsed_stmat.get("error"):
         result["error"] = parsed_stmat["error"]
@@ -2323,13 +2580,24 @@ def resolve_texture_bindings(stmat_path, texture_dirs=None):
         references = _referenced_sets(material)
         set_keys = sorted(references)
         if not set_keys:
+            textureless = not material.get("sources")
             binding = _missing_binding(
                 material,
-                "not_managed",
+                "unassigned" if textureless else "not_managed",
                 [],
-                [],
+                list(REQUIRED_TEXTURE_ROLES) if textureless else [],
             )
             result["bindings"].append(binding)
+            if textureless:
+                result["missing"].append(
+                    {
+                        "material": material["material"],
+                        "material_index": material["material_index"],
+                        "reason": "textureless",
+                        "set_keys": [],
+                        "missing_roles": list(REQUIRED_TEXTURE_ROLES),
+                    }
+                )
             continue
 
         complete_resolutions = []
@@ -2371,17 +2639,20 @@ def resolve_texture_bindings(stmat_path, texture_dirs=None):
                 "texture_dir": resolution["texture_dir"],
                 "stmat_roles": sorted(reference["roles"]),
                 "files": dict(resolution["files"]),
+                "available_roles": list(resolution["files"]),
                 "referenced_set_keys": set_keys,
                 "missing_roles": [],
+                "binding_disposition": "bind_available",
             }
             result["bindings"].append(binding)
             continue
 
+        best_partial = None
         if len(complete_resolutions) > 1:
             reason = "ambiguous_complete_sets"
             missing_roles = []
         else:
-            reason = "incomplete_texture_set"
+            reason = "unassigned"
             if partial_resolutions:
                 best_partial = min(
                     partial_resolutions,
@@ -2392,10 +2663,37 @@ def resolve_texture_bindings(stmat_path, texture_dirs=None):
                     ),
                 )
                 missing_roles = list(best_partial["missing_roles"])
+                if (
+                    len(set_keys) == 1
+                    and best_partial.get("files")
+                    and not best_partial.get("ambiguous_bases")
+                ):
+                    reason = "partial"
             else:
                 missing_roles = list(REQUIRED_TEXTURE_ROLES)
 
-        binding = _missing_binding(material, reason, set_keys, missing_roles)
+        if reason == "partial":
+            set_key = set_keys[0]
+            reference = references[set_key]
+            binding = {
+                "material": material["material"],
+                "material_key": material["material_key"],
+                "material_index": material["material_index"],
+                "status": "partial",
+                "set_key": set_key,
+                "texture_base": best_partial["texture_base"],
+                "texture_dir": best_partial["texture_dir"],
+                "stmat_roles": sorted(reference["roles"]),
+                "files": dict(best_partial["files"]),
+                "available_roles": list(best_partial["files"]),
+                "referenced_set_keys": set_keys,
+                "missing_roles": missing_roles,
+                "binding_disposition": "bind_available",
+            }
+        else:
+            binding = _missing_binding(
+                material, reason, set_keys, missing_roles
+            )
         result["bindings"].append(binding)
         result["missing"].append(
             {
@@ -2417,7 +2715,7 @@ def resolve_texture_bindings(stmat_path, texture_dirs=None):
         if parsed_stmat["status"] == "empty_stmat"
         else "not_applicable"
         if not managed_count
-        else "incomplete"
+        else "partial"
         if result["missing"]
         else "ok"
     )
@@ -2438,6 +2736,7 @@ __all__ = [
     "canonical_output_manifest_candidates",
     "inspect_production_spm_texture_contract",
     "inspect_spm_texture_slots",
+    "inspect_spm_texture_slots_from_text",
     "load_canonical_output_manifest",
     "normalize_material_key",
     "normalize_texture_set_key",

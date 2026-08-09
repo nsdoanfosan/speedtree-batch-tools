@@ -8,16 +8,29 @@ blend, persist a content-addressed receipt, then let Atlas update the owner
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from atlas_manifest_resolver import (
+    resolve_atlas_manifests,
+    selected_manifest_payload,
+)
+from cluster_atlas_source_index import (
+    inspect_persisted_source_index,
+    normalized_path_key,
+)
 from cluster_card_pipeline.contract import _read_spm_root
 from cluster_bark_source_resolution import (
     ClusterBarkSourceResolutionError,
     load_current_isolated_bark_manifest,
+)
+from generator_delivery_scope import (
+    GeneratorDeliveryScopeError,
+    validate_delivery_scope_intent,
 )
 from speedtree_pipeline_contract import (
     SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
@@ -306,6 +319,41 @@ def normalization_receipt_path(blend):
     )
 
 
+def inspect_normalization_source_identity(blend):
+    """Validate the Blender-authored Atlas source index without opening Blender."""
+    blend = Path(blend).expanduser().absolute()
+    receipt_path = normalization_receipt_path(blend)
+    receipt = _read_json(receipt_path)
+    if not receipt:
+        inspected = inspect_persisted_source_index(blend, None)
+        return {**inspected, "receipt": str(receipt_path)}
+    identity = receipt.get("source_blender_index")
+    if identity is None:
+        # Fail closed on the superseded self-projected receipt field.  It is
+        # diagnostic history only and cannot authorize an already-ON no-op.
+        identity = receipt.get("source_blend_content_identity")
+    inspected = inspect_persisted_source_index(blend, identity)
+    reasons = list(inspected.get("refresh_reasons") or ())
+    if (
+        receipt.get("kind") != "speedtree_cluster_sync_normalization"
+        or receipt.get("status") != "ready"
+    ):
+        reasons.append("blender_source_identity_invalid")
+    receipt_blend = str(receipt.get("blend") or "")
+    if not receipt_blend:
+        reasons.append("blender_source_path_identity_missing")
+    elif normalized_path_key(receipt_blend) != normalized_path_key(blend):
+        reasons.append("blender_source_path_changed")
+    reasons = sorted(set(reasons))
+    return {
+        **inspected,
+        "status": "current" if not reasons else "refresh_required",
+        "current": not reasons,
+        "refresh_reasons": reasons,
+        "receipt": str(receipt_path),
+    }
+
+
 def _role_contract(blend):
     stem = Path(blend).stem
     base = stem[3:] if stem.casefold().startswith("sk_") else stem
@@ -516,36 +564,17 @@ def _material_id_by_exact_name(root, material_name):
 
 def _atlas_target_relation_manifest(target_spm):
     target = Path(target_spm).expanduser().absolute()
-    manifest_dir = target.parent / ".atlas_leaf_speedtree_targets"
-    if not manifest_dir.is_dir():
+    # This metadata is used only to prove optional GUID/slot repairs.  A
+    # Provider disagreement must disable the disputed metadata-guided repair,
+    # not abort the otherwise exact normalization operation.
+    resolution = resolve_atlas_manifests(
+        target,
+        require_generator_complete=True,
+        diagnostic_only=True,
+    )
+    if resolution.get("mutation_authorized") is False:
         return {}
-    target_key = str(target.resolve()).casefold()
-    matches = []
-    for path in sorted(manifest_dir.glob("*.json")):
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        spm = str((payload or {}).get("spm") or "").strip()
-        if not spm:
-            continue
-        try:
-            spm_key = str(Path(spm).expanduser().resolve()).casefold()
-        except OSError:
-            spm_key = str(Path(spm).expanduser().absolute()).casefold()
-        if (
-            spm_key == target_key
-            and (payload.get("generator_connection") or {}).get(
-                "complete"
-            )
-        ):
-            matches.append(payload)
-    if len(matches) > 1:
-        raise ClusterNormalizationSyncError(
-            "Multiple Atlas target manifests describe the same SPM: "
-            f"{target}"
-        )
-    return matches[0] if matches else {}
+    return selected_manifest_payload(resolution)
 
 
 def _source_binding_repairs(target_spm, material_record):
@@ -564,16 +593,27 @@ def _source_binding_repairs(target_spm, material_record):
     material_id = material_record["material_id"]
     material_mesh_ids = set(material_record.get("mesh_ids") or [])
     atlas_manifest = _atlas_target_relation_manifest(target)
-    atlas_bindings = {
-        (
+    atlas_bindings = {}
+    ambiguous_binding_keys = set()
+    for item in (
+        atlas_manifest.get("generator_connection") or {}
+    ).get("bindings") or []:
+        if not isinstance(item, dict):
+            continue
+        key = (
             generator_guid_key(item.get("generator_guid")),
             str(item.get("slot_prefix") or "").strip(),
-        ): item
-        for item in (
-            atlas_manifest.get("generator_connection") or {}
-        ).get("bindings") or []
-        if isinstance(item, dict)
-    }
+        )
+        if not all(key) or key in ambiguous_binding_keys:
+            continue
+        previous = atlas_bindings.get(key)
+        if previous is not None and previous != item:
+            # Conflicting metadata cannot authorize a binding rewrite.  Drop
+            # only this key; the live SPM and other exact repairs remain valid.
+            atlas_bindings.pop(key, None)
+            ambiguous_binding_keys.add(key)
+            continue
+        atlas_bindings[key] = item
     live_pairs = [
         pair
         for pair in _generator_property_pairs(root)
@@ -992,6 +1032,26 @@ def _receipt_is_current(recipe):
         or receipt.get("unit_probe_sha256") != recipe["unit_probe_sha256"]
     ):
         return False
+    build = receipt.get("build") or {}
+    current_source_fbx = recipe.get("source_fbx_identity")
+    if isinstance(current_source_fbx, dict):
+        recorded_source_fbx = build.get("source_3d_contract") or {}
+        if (
+            _normalized_path(recorded_source_fbx.get("source_fbx") or "")
+            != _normalized_path(current_source_fbx.get("path") or "")
+            or str(
+                recorded_source_fbx.get("source_fbx_sha256") or ""
+            ).casefold()
+            != str(current_source_fbx.get("sha256") or "").casefold()
+        ):
+            # The physical plan receipt is derived from this exact FBX.  BWR can
+            # legitimately rewrite it while preserving the SPM semantic graph
+            # (for example by removing a zero-face object).  Reusing the older
+            # receipt in that case publishes a brand-new target manifest whose
+            # embedded source hash is already stale.  Invalidate only this
+            # changed source generation so the existing Normalizer run rebuilds
+            # it once; an unchanged FBX continues to use the current receipt.
+            return False
     recorded_semantic = str(
         receipt.get("source_spm_semantic_fingerprint") or ""
     ).casefold()
@@ -1015,12 +1075,10 @@ def _receipt_is_current(recipe):
         is None
     ):
         return False
-    blend = Path(recipe["blend"])
-    if (
-        not blend.is_file()
-        or receipt.get("output_blend_sha256") != _sha256_file(blend)
-    ):
-        return False
+    # The Normalizer dependency is the canonical Cluster SPM/XML/capture
+    # contract below, not every subsequent edit to the Atlas plan collection
+    # saved in the same blend.  Atlas source freshness is validated separately
+    # by ``inspect_normalization_source_identity`` before an already-ON no-op.
     capture_manifest = (
         Path(recipe["capture_output_dir"]).expanduser().absolute()
         / f"{recipe['capture_prefix']}_auto_capture_manifest.json"
@@ -1057,7 +1115,6 @@ def _receipt_is_current(recipe):
     # source geometry, and capture contract were unchanged. Accept those
     # receipts only when their embedded build evidence proves every actual
     # normalization dependency still matches.
-    build = receipt.get("build") or {}
     source_contract = build.get("source_3d_contract") or {}
     capture_contract = build.get("physical_capture_contract") or {}
     capture_frame = capture_contract.get("frame") or {}
@@ -1112,6 +1169,7 @@ def resolve_normalization_recipe(
     canonical_spm=None,
     unit_probe_path,
     capture_resolution=1024,
+    delivery_scope_intents=None,
 ):
     """Build a fail-closed Blender recipe from current BWR and SPM evidence."""
     blend = Path(blend).expanduser().absolute()
@@ -1173,6 +1231,53 @@ def resolve_normalization_recipe(
         _resolve_target_role_material(target, role["material_name"])
         for target in targets
     ]
+    if delivery_scope_intents is not None:
+        if not isinstance(delivery_scope_intents, dict):
+            raise ClusterNormalizationSyncError(
+                "Generator delivery scope intents must be keyed by target SPM."
+            )
+        supplied_by_target = {
+            str(Path(path).expanduser().absolute()).casefold(): intent
+            for path, intent in delivery_scope_intents.items()
+        }
+        if len(supplied_by_target) != len(delivery_scope_intents):
+            raise ClusterNormalizationSyncError(
+                "Generator delivery scope intents contain duplicate target paths."
+            )
+        connected_targets = {
+            str(Path(row["target_spm"]).expanduser().absolute()).casefold()
+            for row in target_material_bindings
+            if row.get("connect_generators") is True
+        }
+        if set(supplied_by_target) != connected_targets:
+            raise ClusterNormalizationSyncError(
+                "Explicit Generator delivery scope must cover exactly every "
+                "Generator-connected target in the recipe."
+            )
+        for binding in target_material_bindings:
+            if binding.get("connect_generators") is not True:
+                continue
+            target_key = str(
+                Path(binding["target_spm"]).expanduser().absolute()
+            ).casefold()
+            intent = supplied_by_target[target_key]
+            try:
+                validate_delivery_scope_intent(
+                    intent,
+                    target_spm=binding["target_spm"],
+                    material_id=binding["source_material_id"],
+                    provider_blend=blend,
+                )
+            except GeneratorDeliveryScopeError as exc:
+                raise ClusterNormalizationSyncError(
+                    "Explicit Generator delivery scope is invalid for "
+                    f"{binding['target_spm']}: {exc}"
+                ) from exc
+            # Target-local delivery intent stays outside the physical Blender
+            # normalization hash.  It is passed through verbatim and sealed by
+            # the SPM producer after the write; this caller never derives it
+            # from current live Generator evidence.
+            binding["generator_delivery_scope_intent"] = copy.deepcopy(intent)
     first_binding = target_material_bindings[0]
     role = {
         **role,
@@ -1201,7 +1306,7 @@ def resolve_normalization_recipe(
         ),
     }
     normalization_contract = {
-        "version": 4,
+        "version": 5,
         "blend": str(blend),
         "canonical_spm": str(canonical),
         "source_spm_semantic_projection_version":
@@ -1228,6 +1333,12 @@ def resolve_normalization_recipe(
         "plan_refinement_levels": 1,
         **role,
     }
+    source_fbx = blend.parent / "fbx" / f"{blend.stem}.fbx"
+    if source_fbx.is_file():
+        normalization_contract["source_fbx_identity"] = {
+            "path": str(source_fbx),
+            "sha256": _sha256_file(source_fbx),
+        }
     if isolated_bark_bundle is not None:
         normalization_contract["isolated_bark_bundle"] = (
             isolated_bark_bundle
@@ -1262,6 +1373,7 @@ def resolve_normalization_recipe(
 __all__ = [
     "ClusterNormalizationSyncError",
     "ClusterSourceBuildRequiredError",
+    "inspect_normalization_source_identity",
     "normalization_receipt_path",
     "resolve_normalization_recipe",
     "validate_isolated_bark_recipe_bundle",

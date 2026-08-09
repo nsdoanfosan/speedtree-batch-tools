@@ -10,6 +10,7 @@ import pytest
 
 from cluster_bark_source_resolution import (
     ClusterBarkSourceResolutionError,
+    canonical_bark_record_plan,
     _copy_canonical_textures,
     _copy_source_external_meshes,
     _normalization_identity,
@@ -425,11 +426,100 @@ def test_final_bark_handoff_scopes_detached_materials_to_generator_consumers():
             extra_material_refs=["old/detached_leaf.tif"],
             generator_material_ids=("1", "2"),
         )
-        with pytest.raises(
-            ClusterBarkSourceResolutionError,
-            match="material_canonical_output_unmapped",
-        ):
-            _normalization_identity(contract, source, required_rows)
+        _signature, degraded = _normalization_identity(
+            contract,
+            source,
+            required_rows,
+        )
+        assert any(
+            issue.get("reason") == "material_canonical_output_unmapped"
+            for issue in degraded["production_texture_handoff"].get(
+                "issues"
+            ) or []
+        )
+
+
+@pytest.mark.parametrize(
+    ("available_roles", "expected_names", "availability"),
+    [
+        (
+            ("color",),
+            {"T_bark_elm_01_color.tga"},
+            "partial",
+        ),
+        ((), set(), "textureless"),
+    ],
+)
+def test_manifestless_partial_or_textureless_bark_still_prepares(
+    tmp_path,
+    available_roles,
+    expected_names,
+    availability,
+):
+    root = tmp_path / "Tree_elm"
+    source = root / "Cluster" / "SK_branch_elm_01.spm"
+    canonical = root / "SK_Tree_elm_01.spm"
+    texture_root = root / "texture"
+    texture_root.mkdir(parents=True)
+    canonical_refs = [
+        "texture/T_bark_elm_01_color.tga",
+        "texture/T_bark_elm_01_normal.tga",
+    ]
+    for role in available_roles:
+        (texture_root / f"T_bark_elm_01_{role}.tga").write_bytes(
+            role.encode("ascii")
+        )
+    _write_spm(
+        source,
+        "M_bark_common_end_01",
+        ["generic/common_color.tga", "generic/common_normal.tga"],
+    )
+    _write_spm(canonical, "M_bark_elm_01", canonical_refs)
+    contract = {
+        "handoff": {
+            "canonical_bark": {
+                "status": "replacement_required",
+                "canonical_material": "M_bark_elm_01",
+                "canonical_sources": [{
+                    "spm": str(canonical),
+                    "material_id": "1",
+                    "material_name": "M_bark_elm_01",
+                    "refs": canonical_refs,
+                }],
+                "cluster_bark_sources": [{
+                    "cluster_spm": str(source),
+                    "material_id": "1",
+                    "material_name": "M_bark_common_end_01",
+                    "replacement": "required",
+                }],
+            },
+        },
+    }
+    required = contract["handoff"]["canonical_bark"][
+        "cluster_bark_sources"
+    ]
+
+    prepared = prepare_isolated_bark_source(
+        source,
+        contract,
+        required,
+        cache_parent=tmp_path / "cache",
+    )
+
+    assert prepared["status"] == "prepared"
+    isolated = Path(prepared["speedtree_spm"])
+    row = extract_material_image_refs(isolated)[0]
+    assert {Path(value).name for value in row["refs"]} == expected_names
+    manifest = json.loads(
+        Path(prepared["manifest"]).read_text(encoding="utf-8")
+    )
+    assert (
+        manifest["production_texture_handoff"]["texture_availability"]
+        == availability
+    )
+    assert not (
+        texture_root / "pcg_st9_canonical_outputs.json"
+    ).exists()
 
 
 def test_same_bytes_provider_rename_rebuilds_exact_filename_bundle():
@@ -817,6 +907,91 @@ def test_direct_owner_canonical_overrides_provider_only_target_provenance():
         } == {"T_bark_black_locast_01_color.tga"}
 
 
+def test_same_authority_texture_disagreement_is_quarantined_not_blocked(
+    tmp_path,
+):
+    root = tmp_path / "Tree_shared"
+    source = root / "Cluster" / "SK_branch_shared_01.spm"
+    owner_a = root / "SK_tree_owner_a_01.spm"
+    owner_b = root / "SK_tree_owner_b_01.spm"
+    _write_spm(
+        source,
+        "M_bark_common_end_01",
+        ["generic/common_color.tga"],
+    )
+    generic = source.parent / "generic" / "common_color.tga"
+    generic.parent.mkdir(parents=True)
+    generic.write_bytes(b"generic")
+    refs_a = [_canonical_output(
+        root,
+        owner_a,
+        "1",
+        "M_bark_shared_01",
+        "T_bark_owner_a_01",
+    )["color"]]
+    refs_b = [_canonical_output(
+        root,
+        owner_b,
+        "1",
+        "M_bark_shared_01",
+        "T_bark_owner_b_01",
+    )["color"]]
+    _write_spm(owner_a, "M_bark_shared_01", refs_a)
+    _write_spm(owner_b, "M_bark_shared_01", refs_b)
+
+    def contract(target, refs):
+        return {
+            "dependencies": [{"spm": str(source)}],
+            "handoff": {
+                "canonical_bark": {
+                    "status": "replacement_required",
+                    "canonical_material": "M_bark_shared_01",
+                    "canonical_sources": [{
+                        "spm": str(target),
+                        "material_id": "1",
+                        "material_name": "M_bark_shared_01",
+                        "refs": refs,
+                    }],
+                    "cluster_bark_sources": [{
+                        "cluster_spm": str(source),
+                        "material_id": "1",
+                        "material_name": "M_bark_common_end_01",
+                        "replacement": "required",
+                    }],
+                },
+            },
+        }
+
+    resolved = resolve_cluster_bark_source_spm(
+        source,
+        [owner_a, owner_b],
+        cache_parent=tmp_path / "cache",
+        live_target_contracts=[
+            {
+                "target_spm": str(owner_a),
+                "contract": contract(owner_a, refs_a),
+            },
+            {
+                "target_spm": str(owner_b),
+                "contract": contract(owner_b, refs_b),
+            },
+        ],
+    )
+
+    assert resolved["status"] == "prepared"
+    isolated_row = extract_material_image_refs(
+        Path(resolved["speedtree_spm"])
+    )[0]
+    assert isolated_row["refs"] == []
+    manifest = json.loads(
+        Path(resolved["manifest"]).read_text(encoding="utf-8")
+    )
+    assert (
+        manifest["production_texture_handoff"]["texture_availability"]
+        == "textureless"
+    )
+
+
 def test_live_pass_through_contract_does_not_fall_back_to_old_receipt():
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary) / "Tree_plain"
@@ -1073,3 +1248,91 @@ def test_isolated_bark_source_rebases_external_texture_dependencies():
             root / leaf_outputs["color"]
         ).read_bytes()
         assert workspace / "Texture" / "chestnut" / "leaf_color.tif" == external_texture
+
+
+class TestCanonicalBarkRecordPlan:
+    """A lost manifest entry is bookkeeping, not missing texture work.
+
+    On 2026-08-04 every canonical bark row blocked in production -- 24 rows
+    across 8 assets -- had its complete six-role T_* set already on disk.  The
+    gate still told the operator to generate those outputs in PCG ST9 Texture,
+    which is work that does not exist.  The plan below is built only from what
+    the row itself proves: its SPM, its material, and the refs that material
+    actually points at.
+    """
+
+    def row(self, root, base="T_bark_test_01", roles=None):
+        texture = root / "texture"
+        texture.mkdir(parents=True, exist_ok=True)
+        roles = roles or list(REQUIRED_TEXTURE_ROLES)
+        refs = []
+        for role in roles:
+            path = texture / f"{base}_{role}.tga"
+            path.write_bytes(b"tga")
+            refs.append(f"texture\\{base}_{role}.tga")
+        return {
+            "spm": str(root / "cluster" / "SK_leaf_test_01.spm"),
+            "material_id": "6",
+            "material_name": "M_bark_test_01",
+            "refs": refs,
+        }
+
+    def test_a_complete_on_disk_set_is_a_recordable_entry(self, tmp_path):
+        row = self.row(tmp_path / "tree_test")
+
+        plan = canonical_bark_record_plan(row)
+
+        assert plan is not None
+        assert plan["texture_base"] == "T_bark_test_01"
+        assert Path(plan["asset_root"]).name == "tree_test"
+        assert plan["material_targets"] == [{
+            "spm": row["spm"],
+            "material_id": "6",
+            "material_name": "M_bark_test_01",
+        }]
+        assert len(plan["output_files"]) == len(REQUIRED_TEXTURE_ROLES)
+
+    def test_an_absent_role_file_is_not_recordable(self, tmp_path):
+        root = tmp_path / "tree_test"
+        row = self.row(root)
+        (root / "texture" / "T_bark_test_01_normal.tga").unlink()
+
+        assert canonical_bark_record_plan(row) is None
+
+    def test_an_empty_role_file_is_not_recordable(self, tmp_path):
+        root = tmp_path / "tree_test"
+        row = self.row(root)
+        (root / "texture" / "T_bark_test_01_normal.tga").write_bytes(b"")
+
+        assert canonical_bark_record_plan(row) is None
+
+    def test_an_incomplete_role_set_is_not_recordable(self, tmp_path):
+        row = self.row(tmp_path / "tree_test", roles=["color", "normal"])
+
+        assert canonical_bark_record_plan(row) is None
+
+    def test_two_texture_bases_are_never_guessed_apart(self, tmp_path):
+        root = tmp_path / "tree_test"
+        row = self.row(root)
+        row["refs"][0] = "texture\\T_bark_other_01_color.tga"
+
+        assert canonical_bark_record_plan(row) is None
+
+    def test_a_non_canonical_base_is_refused(self, tmp_path):
+        row = self.row(tmp_path / "tree_test", base="bark_test_01")
+
+        assert canonical_bark_record_plan(row) is None
+
+    def test_a_row_without_refs_proves_nothing(self, tmp_path):
+        row = self.row(tmp_path / "tree_test")
+        row["refs"] = []
+
+        assert canonical_bark_record_plan(row) is None
+
+    def test_the_asset_root_is_the_cluster_parent(self, tmp_path):
+        root = tmp_path / "tree_test"
+        row = self.row(root)
+
+        plan = canonical_bark_record_plan(row)
+
+        assert Path(plan["asset_root"]) == root.resolve()

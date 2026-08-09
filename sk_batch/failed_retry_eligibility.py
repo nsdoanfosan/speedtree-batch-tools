@@ -32,6 +32,26 @@ UNREAL_RECOVERY_FAILURE_KINDS = frozenset({
     "unreal_crash",
     "not_run",
 })
+# Durable push states that are stamped *before* Unreal ingest is confirmed.
+# `ready` lands when Blender Repair finishes and the row is handed to the push
+# phase; `exported_pending_unreal` lands when Send2UE export finishes and the
+# Unreal result has not been observed. Neither is a failure and neither is a
+# finished pipeline -- if the push phase stops in between, the row keeps a
+# current .blend and never reaches Unreal on its own.
+PUSH_INCOMPLETE_KINDS = frozenset({
+    "exported_pending_unreal",
+    "ready",
+})
+# These are orchestration-history wrappers, not current asset verdicts.  They
+# may explain why an earlier automatic route stopped, but only a fresh content
+# audit may decide whether the asset can Push.
+AUTOMATION_WRAPPER_RETRY_KINDS = frozenset({
+    "automatic_repair",
+    "automatic_repair_failed",
+    "automatic_repair_reaudit_failed",
+    "planned_excluded",
+    "preflight_skip",
+})
 BLENDER_EXPORT_RETRY_FAILURE_KINDS = frozenset({
     "data_error",
     "internal_error",
@@ -118,8 +138,10 @@ def classify_failed_retry(
     *,
     unreal_parent_status=UNREAL_PARENT_ABSENT,
     unreal_parent_diagnostic="",
+    force_rerun=False,
+    force_full_rebuild=False,
 ):
-    """Classify one selected row from structured, content-derived evidence."""
+    """Classify one inventory candidate from structured current evidence."""
 
     entry = entry if isinstance(entry, dict) else {}
     repair_state = (
@@ -157,6 +179,35 @@ def classify_failed_retry(
             parent,
         )
 
+    # These are unfinished Push states, regardless of whether an older parent
+    # manifest is still current.  Parent evidence may safely authorize an
+    # Unreal-only retry after a recorded Unreal failure; it must not convert a
+    # run that never reached Unreal into a terminal success/exclusion.
+    if push_kind in PUSH_INCOMPLETE_KINDS:
+        return _result(
+            BLENDER_REBUILD,
+            "push_never_reached_unreal",
+            (
+                "Blender output is current but the push phase never produced a "
+                f"terminal Unreal result ({push_kind}); regenerate it through "
+                "the full Blender pipeline"
+            ),
+            repair_kind,
+            parent,
+        )
+    if push_kind in AUTOMATION_WRAPPER_RETRY_KINDS:
+        return _result(
+            BLENDER_REBUILD,
+            "automation_wrapper_fresh_pipeline",
+            (
+                "Saved automation status is historical orchestration evidence, "
+                f"not current asset authority ({push_kind}); run the fresh full "
+                "pipeline and let its exact content audit decide"
+            ),
+            repair_kind,
+            parent,
+        )
+
     if parent == UNREAL_PARENT_DEPENDENCY_REBUILD:
         return _result(
             BLENDER_REBUILD,
@@ -167,11 +218,35 @@ def classify_failed_retry(
             parent,
         )
     if parent == UNREAL_PARENT_CURRENT:
+        if force_full_rebuild:
+            return _result(
+                BLENDER_REBUILD,
+                "current_unreal_parent_forced_rebuild",
+                (
+                    "An explicit force-full-rebuild request authorizes the Blender "
+                    "pipeline even when a current immutable Unreal parent "
+                    f"exists ({push_kind or 'missing'})"
+                ),
+                repair_kind,
+                parent,
+            )
         if push_kind in UNREAL_RECOVERY_FAILURE_KINDS:
             return _result(
                 UNREAL_ONLY,
                 "current_immutable_unreal_failure",
                 "Immutable export/source evidence is current",
+                repair_kind,
+                parent,
+            )
+        if force_rerun:
+            return _result(
+                BLENDER_REBUILD,
+                "current_unreal_parent_forced_rebuild",
+                (
+                    "The selected current result has no retryable Unreal "
+                    "failure, so its explicit rerun uses the full Blender "
+                    f"pipeline ({push_kind or 'missing'})"
+                ),
                 repair_kind,
                 parent,
             )
@@ -192,10 +267,13 @@ def classify_failed_retry(
         )
     if parent in {UNREAL_PARENT_INCOMPLETE, UNREAL_PARENT_INVALID}:
         return _result(
-            BLOCKED,
-            "unreal_parent_evidence_" + parent,
+            BLENDER_REBUILD,
+            "unreal_parent_evidence_" + parent + "_full_rebuild",
             unreal_parent_diagnostic
-            or "Unreal parent evidence is incomplete; run the full pipeline",
+            or (
+                "Unreal parent evidence cannot authorize immutable recovery; "
+                "regenerate it through the full Blender pipeline"
+            ),
             repair_kind,
             parent,
         )
@@ -216,17 +294,33 @@ def classify_failed_retry(
 
     if push_kind in BLENDER_EXPORT_RETRY_FAILURE_KINDS:
         return _result(
-            BLOCKED,
-            "push_phase_evidence_missing",
+            BLENDER_REBUILD,
+            "push_phase_evidence_missing_full_rebuild",
             (
                 "Push failure has no export report or complete Unreal "
-                "manifest/checkpoint evidence; run the full pipeline explicitly"
+                "manifest/checkpoint evidence; regenerate it through the "
+                "full Blender pipeline"
             ),
             repair_kind,
             parent,
         )
 
     if repair_current:
+        # An explicit operator force request is an authorization to rebuild, not
+        # a claim that a failure exists. A current success stays ineligible for
+        # the ordinary failed-export route, but must not dead-end when the
+        # operator has already asked for a forced rerun.
+        if force_rerun:
+            return _result(
+                BLENDER_REBUILD,
+                "current_blender_success_forced_rebuild",
+                (
+                    "Current Blender success is rebuilt because an explicit "
+                    "force rerun was requested"
+                ),
+                repair_kind,
+                parent,
+            )
         return _result(
             CURRENT_BLENDER_EXCLUDED,
             "current_blender_success",
@@ -235,6 +329,17 @@ def classify_failed_retry(
             parent,
         )
 
+    if force_rerun:
+        return _result(
+            BLENDER_REBUILD,
+            "retry_evidence_ambiguous_forced_rebuild",
+            (
+                "Retry evidence is incomplete but an explicit force rerun "
+                f"authorizes a full Blender rebuild · {repair_reason}"
+            ),
+            repair_kind,
+            parent,
+        )
     return _result(
         BLOCKED,
         "retry_evidence_ambiguous",
@@ -245,6 +350,7 @@ def classify_failed_retry(
 
 
 __all__ = (
+    "AUTOMATION_WRAPPER_RETRY_KINDS",
     "BLENDER_EXPORT_RETRY_FAILURE_KINDS",
     "BLENDER_REBUILD",
     "BLOCKED",

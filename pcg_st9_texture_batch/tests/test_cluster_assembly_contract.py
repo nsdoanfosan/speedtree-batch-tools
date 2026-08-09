@@ -36,6 +36,7 @@ from pcg_cluster_assembly_contract import (
     _atlas_normalized_variants,
     _canonical_bark_contract,
     _canonical_cluster_texture_refs,
+    _current_live_pair_covered,
     _normalized_generator_delivery,
     _tga_basename_validation,
     _validate_normalized_source_dependency,
@@ -371,6 +372,20 @@ def write_ascii_fbx(path, material_names, mesh_names, pairs):
 
 
 class FbxRoleContractTests(unittest.TestCase):
+    def test_current_complete_pairs_cover_missing_historical_variants(self):
+        targets = [{
+            "fbx_material_mesh_pair": {
+                "status": "complete_pair",
+                "decision": "normalize_part",
+                "complete_pair_count": 1,
+                "error": None,
+            },
+        }]
+
+        self.assertTrue(_current_live_pair_covered(targets))
+        targets[0]["fbx_material_mesh_pair"]["status"] = "material_without_mesh"
+        self.assertFalse(_current_live_pair_covered(targets))
+
     def test_complete_absent_and_partial_roles_are_independent(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             fbx = Path(temp_dir) / "tree.fbx"
@@ -762,9 +777,10 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 dependency["texture_dependencies"][0]["path"], expected
             )
             self.assertIn(
-                "CLUSTER_TGA_BASENAME_INVALID",
+                "CLUSTER_TEXTURE_REFERENCE_MISSING",
                 [row["code"] for row in contract["handoff"]["errors"]],
             )
+            self.assertEqual(contract["handoff"]["status"], "blocked")
 
             # Missing source data is a handoff error, not a reason for a newly
             # written snapshot receipt to invalidate itself.  Downstream reads
@@ -776,7 +792,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 receipt, requested_spm=target
             )
             self.assertIn(
-                "CLUSTER_TGA_BASENAME_INVALID",
+                "CLUSTER_TEXTURE_REFERENCE_MISSING",
                 [
                     row["code"]
                     for row in payload["cluster_assembly"]["handoff"]["errors"]
@@ -889,9 +905,16 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 validation = dependency["tga_basename_validation"]
                 self.assertEqual(validation["status"], "missing")
                 self.assertEqual(validation["reason"], "path_alias_missing")
-                self.assertIn(
+                self.assertNotIn(
+                    "CLUSTER_TGA_BASENAME_INVALID",
+                    [row["code"] for row in contract["handoff"]["issues"]],
+                )
+                self.assertNotIn(
                     "CLUSTER_TGA_BASENAME_INVALID",
                     [row["code"] for row in contract["handoff"]["errors"]],
+                )
+                self.assertNotEqual(
+                    contract["handoff"]["status"], "blocked"
                 )
                 expected_group_status = (
                     "path_alias_ambiguous"
@@ -904,46 +927,31 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 ))
                 self.assertEqual(case["consumer"].read_bytes(), before_consumer)
 
-    def test_issue_67_nothofagus_suffix_and_basename_mismatch_stay_blocked(self):
+    def test_issue_178_live_texture_extensions_are_not_an_export_gate(self):
         with tempfile.TemporaryDirectory() as temp:
             cluster = Path(temp) / "Tree_nothofagus" / "Cluster"
             cluster.mkdir(parents=True)
             output_spm = cluster / "SK_branch_nothofagus_01.spm"
             legacy_output_spm = cluster / "branch_nothofagus_01.spm"
-            (cluster / "branch_nothofagus_01.tga").write_bytes(b"current")
-            old_root = Path(temp) / "sanitized_retired_sync" / "Cluster"
+            refs = [
+                cluster / "branch_nothofagus_01.png",
+                cluster / "branch_nothofagus_01_Opacity.jpg",
+                cluster / "branch_nothofagus_01_Normal.custom_image",
+            ]
+            for ref in refs:
+                ref.write_bytes(b"current")
 
-            for values in (
-                [
-                    old_root / "branch_nothofagus_01.tif",
-                    old_root / "branch_nothofagus_01_Opacity.png",
-                ],
-                [old_root / "branch_nothofagus_02.tga"],
-            ):
-                resolution = {}
-                refs, ignored = _canonical_cluster_texture_refs(
-                    values,
-                    cluster,
-                    resolution_out=resolution,
-                )
-                validation = _tga_basename_validation(
-                    output_spm,
-                    {},
-                    legacy_output_spm=legacy_output_spm,
-                    resolved_refs=refs,
-                    ignored_aliases=ignored,
-                    alias_resolution=resolution,
-                )
-                self.assertEqual(validation["status"], "basename_mismatch")
-                self.assertEqual(
-                    validation["reason"],
-                    "basename_or_suffix_mismatch",
-                )
-                self.assertTrue(validation["invalid"])
-                self.assertNotIn(
-                    str(cluster / "branch_nothofagus_01.tga"),
-                    validation["refs"],
-                )
+            validation = _tga_basename_validation(
+                output_spm,
+                {},
+                legacy_output_spm=legacy_output_spm,
+                resolved_refs=refs,
+            )
+
+            self.assertEqual(validation["status"], "ok")
+            self.assertIsNone(validation["reason"])
+            self.assertEqual(validation["missing"], [])
+            self.assertEqual(validation["invalid"], [])
 
     def test_legacy_texture_path_alias_does_not_stale_canonical_receipt(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1146,9 +1154,19 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 set(dependencies),
                 {"SK_branch_elm_01", "SK_leaf_elm_01", "SK_leaf_elm_side_01"},
             )
-            self.assertEqual(dependencies["SK_branch_elm_01"]["decision"], "blocked")
+            self.assertEqual(
+                dependencies["SK_branch_elm_01"]["decision"],
+                "normalize_part",
+            )
             self.assertTrue(
                 dependencies["SK_branch_elm_01"]["normalized_variants_missing"]
+            )
+            self.assertTrue(
+                dependencies["SK_branch_elm_01"]["current_live_pair_covered"]
+            )
+            self.assertIn(
+                "NORMALIZED_VARIANTS_REQUIRED",
+                [row["code"] for row in contract["handoff"]["issues"]],
             )
             self.assertEqual(dependencies["SK_leaf_elm_01"]["decision"], "blocked")
             self.assertEqual(
@@ -1179,8 +1197,8 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             self.assertEqual(
                 len(contract["handoff"]["cluster_dependencies"]), 3)
             self.assertEqual(
-                contract["handoff"]["errors"],
-                contract["handoff"]["issues"],
+                [row["code"] for row in contract["handoff"]["errors"]],
+                ["FBX_ROLE_MATERIAL_MESH_PARTIAL"],
             )
             self.assertTrue(
                 contract["tree_source_identities"][0]["target_spm"]["sha256"])
@@ -1280,6 +1298,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 "leaf": ("leaf_elm_01", 3, [20]),
                 "leaf_side": ("leaf_elm_side_01", 4, [30, 31, 32]),
             }
+            scope_payloads = {}
             for role, (identity, material_id, mesh_ids) in role_specs.items():
                 rows = []
                 for ordinal, mesh_id in enumerate(mesh_ids, 1):
@@ -1315,23 +1334,16 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                         "meshes": rows,
                     }],
                 }
+                scope_payloads[role] = payload
                 (scope_dir / f"scope_{role}__{target.stem}.json").write_text(
                     json.dumps(payload), encoding="utf-8"
                 )
 
-            # The rolling global file is deliberately stale/malformed.  Once
-            # stable scope receipts exist it must not shadow them.
+            # The rolling global file is a coherent lower-precedence mirror.
+            # A stale disagreement is now a resolver error rather than a
+            # last-writer-wins fallback.
             (folder / "speedtree_import_manifest.json").write_text(
-                json.dumps({
-                    "spm": str(target),
-                    "blend_file": str(blend),
-                    "material_groups": [{
-                        "material": "branch_elm_01",
-                        "material_id": 2,
-                        "mesh_ids": [10, 11],
-                        "meshes": [],
-                    }],
-                }),
+                json.dumps(scope_payloads["branch"]),
                 encoding="utf-8",
             )
 
@@ -1596,13 +1608,21 @@ class ClusterAssemblyContractTests(unittest.TestCase):
 
             original_fbx = source_fbx.read_bytes()
             source_fbx.write_bytes(original_fbx + b"-changed")
-            self.assertIsNone(
-                _atlas_normalized_variants(
-                    folder,
-                    "branch_elm_01",
-                    [target],
-                    audit=audit_module,
-                )
+            drifted_fbx = _atlas_normalized_variants(
+                folder,
+                "branch_elm_01",
+                [target],
+                audit=audit_module,
+            )
+            self.assertEqual(drifted_fbx["status"], "ready")
+            self.assertTrue(
+                drifted_fbx["source_3d_artifacts"]["source_fbx"][
+                    "raw_sha256_drift"
+                ]
+            )
+            self.assertEqual(
+                drifted_fbx["source_fbx_drift_validation"]["status"],
+                "deferred",
             )
             source_fbx.write_bytes(original_fbx)
 
@@ -2233,7 +2253,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 expected,
             )
 
-    def test_divergent_current_overlapping_receipts_fail_closed(self):
+    def test_narrower_current_receipt_wins_over_divergent_wider_scope(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             receipt_dir = root / "receipts"
@@ -2277,16 +2297,59 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             os.utime(first, ns=(1_000_000_000, 1_000_000_000))
             os.utime(second, ns=(2_000_000_000, 2_000_000_000))
 
-            with self.assertRaisesRegex(
-                ClusterAssemblyReceiptAmbiguityError,
-                "run a live Cluster Assembly audit",
-            ):
-                cluster_assembly_receipt_resolution(target, receipt_dir)
+            resolution = cluster_assembly_receipt_resolution(
+                target, receipt_dir
+            )
+            self.assertEqual(
+                resolution["policy"],
+                "narrowest_hash_current_receipt_scope",
+            )
+            self.assertEqual(Path(resolution["selected_receipt"]), first)
+            self.assertEqual(resolution["selected_target_scope_count"], 1)
+            self.assertEqual(
+                [Path(row["path"]) for row in resolution[
+                    "superseded_current_receipts"
+                ]],
+                [second],
+            )
 
             os.utime(first, ns=(3_000_000_000, 3_000_000_000))
             os.utime(second, ns=(1_000_000_000, 1_000_000_000))
-            with self.assertRaises(ClusterAssemblyReceiptAmbiguityError):
-                locate_cluster_assembly_receipt(target, receipt_dir)
+            self.assertEqual(
+                locate_cluster_assembly_receipt(target, receipt_dir),
+                first,
+            )
+
+    def test_divergent_equally_narrow_current_receipts_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            receipt_dir = root / "receipts"
+            target = root / "SK_Tree_elm_01.spm"
+            source = root / "Tree_elm_01.spm"
+            target.write_bytes(b"target")
+            source.write_bytes(b"source")
+            base = {
+                "folder": str(root),
+                "tree_source_identities": [{
+                    "target_spm": file_fingerprint(target),
+                    "authoritative_tree_source": file_fingerprint(source),
+                }],
+                "dependencies": [],
+                "handoff": {"cluster_dependencies": []},
+            }
+            first = persist_cluster_assembly_receipt(
+                base, receipt_dir=receipt_dir
+            )
+            second_payload = json.loads(first.read_text(encoding="utf-8"))
+            second_payload["cluster_assembly"]["handoff"]["status"] = "ok"
+            second = receipt_dir / "cluster_assembly_divergent.json"
+            second.write_text(json.dumps(second_payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                ClusterAssemblyReceiptAmbiguityError,
+                "equally narrow",
+            ):
+                cluster_assembly_receipt_resolution(target, receipt_dir)
 
     def test_persisted_receipt_tracks_nested_physical_source_artifacts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3301,10 +3364,10 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                     "normalized_variants": normalized,
                 }],
             )
-            self.assertEqual(bark["status"], "replacement_required")
+            self.assertEqual(bark["status"], "preserved_live_variants")
             self.assertEqual(
                 bark["cluster_bark_sources"][0]["replacement"],
-                "required",
+                "not_required",
             )
             self.assertIsNone(
                 bark["cluster_bark_sources"][0][
@@ -3489,7 +3552,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                         fixture["production_spm"],
                     )
 
-    def test_same_role_secondary_is_not_bound_to_primary_receipt(self):
+    def test_same_role_secondary_keeps_its_own_normalized_provider(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary) / "Tree_elm"
             cluster_dir = folder / "Cluster"
@@ -3571,7 +3634,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             dependencies = {
                 row["name"]: row for row in contract["dependencies"]
             }
-            lookup.assert_called_once()
+            self.assertEqual(lookup.call_count, 2)
             self.assertIs(
                 dependencies["SK_branch_elm_01"]["normalized_variants"],
                 normalized,
@@ -3581,13 +3644,14 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             )
             self.assertEqual(
                 dependencies["SK_branch_elm_02"]["decision"],
-                "reference_only",
+                "normalize_part",
             )
             self.assertFalse(
                 dependencies["SK_branch_elm_02"]["primary_role_source"]
             )
-            self.assertIsNone(
-                dependencies["SK_branch_elm_02"]["normalized_variants"]
+            self.assertIs(
+                dependencies["SK_branch_elm_02"]["normalized_variants"],
+                normalized,
             )
 
             with mock.patch(
@@ -3617,8 +3681,12 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 stale_primary["normalized_variants_stale"]["status"],
                 "needs_regeneration",
             )
+            self.assertEqual(
+                stale_contract["handoff"]["status"],
+                "ready",
+            )
             self.assertIn(
-                "NORMALIZED_VARIANTS_STALE",
+                "NORMALIZED_VARIANTS_REQUIRED",
                 [
                     row["code"]
                     for row in stale_contract["handoff"]["issues"]
@@ -3638,7 +3706,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 dependencies["SK_branch_elm_02"][
                     "tga_basename_validation"
                 ]["status"],
-                "not_applicable",
+                "basename_mismatch",
             )
 
     def test_owner_folder_bark_identity_is_canonical_content(self):
@@ -3680,7 +3748,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             self.assertEqual(contract["canonical_material"], bark_name)
             self.assertEqual(len(contract["canonical_sources"]), 1)
 
-    def test_multiple_provider_signatures_cannot_supply_missing_owner_bark(
+    def test_multiple_provider_signatures_are_preserved_live_variants(
         self,
     ):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3721,10 +3789,18 @@ class ClusterAssemblyContractTests(unittest.TestCase):
 
             self.assertEqual(
                 contract["status"],
-                "blocked_canonical_ambiguous",
+                "preserved_live_variants",
             )
             self.assertEqual(contract["canonical_sources"], [])
-            self.assertEqual(len(contract["canonical_conflicts"]), 2)
+            self.assertEqual(contract["canonical_conflicts"], [])
+            self.assertEqual(len(contract["live_variants"]), 2)
+            self.assertEqual(
+                {
+                    row["replacement"]
+                    for row in contract["cluster_bark_sources"]
+                },
+                {"not_required"},
+            )
 
     def test_same_signature_bark_labels_alias_expected_provider_identity(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3803,7 +3879,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 {"not_required"},
             )
 
-    def test_same_signature_without_expected_identity_stays_blocked(self):
+    def test_same_signature_without_expected_identity_is_preserved(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary) / "weed_black_locast"
             target = folder / "SK_tree_black_locast_01.spm"
@@ -3834,10 +3910,11 @@ class ClusterAssemblyContractTests(unittest.TestCase):
 
             self.assertEqual(
                 contract["status"],
-                "blocked_canonical_ambiguous",
+                "preserved_live_variants",
             )
             self.assertEqual(contract["canonical_sources"], [])
-            self.assertEqual(len(contract["canonical_conflicts"]), 1)
+            self.assertEqual(contract["canonical_conflicts"], [])
+            self.assertEqual(len(contract["live_variants"]), 1)
 
     def test_same_basenames_in_different_folders_are_not_bark_aliases(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3888,12 +3965,13 @@ class ClusterAssemblyContractTests(unittest.TestCase):
 
             self.assertEqual(
                 contract["status"],
-                "blocked_canonical_ambiguous",
+                "preserved_live_variants",
             )
             self.assertEqual(contract["canonical_sources"], [])
-            self.assertEqual(len(contract["canonical_conflicts"]), 2)
+            self.assertEqual(contract["canonical_conflicts"], [])
+            self.assertEqual(len(contract["live_variants"]), 2)
 
-    def test_direct_owner_bark_requires_same_named_provider_texture_replacement(
+    def test_direct_owner_bark_preserves_distinct_provider_texture_variant(
         self,
     ):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3929,9 +4007,24 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 [{"source_spm": provider, "spm": provider}],
             )
 
-            self.assertEqual(contract["status"], "replacement_required")
+            self.assertEqual(
+                contract["status"], "preserved_live_variants"
+            )
             self.assertEqual(
                 contract["cluster_bark_sources"][0]["replacement"],
+                "not_required",
+            )
+
+            requested = _canonical_bark_contract(
+                audit_module,
+                folder,
+                [target],
+                [{"source_spm": provider, "spm": provider}],
+                mutation_requested=True,
+            )
+            self.assertEqual(requested["status"], "replacement_required")
+            self.assertEqual(
+                requested["cluster_bark_sources"][0]["replacement"],
                 "required",
             )
 
@@ -3983,10 +4076,11 @@ class ClusterAssemblyContractTests(unittest.TestCase):
 
             self.assertEqual(
                 contract["status"],
-                "blocked_canonical_ambiguous",
+                "preserved_live_variants",
             )
             self.assertEqual(contract["canonical_sources"], [])
-            self.assertEqual(len(contract["canonical_conflicts"]), 2)
+            self.assertEqual(contract["canonical_conflicts"], [])
+            self.assertEqual(len(contract["live_variants"]), 2)
 
     def test_barkless_owner_and_provider_do_not_invent_canonical_bark(self):
         with tempfile.TemporaryDirectory() as temporary:

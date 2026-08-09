@@ -46,7 +46,10 @@ REPO_DIR = TOOL_DIR.parent
 sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(TOOL_DIR))
 
+from process_lifecycle import owned_run
+
 from code_compile_gate import (
+    CODE_REVISION_RESTART_ROUTE,
     CompileGateError,
     production_source_manifest,
     run_gate as run_code_compile_gate,
@@ -56,9 +59,83 @@ from code_compile_gate import (
 _PROCESS_PRODUCTION_SOURCE_MANIFEST = production_source_manifest(REPO_DIR)
 from batch_ui_common import CheckedRowController, copy_selected_row_paths
 from shared_queue_runtime import SharedQueueRuntime, WaitCancelled
+from exact_target_command import (
+    build_exact_target_request,
+    run_exact_target_request,
+)
+from repair_orchestration import (
+    ATLAS_MANIFEST_MIRROR_REPAIR,
+    ALL_REPAIR_CONTRACT_CODES,
+    DURABLE_FAILURE_REASON_CODES,
+    GENERATOR_SYNC_TOOL,
+    MODELER_NODE_TABLE_RECOVERY,
+    MODELER_RECOVERY_TOOL,
+    PCG_TEXTURE_TOOL,
+    REPAIR_PLAN_SCHEMA_VERSION,
+    REPAIR_UI_AUTOMATIC,
+    REPAIR_UI_BLOCKED,
+    RepairPlan,
+    STATUS_CANCELLED,
+    STATUS_CLUSTER,
+    STATUS_COMPLETED,
+    STATUS_FINAL_FAILED,
+    STATUS_GENERATOR,
+    STATUS_LABELS as AUTOMATIC_REPAIR_STATUS_LABELS,
+    STATUS_PENDING,
+    STATUS_PIPELINE,
+    STATUS_REAUDIT,
+    STEP3_STANDARD,
+    build_exact_target_repair_plan,
+    compact_success_message,
+    evidence_reason_codes,
+    fresh_repair_receipt_authoritative,
+    has_repair_contract_evidence,
+    repair_progress_payload,
+    repair_ui_decision,
+    stage_running_status,
+)
+from repair_failure_provenance import (
+    REPAIR_FAILURE_KEY,
+    build_repair_failure,
+    mark_fresh_reaudit_attempted,
+    needs_fresh_reaudit,
+    repair_failure_record,
+    root_reason_codes as repair_root_reason_codes,
+)
 from child_progress_contract import (
     material_preflight_inactivity_rules,
     send2ue_inactivity_rules,
+)
+from material_preflight_cache import (
+    load_material_preflight_cache,
+    material_preflight_runtime_signature,
+    store_material_preflight_cache,
+)
+from retry_progress import (
+    BLENDER as RETRY_STAGE_BLENDER,
+    BLOCKED as RETRY_STAGE_BLOCKED,
+    CANCELLED as RETRY_STAGE_CANCELLED,
+    CLAIMED as RETRY_STAGE_CLAIMED,
+    COMPLETE as RETRY_STAGE_COMPLETE,
+    FAILED as RETRY_STAGE_FAILED,
+    OWNER_LOST as RETRY_STAGE_OWNER_LOST,
+    PENDING_UNREAL as RETRY_STAGE_PENDING_UNREAL,
+    PLANNING as RETRY_STAGE_PLANNING,
+    POST_CHECK as RETRY_STAGE_POST_CHECK,
+    SEND2UE as RETRY_STAGE_SEND2UE,
+    SHARED_QUEUE_WAIT as RETRY_STAGE_SHARED_QUEUE_WAIT,
+    UNREAL as RETRY_STAGE_UNREAL,
+    RetryProgressReceipt,
+    stage_for_send2ue_marker,
+)
+from retry_planning import (
+    MAX_REPORT_BYTES as RETRY_PLANNING_MAX_REPORT_BYTES,
+    RetryPlanningContext,
+    RetryPlanningSnapshotError,
+    build_plan_cache_artifact,
+    cheap_durable_candidate,
+    hydrate_plan_cache_artifact,
+    planning_input_signature,
 )
 from artifact_content_key import (
     artifact_record_content_key,
@@ -92,6 +169,7 @@ from sk_common import (
     load_state,
     manifest_item_files_match,
     manual_bones_marker_path,
+    push_source_cache_matches_snapshot,
     save_config,
     save_state,
     scan_cluster_spm_sources,
@@ -103,6 +181,7 @@ from sk_common import (
     speedtree_output_spm_for,
     terminate_process_tree,
     unreal_remote_execution_settings,
+    normalize_wind_override,
     wind_preset_for_spm,
 )
 from spm_leaf_handoff_contract import (
@@ -126,7 +205,7 @@ from speedtree_texture_contract import (
 from push_dependency_schedule import (
     PushDependencyError,
     exact_dependency_contract_from_validated_manifest,
-    expand_push_targets,
+    partition_push_targets,
 )
 from failed_retry_eligibility import (
     BLENDER_EXPORT_RETRY_FAILURE_KINDS,
@@ -164,7 +243,9 @@ from pcg_st9_texture_batch.pcg_canonical_outputs import (
     CanonicalOutputManifestError,
     refresh_atlas_manifests_for_spm,
 )
+from atlas_manifest_resolver import atlas_manifest_mirror_repair_plan
 from repair_runtime_contract import (
+    LEGACY_REPAIR_OUTPUT_CONTRACT_VERSION,
     REPAIR_OUTPUT_CONTRACT_VERSION,
     REPAIR_RUNTIME_RECEIPT_VERSION,
     addon_dir_from_config,
@@ -172,6 +253,7 @@ from repair_runtime_contract import (
     repair_runtime_code_paths,
     repair_runtime_code_state,
     repair_runtime_output_contract,
+    repair_pipeline_output_contract,
     repair_runtime_receipt_needs_migration,
     repair_runtime_receipt_path,
     write_repair_runtime_receipt,
@@ -193,7 +275,7 @@ WIND_OPTIONS = (
     ("자동 (식생 종류 기준)", "auto"),
     ("TREE", "TREE"),
     ("BUSH", "BUSH"),
-    ("GRASS", "GRASS"),
+    ("WEED", "WEED"),
     ("NONE", "NONE"),
 )
 BONE_MODE_OPTIONS = (("자동 계산", "auto"), ("수동 본 유지", "manual"))
@@ -205,12 +287,11 @@ PLANNED_EXCLUSION_KINDS = frozenset({
     "source_review",
     "stale_execution_freeze",
 })
+_INLINE_ATLAS_REPAIR_LOCK = threading.RLock()
+_REGISTERED_RELATION_REPAIR_LOCK = threading.RLock()
 CHECK_ON = "☑"
 CHECK_OFF = "☐"
 STATUS_COLUMNS = ("spm_status", "blend_status", "push_status")
-# Temporary production drain mode: select only owner rows that already have
-# cluster/*.spm providers but do not yet have a local Assembly output.
-TEMP_SELECT_CLUSTER_WITHOUT_ASSEMBLY_PUSH_ROWS = True
 CLUSTER_RELATION_LOCKS_GUARD = threading.Lock()
 _REPAIR_REPORT_READ_LOCAL = threading.local()
 CLUSTER_RELATION_LOCKS = {}
@@ -944,17 +1025,6 @@ def load_current_repair_pipeline_report(spm, *, migrate_legacy=True):
         outcome="ok",
         texture_readiness=texture_readiness,
     )
-    unresolved_materials = [
-        str(intent.get("material_name") or "<unnamed>")
-        for intent in migrated_envelope.get("material_intents") or []
-        if str(intent.get("texture_source_mode") or "") == "unresolved"
-    ]
-    if unresolved_materials:
-        raise ValueError(
-            "legacy Repair report cannot prove material texture bindings; "
-            "run Blender Repair again: "
-            + ", ".join(unresolved_materials)
-        )
     migrated["speedtree_pipeline_contract"] = migrated_envelope
     migrated["speedtree_pipeline_contract_required"] = True
     migrated["report_contract_migration"] = {
@@ -1049,6 +1119,31 @@ def cluster_contract_dependency_for_spm(contract, spm):
             if value and normalized_folder_key(value) == wanted:
                 return dependency
     return None
+
+
+def cluster_live_audit_target_block(contract, target_spm):
+    """Find the one provider whose live delivery explicitly blocks a target.
+
+    The normalization gate is handed its provider; the live-audit gate audits
+    an owner SPM and has to discover it.  Target-local isolation is unchanged:
+    only a provider that names this target in `delivery_blocked_targets`
+    qualifies, so a shared provider issue still fails closed (#16).
+    """
+    for dependency in (contract or {}).get("dependencies") or ():
+        if not isinstance(dependency, dict):
+            continue
+        for field in ("spm", "source_spm", "authoring_spm", "output_spm"):
+            producer = dependency.get(field)
+            if not producer:
+                continue
+            block = cluster_target_delivery_block(
+                contract,
+                target_spm,
+                producer,
+            )
+            if block:
+                return Path(str(producer)), block
+    return None, None
 
 
 def cluster_contract_issues(contract):
@@ -1148,27 +1243,43 @@ def cluster_stale_node_table_recovery_scope(
     target_spm,
     audit_report,
 ):
-    """Seal a complete target-wide legacy scope or explain why it is unsafe.
+    """Seal authoritative authored and required-live scopes or fail closed.
 
-    This adapter intentionally does not invent the newer required-live
-    manifest contract.  It is eligible only for today's strict Atlas policy,
-    where every normalized target Mesh ID is both authored and required live.
-    All provider-role slices for the exact target must be present in the same
-    live audit; a diagnostic stale subset is never promoted to full scope.
+    Only a producer-validated explicit delivery intent may authorize recovery.
+    Live survivors, visibility, node counts, and diagnostic stale subsets are
+    observations, never recovery intent.  Every required provider-role slice
+    for the exact target must be present in the same content-bound live audit.
     """
     target = Path(target_spm).expanduser().resolve(strict=False)
 
     def unavailable(reason_token, **details):
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "available": False,
-            "mode": "interactive_modeler_save_watch",
-            "scope_policy": "complete_target_wide_legacy_strict_v1",
+            "mode": "owned_semantic_uia_modeler_save_watch",
+            "scope_policy": "explicit_sealed_delivery_scopes_v1",
             "reason_token": str(reason_token),
             "target_spm": str(target),
             "audit_report": str(audit_report or ""),
             **copy.deepcopy(details),
         }
+
+    def canonical_mesh_scope(values, label, *, allow_empty=False):
+        if not isinstance(values, (list, tuple)):
+            return None, f"{label}_missing"
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+            for value in values
+        ):
+            return None, f"{label}_invalid"
+        canonical = sorted(set(values))
+        if list(values) != canonical:
+            return None, f"{label}_not_canonical"
+        if not canonical and not allow_empty:
+            return None, f"{label}_missing"
+        return canonical, None
 
     if not isinstance(contract, dict):
         return unavailable("recovery_contract_missing")
@@ -1207,7 +1318,8 @@ def cluster_stale_node_table_recovery_scope(
         "generator_export_evidence_stale_node_table",
         "normalized_and_live_target_mesh_sets_differ",
     }
-    expected_mesh_ids = set()
+    authoring_mesh_ids = set()
+    required_live_mesh_ids = set()
     provider_slices = []
     required_dependency_count = 0
     stale_slice_count = 0
@@ -1246,34 +1358,164 @@ def cluster_stale_node_table_recovery_scope(
         delivery = target_rows[0]
         if delivery.get("generator_variant_policy") != strict_policy:
             return unavailable(
-                "target_delivery_policy_not_legacy_strict",
+                "target_delivery_variant_policy_not_supported",
                 provider_role=str(dependency.get("role") or ""),
             )
-        mesh_values = delivery.get("normalized_target_mesh_ids")
-        if not isinstance(mesh_values, (list, tuple)) or not mesh_values:
+        if delivery.get("delivery_scope_mode") != "explicit_sealed_v1":
             return unavailable(
-                "normalized_target_mesh_scope_missing",
+                "target_delivery_scope_not_explicit",
                 provider_role=str(dependency.get("role") or ""),
             )
-        if any(
-            isinstance(value, bool)
-            or not isinstance(value, int)
-            or value <= 0
-            for value in mesh_values
+        recovery_target_scope = delivery.get("recovery_target_scope")
+        if not (
+            isinstance(recovery_target_scope, dict)
+            and recovery_target_scope.get("contract")
+            == "speedtree_stale_node_recovery_target_scope"
+            and recovery_target_scope.get("schema_version") == 1
+            and recovery_target_scope.get("policy")
+            == "explicit_sealed_scopes_v1"
         ):
             return unavailable(
-                "normalized_target_mesh_scope_invalid",
+                "authoritative_recovery_target_scope_missing",
                 provider_role=str(dependency.get("role") or ""),
             )
-        mesh_ids = sorted(set(mesh_values))
-        if list(mesh_values) != mesh_ids:
+        supplied_scope_sha256 = str(
+            recovery_target_scope.get("scope_sha256") or ""
+        ).strip().casefold()
+        scope_projection = {
+            key: value
+            for key, value in recovery_target_scope.items()
+            if key != "scope_sha256"
+        }
+        expected_scope_sha256 = hashlib.sha256(
+            json.dumps(
+                scope_projection,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if supplied_scope_sha256 != expected_scope_sha256:
             return unavailable(
-                "normalized_target_mesh_scope_not_canonical",
+                "authoritative_recovery_target_scope_hash_mismatch",
                 provider_role=str(dependency.get("role") or ""),
             )
-        if expected_mesh_ids.intersection(mesh_ids):
+        intent_sha256 = str(
+            recovery_target_scope.get("delivery_scope_intent_sha256") or ""
+        ).strip().casefold()
+        if len(intent_sha256) != 64 or any(
+            value not in "0123456789abcdef" for value in intent_sha256
+        ):
             return unavailable(
-                "normalized_target_mesh_scope_overlaps_provider_roles",
+                "target_delivery_scope_intent_sha256_invalid",
+                provider_role=str(dependency.get("role") or ""),
+            )
+        if intent_sha256 != str(
+            delivery.get("delivery_scope_intent_sha256") or ""
+        ).strip().casefold():
+            return unavailable(
+                "target_delivery_scope_intent_echo_mismatch",
+                provider_role=str(dependency.get("role") or ""),
+            )
+        authoring_ids, scope_error = canonical_mesh_scope(
+            recovery_target_scope.get("authoring_mesh_ids"),
+            "authoring_mesh_ids",
+        )
+        if scope_error:
+            return unavailable(
+                scope_error,
+                provider_role=str(dependency.get("role") or ""),
+            )
+        normalized_ids, scope_error = canonical_mesh_scope(
+            delivery.get("normalized_target_mesh_ids"),
+            "normalized_authoring_mesh_ids",
+        )
+        if scope_error:
+            return unavailable(
+                scope_error,
+                provider_role=str(dependency.get("role") or ""),
+            )
+        declared_ids, scope_error = canonical_mesh_scope(
+            delivery.get("declared_target_mesh_ids"),
+            "declared_authoring_mesh_ids",
+        )
+        if scope_error:
+            return unavailable(
+                scope_error,
+                provider_role=str(dependency.get("role") or ""),
+            )
+        if not (normalized_ids == declared_ids == authoring_ids):
+            return unavailable(
+                "authoring_scope_not_exact_declared_scope",
+                provider_role=str(dependency.get("role") or ""),
+            )
+        required_live_ids, scope_error = canonical_mesh_scope(
+            recovery_target_scope.get("required_live_mesh_ids"),
+            "required_live_mesh_ids",
+            allow_empty=True,
+        )
+        if scope_error:
+            return unavailable(
+                scope_error,
+                provider_role=str(dependency.get("role") or ""),
+            )
+        if not set(required_live_ids).issubset(authoring_ids):
+            return unavailable(
+                "required_live_scope_not_authoring_subset",
+                provider_role=str(dependency.get("role") or ""),
+            )
+        current_required_ids, scope_error = canonical_mesh_scope(
+            delivery.get("current_required_target_mesh_ids"),
+            "current_required_live_mesh_ids",
+            allow_empty=True,
+        )
+        if scope_error:
+            return unavailable(
+                scope_error,
+                provider_role=str(dependency.get("role") or ""),
+            )
+        if current_required_ids != required_live_ids:
+            return unavailable(
+                "required_live_scope_not_exact_delivery_scope",
+                provider_role=str(dependency.get("role") or ""),
+            )
+
+        count_fields = {
+            name: delivery.get(name)
+            for name in (
+                "declared_binding_count",
+                "active_required_binding_count",
+                "planned_inactive_binding_count",
+                "delivery_scope_required_live_slot_count",
+                "delivery_scope_continuity_only_slot_count",
+            )
+        }
+        if any(
+            type(value) is not int or value < 0
+            for value in count_fields.values()
+        ):
+            return unavailable(
+                "target_delivery_scope_counts_invalid",
+                provider_role=str(dependency.get("role") or ""),
+            )
+        if not (
+            count_fields["declared_binding_count"] > 0
+            and count_fields["planned_inactive_binding_count"] == 0
+            and count_fields["active_required_binding_count"]
+            == count_fields["delivery_scope_required_live_slot_count"]
+            and count_fields["declared_binding_count"]
+            == count_fields["delivery_scope_required_live_slot_count"]
+            + count_fields["delivery_scope_continuity_only_slot_count"]
+            and bool(required_live_ids)
+            == bool(count_fields["delivery_scope_required_live_slot_count"])
+        ):
+            return unavailable(
+                "target_delivery_scope_counts_inconsistent",
+                provider_role=str(dependency.get("role") or ""),
+            )
+        if authoring_mesh_ids.intersection(authoring_ids):
+            return unavailable(
+                "authoring_mesh_scope_overlaps_provider_roles",
                 provider_role=str(dependency.get("role") or ""),
             )
 
@@ -1291,6 +1533,13 @@ def cluster_stale_node_table_recovery_scope(
                     provider_role=str(dependency.get("role") or ""),
                 )
             canonical_stale_ids = sorted(set(stale_ids))
+            live_node_table = delivery.get("live_node_table")
+            orphan_owner_count = len(
+                (live_node_table or {}).get("orphan_generator_guids") or ()
+            ) if isinstance(live_node_table, dict) else 0
+            orphan_node_count = int(
+                (live_node_table or {}).get("orphan_node_count") or 0
+            ) if isinstance(live_node_table, dict) else 0
             if (
                 list(stale_ids) != canonical_stale_ids
                 or any(
@@ -1299,12 +1548,14 @@ def cluster_stale_node_table_recovery_scope(
                     or value <= 0
                     for value in stale_ids
                 )
-                or not set(canonical_stale_ids).issubset(mesh_ids)
+                or not set(canonical_stale_ids).issubset(required_live_ids)
                 or delivery.get("delivery_reason") != stale_reason
                 or not errors
                 or not errors.issubset(stale_consequences)
                 or not isinstance(delivery.get("live_node_table"), dict)
                 or delivery["live_node_table"].get("stale") is not True
+                or orphan_owner_count <= 0
+                or orphan_node_count <= 0
             ):
                 return unavailable(
                     "target_delivery_not_stale_only",
@@ -1312,36 +1563,55 @@ def cluster_stale_node_table_recovery_scope(
                 )
             stale_slice_count += 1
         elif not (
-            decision == "normalize_part"
-            and not errors
-            and delivery.get("live_generator_delivery_complete") is True
+            (
+                decision == "normalize_part"
+                and not errors
+                and delivery.get("live_generator_delivery_complete") is True
+            )
+            or (
+                decision == "pass_through"
+                and not required_live_ids
+                and not errors
+                and delivery.get("delivery_reason")
+                == "relationship_continuity_only"
+            )
         ):
             return unavailable(
                 "target_delivery_has_independent_blocker",
                 provider_role=str(dependency.get("role") or ""),
             )
 
-        expected_mesh_ids.update(mesh_ids)
+        authoring_mesh_ids.update(authoring_ids)
+        required_live_mesh_ids.update(required_live_ids)
         provider_slices.append({
             "role": str(dependency.get("role") or ""),
             "provider_spm": str(dependency.get("spm") or ""),
-            "normalized_target_mesh_ids": mesh_ids,
+            "delivery_scope_intent_sha256": intent_sha256,
+            "authoring_mesh_ids": authoring_ids,
+            "required_live_mesh_ids": required_live_ids,
             "delivery_decision": decision,
+            "orphan_generator_guid_count": (
+                orphan_owner_count if decision == "blocked" else 0
+            ),
+            "orphan_node_count": (
+                orphan_node_count if decision == "blocked" else 0
+            ),
         })
 
-    if required_dependency_count == 0 or not expected_mesh_ids:
+    if required_dependency_count == 0 or not authoring_mesh_ids:
         return unavailable("target_recovery_scope_empty")
     if stale_slice_count == 0:
         return unavailable("target_has_no_stale_blocking_delivery")
 
     sealed = {
-        "schema_version": 1,
+        "schema_version": 2,
         "available": True,
-        "mode": "interactive_modeler_save_watch",
-        "scope_policy": "complete_target_wide_legacy_strict_v1",
+        "mode": "owned_semantic_uia_modeler_save_watch",
+        "scope_policy": "explicit_sealed_delivery_scopes_v1",
         "target_spm": str(target),
         "target_preimage_raw_sha256": target_sha256,
-        "expected_mesh_ids": sorted(expected_mesh_ids),
+        "authoring_mesh_ids": sorted(authoring_mesh_ids),
+        "required_live_mesh_ids": sorted(required_live_mesh_ids),
         "provider_slices": sorted(
             provider_slices,
             key=lambda row: (row["role"], row["provider_spm"]),
@@ -1363,45 +1633,35 @@ def cluster_stale_node_table_recovery_scope(
 
 
 def target_planned_exclusion_summary(target_spm, reason_token, evidence):
-    """Render a target-first exclusion summary suitable for a narrow GUI row."""
+    """Render one Korean cause/action summary for a narrow GUI row."""
     target = Path(target_spm)
     evidence = evidence if isinstance(evidence, dict) else {}
-    parts = [target.name]
+    decision = repair_ui_decision({
+        "reason_token": reason_token,
+        "evidence": evidence,
+    })
+    parts = [target.name, f"원인: {decision['reason']}"]
     live_node_table = evidence.get("live_node_table")
     live_node_table = (
         live_node_table if isinstance(live_node_table, dict) else {}
     )
     if live_node_table.get("stale") is True:
-        parts.append("stale Node table")
+        parts.append("Node table 오래됨")
         parts.append(
-            "orphan GUIDs "
+            "고아 Generator GUID "
             + str(live_node_table.get("orphan_generator_guid_count") or 0)
+            + "개"
         )
         orphan_nodes = live_node_table.get("orphan_node_count")
         total_nodes = live_node_table.get("total_node_count")
         if orphan_nodes is not None or total_nodes is not None:
-            parts.append(f"orphan Nodes {orphan_nodes or 0}/{total_nodes or 0}")
+            parts.append(f"고아 Node {orphan_nodes or 0}/{total_nodes or 0}")
         mesh_ids = evidence.get("stale_node_table_target_mesh_ids") or ()
         if mesh_ids:
-            parts.append("Mesh IDs " + ",".join(str(value) for value in mesh_ids))
-        recovery = evidence.get("stale_node_table_recovery")
-        if isinstance(recovery, dict) and recovery.get("available") is True:
             parts.append(
-                "action=Batch Tools will request this exact SPM in Modeler; "
-                "verify the displayed path and choose File > Save; Save As "
-                "or incremental Save is not accepted; re-audit/resume is automatic"
+                "대상 Mesh ID " + ",".join(str(value) for value in mesh_ids)
             )
-        else:
-            reason = (
-                str((recovery or {}).get("reason_token") or "scope unavailable")
-                if isinstance(recovery, dict)
-                else "scope unavailable"
-            )
-            parts.append(
-                "action=automatic Modeler recovery is disabled until the "
-                f"target-wide scope is sealed ({reason}); re-run a live audit"
-            )
-    parts.append(f"reason={reason_token}")
+    parts.append(f"조치: {decision['action']}")
     return " | ".join(parts)
 
 
@@ -1421,10 +1681,20 @@ def cluster_relation_refresh_state(cluster_spm, target_spms):
     try:
         registry = load_target_registry(blend)
     except TargetRegistryError as exc:
+        diagnostic_targets = [
+            str(Path(value).expanduser().absolute())
+            for value in target_spms
+        ]
         return {
-            "current": False,
+            # An unreadable registry cannot select a writer.  It removes
+            # mutation authority, but it is not evidence that the current
+            # live target is unsafe to export.
+            "current": True,
             "reason": f"target_registry_invalid: {exc}",
             "targets": [],
+            "actionable_targets": [],
+            "metadata_diagnostic_targets": diagnostic_targets,
+            "mutation_authorized": False,
         }
     registered = {
         normalized_path_key(value)
@@ -1445,8 +1715,21 @@ def cluster_relation_refresh_state(cluster_spm, target_spms):
         row for row in rows
         if row.get("status") != "synced"
     ]
+    diagnostic_stale = []
+    actionable_stale = []
+    for row in stale:
+        resolution = row.get("atlas_manifest_resolution") or {}
+        # Every refresh reason on this row was derived from the selected
+        # manifest payload.  When resolver ownership is diagnostic-only, no
+        # such reason may pick that Provider for a mutation -- including
+        # physical-capture/source-FBX drift.  Independent live content audit,
+        # not disputed metadata, decides whether export can continue.
+        if resolution.get("mutation_authorized") is False:
+            diagnostic_stale.append(row)
+        else:
+            actionable_stale.append(row)
     return {
-        "current": not stale,
+        "current": not actionable_stale,
         "reason": "; ".join(
             f"{Path(row['target_spm']).name}:{row.get('status')}"
             + (
@@ -1454,9 +1737,16 @@ def cluster_relation_refresh_state(cluster_spm, target_spms):
                 if row.get("refresh_reasons")
                 else ""
             )
-            for row in stale
+            for row in actionable_stale
         ),
         "targets": rows,
+        "actionable_targets": [
+            row["target_spm"] for row in actionable_stale
+        ],
+        "metadata_diagnostic_targets": [
+            row["target_spm"] for row in diagnostic_stale
+        ],
+        "mutation_authorized": not diagnostic_stale,
     }
 
 
@@ -1935,6 +2225,58 @@ class BatchItemError(RuntimeError):
         self.report_file = report_file
 
 
+class CodeRevisionRestartRequired(RuntimeError):
+    """Structured evidence for a non-blocking code-revision warning."""
+
+    route = CODE_REVISION_RESTART_ROUTE
+
+    def __init__(
+        self,
+        compile_error,
+        *,
+        context,
+        report=None,
+        log_file=None,
+        report_file=None,
+    ):
+        details = copy.deepcopy(
+            getattr(compile_error, "details", {}) or {}
+        )
+        details.update({
+            "route": CODE_REVISION_RESTART_ROUTE,
+            "status": CODE_REVISION_RESTART_ROUTE,
+            "context": str(context),
+        })
+        message = (
+            f"{context}: {compile_error}\n\n"
+            "정확한 변경 경로는 위에 기록되며 작업은 현재 production "
+            "source 기준으로 계속됩니다. 이 상태는 자산 실패가 아닙니다."
+        )
+        details["message"] = message
+        super().__init__(message)
+        self.details = details
+        self.report = copy.deepcopy(report or {})
+        self.log_file = log_file
+        self.report_file = report_file
+
+    def as_dict(self):
+        return copy.deepcopy(self.details)
+
+
+class InlineAtlasRepairRequested(BatchItemError):
+    """Internal control flow for a read-only child audit's exact repair."""
+
+    def __init__(self, target_spm, report, *, log_file=None, report_file=None):
+        self.target_spm = Path(target_spm)
+        super().__init__(
+            "Atlas manifest exact repair requested",
+            kind="automatic_repair_requested",
+            report=report,
+            log_file=log_file,
+            report_file=report_file,
+        )
+
+
 class TargetPlannedExclusionError(BatchItemError):
     """One target is blocked without making its shared provider fail."""
 
@@ -2017,11 +2359,18 @@ class App:
         self.batch_job_sequence = 0
         self.batch_job_failures = []
         self.shared_queue_runtime = SharedQueueRuntime("sk_batch")
+        self._active_retry_progress = None
+        self._retry_progress_by_run_id = {}
+        self._async_retry_planning_enabled = True
+        self._retry_planning_workers = set()
+        self._ui_thread_ident = threading.get_ident()
+        self._retry_thread_context = threading.local()
         self.cell_editor = None
         self.stop_flag = threading.Event()
         self._app_open = True
         self._recovery_commit_lock = threading.RLock()
         self._recovery_resume_commit = None
+        self._stale_node_table_modeler_session = None
         self.active_procs = set()          # all running child procs (serial or parallel)
         self.procs_lock = threading.Lock()
         self.state_lock = threading.RLock()  # guards self.state writes across worker threads
@@ -2038,7 +2387,9 @@ class App:
         root.title("SK Vegetation Batch — 검사 → 본 세팅 → Blender → Unreal")
         root.geometry("1460x840")
         self._build_ui()
+        self._restore_latest_retry_progress()
         self.root.after(100, self._drain_ui_queue)
+        self.root.after(1000, self._refresh_retry_liveness)
         self.scan()
 
     # ------------------------------------------------------------------ UI
@@ -2195,11 +2546,20 @@ class App:
         Tooltip(lbl6, tip6); Tooltip(spin6, tip6)
 
         self.force_var = tk.BooleanVar(value=False)
-        chk = ttk.Checkbutton(opts, text="완료된 항목도 다시 실행", variable=self.force_var)
+        chk = ttk.Checkbutton(
+            opts,
+            text="최신 .blend/캐시가 있어도 강제로 다시 실행",
+            variable=self.force_var,
+        )
         chk.pack(side="left", padx=12)
         Tooltip(chk, ("② Blender Repair에서, 이미 SPM보다 최신인 .blend가 있는 항목은 기본적으로 "
                       "건너뜁니다. ① SPM 본 세팅도 동일 SPM/옵션 캐시를 기본 사용합니다. "
-                      "이 옵션을 켜면 ①② 모두 강제로 다시 실행합니다."))
+                      "이 옵션을 켜면 ①② 모두 강제로 다시 실행합니다.\n"
+                      "판정 기준은 '작업이 성공했는가'가 아니라 '.blend가 SPM보다 최신인가' "
+                      "입니다. 그래서 export가 게이트에 막혀 산출물이 안 나온 항목도 "
+                      "이전 .blend가 남아 있으면 기본적으로 건너뜁니다.\n"
+                      "↻ 재시도에서도 같은 옵션이 적용되어, 증거가 불완전해 fail-closed로 "
+                      "막히던 항목까지 전체 Blender→Send2UE→Unreal 재빌드로 보냅니다."))
 
         actions = ttk.Frame(self.root, padding=6)
         actions.pack(fill="x")
@@ -2246,19 +2606,33 @@ class App:
                                 "준비 안 된 항목은 이유를 표시하고 건너뛴 뒤, 준비된 것만 push합니다."))
         self.btn_retry_failed = ttk.Button(
             actions,
-            text="↻ 실패 Blender/Unreal 재시도",
+            text="↻ 전체 실패 이력 재시도",
             command=self.start_failed_results_retry,
         )
         self.btn_retry_failed.pack(side="left", padx=(2, 6))
         Tooltip(
             self.btn_retry_failed,
-            "체크된 최근 실패를 원인별로 나눠 재시도합니다.\n"
+            "체크 상태와 무관하게 현재 목록 전체의 실패/stale 이력을 "
+            "원인별로 나눠 재시도합니다.\n"
+            "· Repair reason code: exact PCG 텍스처 또는 Generator/Cluster를 "
+            "자동 복구하고 fresh 재검증 후 Blender/Unreal 재시도\n"
             "· Blender/Send2UE export 실패: ② Blender부터 export를 다시 만들고 "
             "③ Unreal Push까지 실행\n"
             "· Unreal ingest 실패: Blender를 다시 돌리지 않고 기존 FBX·JSON·Assembly "
             "산출물과 입력 identity를 검증한 뒤 현재 Unreal 코드로만 재시도\n"
-            "재시도 가능한 실패가 아니거나 identity 검증에 실패한 항목은 정확한 "
-            "이유를 기록하고 안전하게 제외합니다.",
+            "BAT로 해결할 수 없거나 fresh 재검증에 실패한 항목만 최종 실패로 "
+            "남기고 사용자 조치와 원래 reason code를 기록합니다.",
+        )
+        self.btn_retry_checked = ttk.Button(
+            actions,
+            text="↻ 체크 항목 실패 재시도",
+            command=self.start_checked_failed_results_retry,
+        )
+        self.btn_retry_checked.pack(side="left", padx=(2, 6))
+        Tooltip(
+            self.btn_retry_checked,
+            "현재 체크한 항목만 실패/stale 이력을 판정하고 재시도합니다.\n"
+            "체크하지 않은 항목은 계획·검증·실행 대상에 포함하지 않습니다.",
         )
         self.btn_all = ttk.Button(
             actions,
@@ -2292,6 +2666,49 @@ class App:
             meters,
             text="단계·경과 시간·수동 전환까지 남은 시간은 각 파일 행에 표시됩니다.",
         ).pack(side="left", padx=(14, 0))
+
+        retry_live = ttk.LabelFrame(
+            self.root,
+            text="실패 재시도 진행·liveness (durable receipt)",
+            padding=(8, 4),
+        )
+        retry_live.pack(fill="x", padx=6, pady=(0, 4))
+        self.retry_target_var = tk.StringVar(
+            value="current target: - · 0/0 · partition=-"
+        )
+        self.retry_liveness_var = tk.StringVar(
+            value=(
+                "stage=idle · elapsed 0s · progress age - · "
+                "output age - · heartbeat age -"
+            )
+        )
+        self.retry_outcome_var = tk.StringVar(
+            value=(
+                "retry scope: historical failed/stale selection · "
+                "current state: idle · terminal outcome: pending"
+            )
+        )
+        self.retry_diagnostic_var = tk.StringVar(value="latest: -")
+        ttk.Label(
+            retry_live,
+            textvariable=self.retry_target_var,
+            anchor="w",
+        ).pack(fill="x")
+        ttk.Label(
+            retry_live,
+            textvariable=self.retry_liveness_var,
+            anchor="w",
+        ).pack(fill="x")
+        ttk.Label(
+            retry_live,
+            textvariable=self.retry_outcome_var,
+            anchor="w",
+        ).pack(fill="x")
+        ttk.Label(
+            retry_live,
+            textvariable=self.retry_diagnostic_var,
+            anchor="w",
+        ).pack(fill="x")
 
         cols = ("bone_mode", "wind", "spm_status", "blend_status", "push_status", "folder")
         visible_cols = ("bone_mode", "wind", "spm_status", "blend_status", "push_status")
@@ -2374,6 +2791,328 @@ class App:
 
     def log(self, msg):
         self.ui_queue.put(("log", msg))
+
+    def _retry_progress_notify(self, snapshot):
+        self.ui_queue.put(("retry_progress", snapshot))
+
+    def _retry_progress_thresholds(self, cfg=None):
+        cfg = cfg or getattr(self, "cfg", {}) or {}
+        return {
+            "stall_warning_seconds": float(
+                cfg.get("retry_stall_warning_seconds", 120)
+            ),
+            "owner_lost_seconds": float(
+                cfg.get("retry_owner_lost_seconds", 45)
+            ),
+        }
+
+    def _new_retry_progress(self, target_ids, cfg=None):
+        tracker = RetryProgressReceipt.create(
+            target_ids,
+            notify=self._retry_progress_notify,
+            **self._retry_progress_thresholds(cfg),
+        )
+        self._active_retry_progress = tracker
+        self._retry_progress_by_run_id[tracker.run_id] = tracker
+        return tracker
+
+    def _reusable_retry_plan_cache(self):
+        """Return only a completed prior run's durable plan candidate."""
+
+        if self.__dict__.pop("_skip_retry_plan_cache_once", False):
+            return None
+        tracker = getattr(self, "_active_retry_progress", None)
+        if tracker is None:
+            return None
+        snapshot = tracker.snapshot(evaluate=False)
+        if snapshot.get("run_state") != "terminal":
+            return None
+        return tracker.planning_cache()
+
+    def _restore_latest_retry_progress(self):
+        tracker = RetryProgressReceipt.load_latest(
+            notify=None,
+            **self._retry_progress_thresholds(),
+        )
+        if tracker is None:
+            return None
+        runtime = getattr(self, "shared_queue_runtime", None)
+        if runtime is not None:
+            tracker.reconcile_queue(runtime.queue)
+            planning = tracker.snapshot(evaluate=False).get("planning") or {}
+            tracker.reconcile_planning_owner(
+                runtime.owner_process_alive(planning.get("owner"))
+            )
+        else:
+            tracker.reconcile_planning_owner(None)
+        tracker.set_notify(self._retry_progress_notify)
+        self._active_retry_progress = tracker
+        self._retry_progress_by_run_id[tracker.run_id] = tracker
+        self._render_retry_progress(tracker.snapshot())
+        return tracker
+
+    @staticmethod
+    def _retry_age_text(value):
+        if value is None:
+            return "-"
+        seconds = max(0, int(float(value)))
+        if seconds < 60:
+            return f"{seconds}s"
+        minutes, seconds = divmod(seconds, 60)
+        if minutes < 60:
+            return f"{minutes}m {seconds:02d}s"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}h {minutes:02d}m"
+
+    def _render_retry_progress(self, snapshot):
+        if not isinstance(snapshot, dict):
+            return
+        rows = snapshot.get("targets") or []
+        current_id = snapshot.get("current_target_id")
+        current = next(
+            (row for row in rows if row.get("target_id") == current_id),
+            rows[-1] if rows else None,
+        )
+        if current is None:
+            self.retry_target_var.set("current target: - · 0/0 · partition=-")
+            self.retry_liveness_var.set(
+                "stage=idle · elapsed 0s · progress age - · "
+                "output age - · heartbeat age -"
+            )
+            self.retry_outcome_var.set(
+                "retry scope: historical failed/stale selection · "
+                "current state: idle · terminal outcome: pending"
+            )
+            self.retry_diagnostic_var.set("latest: -")
+            return
+        finished = sum(
+            row.get("terminal_at") is not None for row in rows
+        )
+        succeeded = sum(
+            row.get("stage") == RETRY_STAGE_COMPLETE for row in rows
+        )
+        waiting = sum(
+            row.get("stage") == RETRY_STAGE_PENDING_UNREAL for row in rows
+        )
+        cancelled = sum(
+            row.get("stage") == RETRY_STAGE_CANCELLED for row in rows
+        )
+        blocked = sum(
+            row.get("stage") == RETRY_STAGE_BLOCKED for row in rows
+        )
+        owner_lost = sum(
+            row.get("stage") == RETRY_STAGE_OWNER_LOST for row in rows
+        )
+        failed = sum(
+            row.get("stage") == RETRY_STAGE_FAILED
+            for row in rows
+        )
+        remaining = max(0, len(rows) - finished)
+        terminal = (
+            snapshot.get("run_state") == "terminal"
+            or snapshot.get("terminal_at") is not None
+        )
+        if terminal:
+            outcome_text = (
+                "terminal outcome: "
+                f"{snapshot.get('terminal_outcome') or snapshot.get('stage') or '-'}"
+                + (
+                    f" ({snapshot.get('terminal_reason')})"
+                    if snapshot.get("terminal_reason")
+                    else ""
+                )
+            )
+            state_text = "terminal"
+        else:
+            outcome_text = "terminal outcome: pending"
+            evidence_state = str(
+                snapshot.get("evidence_state") or "evidence_unknown"
+            )
+            if snapshot.get("run_state") == "waiting":
+                state_text = "waiting"
+            elif evidence_state in {
+                "stalled",
+                "owner_lost",
+                "failed",
+                "owner_unknown",
+                "heartbeat_unknown",
+            }:
+                state_text = evidence_state
+            else:
+                state_text = "running"
+        continuation = (
+            " · current run continues after individual failures"
+            if (failed or owner_lost or blocked) and remaining
+            else ""
+        )
+        self.retry_outcome_var.set(
+            "retry scope: historical failed/stale selection · "
+            f"current state: {state_text} · success {succeeded} · "
+            f"waiting {waiting} · cancelled {cancelled} · "
+            f"blocked {blocked} · owner_lost {owner_lost} · "
+            f"failed {failed} · remaining {remaining} · {outcome_text}"
+            + continuation
+        )
+        partition_ordinal = current.get("partition_ordinal") or "?"
+        partition_total = current.get("partition_total") or "?"
+        planning = snapshot.get("planning") or {}
+        planning_progress = planning.get("progress") or {}
+        planning_visible = (
+            current.get("stage") == RETRY_STAGE_PLANNING
+            and planning.get("status") in {"active", "ready", "committing"}
+        )
+        if planning_visible and planning_progress:
+            completed = int(planning_progress.get("completed_count") or 0)
+            total = int(planning_progress.get("total_count") or len(rows))
+            percent = (completed / total * 100.0) if total else 0.0
+            substage = str(planning_progress.get("substage") or "planning")
+            cache_status = str(
+                planning_progress.get("cache_status") or "unchecked"
+            )
+            self.retry_target_var.set(
+                f"planning: {substage} · {completed}/{total} · "
+                f"current {current.get('target_name') or '-'} · "
+                f"cache={cache_status}"
+            )
+            self.progress_var.set(
+                f"retry planning · {substage} · {completed}/{total} · "
+                f"classified {int(planning_progress.get('classified_count') or 0)} · "
+                f"validated {int(planning_progress.get('validated_count') or 0)} · "
+                f"cache={cache_status}"
+            )
+            self.batch_progress.configure(value=percent)
+            self.batch_progress_var.set(
+                f"{completed}/{total} ({percent:.0f}%)"
+            )
+        else:
+            self.retry_target_var.set(
+                f"current target: {current.get('target_name') or '-'} · "
+                f"{finished}/{len(rows)} finished · partition="
+                f"{current.get('partition') or '-'} "
+                f"{partition_ordinal}/{partition_total}"
+            )
+        # Prefix this as an individual target observation: an item-level
+        # failed stage is not a current batch terminal outcome.
+        self.retry_liveness_var.set(
+            "evidence state="
+            f"{snapshot.get('evidence_state') or 'unknown'} · "
+            "current target stage="
+            f"{current.get('stage') or '-'} · wall elapsed "
+            f"{self._retry_age_text(current.get('wall_elapsed_seconds', current.get('elapsed_seconds')))} · "
+            "progress age "
+            f"{self._retry_age_text(current.get('last_progress_age_seconds'))} · "
+            "output age "
+            f"{self._retry_age_text(current.get('last_output_age_seconds'))} · "
+            "heartbeat age "
+            f"{self._retry_age_text(current.get('last_heartbeat_age_seconds'))}"
+        )
+        self.retry_diagnostic_var.set(
+            "latest: " + str(current.get("latest_diagnostic") or "-")
+        )
+
+    def _retry_tracker_for_job(self, job=None):
+        job = job or getattr(self, "active_batch_job", None)
+        if not isinstance(job, dict):
+            return None
+        tracker = job.get("_retry_progress_tracker")
+        if tracker is not None:
+            return tracker
+        metadata = job.get("retry_metadata") or {}
+        run_id = str(metadata.get("progress_run_id") or "")
+        tracker = getattr(self, "_retry_progress_by_run_id", {}).get(run_id)
+        if tracker is not None:
+            job["_retry_progress_tracker"] = tracker
+        return tracker
+
+    def _retry_transition(
+        self,
+        target_id,
+        stage,
+        diagnostic,
+        *,
+        progress=False,
+        output=False,
+        heartbeat=False,
+        terminal_reason=None,
+        outcome=None,
+    ):
+        tracker = self._retry_tracker_for_job()
+        if tracker is None:
+            return False
+        return tracker.transition(
+            str(target_id),
+            stage,
+            diagnostic=diagnostic,
+            progress=progress,
+            output=output,
+            heartbeat=heartbeat,
+            terminal_reason=terminal_reason,
+            outcome=outcome,
+        )
+
+    def _refresh_retry_liveness(self):
+        if not getattr(self, "_app_open", True):
+            return
+        tracker = getattr(self, "_active_retry_progress", None)
+        active_job = getattr(self, "active_batch_job", None)
+        job_tracker = self._retry_tracker_for_job(active_job)
+        if job_tracker is not None:
+            tracker = job_tracker
+            self._active_retry_progress = tracker
+            lease = getattr(self, "_active_shared_queue_lease", None)
+            partition = str(
+                ((active_job or {}).get("retry_metadata") or {}).get(
+                    "partition"
+                )
+                or ""
+            )
+            if lease is not None and partition:
+                heartbeat_error = lease.heartbeat_error
+                if heartbeat_error is not None:
+                    tracker.mark_partition_terminal(
+                        partition,
+                        RETRY_STAGE_OWNER_LOST,
+                        "shared queue lease heartbeat lost: "
+                        + compact_error_message(heartbeat_error, 160),
+                    )
+                    self.stop_flag.set()
+                else:
+                    snapshot = tracker.snapshot(evaluate=False)
+                    current_id = snapshot.get("current_target_id")
+                    if current_id:
+                        tracker.observe_process(current_id)
+        if tracker is not None:
+            runtime = getattr(self, "shared_queue_runtime", None)
+            if runtime is not None:
+                tracker.reconcile_queue(runtime.queue)
+                planning = tracker.snapshot(evaluate=False).get(
+                    "planning"
+                ) or {}
+                owner_alive = runtime.owner_process_alive(
+                    planning.get("owner")
+                )
+                worker = next(
+                    (
+                        candidate
+                        for candidate in getattr(
+                            self, "_retry_planning_workers", ()
+                        )
+                        if getattr(
+                            candidate, "retry_progress_run_id", None
+                        ) == tracker.run_id
+                    ),
+                    None,
+                )
+                if (
+                    worker is not None
+                    and planning.get("status") == "active"
+                ):
+                    owner_alive = worker.is_alive()
+                tracker.reconcile_planning_owner(owner_alive)
+            else:
+                tracker.reconcile_planning_owner(None)
+            self._render_retry_progress(tracker.snapshot())
+        self.root.after(1000, self._refresh_retry_liveness)
 
     def _table_display_value(self, iid, column, value):
         if column not in STATUS_COLUMNS:
@@ -2477,26 +3216,15 @@ class App:
                         self._set_batch_queue_controls(False)
                 elif kind == "batch_job_done":
                     self._finish_batch_job(payload)
+                elif kind == "retry_progress":
+                    self._render_retry_progress(payload)
+                elif kind == "retry_plan_ready":
+                    self._commit_failed_retry_plan(payload)
                 elif kind == "modeler_recovery":
                     target = Path(payload["target_spm"])
                     self.progress_var.set(
-                        "SpeedTree Modeler manual Save waiting — "
+                        "SpeedTree Modeler semantic Save in progress — "
                         + target.name
-                    )
-                    messagebox.showinfo(
-                        "SpeedTree Modeler Save required",
-                        (
-                            "Batch Tools asked SpeedTree Modeler to open:\n\n"
-                            f"{target}\n\n"
-                            "Verify that this exact SPM is displayed. Do not "
-                            "make unrelated edits. Choose File > Save yourself. "
-                            "Do not use Save As or incremental Save.\n\n"
-                            "Batch Tools does not automate keyboard input or "
-                            "close Modeler. It is watching the exact file and "
-                            "will re-audit it before resuming this job once. "
-                            "Stop cancels the watcher but leaves Modeler open."
-                        ),
-                        parent=self.root,
                     )
         except queue.Empty:
             pass
@@ -2672,6 +3400,10 @@ class App:
         if prepared is None:
             self._scan_generation = getattr(self, "_scan_generation", 0) + 1
             generation = self._scan_generation
+            # An explicit scan starts a new asset verification session.
+            # Queue boundaries do not: the memo itself re-fingerprints all
+            # inputs and live artifacts before any reuse.
+            self._reset_cluster_receipt_refresh_memo()
             root = self.root_var.get()
             self.cfg = self._collect_cfg()
             self.cfg["root"] = root
@@ -2836,10 +3568,10 @@ class App:
                     calibration_cache["settings_signature"] = (
                         self.spm_calibration_signature
                     )
-            wind_override = entry.get("wind_override", "auto")
-            if wind_override not in {value for _label, value in WIND_OPTIONS}:
-                wind_override = "auto"
-                entry["wind_override"] = "auto"
+            saved_wind_override = entry.get("wind_override", "auto")
+            wind_override = normalize_wind_override(saved_wind_override)
+            if wind_override != saved_wind_override:
+                entry["wind_override"] = wind_override
             manual_bones_locked = is_manual_bones_locked(spm, entry)
             if manual_bones_locked:
                 entry["manual_bones_locked"] = True
@@ -2908,8 +3640,6 @@ class App:
                 ),
             )
             self.row_copy_paths[iid] = [spm]
-        if TEMP_SELECT_CLUSTER_WITHOUT_ASSEMBLY_PUSH_ROWS:
-            self._set_temporary_cluster_without_assembly_push_rows()
         self.checked_rows.sync_after_reload()
         save_state(self.state)
         cache_count = sum(
@@ -3589,6 +4319,8 @@ class App:
             self._recovery_commit_lock = threading.RLock()
         if not hasattr(self, "_recovery_resume_commit"):
             self._recovery_resume_commit = None
+        if not hasattr(self, "_stale_node_table_modeler_session"):
+            self._stale_node_table_modeler_session = None
 
     def _snapshot_batch_request(self, target_iids):
         inventory = {
@@ -3621,7 +4353,7 @@ class App:
         # visible inventory, so only those controls are frozen.
         for name in (
             "btn_check", "btn_spm", "btn_blender", "btn_push",
-            "btn_retry_failed", "btn_all",
+            "btn_retry_failed", "btn_retry_checked", "btn_all",
             "btn_select_all", "btn_clear_all", "btn_recent_24h",
         ):
             button = getattr(self, name, None)
@@ -3645,9 +4377,6 @@ class App:
             and not self.pending_batch_jobs
         ):
             self.batch_job_failures = []
-            # One queue drain owns one validated live-audit memo generation.
-            # Every lookup still re-fingerprints the production inputs.
-            self._reset_cluster_receipt_refresh_memo()
         self.batch_job_sequence += 1
         job = dict(job)
         job["id"] = self.batch_job_sequence
@@ -3686,6 +4415,17 @@ class App:
                 return None
             job["shared_queue_job_id"] = shared["id"]
             job["shared_queue_sequence"] = shared["sequence"]
+            tracker = job.get("_retry_progress_tracker")
+            partition = str(
+                (job.get("retry_metadata") or {}).get("partition") or ""
+            )
+            if tracker is not None and partition:
+                tracker.register_queue_job(
+                    partition,
+                    shared["id"],
+                    shared["sequence"],
+                    local_job_id=job["id"],
+                )
         self.pending_batch_jobs.append(job)
         if self.active_batch_job is not None:
             pending = len(self.pending_batch_jobs)
@@ -3715,10 +4455,13 @@ class App:
         self._active_retry_metadata = copy.deepcopy(
             job.get("retry_metadata") or {}
         )
+        self._inline_atlas_repair_results = {}
+        self._registered_relation_repair_results = {}
         self._active_batch_inventory = job["inventory"]
         self._active_batch_items = job["inventory"]
         self._ensure_cluster_receipt_refresh_memo()
         self.stop_flag.clear()
+        self._mark_previous_cancellations_pending(job)
         with self._recovery_commit_lock:
             self._recovery_resume_commit = None
         self.batch_progress.configure(value=0)
@@ -3736,6 +4479,114 @@ class App:
         )
         self.worker.start()
 
+    def _mark_previous_cancellations_pending(self, job):
+        """Do not present a previous stop as the state of a new active job."""
+
+        state = getattr(self, "state", None)
+        state_lock = getattr(self, "state_lock", None)
+        ui_queue = getattr(self, "ui_queue", None)
+        if not isinstance(state, dict) or state_lock is None:
+            return
+
+        if str(job.get("mode") or "") == "pipeline":
+            columns = {
+                "spm": ("spm_status",),
+                "blender": ("spm_status", "blend_status"),
+                "push": STATUS_COLUMNS,
+            }.get(str(job.get("terminal_phase") or "push"), STATUS_COLUMNS)
+        else:
+            columns = {
+                "check": ("spm_status",),
+                "spm": ("spm_status",),
+                "blender": ("blend_status",),
+                "push": ("push_status",),
+            }.get(str(job.get("phase") or ""), STATUS_COLUMNS)
+
+        changed = []
+        with state_lock:
+            for item in job.get("targets") or ():
+                iid = str(item.get("spm") or "")
+                entry = state.get(iid)
+                if not iid or not isinstance(entry, dict):
+                    continue
+                for column in columns:
+                    kind = str(entry.get(f"{column}_kind") or "").casefold()
+                    if kind not in {"cancelled", "stopped"}:
+                        continue
+                    entry[column] = "재실행 대기"
+                    entry[f"{column}_kind"] = "rerun_pending"
+                    changed.append((iid, column))
+            if changed:
+                save_state(state)
+
+        if ui_queue is not None:
+            for iid, column in changed:
+                ui_queue.put(("cell", (iid, column, "재실행 대기")))
+
+    def _production_source_revision_precheck(self):
+        try:
+            current = production_source_manifest(REPO_DIR)
+            validate_production_source_manifest(
+                _PROCESS_PRODUCTION_SOURCE_MANIFEST,
+                current,
+                label="Preflight production source",
+            )
+        except CompileGateError as exc:
+            self._present_code_revision_restart_required(
+                CodeRevisionRestartRequired(
+                    exc,
+                    context=(
+                        "Code revision changed before job start; continuing "
+                        "with the current production sources"
+                    ),
+                )
+            )
+        return None
+
+    def _present_code_revision_restart_required(self, requirement):
+        details = (
+            requirement.as_dict()
+            if isinstance(requirement, CodeRevisionRestartRequired)
+            else copy.deepcopy(requirement or {})
+        )
+        details.update({
+            "route": "code_revision_warning",
+            "status": "warning",
+            "asset_failure": False,
+            "batch_continues": True,
+        })
+        message = str(
+            details.get("message")
+            or "Code revision changed; the batch continues with current code."
+        )
+        details["message"] = message
+        signature = (
+            str(details.get("expected_revision") or ""),
+            str(details.get("actual_revision") or ""),
+        )
+        if not any(signature):
+            signature = (
+                hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                "",
+            )
+        self.__dict__.pop("_code_revision_restart_required", None)
+        progress_var = getattr(self, "progress_var", None)
+        if callable(getattr(progress_var, "set", None)):
+            progress_var.set(
+                "code_revision_warning · 현재 코드로 작업 계속"
+            )
+        if signature != getattr(
+            self,
+            "_last_code_revision_restart_notice_signature",
+            None,
+        ):
+            self._last_code_revision_restart_notice_signature = signature
+            if callable(getattr(self, "log", None)):
+                self.log(
+                    "[code_revision_warning · non-blocking]\n" + message
+                )
+        return details
+
     def _freeze_batch_production_source_manifest(self):
         gate_result = run_code_compile_gate(
             REPO_DIR,
@@ -3749,11 +4600,15 @@ class App:
                 label="Batch-start production source",
             )
         except CompileGateError as exc:
-            raise BatchItemError(
-                "Production sources changed after the GUI process loaded; "
-                "restart SK Batch before running another batch: " + str(exc),
-                kind="internal_error",
-            ) from exc
+            self._present_code_revision_restart_required(
+                CodeRevisionRestartRequired(
+                    exc,
+                    context=(
+                        "Production sources changed after the GUI loaded; "
+                        "the batch uses the current compiled source set"
+                    ),
+                )
+            )
         self._active_production_source_manifest = manifest
         self.log(
             "Production source revision 고정: "
@@ -3782,15 +4637,21 @@ class App:
                 label="Parent production source",
             )
         except CompileGateError as exc:
-            raise BatchItemError(
-                "Production source revision changed during the active batch: "
-                + str(exc),
-                kind="internal_error",
-            ) from exc
+            self._present_code_revision_restart_required(
+                CodeRevisionRestartRequired(
+                    exc,
+                    context=(
+                        "Production source revision changed during the active "
+                        "batch; continuing with the current source set"
+                    ),
+                )
+            )
+            self._active_production_source_manifest = current
+            return current
         return expected
 
-    @staticmethod
     def _require_child_production_source_manifest(
+        self,
         payload,
         expected_manifest,
         *,
@@ -3803,14 +4664,20 @@ class App:
                 expected_manifest,
             )
         except CompileGateError as exc:
-            raise BatchItemError(
-                "Cluster Assembly live audit worker revision mismatch: "
-                + str(exc),
-                kind="internal_error",
+            warning = CodeRevisionRestartRequired(
+                exc,
+                context=(
+                    "Cluster Assembly live audit worker revision differs; "
+                    "keeping the live audit result"
+                ),
                 report=payload if isinstance(payload, dict) else None,
                 log_file=log_file,
                 report_file=report_file,
-            ) from exc
+            )
+            self._present_code_revision_restart_required(warning)
+            return copy.deepcopy(
+                (payload or {}).get("production_source_revision") or {}
+            )
 
     def _run_queued_batch_job(self, job):
         error = None
@@ -3819,7 +4686,10 @@ class App:
         summary = {
             "selected_count": len(job.get("targets") or ()),
             "completed_count": 0,
+            "pending_count": 0,
+            "cancelled_count": 0,
             "blocked_count": 0,
+            "owner_lost_count": 0,
             "planned_excluded_count": 0,
             "dependency_blocked_count": 0,
             "failed_count": 0,
@@ -3827,6 +4697,10 @@ class App:
             "shared_failures": [],
         }
         lease = None
+        tracker = self._retry_tracker_for_job(job)
+        retry_partition = str(
+            (job.get("retry_metadata") or {}).get("partition") or ""
+        )
         try:
             shared_job_id = job.get("shared_queue_job_id")
             shared_runtime = getattr(
@@ -3845,6 +4719,13 @@ class App:
                         + f" · 대기 {queued}개"
                     )
                     self.ui_queue.put(("progress", text))
+                    if tracker is not None and retry_partition:
+                        tracker.queue_wait(
+                            retry_partition,
+                            position=position,
+                            queued_count=queued,
+                            running_head=wait_state.get("running_head"),
+                        )
 
                 lease = shared_runtime.wait_for_turn(
                     shared_job_id,
@@ -3852,10 +4733,14 @@ class App:
                     cancel_event=self.stop_flag,
                 )
                 self._active_shared_queue_lease = lease
+                if tracker is not None and retry_partition:
+                    tracker.claimed(retry_partition, lease.record)
                 self.ui_queue.put((
                     "progress",
                     "공용 대기열 진입 · 단독 실행",
                 ))
+            elif tracker is not None and retry_partition:
+                tracker.claimed(retry_partition)
             self.__dict__.pop("_phase_result_summary", None)
             self._freeze_batch_production_source_manifest()
             if job["mode"] == "pipeline":
@@ -3871,20 +4756,59 @@ class App:
                     job.get("recovery_requests") or [],
                     emit_done=False,
                 )
+            elif job["mode"] == "failed_retry_repair":
+                if lease is None:
+                    raise RuntimeError(
+                        "automatic exact repair requires a current shared queue lease"
+                    )
+                completed = self._run_failed_retry_repair_job(job, lease)
             else:
                 completed = self._run_batch(
                     job["phase"], job["targets"], emit_done=False
                 )
+            authoritative_summary = getattr(
+                self,
+                "_phase_result_summary",
+                None,
+            )
             summary = copy.deepcopy(
-                getattr(self, "_phase_result_summary", None)
-                or self._summarize_phase_targets(job["targets"])
+                authoritative_summary
+                or self._summarize_phase_targets(
+                    job["targets"],
+                    phase=(
+                        job.get("terminal_phase")
+                        if job.get("mode") == "pipeline"
+                        else "push"
+                        if job.get("mode") == "unreal_recovery"
+                        else job.get("phase")
+                    ),
+                )
             )
             failed_count = int(summary["failed_count"])
             blocked_count = int(summary["blocked_count"])
-            if self.stop_flag.is_set():
-                status = "stopped"
-            elif failed_count or blocked_count:
+            owner_lost_count = int(summary.get("owner_lost_count", 0) or 0)
+            pending_count = int(summary.get("pending_count", 0) or 0)
+            cancelled_count = int(summary.get("cancelled_count", 0) or 0)
+            completed_count = int(summary.get("completed_count", 0) or 0)
+            selected_count = int(summary.get("selected_count", 0) or 0)
+            actual_problem_count = (
+                failed_count + blocked_count + owner_lost_count
+            )
+            if (
+                selected_count
+                and completed_count == selected_count
+                and (
+                    not self.stop_flag.is_set()
+                    or authoritative_summary is not None
+                )
+            ):
+                status = "completed"
+            elif actual_problem_count:
                 status = "partial"
+            elif cancelled_count or self.stop_flag.is_set():
+                status = "stopped"
+            elif pending_count:
+                status = "waiting"
             elif completed is False:
                 status = "failed"
             if status == "partial":
@@ -3892,10 +4816,17 @@ class App:
                     str(row.get("reason_token"))
                     for row in summary["target_outcomes"]
                     if row.get("reason_token")
+                    and row.get("outcome") in {
+                        "failed",
+                        "blocked",
+                        "planned_excluded",
+                        "owner_lost",
+                    }
                 })
                 error = (
                     f"completed={summary['completed_count']} "
-                    f"blocked={blocked_count} failed={failed_count}"
+                    f"blocked={blocked_count} failed={failed_count} "
+                    f"owner_lost={owner_lost_count}"
                     + (f" | reasons={','.join(tokens)}" if tokens else "")
                 )
             elif status == "failed":
@@ -3903,6 +4834,23 @@ class App:
                     getattr(self, "_phase_abort_reason", None)
                     or "작업이 완료되지 않음"
                 )
+        except CodeRevisionRestartRequired as exc:
+            revision_restart = exc.as_dict()
+            error = str(exc)
+            status = "completed"
+            summary.setdefault("job_diagnostics", []).append({
+                **copy.deepcopy(revision_restart),
+                "stage": "production_source_revision",
+                "route": "code_revision_warning",
+                "asset_failure": False,
+                "batch_continues": True,
+            })
+            self._present_code_revision_restart_required(revision_restart)
+            self.log(
+                f"[대기열 #{job['id']}] "
+                f"code_revision_warning · continuing\n{error}"
+            )
+            error = None
         except WaitCancelled:
             error = "공용 대기열 대기 중 취소됨"
             status = "stopped"
@@ -3916,9 +4864,9 @@ class App:
         finally:
             if lease is not None and not lease.finished:
                 try:
-                    lease.finish(
-                        success=(status == "completed"),
-                        result={
+                    finish_options = {
+                        "success": status in {"completed", "waiting"},
+                        "result": {
                             "tool": "sk_batch",
                             "local_job_id": job["id"],
                             "outcome": status,
@@ -3928,14 +4876,51 @@ class App:
                             ),
                             **summary,
                         },
-                    )
+                    }
+                    if status == "stopped":
+                        finish_options["terminal_status"] = "cancelled"
+                    lease.finish(**finish_options)
                 except Exception as queue_exc:
-                    error = compact_error_message(queue_exc)
+                    queue_error = compact_error_message(queue_exc)
+                    summary.setdefault("job_diagnostics", []).append({
+                        "stage": "shared_queue_finalization",
+                        "error": queue_error,
+                        "asset_failure": False,
+                        "owner_lost": bool(
+                            getattr(lease, "heartbeat_error", None)
+                        ),
+                    })
+                    error = queue_error
                     status = "failed"
+                    if tracker is not None and retry_partition:
+                        reconciled = tracker.reconcile_queue(
+                            getattr(
+                                self,
+                                "shared_queue_runtime",
+                                None,
+                            ).queue
+                        )
+                        if (
+                            not reconciled
+                            and lease.heartbeat_error is not None
+                        ):
+                            tracker.mark_partition_terminal(
+                                retry_partition,
+                                RETRY_STAGE_OWNER_LOST,
+                                "shared queue lease lost before receipt finalization",
+                            )
                     self.log(
                         f"[대기열 #{job['id']}] 공용 대기열 종료 기록 실패 · "
-                        f"{job['label']}: {error}"
+                        f"{job['label']}: {queue_error}"
                     )
+            if tracker is not None:
+                self._finalize_retry_progress_for_job(
+                    job,
+                    tracker,
+                    status,
+                    summary,
+                    error,
+                )
             self.__dict__.pop("_active_shared_queue_lease", None)
             self.ui_queue.put((
                 "batch_job_done",
@@ -3950,6 +4935,97 @@ class App:
                 },
             ))
 
+    def _finalize_retry_progress_for_job(
+        self,
+        job,
+        tracker,
+        status,
+        summary,
+        error,
+    ):
+        """Seal only this partition while preserving prior target terminals."""
+        metadata = job.get("retry_metadata") or {}
+        partition = str(metadata.get("partition") or "")
+        selected_ids = [
+            str(value) for value in metadata.get("selected_queue_ids") or []
+        ]
+        outcomes = {
+            str(row.get("target")): row
+            for row in (summary or {}).get("target_outcomes") or []
+            if isinstance(row, dict) and row.get("target")
+        }
+        for target_id in selected_ids:
+            row = outcomes.get(target_id)
+            outcome = str((row or {}).get("outcome") or "")
+            reason = str(
+                (row or {}).get("reason_token")
+                or error
+                or outcome
+                or status
+            )
+            if outcome == "completed" or (
+                not outcome and status == "completed"
+            ):
+                tracker.transition(
+                    target_id,
+                    RETRY_STAGE_POST_CHECK,
+                    diagnostic="post-check complete",
+                    progress=True,
+                    heartbeat=True,
+                )
+                tracker.transition(
+                    target_id,
+                    RETRY_STAGE_COMPLETE,
+                    diagnostic="retry target complete",
+                    terminal_reason="completed",
+                    outcome=RETRY_STAGE_COMPLETE,
+                )
+            elif outcome in {
+                "pending_unreal",
+                "exported_pending_unreal",
+            } or (not outcome and status == "waiting"):
+                tracker.transition(
+                    target_id,
+                    RETRY_STAGE_PENDING_UNREAL,
+                    diagnostic=reason or "exported; Unreal pending",
+                    outcome=RETRY_STAGE_PENDING_UNREAL,
+                )
+            elif outcome in {"cancelled", "stopped"} or (
+                not outcome and status == "stopped"
+            ):
+                tracker.transition(
+                    target_id,
+                    RETRY_STAGE_CANCELLED,
+                    diagnostic=reason,
+                    terminal_reason="operator_cancelled",
+                    outcome=RETRY_STAGE_CANCELLED,
+                )
+            elif outcome == "owner_lost":
+                tracker.transition(
+                    target_id,
+                    RETRY_STAGE_OWNER_LOST,
+                    diagnostic=reason,
+                    terminal_reason="owner_lost",
+                    outcome=RETRY_STAGE_OWNER_LOST,
+                )
+            elif outcome in {"blocked", "planned_excluded"}:
+                tracker.transition(
+                    target_id,
+                    RETRY_STAGE_BLOCKED,
+                    diagnostic=reason,
+                    terminal_reason=reason,
+                    outcome=RETRY_STAGE_BLOCKED,
+                )
+            else:
+                tracker.transition(
+                    target_id,
+                    RETRY_STAGE_FAILED,
+                    diagnostic=reason,
+                    terminal_reason=reason,
+                    outcome=RETRY_STAGE_FAILED,
+                )
+        tracker.finalize()
+
     def _finish_batch_job(self, payload):
         self._ensure_batch_queue_state()
         job = self.active_batch_job
@@ -3959,6 +5035,14 @@ class App:
         status = payload.get("status")
         if status is None:
             status = "failed" if error else "completed"
+        if status == CODE_REVISION_RESTART_ROUTE:
+            requirement = copy.deepcopy(
+                payload.get(CODE_REVISION_RESTART_ROUTE) or {}
+            )
+            requirement.setdefault("message", str(error or ""))
+            self._present_code_revision_restart_required(requirement)
+            status = "completed"
+            error = None
         if status in {"failed", "partial"}:
             self.batch_job_failures.append(
                 {
@@ -3969,8 +5053,17 @@ class App:
                     "completed_count": int(
                         payload.get("completed_count", 0) or 0
                     ),
+                    "pending_count": int(
+                        payload.get("pending_count", 0) or 0
+                    ),
+                    "cancelled_count": int(
+                        payload.get("cancelled_count", 0) or 0
+                    ),
                     "blocked_count": int(
                         payload.get("blocked_count", 0) or 0
+                    ),
+                    "owner_lost_count": int(
+                        payload.get("owner_lost_count", 0) or 0
                     ),
                     "planned_excluded_count": int(
                         payload.get("planned_excluded_count", 0) or 0
@@ -3993,6 +5086,7 @@ class App:
             "completed": "완료",
             "partial": "실패/준비 제외 기록 후 다음 작업 계속",
             "failed": "실패 기록 후 다음 작업 계속",
+            "waiting": "Unreal 대기 상태 기록",
             "stopped": "중지",
         }.get(status, str(status))
         self.log(
@@ -4012,24 +5106,40 @@ class App:
             "_active_push_dependency_map",
             "_active_push_auto_added_ids",
             "_headless_progress_label",
+            "_retry_checkpoint_versions",
+            "_retry_checkpoint_output_lines",
             "_phase_failed_items",
             "_phase_result_summary",
+            "_inline_atlas_repair_results",
         ):
             self.__dict__.pop(key, None)
         if self.pending_batch_jobs:
             self._start_next_batch_job()
             return
-        self._reset_cluster_receipt_refresh_memo()
         self._set_batch_queue_controls(False)
         failure_count = len(self.batch_job_failures)
         if status == "stopped":
-            self.progress_var.set("대기열 중지됨")
+            self.progress_var.set(
+                "대기열 중지됨 · cancelled "
+                f"{int(payload.get('cancelled_count', 0) or 0)}"
+            )
+        elif status == "waiting":
+            self.progress_var.set(
+                "대기열 완료 · Unreal 대기 "
+                f"{int(payload.get('pending_count', 0) or 0)}"
+            )
         elif failure_count:
             tokens = sorted({
                 str(row.get("reason_token"))
                 for failure in self.batch_job_failures
                 for row in failure.get("target_outcomes") or ()
                 if row.get("reason_token")
+                and row.get("outcome") in {
+                    "failed",
+                    "blocked",
+                    "planned_excluded",
+                    "owner_lost",
+                }
             })
             completed_total = sum(
                 row.get("completed_count", 0)
@@ -4043,10 +5153,15 @@ class App:
                 row.get("failed_count", 0)
                 for row in self.batch_job_failures
             )
+            owner_lost_total = sum(
+                row.get("owner_lost_count", 0)
+                for row in self.batch_job_failures
+            )
             self.progress_var.set(
                 "대기열 완료 · "
                 f"completed {completed_total} · "
-                f"blocked {blocked_total} · failed {failed_total}"
+                f"blocked {blocked_total} · owner_lost {owner_lost_total} · "
+                f"failed {failed_total}"
                 + (f" · {', '.join(tokens)}" if tokens else "")
             )
         else:
@@ -4086,6 +5201,287 @@ class App:
         }
         self._enqueue_batch_job(job)
 
+    def _failed_retry_planning_context(self):
+        local = getattr(self, "_retry_thread_context", None)
+        context = getattr(local, "planning_context", None)
+        return context if isinstance(context, RetryPlanningContext) else None
+
+    def _failed_retry_state_entry(self, iid):
+        context = self._failed_retry_planning_context()
+        if context is not None:
+            return context.entry(iid)
+        with self.state_lock:
+            value = self.state.get(str(iid), {})
+            return copy.deepcopy(value if isinstance(value, dict) else {})
+
+    @staticmethod
+    def _canonical_receipt_sha256(value):
+        return hashlib.sha256(json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")).hexdigest()
+
+    def _failure_record_provenance(self, iid):
+        """Bind one durable failure to target bytes and running code."""
+
+        target = Path(iid).expanduser().absolute()
+        source_identity = self._artifact_path_identity(target)
+        manifest = getattr(
+            self,
+            "_active_production_source_manifest",
+            None,
+        ) or _PROCESS_PRODUCTION_SOURCE_MANIFEST
+        return {
+            "schema_version": 1,
+            "target_source": source_identity,
+            "production_source_revision": str(manifest.content_hash),
+        }
+
+    def _bind_failure_record(self, iid, kind, reason, details=None):
+        provenance = self._failure_record_provenance(iid)
+        dependency_artifacts = (
+            (details or {}).get("dependency_artifacts")
+            if isinstance(details, dict)
+            else None
+        )
+        if isinstance(dependency_artifacts, dict):
+            provenance["dependency_artifacts"] = copy.deepcopy(
+                dependency_artifacts
+            )
+        evidence = {
+            "kind": str(kind),
+            "message": str(reason),
+            "details": copy.deepcopy(details or {}),
+        }
+        return {
+            "failure_provenance": provenance,
+            "production_source_revision": provenance[
+                "production_source_revision"
+            ],
+            "provenance_sha256": self._canonical_receipt_sha256(provenance),
+            "evidence_sha256": self._canonical_receipt_sha256(evidence),
+        }
+
+    @staticmethod
+    def _content_identity_matches(recorded, current):
+        if not isinstance(recorded, dict) or not isinstance(current, dict):
+            return False
+        if not isinstance(recorded.get("exists"), bool) or not isinstance(
+            current.get("exists"), bool
+        ):
+            return False
+        if bool(recorded.get("exists")) != bool(current.get("exists")):
+            return False
+        try:
+            same_path = _normalized_path(recorded.get("path") or "") == (
+                _normalized_path(current.get("path") or "")
+            )
+        except (OSError, ValueError):
+            return False
+        if not same_path:
+            return False
+        if recorded.get("exists") is not True:
+            return True
+        return bool(
+            str(recorded.get("fingerprint") or "").casefold()
+            == str(current.get("fingerprint") or "").casefold()
+            and recorded.get("fingerprint")
+            and str(recorded.get("fingerprint_algorithm") or "")
+            == str(current.get("fingerprint_algorithm") or "")
+            and int(recorded.get("size", -1))
+            == int(current.get("size", -2))
+        )
+
+    def _failure_record_freshness(self, iid, error):
+        """Cheaply decide whether a saved failure still describes reality."""
+
+        if not isinstance(error, dict):
+            return {
+                "status": "invalid",
+                "reason": "저장된 실패 행에 구조화된 오류가 없습니다.",
+            }
+        provenance = error.get("failure_provenance")
+        if not isinstance(provenance, dict):
+            return {
+                "status": "invalid",
+                "reason": "과거 실패 행에 target content key가 없어 폐기했습니다.",
+            }
+        if error.get("provenance_sha256") != self._canonical_receipt_sha256(
+            provenance
+        ):
+            return {
+                "status": "invalid",
+                "reason": "과거 실패 행의 provenance checksum이 일치하지 않습니다.",
+            }
+        recorded_revision = str(
+            provenance.get("production_source_revision") or ""
+        )
+        if str(error.get("production_source_revision") or "") != (
+            recorded_revision
+        ):
+            return {
+                "status": "invalid",
+                "reason": "과거 실패 행의 direct source revision이 일치하지 않습니다.",
+            }
+        current_revision = str(
+            (
+                getattr(self, "_active_production_source_manifest", None)
+                or _PROCESS_PRODUCTION_SOURCE_MANIFEST
+            ).content_hash
+        )
+        if not recorded_revision or recorded_revision != current_revision:
+            return {
+                "status": "invalid",
+                "reason": (
+                    "과거 실패 행을 만든 production source revision이 "
+                    "현재 코드와 달라 폐기했습니다."
+                ),
+                "recorded_revision": recorded_revision,
+                "current_revision": current_revision,
+            }
+        recorded_source = provenance.get("target_source")
+        try:
+            current = self._failure_record_provenance(iid)["target_source"]
+        except (OSError, ValueError) as exc:
+            return {
+                "status": "invalid",
+                "reason": f"target content key를 다시 확인할 수 없습니다: {exc}",
+            }
+        if not self._content_identity_matches(recorded_source, current):
+            return {
+                "status": "invalid",
+                "reason": "target content key가 과거 실패 행 이후 변경되었습니다.",
+                "recorded_source": copy.deepcopy(recorded_source),
+                "current_source": current,
+            }
+        dependency_artifacts = provenance.get("dependency_artifacts")
+        if isinstance(dependency_artifacts, dict):
+            for dependency, artifact in dependency_artifacts.items():
+                phase = str(
+                    (artifact or {}).get("phase")
+                    if isinstance(artifact, dict)
+                    else ""
+                )
+                identities = (
+                    (artifact or {}).get("artifact_identity")
+                    if isinstance(artifact, dict)
+                    else None
+                )
+                if not isinstance(identities, dict) or not identities:
+                    return {
+                        "status": "invalid",
+                        "reason": (
+                            "과거 dependency 행에 producer artifact "
+                            f"content key가 없습니다: {Path(dependency).name}"
+                        ),
+                    }
+                if phase not in {"blender", "push"}:
+                    return {
+                        "status": "invalid",
+                        "reason": (
+                            "과거 dependency 행에 producer artifact phase가 "
+                            f"없습니다: {Path(dependency).name}"
+                        ),
+                    }
+                current_verdict = self._dependency_artifact_verdict(
+                    dependency,
+                    phase=phase,
+                )
+                if str(current_verdict.get("status") or "") != str(
+                    artifact.get("status") or ""
+                ):
+                    return {
+                        "status": "invalid",
+                        "reason": (
+                            "producer artifact 상태가 과거 dependency 행 "
+                            f"이후 변경되었습니다: {Path(dependency).name}"
+                        ),
+                        "recorded_status": str(
+                            artifact.get("status") or ""
+                        ),
+                        "current_status": str(
+                            current_verdict.get("status") or ""
+                        ),
+                    }
+                for recorded_identity in identities.values():
+                    if not isinstance(recorded_identity, dict):
+                        return {
+                            "status": "invalid",
+                            "reason": "과거 producer artifact identity가 손상되었습니다.",
+                        }
+                    current_identity = self._artifact_path_identity(
+                        recorded_identity.get("path") or ""
+                    )
+                    if not self._content_identity_matches(
+                        recorded_identity,
+                        current_identity,
+                    ):
+                        return {
+                            "status": "invalid",
+                            "reason": (
+                                "producer artifact content key가 과거 "
+                                "dependency 행 이후 변경되었습니다: "
+                                f"{Path(dependency).name}"
+                            ),
+                            "recorded_artifact": copy.deepcopy(
+                                recorded_identity
+                            ),
+                            "current_artifact": current_identity,
+                        }
+        evidence = {
+            "kind": str(error.get("kind") or ""),
+            "message": str(error.get("message") or ""),
+            "details": {
+                key: copy.deepcopy(value)
+                for key, value in error.items()
+                if key not in {
+                    "time",
+                    "kind",
+                    "message",
+                    "failure_provenance",
+                    "production_source_revision",
+                    "provenance_sha256",
+                    "evidence_sha256",
+                }
+            },
+        }
+        if error.get("evidence_sha256") != self._canonical_receipt_sha256(
+            evidence
+        ):
+            return {
+                "status": "invalid",
+                "reason": "과거 실패 행의 evidence checksum이 일치하지 않습니다.",
+            }
+        return {
+            "status": "current",
+            "reason": "target content key와 production source revision이 일치합니다.",
+            "production_source_revision": current_revision,
+        }
+
+    def _effective_failure_entry(self, iid, entry):
+        """Drop only invalid saved errors before retry routing."""
+
+        effective = copy.deepcopy(entry if isinstance(entry, dict) else {})
+        verdicts = {}
+        for column in ("push_status", "blend_status", "spm_status"):
+            error_key = f"{column}_error"
+            error = effective.get(error_key)
+            if not isinstance(error, dict):
+                continue
+            verdict = self._failure_record_freshness(iid, error)
+            verdicts[column] = verdict
+            if verdict.get("status") == "current":
+                continue
+            effective.pop(error_key, None)
+            # Keep the phase marker only as a route to current validation.
+            # The bound error/cause is void, so dependency and exact-repair
+            # logic cannot obey it.  Parent artifact validation may still use
+            # the phase marker to choose Unreal rebind vs Blender rebuild.
+        return effective, verdicts
+
     def _failed_retry_repair_state(self, iid):
         """Return one live provenance decision, never a saved table label."""
         try:
@@ -4104,8 +5500,1064 @@ class App:
                 ),
             }
 
+    def _failed_retry_durable_evidence(
+        self,
+        iid,
+        repair_state=None,
+        *,
+        entry_override=None,
+        failure_record_verdicts=None,
+    ):
+        """Return the saved structured failure plus current live provenance."""
+
+        context = self._failed_retry_planning_context()
+        entry = (
+            copy.deepcopy(entry_override)
+            if isinstance(entry_override, dict)
+            else self._failed_retry_state_entry(iid)
+        )
+        automation = entry.get("failed_retry_automation") or {}
+        automation_status = str(
+            automation.get("status")
+            if isinstance(automation, dict)
+            else ""
+        )
+        disposition = "candidate"
+        if automation_status == STATUS_COMPLETED:
+            disposition = "current_success"
+        elif automation_status == STATUS_CANCELLED:
+            disposition = "resumable_cancelled"
+        authoritative_result = None
+        authoritative_reader = getattr(
+            self,
+            "_target_authoritative_result",
+            None,
+        )
+        if callable(authoritative_reader):
+            authoritative_result = authoritative_reader(str(iid), "push")
+        normalized_outcome = str(
+            (authoritative_result or {}).get("outcome") or ""
+        )
+        if normalized_outcome == "completed":
+            disposition = "current_success"
+        elif normalized_outcome == "pending_unreal":
+            disposition = "current_wait"
+        elif (
+            normalized_outcome == "cancelled"
+            and disposition != "resumable_cancelled"
+        ):
+            disposition = "current_cancelled"
+        reason_token, evidence = self._failure_result_from_entry(entry)
+        current_errors = {
+            key: copy.deepcopy(value)
+            for key, value in entry.items()
+            if key in {
+                "push_status_error",
+                "blend_status_error",
+                "spm_status_error",
+            }
+        }
+        if disposition in {
+            "current_success",
+            "current_wait",
+            "current_cancelled",
+        }:
+            reason_token = disposition
+            evidence = {}
+            current_errors = {}
+        report_payloads = []
+        if disposition not in {
+            "current_success",
+            "current_wait",
+            "current_cancelled",
+        }:
+            pending = [evidence, current_errors]
+            report_paths = []
+            while pending:
+                value = pending.pop()
+                if isinstance(value, dict):
+                    for key, child in value.items():
+                        if key in {"report", "audit_report", "report_file"}:
+                            if isinstance(child, (str, os.PathLike)):
+                                report_paths.append(Path(child))
+                        elif isinstance(child, (dict, list, tuple)):
+                            pending.append(child)
+                elif isinstance(value, (list, tuple)):
+                    pending.extend(value)
+            seen_reports = set()
+            for report_path in report_paths:
+                absolute = report_path.expanduser().absolute()
+                key = os.path.normcase(str(absolute)).casefold()
+                if key in seen_reports:
+                    continue
+                seen_reports.add(key)
+                try:
+                    if (
+                        not absolute.is_file()
+                        or absolute.stat().st_size
+                        > RETRY_PLANNING_MAX_REPORT_BYTES
+                    ):
+                        continue
+                    payload = (
+                        context.load_json(
+                            absolute,
+                            namespace="durable_report",
+                            max_bytes=RETRY_PLANNING_MAX_REPORT_BYTES,
+                        )
+                        if context is not None
+                        else json.loads(
+                            absolute.read_text(encoding="utf-8")
+                        )
+                    )
+                except (
+                    OSError,
+                    UnicodeError,
+                    json.JSONDecodeError,
+                    RetryPlanningSnapshotError,
+                ):
+                    continue
+                report_payloads.append({
+                    "path": str(absolute),
+                    "payload": payload,
+                })
+        resumable = {}
+        if disposition == "resumable_cancelled" and isinstance(
+            automation, dict
+        ):
+            resumable = {
+                "original_failure": copy.deepcopy(
+                    automation.get("original_failure") or {}
+                ),
+                "plan": copy.deepcopy(automation.get("plan") or {}),
+                "cancelled_receipt": {
+                    key: copy.deepcopy(automation.get(key))
+                    for key in (
+                        "request_id",
+                        "parent_retry_id",
+                        "exact_spm",
+                        "status",
+                        "attempted_stages",
+                    )
+                },
+            }
+        atlas_manifest_repair = {}
+        if disposition == "candidate":
+            try:
+                current_atlas_plan = atlas_manifest_mirror_repair_plan(iid)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                current_atlas_plan = {}
+            if current_atlas_plan.get("status") in {
+                "repairable",
+                "unrepairable",
+            }:
+                atlas_manifest_repair = current_atlas_plan
+        return {
+            "schema_version": 1,
+            "queue_id": str(iid),
+            "terminal_disposition": disposition,
+            "current_phase_errors": current_errors,
+            "current_report_payloads": report_payloads,
+            "selected_failure": {
+                "reason_token": reason_token,
+                "evidence": copy.deepcopy(evidence),
+            },
+            "resumable_cancelled": resumable,
+            "current_atlas_manifest_repair": atlas_manifest_repair,
+            "current_repair_state": copy.deepcopy(
+                repair_state
+                if isinstance(repair_state, dict)
+                    else self._failed_retry_repair_state(iid)
+            ),
+            "failure_record_freshness": copy.deepcopy(
+                failure_record_verdicts or {}
+            ),
+        }
+
+    def _recover_missing_root_reason(self, iid, evidence):
+        """Regenerate a lost root reason with exactly one fresh audit.
+
+        A row that carries only repair wrappers -- `automatic_repair_failed`
+        and friends -- records that a repair failed without recording what it
+        was for.  The operator action printed on such a row already says to
+        run a fresh audit and retry the real reason, so run it rather than
+        print it (#167).
+
+        The budget is one, durable, and spent *before* the audit runs: the
+        state this recovers from is exactly the state a crash leaves behind,
+        so an in-memory counter would reset into a loop.
+        """
+        if not needs_fresh_reaudit(evidence):
+            return evidence
+
+        # The evidence above decides whether a recovery is warranted; the
+        # state row holds the budget.  Keeping them separate matters because
+        # the wrapper can land on any status column, while the budget must be
+        # one per target no matter which column recorded the failure.
+        with self.state_lock:
+            entry = self.state.setdefault(str(iid), {})
+            record = repair_failure_record(entry)
+            if record.get("fresh_reaudit_attempted"):
+                return evidence
+            entry[REPAIR_FAILURE_KEY] = mark_fresh_reaudit_attempted(
+                {REPAIR_FAILURE_KEY: record} if record else {},
+                request_id=str(iid),
+            )[REPAIR_FAILURE_KEY]
+            save_state(self.state)
+
+        self.log(
+            "[복구 provenance] 원인 코드가 남지 않은 실패 행을 fresh audit으로 "
+            f"1회 재생성합니다 · {Path(iid).name}"
+        )
+        try:
+            fresh_state = self._failed_retry_repair_state(iid)
+        except Exception as exc:  # noqa: BLE001 - audit must not raise here
+            fresh_state = {
+                "current": False,
+                "push_ready": False,
+                "kind": "inspection_incomplete",
+                "reason": compact_error_message(exc, 240),
+            }
+
+        recovered = copy.deepcopy(evidence)
+        recovered["fresh_reaudit"] = {
+            "policy": "single_shot_root_reason_recovery_v1",
+            "repair_state": copy.deepcopy(fresh_state),
+        }
+        recovered[REPAIR_FAILURE_KEY] = mark_fresh_reaudit_attempted(
+            {REPAIR_FAILURE_KEY: evidence.get(REPAIR_FAILURE_KEY)}
+            if isinstance(evidence, dict)
+            else {},
+            request_id=str(iid),
+        )[REPAIR_FAILURE_KEY]
+        recovered["current_repair_state"] = copy.deepcopy(fresh_state)
+        return recovered
+
+    def _set_failed_retry_automatic_status(
+        self,
+        iid,
+        status,
+        *,
+        plan=None,
+        attempted_stages=(),
+        completed_stages=0,
+        error="",
+        friendly_reason="",
+        remaining_action="",
+        preserve_phase_status=False,
+    ):
+        """Persist automation progress without erasing a newer phase verdict."""
+
+        iid = str(iid)
+        label = AUTOMATIC_REPAIR_STATUS_LABELS.get(status, str(status))
+        plan_payload = (
+            plan.metadata() if hasattr(plan, "metadata")
+            else copy.deepcopy(dict(plan or {}))
+        )
+        progress = repair_progress_payload(
+            plan_payload,
+            status=status,
+            completed_stages=completed_stages,
+            attempted_stages=attempted_stages,
+            error=error,
+        )
+        progress.update({
+            "friendly_reason": str(friendly_reason or ""),
+            "remaining_action": str(remaining_action or ""),
+        })
+        display = label
+        if status == STATUS_FINAL_FAILED and friendly_reason:
+            display = f"최종 차단 · 원인: {friendly_reason}"
+            if remaining_action:
+                display += f" · 조치: {remaining_action}"
+        elif status == STATUS_COMPLETED:
+            display = compact_success_message(attempted_stages)
+        if not preserve_phase_status:
+            self.ui_queue.put(("cell", (iid, "push_status", display)))
+        with self.state_lock:
+            entry = self.state.setdefault(iid, {})
+            automation = entry.setdefault("failed_retry_automation", {})
+            if "original_failure" not in automation:
+                automation["original_failure"] = {
+                    key: copy.deepcopy(value)
+                    for key, value in entry.items()
+                    if key.endswith("_status_error")
+                    or key.endswith("_status_kind")
+                }
+            automation.update(progress)
+            automation["plan"] = plan_payload
+            if not preserve_phase_status:
+                entry["push_status"] = display
+                entry["push_status_kind"] = (
+                    "automatic_repair_failed"
+                    if status == STATUS_FINAL_FAILED
+                    else "automatic_repair"
+                )
+                if status == STATUS_FINAL_FAILED:
+                    entry["push_status_error"] = {
+                        "time": datetime.now().isoformat(timespec="seconds"),
+                        "kind": "automatic_repair_failed",
+                        "message": friendly_reason or "자동 복구 후 재검증 실패",
+                        "attempted_stages": copy.deepcopy(list(attempted_stages)),
+                        "remaining_action": str(remaining_action or ""),
+                        "reason_codes": list(
+                            plan_payload.get("reason_codes") or ()
+                        ),
+                        "raw_error": str(error or ""),
+                    }
+                else:
+                    entry.pop("push_status_error", None)
+            save_state(self.state)
+        return progress
+
+    def _fresh_reaudit_after_exact_repair(self, item, stage):
+        """Run the existing read-only exact SPM audit after every BAT stage."""
+
+        iid = str(item["spm"])
+        stage_name = str(stage.get("stage") or "")
+        exact_spm = Path(item["spm"])
+        evidence = {}
+        if stage_name == "atlas_manifest_repair":
+            refreshed = self._refresh_canonical_atlas_manifests(exact_spm)
+            current_plan = atlas_manifest_mirror_repair_plan(exact_spm)
+            if current_plan.get("status") != "not_needed":
+                raise RuntimeError(
+                    "Atlas manifest conflict remained after exact repair"
+                )
+            evidence["atlas_manifest_refresh"] = copy.deepcopy(refreshed)
+        if stage_name == "pcg_texture":
+            artifact = self._execute_material_preflight(
+                exact_spm,
+                speedtree_output_spm_for(exact_spm),
+                datetime.now().strftime("%Y%m%d_%H%M%S_reaudit"),
+            )
+            material_result = artifact.get("result") or {}
+            if (
+                artifact.get("code") != 0
+                or material_result.get("status") != "ok"
+            ):
+                raise RuntimeError(
+                    material_result.get("failure_reason")
+                    or material_result.get("error")
+                    or "PCG texture fresh material re-audit failed"
+                )
+            evidence["material_preflight_report"] = str(
+                artifact.get("report") or ""
+            )
+        if stage_name in {"generator_sync_and_cluster", "cluster_refresh"}:
+            providers = [
+                Path(path)
+                for path in stage.get("target_spms") or ()
+                if os.path.normcase(os.path.abspath(str(path))).casefold()
+                != os.path.normcase(os.path.abspath(str(exact_spm))).casefold()
+            ]
+            observations = []
+            for provider in providers:
+                observations.append(
+                    self._cluster_normalization_stage_observation(
+                        exact_spm,
+                        datetime.now().strftime("%Y%m%d_%H%M%S_reaudit"),
+                        provider,
+                        require_normalized=True,
+                    )
+                )
+            if stage_name == "generator_sync_and_cluster" and not observations:
+                raise RuntimeError(
+                    "Generator/Cluster fresh re-audit has no exact provider target"
+                )
+            evidence["cluster_observations"] = observations
+        self._job_check(iid, Path(item["spm"]))
+        state = self._failed_retry_repair_state(iid)
+        if state.get("kind") == "inspection_incomplete":
+            raise RuntimeError(state.get("reason") or "fresh re-audit incomplete")
+        return {
+            "stage": str(stage.get("stage") or ""),
+            "status": "audited",
+            "repair_state": copy.deepcopy(state),
+            "evidence": evidence,
+        }
+
+    def _execute_exact_repair_stage(
+        self,
+        plan,
+        stage,
+        lease,
+        *,
+        stage_index,
+        receipt,
+        provenance_source,
+        on_progress=None,
+    ):
+        """Execute one registry-selected stage through the shared BAT path."""
+
+        from pcg_st9_texture_batch.exact_target_repair import (
+            execute_step3_standard,
+        )
+        from spm_generator_sync.exact_target_repair import (
+            execute_exact_generator_request,
+        )
+
+        def execute_modeler_node_table(
+            request,
+            *,
+            progress,
+            cancel_event,
+            lease,
+        ):
+            del lease
+            if cancel_event.is_set():
+                raise WaitCancelled("Modeler Node table repair cancelled")
+            scope = copy.deepcopy(stage.get("recovery_scope") or {})
+            producer_spm = stage.get("producer_spm")
+            target_spms = list(request.get("target_spms") or ())
+            if (
+                scope.get("available") is not True
+                or not producer_spm
+                or len(target_spms) != 1
+            ):
+                return {
+                    "outcome": "failed",
+                    "shared_queue_success": False,
+                    "reason": "sealed Modeler Node table scope is incomplete",
+                }
+            target_spm = Path(target_spms[0])
+            synthetic = TargetPlannedExclusionError(
+                "sealed Modeler Node table repair",
+                reason_token="normalized_generator_node_table_stale",
+                target_spm=target_spm,
+                producer_spm=producer_spm,
+                evidence={
+                    "issue_codes": [
+                        "NORMALIZED_GENERATOR_NODE_TABLE_STALE"
+                    ],
+                    "stale_node_table_recovery": scope,
+                },
+            )
+            progress(
+                "modeler_node_table_recovery",
+                completed=0,
+                remaining=1,
+                unit_stage="modeler_node_table_recovery",
+            )
+            try:
+                resolution = self._attempt_stale_node_table_recovery(
+                    synthetic,
+                    f"exact_{request['request_id']}",
+                    producer_spm,
+                    require_normalized=False,
+                )
+            except BatchItemError as exc:
+                if exc.kind == "cancelled":
+                    raise WaitCancelled(str(exc)) from exc
+                raise
+            if resolution is None:
+                attempt = synthetic.evidence.get("recovery_attempt") or {}
+                return {
+                    "outcome": "failed",
+                    "shared_queue_success": False,
+                    "reason": str(
+                        attempt.get("reason_token")
+                        or "sealed Modeler Node table repair failed"
+                    ),
+                    "recovery_attempt": copy.deepcopy(attempt),
+                }
+            progress(
+                "modeler_node_table_recovery",
+                completed=1,
+                remaining=0,
+                unit_stage="modeler_node_table_recovery",
+            )
+            return {
+                "outcome": "completed",
+                "shared_queue_success": True,
+                "live_resolution": copy.deepcopy(resolution),
+            }
+
+        executors = {
+            PCG_TEXTURE_TOOL: execute_step3_standard,
+            GENERATOR_SYNC_TOOL: execute_exact_generator_request,
+            MODELER_RECOVERY_TOOL: execute_modeler_node_table,
+        }
+        tool = str(stage.get("tool") or "")
+        if (
+            tool == MODELER_RECOVERY_TOOL
+            and stage.get("repair_action") != MODELER_NODE_TABLE_RECOVERY
+        ):
+            raise RuntimeError(
+                "unsupported SpeedTree Modeler exact repair action: "
+                + str(stage.get("repair_action") or "")
+            )
+        executor = executors.get(tool)
+        if executor is None:
+            raise RuntimeError(f"unsupported exact repair tool: {tool}")
+        request = build_exact_target_request(
+            tool=tool,
+            repair_action=stage["repair_action"],
+            target_spms=stage["target_spms"],
+            repair_stage=stage["stage"],
+            provenance={
+                "reason_codes": list(plan.get("reason_codes") or ()),
+                "evidence_sha256": plan.get("evidence_sha256"),
+                "source": str(provenance_source),
+            },
+            parent_retry_id=plan["parent_retry_id"],
+            request_id=f"{plan['request_id']}-{stage_index}",
+            receipt=receipt,
+        )
+        return run_exact_target_request(
+            request,
+            executor,
+            inherited_lease=lease,
+            cancel_event=self.stop_flag,
+            on_progress=on_progress,
+        )
+
+    def _run_failed_retry_repair_job(self, job, lease):
+        """Run exact BAT stages, fresh-audit, then re-enter the pipeline."""
+        targets_by_id = {
+            str(item["spm"]): item for item in job.get("targets") or ()
+        }
+        plans = list(job.get("repair_plans") or ())
+        plans_by_id = {
+            str(plan.get("exact_spm")): plan for plan in plans
+        }
+        total_stage_count = sum(len(plan.get("stages") or ()) for plan in plans)
+        global_completed = 0
+        outcomes = []
+        pipeline_targets = []
+        pipeline_reaudit_ids = set()
+        cancelled_repair_ids = set()
+
+        for plan in plans:
+            iid = str(plan["exact_spm"])
+            item = targets_by_id.get(iid)
+            attempted = []
+            if item is None:
+                missing_decision = repair_ui_decision({
+                    "reason_token": "repair_inventory_target_missing",
+                    "evidence": {"plan": copy.deepcopy(plan)},
+                })
+                outcomes.append({
+                    "target": iid,
+                    "target_name": Path(iid).name,
+                    "outcome": "failed",
+                    "reason_token": "repair_inventory_target_missing",
+                    "evidence": {"plan": copy.deepcopy(plan)},
+                })
+                self._set_failed_retry_automatic_status(
+                    iid,
+                    STATUS_FINAL_FAILED,
+                    plan=plan,
+                    friendly_reason=missing_decision["reason"],
+                    remaining_action=missing_decision["action"],
+                )
+                continue
+
+            cancelled = False
+            failed = None
+            exact_stages = list(plan.get("stages") or ())
+            for stage_index, stage in enumerate(exact_stages, 1):
+                if self.stop_flag.is_set():
+                    cancelled = True
+                    break
+                status = stage_running_status(stage)
+                self._set_failed_retry_automatic_status(
+                    iid,
+                    status,
+                    plan=plan,
+                    attempted_stages=attempted,
+                    completed_stages=stage_index - 1,
+                )
+                label = AUTOMATIC_REPAIR_STATUS_LABELS[status]
+                self.ui_queue.put((
+                    "progress",
+                    f"{Path(iid).name} · {label} · "
+                    f"완료 {global_completed}/{total_stage_count} · "
+                    f"남음 {max(0, total_stage_count - global_completed)}",
+                ))
+                receipt = LOG_DIR / (
+                    f"exact_repair_{plan['request_id']}_{stage_index}.json"
+                )
+                current_stage_status = [status]
+
+                def on_exact_progress(payload, asset=Path(iid).name):
+                    unit_stage = str(payload.get("unit_stage") or "")
+                    desired_status = (
+                        STATUS_CLUSTER
+                        if unit_stage == "cluster_refresh"
+                        else (
+                            STATUS_GENERATOR
+                            if unit_stage == "generator_sync"
+                            else current_stage_status[0]
+                        )
+                    )
+                    if desired_status != current_stage_status[0]:
+                        current_stage_status[0] = desired_status
+                        self._set_failed_retry_automatic_status(
+                            iid,
+                            desired_status,
+                            plan=plan,
+                            attempted_stages=attempted,
+                            completed_stages=stage_index - 1,
+                        )
+                    self.ui_queue.put((
+                        "progress",
+                        f"{asset} · "
+                        f"{payload.get('current_stage') or label} · "
+                        f"완료 {global_completed}/{total_stage_count} · "
+                        f"남음 {max(0, total_stage_count - global_completed)}",
+                    ))
+
+                try:
+                    terminal = self._execute_exact_repair_stage(
+                        plan,
+                        stage,
+                        lease,
+                        stage_index=stage_index,
+                        receipt=receipt,
+                        provenance_source="sk_batch.failed_retry",
+                        on_progress=on_exact_progress,
+                    )
+                except CodeRevisionRestartRequired:
+                    raise
+                except WaitCancelled as exc:
+                    attempted.append({
+                        "stage": stage["stage"],
+                        "tool": stage["tool"],
+                        "repair_action": stage["repair_action"],
+                        "targets": list(stage["target_spms"]),
+                        "receipt": str(receipt),
+                        "status": "cancelled",
+                        "error": compact_error_message(exc, 400),
+                    })
+                    cancelled = True
+                    break
+                except Exception as exc:
+                    raw_error = compact_error_message(exc, 400)
+                    attempted.append({
+                        "stage": stage["stage"],
+                        "tool": stage["tool"],
+                        "repair_action": stage["repair_action"],
+                        "targets": list(stage["target_spms"]),
+                        "receipt": str(receipt),
+                        "status": "orchestration_diagnostic",
+                        "error": raw_error,
+                    })
+                    failed = (
+                        "BAT exact repair orchestration failed",
+                        raw_error,
+                    )
+                    break
+                attempted_row = {
+                    "stage": stage["stage"],
+                    "tool": stage["tool"],
+                    "repair_action": stage["repair_action"],
+                    "targets": list(stage["target_spms"]),
+                    "receipt": str(receipt),
+                    "status": terminal.get("status"),
+                }
+                attempted.append(attempted_row)
+                terminal_status = str(
+                    terminal.get("terminal_status")
+                    or terminal.get("status")
+                    or ""
+                )
+                if terminal_status == "cancelled":
+                    cancelled = True
+                    break
+                if terminal_status != "completed":
+                    failed = (
+                        "BAT exact repair failed",
+                        terminal.get("error")
+                        or str((terminal.get("result") or {}).get("reason") or ""),
+                    )
+                    break
+                global_completed += 1
+                if stage_index < len(exact_stages):
+                    # One exact repair plan is one bounded transaction.  An
+                    # early stage may intentionally prepare inputs that only a
+                    # later registered Generator/Cluster stage makes current.
+                    # Auditing the whole asset at that intermediate boundary
+                    # would create a new checkpoint and strand the remaining
+                    # known repair action.
+                    attempted_row["fresh_reaudit"] = {
+                        "status": "deferred_until_remaining_exact_stages",
+                        "remaining_stage_count": (
+                            len(exact_stages) - stage_index
+                        ),
+                    }
+                    self.ui_queue.put((
+                        "progress",
+                        f"{Path(iid).name}: exact repair stage "
+                        f"{stage_index}/{len(exact_stages)} complete",
+                    ))
+                    continue
+                self._set_failed_retry_automatic_status(
+                    iid,
+                    STATUS_REAUDIT,
+                    plan=plan,
+                    attempted_stages=attempted,
+                    completed_stages=stage_index,
+                )
+                self.ui_queue.put((
+                    "progress",
+                    f"{Path(iid).name} · 재검증 중 · "
+                    f"완료 {global_completed}/{total_stage_count} · "
+                    f"남음 {max(0, total_stage_count - global_completed)}",
+                ))
+                try:
+                    attempted_row["fresh_reaudit"] = (
+                        self._fresh_reaudit_after_exact_repair(item, stage)
+                    )
+                except CodeRevisionRestartRequired:
+                    raise
+                except Exception as exc:
+                    failed = (
+                        "fresh re-audit failed",
+                        compact_error_message(exc, 400),
+                    )
+                    break
+
+            if cancelled:
+                cancelled_repair_ids.add(iid)
+                self._set_failed_retry_automatic_status(
+                    iid,
+                    STATUS_CANCELLED,
+                    plan=plan,
+                    attempted_stages=attempted,
+                    completed_stages=sum(
+                        row.get("status") == "completed" for row in attempted
+                    ),
+                )
+                outcomes.append({
+                    "target": iid,
+                    "target_name": Path(iid).name,
+                    "outcome": "cancelled",
+                    "reason_token": "automatic_repair_cancelled",
+                    "evidence": {"attempted_stages": copy.deepcopy(attempted)},
+                })
+                continue
+            if failed is not None:
+                headline, raw_error = failed
+                reaudit_failed = headline == "fresh re-audit failed"
+                failure_token = (
+                    "automatic_repair_reaudit_failed"
+                    if reaudit_failed
+                    else "automatic_repair_failed"
+                )
+                failure_evidence = {
+                    "attempted_stages": copy.deepcopy(attempted),
+                    "raw_error": raw_error,
+                    "reason_codes": list(plan.get("reason_codes") or ()),
+                }
+                # A BAT process/result failure is orchestration evidence, not
+                # an asset verdict. Preserve it on the immutable retry item
+                # and return to the ordinary full pipeline. Its fresh content
+                # preflight is the only authority that may block this target.
+                self._set_failed_retry_automatic_status(
+                    iid,
+                    STATUS_PIPELINE,
+                    plan=plan,
+                    attempted_stages=attempted,
+                    completed_stages=sum(
+                        row.get("status") == "completed" for row in attempted
+                    ),
+                )
+                item["_failed_retry_attempted_stages"] = attempted
+                item["_failed_retry_stage_diagnostic"] = {
+                    "reason_token": failure_token,
+                    "headline": headline,
+                    "evidence": failure_evidence,
+                }
+                pipeline_targets.append(item)
+                pipeline_reaudit_ids.add(iid)
+                self.log(
+                    "[automatic repair diagnostic] BAT result does not gate "
+                    f"export; fresh full pipeline retained: {Path(iid).name} "
+                    f"({failure_token}: {raw_error})"
+                )
+                continue
+            self._set_failed_retry_automatic_status(
+                iid,
+                STATUS_PIPELINE,
+                plan=plan,
+                attempted_stages=attempted,
+                completed_stages=len(plan.get("stages") or ()),
+            )
+            item["_failed_retry_attempted_stages"] = attempted
+            pipeline_targets.append(item)
+            pipeline_reaudit_ids.add(iid)
+
+        pipeline_target_ids = {
+            str(item["spm"]) for item in pipeline_targets
+        }
+        resume_after_repairs = copy.deepcopy(
+            job.get("resume_after_repairs") or {}
+        )
+        for resume_iid, required_roots in resume_after_repairs.items():
+            resume_iid = str(resume_iid)
+            required_roots = [str(value) for value in required_roots or ()]
+            item = targets_by_id.get(resume_iid)
+            missing_roots = [
+                root
+                for root in required_roots
+                if root not in pipeline_reaudit_ids
+            ]
+            if item is not None and required_roots and not missing_roots:
+                if resume_iid not in pipeline_target_ids:
+                    item["_failed_retry_resumed_by"] = required_roots
+                    pipeline_targets.append(item)
+                    pipeline_target_ids.add(resume_iid)
+                self.log(
+                    "[자동 복구 완료] 필수 Cluster 복구 후 Blender 재개: "
+                    f"{Path(resume_iid).name}"
+                )
+                continue
+            cancelled_roots = [
+                root for root in required_roots
+                if root in cancelled_repair_ids
+            ]
+            if cancelled_roots or self.stop_flag.is_set():
+                names = ", ".join(
+                    Path(value).name
+                    for value in cancelled_roots or required_roots
+                )
+                reason = (
+                    "필수 Cluster 자동 복구가 취소되어 Blender 재개도 "
+                    f"취소했습니다: {names or '대상 없음'}"
+                )
+                self._record_phase_status(
+                    resume_iid,
+                    "push_status",
+                    f"재시도 취소: {reason}",
+                    "cancelled",
+                    reason,
+                    details={
+                        "blocked_by": required_roots,
+                        "repair_disposition": "cancelled",
+                    },
+                    persist=True,
+                )
+                outcomes.append({
+                    "target": resume_iid,
+                    "target_name": Path(resume_iid).name,
+                    "outcome": "cancelled",
+                    "reason_token": "required_cluster_repair_cancelled",
+                    "evidence": {"blocked_by": required_roots},
+                })
+                continue
+            names = ", ".join(
+                Path(value).name for value in missing_roots or required_roots
+            )
+            reason = (
+                "필수 Cluster 자동 복구가 완료되지 않아 Blender를 재개하지 "
+                f"못했습니다: {names or '대상 없음'}"
+            )
+            if item is None:
+                reason = "재개할 소비자가 current inventory에서 사라졌습니다."
+            self._record_phase_status(
+                resume_iid,
+                "push_status",
+                f"최종 차단: {reason}",
+                "dependency_blocked",
+                reason,
+                details={
+                    "blocked_by": required_roots,
+                    "repair_disposition": REPAIR_UI_BLOCKED,
+                },
+                persist=True,
+            )
+            outcomes.append({
+                "target": resume_iid,
+                "target_name": Path(resume_iid).name,
+                "outcome": "blocked",
+                "reason_token": "required_cluster_repair_failed",
+                "evidence": {"blocked_by": required_roots},
+            })
+
+        if pipeline_targets and not self.stop_flag.is_set():
+            self.ui_queue.put((
+                "progress",
+                f"Blender-Unreal 재시도 중 · 대상 {len(pipeline_targets)} · "
+                f"완료 0 · 남음 {len(pipeline_targets)}",
+            ))
+            self._run_full_pipeline(
+                pipeline_targets,
+                terminal_phase="push",
+                selected_scope=True,
+                emit_done=False,
+            )
+            pipeline_summary = copy.deepcopy(
+                getattr(self, "_phase_result_summary", None)
+                or self._summarize_phase_targets(pipeline_targets)
+            )
+            pipeline_by_id = {
+                str(row.get("target")): row
+                for row in pipeline_summary.get("target_outcomes") or ()
+            }
+            for item in pipeline_targets:
+                iid = str(item["spm"])
+                attempted = item.pop("_failed_retry_attempted_stages", [])
+                stage_diagnostic = item.pop(
+                    "_failed_retry_stage_diagnostic",
+                    None,
+                )
+                resumed_by = item.pop("_failed_retry_resumed_by", [])
+                pipeline_row = copy.deepcopy(pipeline_by_id.get(iid, {}))
+                if stage_diagnostic and pipeline_row:
+                    pipeline_row.setdefault("evidence", {})[
+                        "automatic_repair_attempt"
+                    ] = copy.deepcopy(stage_diagnostic)
+                plan = plans_by_id.get(iid)
+                pipeline_outcome = str(pipeline_row.get("outcome") or "")
+                if plan is None:
+                    outcomes.append(pipeline_row or {
+                        "target": iid,
+                        "target_name": Path(iid).name,
+                        "outcome": "failed",
+                        "reason_token": "resumed_pipeline_result_missing",
+                        "evidence": {"resumed_by": resumed_by},
+                    })
+                    continue
+                if pipeline_outcome == "completed":
+                    final_receipt = self._set_failed_retry_automatic_status(
+                        iid,
+                        STATUS_COMPLETED,
+                        plan=plan,
+                        attempted_stages=attempted,
+                        completed_stages=len(attempted),
+                        preserve_phase_status=True,
+                    )
+                    if not fresh_repair_receipt_authoritative(
+                        final_receipt, plan
+                    ):
+                        pipeline_row.setdefault("evidence", {})[
+                            "automatic_repair_receipt_diagnostic"
+                        ] = {
+                            "status": "identity_mismatch",
+                            "asset_failure": False,
+                            "fresh_pipeline_outcome": "completed",
+                            "receipt": copy.deepcopy(final_receipt),
+                        }
+                        self.log(
+                            "[automatic repair route] completed fresh pipeline "
+                            "owns the target verdict despite receipt bookkeeping "
+                            f"mismatch: {Path(iid).name}"
+                        )
+                elif pipeline_outcome == "pending_unreal":
+                    self._set_failed_retry_automatic_status(
+                        iid,
+                        STATUS_PIPELINE,
+                        plan=plan,
+                        attempted_stages=attempted,
+                        completed_stages=len(attempted),
+                        preserve_phase_status=True,
+                    )
+                elif pipeline_outcome == "cancelled" or (
+                    not pipeline_outcome and self.stop_flag.is_set()
+                ):
+                    self._set_failed_retry_automatic_status(
+                        iid,
+                        STATUS_CANCELLED,
+                        plan=plan,
+                        attempted_stages=attempted,
+                        completed_stages=len(attempted),
+                        preserve_phase_status=True,
+                    )
+                    if not pipeline_row:
+                        pipeline_row = {
+                            "target": iid,
+                            "target_name": Path(iid).name,
+                            "outcome": "cancelled",
+                            "reason_token": "automatic_retry_cancelled",
+                            "evidence": {},
+                        }
+                else:
+                    retry_token = str(
+                        pipeline_row.get("reason_token")
+                        or "pipeline_retry_result_missing"
+                    )
+                    # `_run_full_pipeline` already persisted the exact current
+                    # content result. Do not overwrite it with the historical
+                    # automation wrapper that preceded this audit.
+                    self.log(
+                        "[automatic repair route] fresh pipeline result owns "
+                        f"the target verdict: {Path(iid).name} "
+                        f"({retry_token})"
+                    )
+                outcomes.append(pipeline_row or {
+                    "target": iid,
+                    "target_name": Path(iid).name,
+                    "outcome": "failed",
+                    "reason_token": "pipeline_retry_result_missing",
+                    "evidence": {},
+                })
+        elif pipeline_targets:
+            for item in pipeline_targets:
+                iid = str(item["spm"])
+                attempted = item.pop("_failed_retry_attempted_stages", [])
+                item.pop("_failed_retry_stage_diagnostic", None)
+                item.pop("_failed_retry_resumed_by", None)
+                plan = plans_by_id.get(iid)
+                if plan is not None:
+                    self._set_failed_retry_automatic_status(
+                        iid,
+                        STATUS_CANCELLED,
+                        plan=plan,
+                        attempted_stages=attempted,
+                        completed_stages=len(attempted),
+                    )
+                outcomes.append({
+                    "target": iid,
+                    "target_name": Path(iid).name,
+                    "outcome": "cancelled",
+                    "reason_token": "automatic_retry_cancelled",
+                    "evidence": {"attempted_stages": copy.deepcopy(attempted)},
+                })
+
+        completed_count = sum(
+            row.get("outcome") == "completed" for row in outcomes
+        )
+        pending_count = sum(
+            row.get("outcome") == "pending_unreal" for row in outcomes
+        )
+        failed_count = sum(row.get("outcome") == "failed" for row in outcomes)
+        cancelled_count = sum(
+            row.get("outcome") == "cancelled" for row in outcomes
+        )
+        blocked_count = sum(
+            row.get("outcome") in {"blocked", "planned_excluded"}
+            for row in outcomes
+        )
+        owner_lost_count = sum(
+            row.get("outcome") == "owner_lost" for row in outcomes
+        )
+        summary = {
+            "selected_count": len(outcomes),
+            "completed_count": completed_count,
+            "pending_count": pending_count,
+            "blocked_count": blocked_count,
+            "owner_lost_count": owner_lost_count,
+            "planned_excluded_count": sum(
+                row.get("outcome") == "planned_excluded" for row in outcomes
+            ),
+            "dependency_blocked_count": sum(
+                row.get("outcome") == "blocked" for row in outcomes
+            ),
+            "failed_count": failed_count,
+            "cancelled_count": cancelled_count,
+            "target_outcomes": outcomes,
+            "shared_failures": [],
+        }
+        self._phase_result_summary = summary
+        return not (
+            failed_count
+            or blocked_count
+            or owner_lost_count
+            or cancelled_count
+        )
+
     def _failed_retry_parent_source_record(self, queue_id, parent_item):
-        state_entry = self.state.get(queue_id, {})
+        state_entry = self._failed_retry_state_entry(queue_id)
         expected = str(parent_item.get("source_fingerprint") or "")
         source_record = copy.deepcopy(
             state_entry.get("push_source_fingerprint_cache") or {}
@@ -4148,14 +6600,10 @@ class App:
             raise PushUnrealRecoveryError(
                 "parent manifest item has no Blender source path"
             )
-        current_fingerprint = self._source_push_fingerprint(
-            Path(blend_value), queue_id
-        )
-        current_record = copy.deepcopy(
-            self.state.get(queue_id, {}).get(
-                "push_source_fingerprint_cache"
-            )
-            or {}
+        current_fingerprint, current_record = self._source_push_fingerprint(
+            Path(blend_value),
+            queue_id,
+            return_record=True,
         )
         validate_unreal_only_recovery_evidence(
             parent_item,
@@ -4167,27 +6615,695 @@ class App:
         return current_record
 
     def start_failed_results_retry(self):
-        """Classify and partition failed/stale Blender and Unreal retries."""
+        """Plan complete-inventory retry work without blocking the Tk thread."""
+        return self._start_failed_results_retry(
+            list(self.items),
+            scope="all",
+            dialog_title="전체 실패 이력 재시도",
+            empty_message="현재 목록 전체에 재시도할 대상이 없습니다.",
+        )
+
+    def start_checked_failed_results_retry(self):
+        """Plan failed/stale retry work for the exact checked rows only."""
+        return self._start_failed_results_retry(
+            [
+                iid
+                for iid, item in self.items.items()
+                if bool(item.get("checked"))
+            ],
+            scope="checked",
+            dialog_title="체크 항목 실패 재시도",
+            empty_message="체크한 재시도 대상이 없습니다.",
+        )
+
+    def _start_failed_results_retry(
+        self,
+        candidate_iids,
+        *,
+        scope,
+        dialog_title,
+        empty_message,
+    ):
+        """Snapshot one explicit retry scope and plan it off the Tk thread."""
         self._close_cell_editor()
-        selected_iids = [
-            iid for iid, item in self.items.items() if item["checked"]
-        ]
-        if not selected_iids:
-            messagebox.showinfo("SK Batch", "선택된 항목이 없습니다.")
+        candidate_iids = list(candidate_iids)
+        if not candidate_iids:
+            messagebox.showinfo(
+                dialog_title,
+                empty_message,
+            )
             return
-
-        repair_states = {
-            iid: self._failed_retry_repair_state(iid)
-            for iid in selected_iids
+        self._production_source_revision_precheck()
+        # Capture the operator's rerun authority on the Tk owner thread.  The
+        # planner runs in a worker and must never read a live Tk variable.  An
+        # exact checked retry is itself an explicit rerun request; it does not
+        # require a second force checkbox and a historical success receipt
+        # cannot veto it (#175/#178).
+        force_var = getattr(self, "force_var", None)
+        try:
+            force_checked = bool(force_var.get()) if force_var else False
+        except Exception:
+            force_checked = False
+        retry_force_rerun = bool(scope == "checked" or force_checked)
+        retry_force_full_rebuild = bool(force_checked)
+        retry_request = {
+            "scope": str(scope),
+            "dialog_title": str(dialog_title),
+            "empty_message": str(empty_message),
+            "force_rerun": retry_force_rerun,
+            "force_full_rebuild": retry_force_full_rebuild,
         }
+        cfg = dict(self._collect_cfg())
+        cfg["_retry_force_rerun"] = retry_force_rerun
+        cfg["_retry_force_full_rebuild"] = retry_force_full_rebuild
+        inventory_snapshot, _snapshot_targets = self._snapshot_batch_request(
+            candidate_iids
+        )
+        cached_plan = self._reusable_retry_plan_cache()
+        tracker = None
+        if getattr(self, "_async_retry_planning_enabled", False):
+            if (
+                getattr(self, "active_batch_job", None) is None
+                and not getattr(self, "pending_batch_jobs", ())
+            ):
+                self.stop_flag.clear()
+            self._set_batch_queue_controls(True)
+            self.progress_var.set(
+                f"retry stage={RETRY_STAGE_PLANNING} · "
+                f"대상 {len(candidate_iids)}개"
+            )
+            # Flush the planning label before any inventory/parent validation
+            # begins in the worker. This callback is the Tk owner thread.
+            self.root.update_idletasks()
+            tracker = self._new_retry_progress(candidate_iids, cfg)
+            planning_session_id = uuid.uuid4().hex
+            runtime = getattr(self, "shared_queue_runtime", None)
+            if runtime is not None:
+                planning_owner = runtime.owner_identity
+            else:
+                planning_owner = {
+                    "owner_id": f"sk_batch-planning:{os.getpid()}",
+                    "hostname": os.environ.get("COMPUTERNAME") or "local",
+                    "pid": os.getpid(),
+                    "process_marker": None,
+                }
+            planning_owner.update({
+                "planning_session_id": planning_session_id,
+                "thread_name": f"retry-planner-{tracker.run_id[:8]}",
+            })
+            tracker.start_planning(planning_owner)
+            planning_finished = threading.Event()
+
+            def plan_in_worker():
+                plan = None
+                try:
+                    plan = self._build_failed_retry_plan(
+                        candidate_iids,
+                        cfg,
+                        tracker=tracker,
+                        inventory_snapshot=inventory_snapshot,
+                        planning_session_id=planning_session_id,
+                        cached_plan_cache=cached_plan,
+                    )
+                except Exception as exc:
+                    plan = {
+                        "error": compact_error_message(exc),
+                        "tracker": tracker,
+                        "selected_iids": list(candidate_iids),
+                        "cfg": cfg,
+                    }
+                if plan is not None:
+                    plan["_retry_request"] = copy.deepcopy(retry_request)
+                    tracker.planning_ready(planning_session_id)
+                    planning_finished.set()
+                    self.ui_queue.put(("retry_plan_ready", plan))
+
+            worker = threading.Thread(
+                target=plan_in_worker,
+                name=planning_owner["thread_name"],
+                daemon=True,
+            )
+            worker.retry_progress_run_id = tracker.run_id
+            self._retry_planning_workers.add(worker)
+            worker.start()
+
+            def heartbeat_planner():
+                while not planning_finished.wait(1.0):
+                    if not worker.is_alive():
+                        tracker.finish_planning(
+                            RETRY_STAGE_FAILED,
+                            "planner thread terminated before plan commit",
+                        )
+                        planning_finished.set()
+                        return
+                    if not tracker.planning_heartbeat(
+                        planning_session_id,
+                        thread_ident=worker.ident,
+                    ):
+                        return
+
+            threading.Thread(
+                target=heartbeat_planner,
+                name=f"retry-planner-heartbeat-{tracker.run_id[:8]}",
+                daemon=True,
+            ).start()
+            return tracker.run_id
+
+        plan = self._build_failed_retry_plan(
+            candidate_iids,
+            cfg,
+            inventory_snapshot=inventory_snapshot,
+        )
+        plan["_retry_request"] = copy.deepcopy(retry_request)
+        return self._commit_failed_retry_plan(plan)
+
+    def _build_failed_retry_plan(
+        self,
+        candidate_iids,
+        cfg,
+        tracker=None,
+        inventory_snapshot=None,
+        planning_session_id=None,
+        cached_plan_cache=None,
+    ):
+        """Capture one bounded generation, then build without Tk or live state."""
+        candidate_iids = list(candidate_iids)
+        cfg = dict(cfg)
+        cfg["_planning_production_source_revision"] = str(
+            _PROCESS_PRODUCTION_SOURCE_MANIFEST.content_hash
+        )
+        if inventory_snapshot is None:
+            inventory_snapshot, _targets = self._snapshot_batch_request(
+                candidate_iids
+            )
+        local = getattr(self, "_retry_thread_context", None)
+        if local is None:
+            local = threading.local()
+            self._retry_thread_context = local
+        previous = getattr(local, "planning_context", None)
+        context = RetryPlanningContext.capture(
+            target_ids=candidate_iids,
+            state=getattr(self, "state", {}),
+            state_lock=getattr(self, "state_lock", threading.RLock()),
+            cfg_snapshot=cfg,
+            inventory_snapshot=inventory_snapshot,
+            cancel_event=getattr(self, "stop_flag", None),
+            tracker=tracker,
+            planning_session_id=planning_session_id,
+        )
+        local.planning_context = context
+        try:
+            context.publish(
+                "cache_lookup",
+                scanned=0,
+                total=len(candidate_iids),
+                cache_status="checking",
+                progress=False,
+                force=True,
+            )
+            cache_hit = bool(
+                isinstance(cached_plan_cache, dict)
+                and cached_plan_cache.get("schema_version") == 1
+                and cached_plan_cache.get("input_signature")
+                == context.input_signature
+                and isinstance(cached_plan_cache.get("artifact"), dict)
+                and tracker is not None
+            )
+            if cache_hit:
+                try:
+                    plan = hydrate_plan_cache_artifact(
+                        cached_plan_cache["artifact"],
+                        inventory_snapshot=inventory_snapshot,
+                        cfg_snapshot=cfg,
+                        tracker=tracker,
+                        side_effects_committed=bool(
+                            cached_plan_cache.get("side_effects_committed")
+                        ),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    context.counters["plan_cache_invalid"] += 1
+                    cache_hit = False
+                else:
+                    context.counters["plan_cache_hits"] += 1
+                    context.publish(
+                        "cache_reuse",
+                        scanned=len(candidate_iids),
+                        total=len(candidate_iids),
+                        last_completed="saved retry plan",
+                        cache_status="hit",
+                        force=True,
+                    )
+                    artifact = copy.deepcopy(cached_plan_cache["artifact"])
+            if not cache_hit:
+                context.counters["plan_cache_misses"] += 1
+                context.publish(
+                    "cache_lookup",
+                    scanned=0,
+                    total=len(candidate_iids),
+                    cache_status="miss",
+                    progress=False,
+                    force=True,
+                )
+                plan = self._build_failed_retry_plan_scoped(
+                    candidate_iids,
+                    cfg,
+                    tracker=tracker,
+                    inventory_snapshot=inventory_snapshot,
+                    planning_context=context,
+                )
+                artifact = None
+                if tracker is not None:
+                    try:
+                        artifact = build_plan_cache_artifact(
+                            plan,
+                            tracker.snapshot(evaluate=False),
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        context.counters["plan_cache_write_rejections"] += 1
+            plan["_planning_input_signature"] = copy.deepcopy(
+                context.input_signature
+            )
+            plan["_planning_inventory_snapshot"] = copy.deepcopy(
+                inventory_snapshot
+            )
+            plan["_planning_cache_artifact"] = artifact
+            plan["_planning_session_id"] = planning_session_id
+            plan["_planning_cache_reused"] = cache_hit
+            if (
+                tracker is not None
+                and planning_session_id is not None
+                and artifact is not None
+            ):
+                tracker.store_planning_cache(
+                    planning_session_id,
+                    input_signature=context.input_signature,
+                    artifact=artifact,
+                    side_effects_committed=(
+                        bool(cached_plan_cache.get("side_effects_committed"))
+                        if cache_hit
+                        else False
+                    ),
+                )
+            plan["planning_diagnostics"] = context.diagnostics()
+            plan["planning_diagnostics"]["plan_cache"] = (
+                "hit" if cache_hit else "miss"
+            )
+            return plan
+        finally:
+            if previous is None:
+                try:
+                    del local.planning_context
+                except AttributeError:
+                    pass
+            else:
+                local.planning_context = previous
+
+    def _build_failed_retry_plan_scoped(
+        self,
+        candidate_iids,
+        cfg,
+        *,
+        tracker=None,
+        inventory_snapshot=None,
+        planning_context,
+    ):
+        """Return immutable queue jobs from one RetryPlanningContext."""
+        candidate_iids = list(candidate_iids)
+        cfg = dict(cfg)
+        self._pipeline_dependency_artifact_cache = {}
+        deferred_status_updates = []
+        deferred_logs = []
+
+        def defer_status(iid, status, **kwargs):
+            deferred_status_updates.append({
+                "iid": str(iid),
+                "status": str(status),
+                "kwargs": kwargs,
+            })
+
+        repair_states = {}
+        effective_entries = {}
+        failure_record_verdicts = {}
+        fresh_candidate_iids = []
+        with planning_context.span("cheap_candidate_discovery"):
+            for index, iid in enumerate(candidate_iids, start=1):
+                planning_context.check_cancel()
+                entry, record_verdicts = self._effective_failure_entry(
+                    iid,
+                    planning_context.entry(iid),
+                )
+                effective_entries[iid] = entry
+                failure_record_verdicts[iid] = record_verdicts
+                saved_signature = self._normalized_live_status_signature(
+                    entry.get("live_status_signature")
+                )
+                live_identity_current = False
+                if saved_signature is not None:
+                    try:
+                        current_signature = self._live_status_signature(
+                            Path(iid),
+                            tuple(entry.get("live_texture_paths") or ()),
+                        )
+                        live_identity_current = (
+                            current_signature == saved_signature
+                        )
+                        planning_context.counters[
+                            "durable_identity_matches"
+                            if live_identity_current
+                            else "durable_identity_misses"
+                        ] += 1
+                    except OSError:
+                        planning_context.counters[
+                            "durable_identity_incomplete"
+                        ] += 1
+                candidate, reason = cheap_durable_candidate(
+                    entry,
+                    live_identity_current=live_identity_current,
+                )
+                planning_context.counters["candidate_rows"] += int(candidate)
+                planning_context.counters["durable_current_excluded"] += int(
+                    not candidate
+                )
+                if candidate:
+                    fresh_candidate_iids.append(iid)
+                else:
+                    repair_states[iid] = {
+                        "current": True,
+                        "push_ready": True,
+                        "kind": "ready",
+                        "reason": reason,
+                    }
+                planning_context.publish(
+                    "cheap_candidate",
+                    current_target=iid,
+                    scanned=index,
+                    last_completed=iid,
+                )
+
+        with planning_context.span("repair_state_validation"):
+            total_fresh = len(fresh_candidate_iids)
+            for index, iid in enumerate(fresh_candidate_iids, start=1):
+                planning_context.check_cancel()
+                planning_context.publish(
+                    "repair_state_validation",
+                    current_target=iid,
+                    scanned=(
+                        len(candidate_iids) - total_fresh + index - 1
+                    ),
+                    last_completed=(
+                        fresh_candidate_iids[index - 2]
+                        if index > 1
+                        else "cheap candidate pass"
+                    ),
+                    progress=False,
+                )
+                current_failure_record = any(
+                    verdict.get("status") == "current"
+                    for verdict in failure_record_verdicts.get(iid, {}).values()
+                )
+                if current_failure_record:
+                    repair_states[iid] = {
+                        "current": False,
+                        "push_ready": False,
+                        "kind": "recorded_failure_current",
+                        "reason": (
+                            "저장된 실패 행의 target content key와 "
+                            "production source revision이 current입니다."
+                        ),
+                    }
+                    planning_context.counters[
+                        "current_failure_records_reused"
+                    ] += 1
+                else:
+                    repair_states[iid] = self._failed_retry_repair_state(iid)
+                    planning_context.counters[
+                        "invalid_failure_records_reaudited"
+                    ] += 1
+                    planning_context.counters[
+                        "repair_state_validations"
+                    ] += 1
+                planning_context.publish(
+                    "repair_state_validation",
+                    current_target=iid,
+                    scanned=len(candidate_iids) - total_fresh + index,
+                    last_completed=iid,
+                )
+        retry_run_id = (
+            "failed-retry-"
+            + datetime.now().strftime("%Y%m%dT%H%M%S")
+            + "-"
+            + uuid.uuid4().hex[:10]
+        )
+        automatic_plans = {}
+        unsupported_plans = {}
+        for evidence_index, iid in enumerate(
+            fresh_candidate_iids,
+            start=1,
+        ):
+            planning_context.check_cancel()
+            with planning_context.span("durable_evidence_load"):
+                evidence = self._failed_retry_durable_evidence(
+                    iid,
+                    repair_states[iid],
+                    entry_override=effective_entries[iid],
+                    failure_record_verdicts=failure_record_verdicts[iid],
+                )
+            with planning_context.span("root_reason_recovery"):
+                evidence = self._recover_missing_root_reason(iid, evidence)
+            planning_context.counters["durable_evidence_rows"] += 1
+            planning_context.publish(
+                "durable_evidence",
+                current_target=iid,
+                scanned=(
+                    len(candidate_iids)
+                    - len(fresh_candidate_iids)
+                    + evidence_index
+                ),
+                last_completed=iid,
+            )
+            if not has_repair_contract_evidence(evidence):
+                continue
+            reason_codes = (
+                set(evidence_reason_codes(evidence))
+                & ALL_REPAIR_CONTRACT_CODES
+            )
+            if reason_codes and reason_codes.issubset(
+                DURABLE_FAILURE_REASON_CODES
+            ):
+                # These are real terminal failures, not informational facts.
+                # Their recovery owner is the phase-aware retry classifier
+                # below (Unreal-only vs Blender rebuild), not an exact BAT
+                # mutation plan.  The classifier always emits a runnable job
+                # or an explicit Korean blocked row.
+                planning_context.counters[
+                    "durable_failures_routed_by_phase"
+                ] += 1
+                continue
+            request_id = (
+                "repair-"
+                + hashlib.sha256(
+                    (iid + retry_run_id).encode("utf-8")
+                ).hexdigest()[:16]
+            )
+            try:
+                plan = build_exact_target_repair_plan(
+                    iid,
+                    evidence,
+                    inventory_paths=candidate_iids,
+                    parent_retry_id=retry_run_id,
+                    request_id=request_id,
+                )
+            except (FileNotFoundError, TypeError, ValueError) as exc:
+                raw_error = compact_error_message(exc, 240)
+                if Path(iid).is_file():
+                    # A repair-plan/provenance wrapper is not export
+                    # authority.  Keep the exact diagnostic, then let the
+                    # phase classifier run a fresh full pipeline; concrete
+                    # current content failures will be reported by that
+                    # pipeline instead of by a zero-stage automation record.
+                    planning_context.counters[
+                        "repair_plan_diagnostics_routed_to_pipeline"
+                    ] += 1
+                    deferred_logs.append(
+                        "[retry routing] repair plan unavailable; fresh full "
+                        f"pipeline retained for {Path(iid).name}: {raw_error}"
+                    )
+                    continue
+                plan = RepairPlan(
+                    REPAIR_PLAN_SCHEMA_VERSION,
+                    request_id,
+                    retry_run_id,
+                    str(Path(iid).expanduser().absolute()),
+                    hashlib.sha256(json.dumps(
+                        evidence,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        default=str,
+                    ).encode("utf-8")).hexdigest(),
+                    evidence_reason_codes(evidence),
+                    (),
+                    False,
+                    STATUS_FINAL_FAILED,
+                    "exact target/provenance 검증에 실패해 자동 복구를 시작하지 않았습니다.",
+                    "목록을 새로 검사해 canonical SPM identity를 갱신한 뒤 다시 실행하세요.",
+                )
+                unsupported_plans[iid] = plan
+                defer_status(
+                    iid,
+                    STATUS_FINAL_FAILED,
+                    plan=plan,
+                    error=raw_error,
+                    friendly_reason=plan.friendly_reason,
+                    remaining_action=plan.remaining_action,
+                )
+                deferred_logs.append(
+                    f"[automatic repair plan excluded] {Path(iid).name}: "
+                    f"{raw_error}"
+                )
+                continue
+            if plan.supported:
+                automatic_plans[iid] = plan
+                defer_status(
+                    iid,
+                    STATUS_PENDING,
+                    plan=plan,
+                )
+            else:
+                if Path(iid).is_file():
+                    planning_context.counters[
+                        "unsupported_repair_routed_to_pipeline"
+                    ] += 1
+                    deferred_logs.append(
+                        "[retry routing] metadata/repair plan is not an "
+                        "export gate; fresh full pipeline retained for "
+                        f"{Path(iid).name}: "
+                        f"reason_codes={','.join(plan.reason_codes)}"
+                    )
+                    continue
+                unsupported_plans[iid] = plan
+                defer_status(
+                    iid,
+                    STATUS_FINAL_FAILED,
+                    plan=plan,
+                    friendly_reason=plan.friendly_reason,
+                    remaining_action=plan.remaining_action,
+                )
+                deferred_logs.append(
+                    f"[automatic repair unsupported] {Path(iid).name}: "
+                    f"{plan.friendly_reason} | remaining={plan.remaining_action} | "
+                    f"details reason_codes={','.join(plan.reason_codes)}"
+                )
+        bat_handled_ids = set(automatic_plans) | set(unsupported_plans)
+        candidate_by_path = {
+            os.path.normcase(os.path.abspath(str(iid))).casefold(): iid
+            for iid in candidate_iids
+        }
+
+        def blocked_dependencies(iid):
+            entry = effective_entries.get(iid, {})
+            dependencies = []
+            for status_column, error_column in (
+                ("push_status_kind", "push_status_error"),
+                ("blend_status_kind", "blend_status_error"),
+                ("spm_status_kind", "spm_status_error"),
+            ):
+                error = entry.get(error_column)
+                if not isinstance(error, dict):
+                    continue
+                status_kind = str(entry.get(status_column) or "")
+                error_kind = str(error.get("kind") or "")
+                if status_kind != "dependency_blocked" and not (
+                    not status_kind and error_kind == "dependency_blocked"
+                ):
+                    continue
+                blocked_by = error.get("blocked_by")
+                if not isinstance(blocked_by, (list, tuple, set)):
+                    continue
+                for value in blocked_by:
+                    key = os.path.normcase(
+                        os.path.abspath(str(value))
+                    ).casefold()
+                    dependency = candidate_by_path.get(key)
+                    if dependency and dependency not in dependencies:
+                        dependencies.append(dependency)
+            return dependencies
+
+        def automatic_dependency_roots(iid):
+            memo = {}
+
+            def visit(target, visiting):
+                if target in memo:
+                    return memo[target]
+                if target in visiting:
+                    return None
+                dependencies = blocked_dependencies(target)
+                if not dependencies:
+                    return None
+                roots = set()
+                next_visiting = set(visiting)
+                next_visiting.add(target)
+                for dependency in dependencies:
+                    if dependency in automatic_plans:
+                        roots.add(dependency)
+                        continue
+                    nested = visit(dependency, next_visiting)
+                    if not nested:
+                        return None
+                    roots.update(nested)
+                memo[target] = roots
+                return roots
+
+            roots = visit(iid, set())
+            if not roots:
+                return ()
+            return tuple(
+                candidate
+                for candidate in candidate_iids
+                if candidate in roots
+            )
+
+        resume_after_repairs = {}
+        for iid in candidate_iids:
+            if iid in bat_handled_ids:
+                continue
+            roots = automatic_dependency_roots(iid)
+            if roots:
+                resume_after_repairs[iid] = roots
+        bat_handled_ids.update(resume_after_repairs)
+        planning_context.counters["dependency_resume_targets"] += len(
+            resume_after_repairs
+        )
         parent_statuses = {
-            iid: UNREAL_PARENT_ABSENT for iid in selected_iids
+            iid: UNREAL_PARENT_ABSENT for iid in candidate_iids
         }
-        parent_diagnostics = {iid: "" for iid in selected_iids}
+        parent_diagnostics = {iid: "" for iid in candidate_iids}
         grouped = {}
+        validated_parent_manifests = {}
 
-        for iid in selected_iids:
-            entry = self.state.get(iid, {})
+        for parent_index, iid in enumerate(candidate_iids, start=1):
+            planning_context.check_cancel()
+            planning_context.publish(
+                "parent_grouping",
+                current_target=iid,
+                scanned=parent_index - 1,
+                last_completed=(
+                    candidate_iids[parent_index - 2]
+                    if parent_index > 1
+                    else "durable evidence pass"
+                ),
+                progress=False,
+            )
+            entry = effective_entries.get(iid, {})
+            push_status_kind = str(entry.get("push_status_kind") or "")
+            if (
+                push_status_kind == "imported_ok"
+                and repair_states[iid].get("current") is True
+            ):
+                # A content-proven successful ingest is not a failed Unreal
+                # parent. Unknown Repair state still takes the existing
+                # fail-closed parent path; known stale state rebuilds below.
+                continue
             paths = entry.get("push_paths") or {}
             manifest_value = paths.get("manifest")
             checkpoint_value = paths.get("checkpoint")
@@ -4200,21 +7316,49 @@ class App:
                     "전체 Blender→Push를 명시적으로 실행하세요"
                 )
                 continue
-            if str(entry.get("push_status_kind") or "") not in (
-                UNREAL_RECOVERY_FAILURE_KINDS
-            ):
+            if push_status_kind not in UNREAL_RECOVERY_FAILURE_KINDS:
                 parent_statuses[iid] = UNREAL_PARENT_INVALID
                 parent_diagnostics[iid] = (
                     "Unreal parent는 있으나 retryable ingest 실패 상태가 아님"
                 )
                 continue
             try:
-                manifest_path, manifest, items_by_id = (
-                    load_unreal_recovery_parent_manifest(manifest_value)
-                )
-                checkpoint = json.loads(
-                    Path(checkpoint_value).read_text(encoding="utf-8")
-                )
+                with planning_context.span("parent_grouping_validation"):
+                    manifest_payload = planning_context.load_json(
+                        manifest_value,
+                        namespace="parent_manifest",
+                    )
+                    manifest_identity = (
+                        planning_context.parent_cache.identity(
+                            manifest_value,
+                            namespace="parent_manifest",
+                        )
+                    )
+                    parent_snapshot = validated_parent_manifests.get(
+                        manifest_identity
+                    )
+                    if parent_snapshot is None:
+                        parent_snapshot = (
+                            load_unreal_recovery_parent_manifest(
+                                manifest_value,
+                                manifest_payload=manifest_payload,
+                            )
+                        )
+                        validated_parent_manifests[manifest_identity] = (
+                            parent_snapshot
+                        )
+                        planning_context.counters[
+                            "parent_manifest_validations"
+                        ] += 1
+                    else:
+                        planning_context.counters[
+                            "parent_manifest_validation_cache_hits"
+                        ] += 1
+                    manifest_path, manifest, items_by_id = parent_snapshot
+                    checkpoint = planning_context.load_json(
+                        checkpoint_value,
+                        namespace="parent_checkpoint",
+                    )
                 checkpoint_status = str(
                     ((checkpoint.get("items") or {}).get(iid) or {}).get(
                         "status"
@@ -4230,7 +7374,13 @@ class App:
                     raise PushUnrealRecoveryError(
                         "selected item is absent from its parent manifest"
                     )
-            except (OSError, TypeError, ValueError, PushUnrealRecoveryError) as exc:
+            except (
+                OSError,
+                TypeError,
+                ValueError,
+                PushUnrealRecoveryError,
+                RetryPlanningSnapshotError,
+            ) as exc:
                 parent_statuses[iid] = UNREAL_PARENT_INVALID
                 parent_diagnostics[iid] = compact_error_message(exc, 160)
                 continue
@@ -4251,36 +7401,70 @@ class App:
             )
             group["selected_queue_ids"].append(iid)
             parent_statuses[iid] = UNREAL_PARENT_CANDIDATE
+            planning_context.publish(
+                "parent_grouping",
+                current_target=iid,
+                scanned=parent_index,
+                last_completed=iid,
+            )
+
+        # This immutable value was captured on the Tk owner thread before the
+        # async planner started and is part of the plan-cache signature.
+        retry_force_rerun = bool(cfg.get("_retry_force_rerun"))
+        retry_force_full_rebuild = bool(
+            cfg.get("_retry_force_full_rebuild")
+        )
 
         def classify(iid):
             return classify_failed_retry(
-                self.state.get(iid, {}),
+                effective_entries.get(iid, {}),
                 repair_states[iid],
                 unreal_parent_status=parent_statuses[iid],
                 unreal_parent_diagnostic=parent_diagnostics[iid],
+                force_rerun=retry_force_rerun,
+                force_full_rebuild=retry_force_full_rebuild,
             )
 
-        decisions = {iid: classify(iid) for iid in selected_iids}
+        decisions = {}
+        with planning_context.span("classification"):
+            for classification_index, iid in enumerate(
+                candidate_iids,
+                start=1,
+            ):
+                planning_context.check_cancel()
+                decisions[iid] = classify(iid)
+                planning_context.counters["classifications"] += 1
+                planning_context.publish(
+                    "classification",
+                    current_target=iid,
+                    scanned=classification_index,
+                    last_completed=iid,
+                )
         rebuild_ids = {
             iid
             for iid, decision in decisions.items()
             if decision.classification == BLENDER_REBUILD
+            and iid not in bat_handled_ids
         }
         recovery_requests = []
 
         for group in grouped.values():
+            planning_context.check_cancel()
             pending_selected = [
                 iid
                 for iid in group["selected_queue_ids"]
                 if decisions[iid].classification
                 == PENDING_UNREAL_VALIDATION
+                and iid not in bat_handled_ids
             ]
             if not pending_selected:
                 continue
             try:
-                required_ids = unreal_recovery_dependency_closure(
-                    group["items_by_id"], pending_selected
-                )
+                with planning_context.span("dependency_closure"):
+                    required_ids = unreal_recovery_dependency_closure(
+                        group["items_by_id"], pending_selected
+                    )
+                planning_context.counters["dependency_closures"] += 1
             except PushUnrealRecoveryError as exc:
                 for iid in pending_selected:
                     parent_statuses[iid] = UNREAL_PARENT_INVALID
@@ -4306,15 +7490,24 @@ class App:
             source_records = {}
             try:
                 for queue_id in sorted(required_ids):
+                    planning_context.check_cancel()
                     parent_item = group["items_by_id"][queue_id]
-                    source_record = self._failed_retry_parent_source_record(
-                        queue_id, parent_item
-                    )
-                    self._validate_failed_retry_unreal_item_current(
-                        queue_id,
-                        parent_item,
-                        source_record,
-                    )
+                    with planning_context.span(
+                        "immutable_unreal_validation"
+                    ):
+                        source_record = (
+                            self._failed_retry_parent_source_record(
+                                queue_id, parent_item
+                            )
+                        )
+                        self._validate_failed_retry_unreal_item_current(
+                            queue_id,
+                            parent_item,
+                            source_record,
+                        )
+                    planning_context.counters[
+                        "immutable_unreal_validations"
+                    ] += 1
                     source_records[queue_id] = source_record
             except (
                 OSError,
@@ -4330,6 +7523,11 @@ class App:
                         + compact_error_message(exc, 160)
                         + " · 전체 Blender→Push를 실행하세요"
                     )
+                # The manifest dependency graph was structurally valid even
+                # though its immutable source proof was not. Preserve that
+                # exact closure for the safe full-pipeline fallback instead
+                # of excluding the current provider and blocking its tree.
+                rebuild_ids.update(required_ids)
                 continue
 
             for iid in pending_selected:
@@ -4368,26 +7566,42 @@ class App:
             rebuild_ids.update(conflicting["selected_queue_ids"])
             recovery_requests.remove(conflicting)
 
-        decisions = {iid: classify(iid) for iid in selected_iids}
+        with planning_context.span("classification"):
+            decisions = {
+                iid: classify(iid)
+                for iid in candidate_iids
+            }
+        planning_context.counters["classifications"] += len(candidate_iids)
         export_iids = [
             iid
-            for iid in selected_iids
-            if decisions[iid].classification == BLENDER_REBUILD
+            for iid in candidate_iids
+            if (
+                decisions[iid].classification == BLENDER_REBUILD
+                or iid in rebuild_ids
+            )
+            and iid not in bat_handled_ids
         ]
         unreal_iids = [
             iid
-            for iid in selected_iids
+            for iid in candidate_iids
             if decisions[iid].classification == UNREAL_ONLY
+            and iid not in bat_handled_ids
         ]
         skipped = []
-        for iid in selected_iids:
+        for iid in candidate_iids:
+            if iid in bat_handled_ids:
+                continue
             decision = decisions[iid]
-            if decision.classification in {BLENDER_REBUILD, UNREAL_ONLY}:
+            if (
+                decision.classification in {BLENDER_REBUILD, UNREAL_ONLY}
+                or iid in rebuild_ids
+            ):
                 continue
             prefix = (
-                "current Blender success 제외"
+                ".blend가 SPM보다 최신 · 제외 (강제 재실행 옵션으로 재빌드 가능)"
                 if decision.classification == CURRENT_BLENDER_EXCLUDED
-                else "재시도 증거 불완전 · fail closed"
+                else "재시도 증거 불완전 · fail closed "
+                "(강제 재실행 옵션으로 재빌드 가능)"
             )
             skipped.append(
                 f"{Path(iid).name}: {prefix} · "
@@ -4395,26 +7609,91 @@ class App:
             )
 
         if skipped:
-            self.log(
-                "실패/stale 재시도 제외:\n  - " + "\n  - ".join(skipped)
+            deferred_logs.append(
+                "전체 대상 실패/stale 재시도 제외:\n  - "
+                + "\n  - ".join(skipped)
             )
+        terminal_details = [
+            f"{Path(iid).name}: {plan.friendly_reason}\n"
+            "  attempted automatic repair: none\n"
+            f"  remaining action: {plan.remaining_action}\n"
+            f"  details reason_codes={','.join(plan.reason_codes)}"
+            for iid, plan in unsupported_plans.items()
+        ]
         eligible_set = set(export_iids) | set(unreal_iids)
         eligible_iids = [
-            iid for iid in selected_iids if iid in eligible_set
+            iid for iid in candidate_iids if iid in eligible_set
         ]
-        if not eligible_iids:
-            messagebox.showinfo(
-                "실패 Blender/Unreal 재시도",
-                "재시도 가능한 선택 항목이 없습니다.\n\n"
-                + "\n".join(skipped[:8]),
-            )
-            return
+        runnable_set = (
+            eligible_set
+            | set(automatic_plans)
+            | set(resume_after_repairs)
+        )
+        runnable_ids = [
+            iid for iid in candidate_iids if iid in runnable_set
+        ]
+        if not runnable_ids:
+            if tracker is not None:
+                for iid in candidate_iids:
+                    if iid in unsupported_plans:
+                        repair_plan = unsupported_plans[iid]
+                        tracker.transition(
+                            iid,
+                            RETRY_STAGE_FAILED,
+                            diagnostic=repair_plan.friendly_reason,
+                            terminal_reason=(
+                                next(iter(repair_plan.reason_codes), None)
+                                or "automatic_repair_unsupported"
+                            ),
+                            outcome=RETRY_STAGE_FAILED,
+                        )
+                    else:
+                        decision = decisions[iid]
+                        if (
+                            decision.classification
+                            == CURRENT_BLENDER_EXCLUDED
+                        ):
+                            tracker.transition(
+                                iid,
+                                RETRY_STAGE_COMPLETE,
+                                diagnostic=decision.diagnostic,
+                                terminal_reason=decision.reason_code,
+                                outcome=RETRY_STAGE_COMPLETE,
+                            )
+                            continue
+                        tracker.transition(
+                            iid,
+                            RETRY_STAGE_BLOCKED,
+                            diagnostic=decision.diagnostic,
+                            terminal_reason=decision.reason_code,
+                            outcome=RETRY_STAGE_BLOCKED,
+                        )
+                tracker.finalize("no retryable targets")
+            return {
+                "jobs": [],
+                "skipped": terminal_details + skipped,
+                "selected_iids": candidate_iids,
+                "cfg": cfg,
+                "tracker": tracker,
+                "deferred_status_updates": deferred_status_updates,
+                "deferred_logs": deferred_logs,
+            }
 
-        cfg = dict(self._collect_cfg())
-        save_config(cfg)
-        inventory, targets = self._snapshot_batch_request(eligible_iids)
+        with planning_context.span("snapshot_commit"):
+            inventory = copy.deepcopy(dict(inventory_snapshot or {}))
+            targets = [
+                inventory[iid]
+                for iid in runnable_ids
+                if iid in inventory
+            ]
+        planning_context.publish(
+            "snapshot_commit",
+            scanned=len(candidate_iids),
+            last_completed="immutable queue plan",
+        )
         targets_by_id = {str(item["spm"]): item for item in targets}
         action_kind = "failed_blender_export_and_unreal_retry"
+        jobs = []
 
         def eligibility_receipt(ids):
             return {
@@ -4422,7 +7701,24 @@ class App:
                 "items": [
                     {
                         "queue_id": iid,
-                        **decisions[iid].metadata(),
+                        **(
+                            {
+                                **decisions[iid].metadata(),
+                                "classification": BLENDER_REBUILD,
+                                "reason_code": (
+                                    "unreal_dependency_full_rebuild_fallback"
+                                ),
+                                "diagnostic": (
+                                    "Exact immutable parent dependency is "
+                                    "included in the full rebuild fallback"
+                                ),
+                                "scheduled_as_dependency": True,
+                            }
+                            if iid in rebuild_ids
+                            and decisions[iid].classification
+                            != BLENDER_REBUILD
+                            else decisions[iid].metadata()
+                        ),
                     }
                     for iid in ids
                 ],
@@ -4436,7 +7732,23 @@ class App:
         ]
         if unreal_targets:
             unreal_ids = [str(item["spm"]) for item in unreal_targets]
-            self._enqueue_batch_job({
+            metadata = {
+                "schema_version": 1,
+                "kind": action_kind,
+                "partition": "unreal_ingest",
+                "execution_path": "immutable_unreal_only",
+                "selected_queue_ids": unreal_ids,
+                "eligibility": eligibility_receipt(unreal_ids),
+            }
+            if tracker is not None:
+                tracker.assign_partition(
+                    "unreal_ingest", unreal_ids, "immutable_unreal_only"
+                )
+                metadata.update({
+                    "progress_run_id": tracker.run_id,
+                    "progress_receipt_path": str(tracker.path),
+                })
+            jobs.append({
                 "label": (
                     "실패 재시도 · Unreal-only current-code · "
                     f"{len(unreal_targets)}개"
@@ -4451,14 +7763,104 @@ class App:
                 "force_rerun": False,
                 "push_transport": "headless",
                 "recovery_requests": recovery_requests,
-                "retry_metadata": {
+                "retry_metadata": metadata,
+                "_retry_progress_tracker": tracker,
+            })
+
+        # The queue label describes the current execution. Historical
+        # failed/stale classification is shown only in the retry receipt UI.
+        if unreal_targets:
+            jobs[-1]["label"] = (
+                "Retry run · Unreal-only current-code · "
+                f"{len(unreal_targets)} targets"
+            )
+
+        repair_root_targets = [
+            targets_by_id[iid]
+            for iid in candidate_iids
+            if iid in automatic_plans and iid in targets_by_id
+        ]
+        if repair_root_targets:
+            repair_ids = [str(item["spm"]) for item in repair_root_targets]
+            resume_ids = [
+                iid
+                for iid in candidate_iids
+                if iid in resume_after_repairs and iid in targets_by_id
+            ]
+            repair_job_ids = [
+                iid
+                for iid in candidate_iids
+                if iid in set(repair_ids) | set(resume_ids)
+            ]
+            repair_targets = [targets_by_id[iid] for iid in repair_job_ids]
+            metadata = {
+                "schema_version": 1,
+                "kind": action_kind,
+                "partition": "exact_bat_repair",
+                "execution_path": (
+                    "exact_bat_then_fresh_reaudit_then_blender_unreal"
+                ),
+                "selected_queue_ids": repair_job_ids,
+                "eligibility": {
                     "schema_version": 1,
-                    "kind": action_kind,
-                    "partition": "unreal_ingest",
-                    "execution_path": "immutable_unreal_only",
-                    "selected_queue_ids": unreal_ids,
-                    "eligibility": eligibility_receipt(unreal_ids),
+                    "items": [
+                        {
+                            "queue_id": iid,
+                            **(
+                                {
+                                    "repair_plan": automatic_plans[
+                                        iid
+                                    ].metadata(),
+                                }
+                                if iid in automatic_plans
+                                else {
+                                    "reason_code": (
+                                        "required_cluster_repaired_resume"
+                                    ),
+                                    "resume_after_repairs": list(
+                                        resume_after_repairs[iid]
+                                    ),
+                                }
+                            ),
+                        }
+                        for iid in repair_job_ids
+                    ],
                 },
+            }
+            if tracker is not None:
+                tracker.assign_partition(
+                    "exact_bat_repair", repair_job_ids,
+                    metadata["execution_path"],
+                )
+                metadata.update({
+                    "progress_run_id": tracker.run_id,
+                    "progress_receipt_path": str(tracker.path),
+                })
+            jobs.append({
+                "label": (
+                    "자동 복구 · exact BAT → 재검증 → "
+                    f"차단 소비자 재개 → Blender/Unreal · "
+                    f"{len(repair_targets)}"
+                ),
+                "mode": "failed_retry_repair",
+                "phase": "push",
+                "terminal_phase": "push",
+                "selected_scope": True,
+                "targets": repair_targets,
+                "inventory": inventory,
+                "cfg": cfg,
+                "force_rerun": True,
+                "push_transport": "headless",
+                "repair_plans": [
+                    automatic_plans[iid].metadata()
+                    for iid in repair_ids
+                ],
+                "resume_after_repairs": {
+                    iid: list(resume_after_repairs[iid])
+                    for iid in resume_ids
+                },
+                "retry_metadata": metadata,
+                "_retry_progress_tracker": tracker,
             })
 
         export_targets = [
@@ -4466,7 +7868,25 @@ class App:
         ]
         if export_targets:
             export_ids = [str(item["spm"]) for item in export_targets]
-            self._enqueue_batch_job({
+            metadata = {
+                "schema_version": 1,
+                "kind": action_kind,
+                "partition": "blender_export",
+                "execution_path": "blender_send2ue_then_unreal",
+                "selected_queue_ids": export_ids,
+                "eligibility": eligibility_receipt(export_ids),
+            }
+            if tracker is not None:
+                tracker.assign_partition(
+                    "blender_export",
+                    export_ids,
+                    "blender_send2ue_then_unreal",
+                )
+                metadata.update({
+                    "progress_run_id": tracker.run_id,
+                    "progress_receipt_path": str(tracker.path),
+                })
+            jobs.append({
                 "label": (
                     "실패/stale 재시도 · Blender/Send2UE→Unreal · "
                     f"{len(export_targets)}개"
@@ -4480,15 +7900,276 @@ class App:
                 "cfg": cfg,
                 "force_rerun": True,
                 "push_transport": "headless",
-                "retry_metadata": {
-                    "schema_version": 1,
-                    "kind": action_kind,
-                    "partition": "blender_export",
-                    "execution_path": "blender_send2ue_then_unreal",
-                    "selected_queue_ids": export_ids,
-                    "eligibility": eligibility_receipt(export_ids),
-                },
+                "retry_metadata": metadata,
+                "_retry_progress_tracker": tracker,
             })
+
+        if export_targets:
+            jobs[-1]["label"] = (
+                "Retry run · Blender/Send2UE→Unreal · "
+                f"{len(export_targets)} targets"
+            )
+
+        missing_ids = [
+            iid for iid in runnable_ids if iid not in targets_by_id
+        ]
+        if tracker is not None:
+            for iid in candidate_iids:
+                if iid in runnable_set and iid not in missing_ids:
+                    continue
+                if iid in unsupported_plans:
+                    repair_plan = unsupported_plans[iid]
+                    tracker.transition(
+                        iid,
+                        RETRY_STAGE_FAILED,
+                        diagnostic=repair_plan.friendly_reason,
+                        terminal_reason=(
+                            next(iter(repair_plan.reason_codes), None)
+                            or "automatic_repair_unsupported"
+                        ),
+                        outcome=RETRY_STAGE_FAILED,
+                    )
+                else:
+                    decision = decisions[iid]
+                    if (
+                        decision.classification
+                        == CURRENT_BLENDER_EXCLUDED
+                        and iid not in missing_ids
+                    ):
+                        tracker.transition(
+                            iid,
+                            RETRY_STAGE_COMPLETE,
+                            diagnostic=decision.diagnostic,
+                            terminal_reason=decision.reason_code,
+                            outcome=RETRY_STAGE_COMPLETE,
+                        )
+                        continue
+                    tracker.transition(
+                        iid,
+                        RETRY_STAGE_BLOCKED,
+                        diagnostic=(
+                            "selected target disappeared from the planning snapshot"
+                            if iid in missing_ids
+                            else decision.diagnostic
+                        ),
+                        terminal_reason=(
+                            "planning_target_missing"
+                            if iid in missing_ids
+                            else decision.reason_code
+                        ),
+                        outcome=RETRY_STAGE_BLOCKED,
+                    )
+        return {
+            "jobs": jobs,
+            "skipped": terminal_details + skipped,
+            "selected_iids": candidate_iids,
+            "cfg": cfg,
+            "tracker": tracker,
+            "deferred_status_updates": deferred_status_updates,
+            "deferred_logs": deferred_logs,
+        }
+
+    def _commit_failed_retry_plan(self, plan):
+        """Main-thread half of planning: message boxes, Tk, and enqueue."""
+        if not isinstance(plan, dict):
+            return None
+        retry_request = copy.deepcopy(plan.get("_retry_request") or {})
+        retry_scope = str(retry_request.get("scope") or "all")
+        dialog_title = str(
+            retry_request.get("dialog_title") or "전체 실패 이력 재시도"
+        )
+        ui_thread_ident = getattr(
+            self,
+            "_ui_thread_ident",
+            threading.main_thread().ident,
+        )
+        if threading.get_ident() != ui_thread_ident:
+            raise RuntimeError(
+                "retry planning commit must run on the Tk owner thread"
+            )
+        current = threading.current_thread()
+        workers = getattr(self, "_retry_planning_workers", None)
+        if isinstance(workers, set):
+            finished_workers = {
+                worker for worker in workers if not worker.is_alive()
+            }
+            workers.difference_update(finished_workers)
+            workers.discard(current)
+        tracker = plan.get("tracker")
+        self._production_source_revision_precheck()
+        error = plan.get("error")
+        if self.stop_flag.is_set() and tracker is not None:
+            tracker.finish_planning(
+                RETRY_STAGE_CANCELLED,
+                "operator cancelled during retry planning",
+            )
+            if not getattr(self, "active_batch_job", None) and not getattr(
+                self, "pending_batch_jobs", ()
+            ):
+                self._set_batch_queue_controls(False)
+            return None
+        if tracker is not None and not tracker.claim_planning_commit():
+            # A duplicate ready event, cooperative cancellation, or restored
+            # terminal receipt must never enqueue the same immutable plan.
+            return None
+        if plan.get("_planning_cache_reused"):
+            with self.state_lock:
+                current_state = copy.deepcopy(dict(self.state or {}))
+            current_signature = planning_input_signature(
+                plan.get("selected_iids") or (),
+                current_state,
+                plan.get("cfg") or {},
+                plan.get("_planning_inventory_snapshot") or {},
+            )
+            if current_signature != plan.get("_planning_input_signature"):
+                if tracker is not None:
+                    tracker.finish_planning(
+                        RETRY_STAGE_CANCELLED,
+                        "cached retry plan input changed before commit; replanning",
+                    )
+                self._skip_retry_plan_cache_once = True
+                restart = (
+                    self.start_checked_failed_results_retry
+                    if retry_scope == "checked"
+                    else self.start_failed_results_retry
+                )
+                self.root.after(0, restart)
+                return None
+        if error:
+            if tracker is not None:
+                tracker.finish_planning(
+                    RETRY_STAGE_FAILED,
+                    error,
+                )
+            messagebox.showerror(
+                "실패 재시도 planning 실패",
+                str(error),
+                parent=self.root,
+            )
+            if not getattr(self, "active_batch_job", None) and not getattr(
+                self, "pending_batch_jobs", ()
+            ):
+                self._set_batch_queue_controls(False)
+            return None
+        diagnostics = plan.get("planning_diagnostics") or {}
+        if diagnostics:
+            self.log(
+                "[retry planning diagnostics] "
+                + json.dumps(
+                    diagnostics,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        for update in plan.get("deferred_status_updates") or ():
+            self._set_failed_retry_automatic_status(
+                update["iid"],
+                update["status"],
+                **dict(update.get("kwargs") or {}),
+            )
+        for message in plan.get("deferred_logs") or ():
+            self.log(message)
+        cfg = dict(plan.get("cfg") or {})
+        persisted_cfg = dict(cfg)
+        persisted_cfg.pop("_retry_force_rerun", None)
+        persisted_cfg.pop("_retry_force_full_rebuild", None)
+        artifact = plan.get("_planning_cache_artifact")
+        planning_session_id = plan.get("_planning_session_id")
+        if (
+            tracker is not None
+            and planning_session_id is not None
+            and isinstance(artifact, dict)
+        ):
+            with self.state_lock:
+                committed_state = copy.deepcopy(dict(self.state or {}))
+            committed_signature = planning_input_signature(
+                plan.get("selected_iids") or (),
+                committed_state,
+                cfg,
+                plan.get("_planning_inventory_snapshot") or {},
+            )
+            original_signature = plan.get("_planning_input_signature") or {}
+            if committed_signature.get("file_identities_sha256") == (
+                original_signature.get("file_identities_sha256")
+            ):
+                tracker.store_planning_cache(
+                    planning_session_id,
+                    input_signature=committed_signature,
+                    artifact=artifact,
+                    side_effects_committed=True,
+                )
+        try:
+            save_config(persisted_cfg)
+        except Exception as exc:
+            error = compact_error_message(exc)
+            if tracker is not None:
+                tracker.finish_planning(
+                    RETRY_STAGE_FAILED,
+                    "retry plan config commit failed: " + error,
+                )
+            messagebox.showerror(
+                "실패 재시도 planning commit 실패",
+                error,
+                parent=getattr(self, "root", None),
+            )
+            if not getattr(self, "active_batch_job", None) and not getattr(
+                self, "pending_batch_jobs", ()
+            ):
+                self._set_batch_queue_controls(False)
+            return None
+        jobs = list(plan.get("jobs") or [])
+        if not jobs:
+            if tracker is not None:
+                tracker.complete_planning_commit()
+            messagebox.showinfo(
+                dialog_title,
+                (
+                    "체크 항목에 재시도 가능한 실패/stale 이력이 없습니다."
+                    if retry_scope == "checked"
+                    else "현재 목록 전체에 재시도 가능한 실패/stale 이력이 없습니다."
+                )
+                + "\n\n"
+                + "\n".join((plan.get("skipped") or [])[:8]),
+                parent=getattr(self, "root", None),
+            )
+            if not getattr(self, "active_batch_job", None) and not getattr(
+                self, "pending_batch_jobs", ()
+            ):
+                self._set_batch_queue_controls(False)
+            return None
+        enqueued = []
+        for job in jobs:
+            job_cfg = dict(job.get("cfg") or {})
+            job_cfg.pop("_retry_force_rerun", None)
+            job_cfg.pop("_retry_force_full_rebuild", None)
+            job["cfg"] = job_cfg
+            if self.stop_flag.is_set():
+                if tracker is not None:
+                    partition = (job.get("retry_metadata") or {}).get(
+                        "partition", "unclassified"
+                    )
+                    tracker.mark_partition_terminal(
+                        partition,
+                        RETRY_STAGE_CANCELLED,
+                        "operator cancelled before plan partition enqueue",
+                    )
+                continue
+            local_id = self._enqueue_batch_job(job)
+            if local_id is not None:
+                enqueued.append(local_id)
+            elif tracker is not None:
+                partition = (job.get("retry_metadata") or {}).get(
+                    "partition", "unclassified"
+                )
+                tracker.mark_partition_terminal(
+                    partition,
+                    RETRY_STAGE_FAILED,
+                    "shared queue registration failed; retry not executed",
+                )
+        if tracker is not None:
+            tracker.complete_planning_commit()
+        return enqueued
 
     def start_failed_unreal_retry(self):
         """Backward-compatible entry point for existing UI integrations."""
@@ -4500,6 +8181,7 @@ class App:
         if not target_iids:
             messagebox.showinfo("SK Batch", "현재 목록에 항목이 없습니다.")
             return
+        self._production_source_revision_precheck()
         cfg = dict(self._collect_cfg())
         save_config(cfg)
         inventory, targets = self._snapshot_batch_request(target_iids)
@@ -4522,24 +8204,205 @@ class App:
         self._enqueue_batch_job(job)
 
     @staticmethod
-    def _pipeline_dependency_blocks(
-        targets,
-        dependency_map,
-        root_failed_ids,
-    ):
-        """Return exact consumer blocks from the validated dependency map."""
-        failed = {str(value) for value in root_failed_ids}
-        blocked = {}
-        for item in targets:
-            iid = str(item["spm"])
-            causes = tuple(
-                dependency
-                for dependency in dependency_map.get(iid, ())
-                if dependency in failed
+    def _dependency_artifact_state_label(status):
+        return {
+            "missing": "산출물 없음",
+            "stale": "산출물 낡음",
+            "waiting": "산출물 생성/반영 대기",
+            "current": "산출물 current",
+        }.get(str(status or ""), "산출물 검증 실패")
+
+    @staticmethod
+    def _artifact_path_identity(path):
+        candidate = Path(path).expanduser().absolute()
+        try:
+            return {
+                "path": str(candidate),
+                "exists": True,
+                **sampled_file_content_snapshot(candidate),
+            }
+        except FileNotFoundError:
+            return {"path": str(candidate), "exists": False}
+        except OSError as exc:
+            return {
+                "path": str(candidate),
+                "exists": None,
+                "error": compact_error_message(exc, 160),
+            }
+
+    def _dependency_artifact_identity(self, dependency, phase, verdict):
+        paths = {
+            "producer_spm": Path(dependency),
+            "producer_blend": blend_path_for(dependency),
+        }
+        if phase == "blender":
+            paths["producer_repair_report"] = repair_pipeline_report_path(
+                Path(dependency)
             )
-            if causes:
-                blocked[iid] = causes
-        return blocked
+        manifest = str((verdict or {}).get("manifest") or "")
+        if manifest:
+            paths["producer_push_manifest"] = Path(manifest)
+        return {
+            name: self._artifact_path_identity(path)
+            for name, path in paths.items()
+        }
+
+    @staticmethod
+    def _saved_dependency_blender_receipt_current(dependency):
+        """Read-only content-key check for an existing producer output."""
+
+        try:
+            report = load_current_repair_pipeline_report(
+                Path(dependency),
+                migrate_legacy=False,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return False
+        return str(
+            (report.get("handoff_preflight") or {}).get("status") or ""
+        ) in {"ok", "source_review"}
+
+    def _current_push_output_artifact_state(self, dependency):
+        """Validate persisted export/import evidence despite a new failed row."""
+        iid = str(dependency)
+        entry = self._failed_retry_state_entry(iid)
+        source_cache = entry.get("push_source_fingerprint_cache") or {}
+        export_cache = entry.get("push_export_cache") or {}
+        if (
+            source_cache.get("version")
+            != PUSH_SOURCE_FINGERPRINT_CACHE_VERSION
+            or not source_cache.get("fingerprint")
+        ):
+            return {
+                "status": "missing",
+                "phase": "push",
+                "reason": "current Push 입력 영수증이 없습니다.",
+            }
+        try:
+            current_snapshot = push_source_snapshot(
+                blend_path_for(dependency),
+                self._push_source_dependency_paths(dependency),
+            )
+        except (OSError, ValueError, KeyError) as exc:
+            return {
+                "status": "missing",
+                "phase": "push",
+                "reason": f"Push 입력 파일을 확인할 수 없습니다: {exc}",
+            }
+        if not push_source_cache_matches_snapshot(
+            source_cache, current_snapshot
+        ):
+            return {
+                "status": "stale",
+                "phase": "push",
+                "reason": "Blender 또는 Push 입력이 영수증 이후 변경되었습니다.",
+            }
+        if export_cache.get("source_fingerprint") != source_cache.get(
+            "fingerprint"
+        ):
+            return {
+                "status": "stale",
+                "phase": "push",
+                "reason": "Push export 영수증이 current 입력과 일치하지 않습니다.",
+            }
+        manifest_path = Path(export_cache.get("manifest") or "")
+        if not manifest_path.is_file():
+            return {
+                "status": "missing",
+                "phase": "push",
+                "reason": f"Push export manifest가 없습니다: {manifest_path}",
+            }
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest_item = next(
+                row for row in (manifest.get("items") or ())
+                if str((row or {}).get("queue_id")) == iid
+            )
+        except (OSError, ValueError, StopIteration, TypeError) as exc:
+            return {
+                "status": "stale",
+                "phase": "push",
+                "reason": f"Push export manifest의 exact 항목이 유효하지 않습니다: {exc}",
+            }
+        if not manifest_item_files_match(manifest_item):
+            return {
+                "status": "stale",
+                "phase": "push",
+                "reason": "Push export 파일 fingerprint가 current manifest와 다릅니다.",
+            }
+        export_fingerprint = export_cache.get("fingerprint")
+        if not export_fingerprint or manifest_item.get(
+            "fingerprint"
+        ) != export_fingerprint:
+            return {
+                "status": "stale",
+                "phase": "push",
+                "reason": "Push export fingerprint가 manifest와 일치하지 않습니다.",
+            }
+        if entry.get("push_import_fingerprint") == export_fingerprint:
+            return {
+                "status": "current",
+                "phase": "push",
+                "reason": "current export가 Unreal import 영수증과 일치합니다.",
+                "manifest": str(manifest_path),
+                "fingerprint": export_fingerprint,
+            }
+        return {
+            "status": "waiting",
+            "phase": "push",
+            "reason": "current export는 있으나 Unreal import 완료 영수증이 없습니다.",
+            "manifest": str(manifest_path),
+            "fingerprint": export_fingerprint,
+        }
+
+    def _dependency_artifact_verdict(self, dependency, *, phase):
+        """Return artifact truth independently of this run's failure row."""
+        dependency = str(dependency)
+        cache = self.__dict__.setdefault(
+            "_pipeline_dependency_artifact_cache", {}
+        )
+        key = (str(phase), _normalized_path(dependency))
+        if key in cache:
+            return copy.deepcopy(cache[key])
+        if phase == "push":
+            verdict = self._current_push_output_artifact_state(dependency)
+        else:
+            blend = blend_path_for(Path(dependency))
+            if not blend.is_file():
+                verdict = {
+                    "status": "missing",
+                    "phase": "blender",
+                    "output_kind": "missing_blend",
+                    "reason": f"Blender 산출물이 없습니다: {blend}",
+                }
+            elif self._saved_dependency_blender_receipt_current(
+                Path(dependency)
+            ):
+                verdict = {
+                    "status": "current",
+                    "phase": "blender",
+                    "reason": (
+                        "saved Blender/Repair 영수증이 current producer "
+                        "SPM content key와 일치합니다."
+                    ),
+                }
+            else:
+                verdict = {
+                    "status": "stale",
+                    "phase": "blender",
+                    "output_kind": "repair_receipt_not_current",
+                    "reason": (
+                        "Blender/Repair 영수증이 current producer SPM "
+                        "content key와 일치하지 않습니다."
+                    ),
+                }
+        verdict["artifact_identity"] = self._dependency_artifact_identity(
+            dependency,
+            phase,
+            verdict,
+        )
+        cache[key] = copy.deepcopy(verdict)
+        return verdict
 
     @staticmethod
     def _filter_pipeline_excluded_targets(targets, excluded_ids):
@@ -4554,7 +8417,7 @@ class App:
 
         A ``dependency_blocked`` column has no cause of its own -- it only
         records which upstream rows it was blocked by. Stopping there just
-        repeats "차단: required Cluster stage failed" one hop away from the
+        repeats a generic required-Cluster block one hop away from the
         actual error, so walk ``blocked_by`` to the real failure instead.
         """
         seen = _seen if _seen is not None else set()
@@ -4653,51 +8516,6 @@ class App:
                 return result
         return ""
 
-    def _record_pipeline_dependency_block(
-        self,
-        item,
-        column,
-        blocked_sources,
-        *,
-        persist,
-        publish_repair_contract=False,
-    ):
-        iid = str(item["spm"])
-        names = ", ".join(
-            sorted(Path(value).name for value in blocked_sources)
-        )
-        reason = f"required Cluster stage failed: {names}"
-        # Name the root cause on the consumer row too.  Without it a blocked
-        # asset only says which file failed, so an operator cannot tell an asset
-        # data problem from a tool problem without hunting for the other row.
-        root_causes = sorted({
-            text
-            for text in (
-                self._recorded_failure_reason(value)
-                for value in blocked_sources
-            )
-            if text
-        })
-        if root_causes:
-            reason = f"{reason} — 원인: {' | '.join(root_causes)}"
-        self._record_phase_status(
-            iid,
-            column,
-            f"차단: {reason}",
-            "dependency_blocked",
-            reason,
-            details={"blocked_by": list(blocked_sources)},
-            persist=persist,
-        )
-        if publish_repair_contract:
-            self._publish_repair_stage_contract(
-                item["spm"],
-                ready=False,
-                reason=reason,
-                kind="dependency_blocked",
-            )
-        self.log(f"[의존성 차단] {Path(iid).name}: {reason}")
-
     def _record_pipeline_planned_exclusion(self, target_spm, error):
         """Persist one target-local block without failing a shared producer."""
         target = Path(target_spm)
@@ -4732,42 +8550,57 @@ class App:
             "reason_token": reason_token,
             "evidence": copy.deepcopy(evidence),
         }
+        decision = repair_ui_decision({
+            "reason_token": reason_token,
+            "evidence": evidence,
+        })
+        details["repair_disposition"] = decision["status"]
+        details["reason_ko"] = decision["reason"]
+        details["action_ko"] = decision["action"]
         status_summary = target_planned_exclusion_summary(
             target,
             reason_token,
             evidence,
         )
+        # 자동 복구 대상 is a promise, so it may only appear before a repair
+        # runs.  By the time an exclusion is recorded the attempt has already
+        # been made, declined, or ruled out, and the row must say which (#160).
+        attempt = evidence.get("repair_attempt")
+        attempt_status = str(
+            (attempt or {}).get("status") or ""
+        ) if isinstance(attempt, dict) else ""
+        if attempt_status in {"failed", "repaired_but_reaudit_blocked"}:
+            status_prefix = "자동 복구 실패"
+        elif attempt_status:
+            status_prefix = "최종 차단"
+        elif decision["status"] == REPAIR_UI_AUTOMATIC:
+            status_prefix = "복구 계획됨"
+        else:
+            status_prefix = "최종 차단"
         self._record_phase_status(
             iid,
             "blend_status",
-            f"Sync excluded: {status_summary}",
+            f"{status_prefix}: Generator/Cluster Sync · {status_summary}",
             "planned_excluded",
-            str(error),
+            f"원인: {decision['reason']} · 조치: {decision['action']}",
             details=details,
             persist=False,
         )
         self._record_phase_status(
             iid,
             "push_status",
-            f"Push blocked: {status_summary}",
+            f"{status_prefix}: Push 대기 · {status_summary}",
             "planned_excluded",
-            str(error),
+            f"원인: {decision['reason']} · 조치: {decision['action']}",
             details=details,
             persist=True,
         )
         self.log(
-            "[target planned exclusion] "
-            f"{status_summary}; Sync is not Push readiness"
+            f"[{status_prefix}] {status_summary}"
         )
 
-    def _target_failure_result(self, iid, default_token="item_failed"):
-        state = getattr(self, "state", {}) or {}
-        lock = getattr(self, "state_lock", None)
-        if lock is None:
-            entry = state.get(str(iid))
-        else:
-            with lock:
-                entry = state.get(str(iid))
+    @staticmethod
+    def _failure_result_from_entry(entry, default_token="item_failed"):
         entry = dict(entry) if isinstance(entry, dict) else {}
         for column in ("push_status", "blend_status", "spm_status"):
             kind = str(entry.get(f"{column}_kind") or "")
@@ -4786,6 +8619,19 @@ class App:
             return reason_token, evidence
         return default_token, {}
 
+    def _target_failure_result(self, iid, default_token="item_failed"):
+        context = self._failed_retry_planning_context()
+        state = getattr(self, "state", {}) or {}
+        lock = getattr(self, "state_lock", None)
+        if context is not None:
+            entry = context.entry(iid)
+        elif lock is None:
+            entry = state.get(str(iid))
+        else:
+            with lock:
+                entry = state.get(str(iid))
+        return self._failure_result_from_entry(entry, default_token)
+
     def _target_failure_kind(self, iid):
         state = getattr(self, "state", {}) or {}
         entry = state.get(str(iid))
@@ -4796,7 +8642,139 @@ class App:
                 return kind
         return ""
 
-    def _summarize_phase_targets(self, targets):
+    @staticmethod
+    def _target_outcome_for_kind(kind, message=""):
+        """Map one durable status kind to its authoritative result class."""
+        normalized = str(kind or "").strip().casefold()
+        diagnostic = str(message or "").strip().casefold()
+        if normalized == "rerun_pending":
+            return None
+        if "사용자 중지" in diagnostic or "operator cancel" in diagnostic:
+            return "cancelled"
+        if normalized in {"completed", "imported_ok", "ready"}:
+            return "completed"
+        if normalized in {
+            "exported_pending_unreal",
+            "importing",
+            "dependency_waiting",
+        }:
+            return "pending_unreal"
+        if normalized in {"cancelled", "stopped"}:
+            return "cancelled"
+        if normalized == "owner_lost":
+            return "owner_lost"
+        if normalized in PLANNED_EXCLUSION_KINDS:
+            return "planned_excluded"
+        if normalized in {
+            "dependency_blocked",
+            "manual_required",
+            "not_run",
+            "not_run_unreal",
+            "recovery_blocked",
+        }:
+            return "blocked"
+        if normalized:
+            return "failed"
+        return None
+
+    def _target_authoritative_result(self, iid, phase=None):
+        """Project the latest durable phase state without relabeling it failed."""
+        phase_columns = {
+            "check": ("spm_status",),
+            "spm": ("spm_status",),
+            "blender": ("blend_status", "spm_status"),
+            "push": ("push_status", "blend_status", "spm_status"),
+        }
+        columns = phase_columns.get(
+            str(phase or ""),
+            ("push_status", "blend_status", "spm_status"),
+        )
+        context = self._failed_retry_planning_context()
+        state = getattr(self, "state", {}) or {}
+        lock = getattr(self, "state_lock", None)
+        if context is not None:
+            entry = copy.deepcopy(context.entry(iid))
+        elif lock is None:
+            entry = copy.deepcopy(state.get(str(iid), {}))
+        else:
+            with lock:
+                entry = copy.deepcopy(state.get(str(iid), {}))
+        for column in columns:
+            error = entry.get(f"{column}_error")
+            error = error if isinstance(error, dict) else {}
+            result = entry.get(f"{column}_result")
+            result = result if isinstance(result, dict) else {}
+            kind = str(
+                entry.get(f"{column}_kind")
+                or result.get("kind")
+                or error.get("kind")
+                or ""
+            )
+            message = str(
+                result.get("message")
+                or error.get("message")
+                or entry.get(column)
+                or ""
+            )
+            outcome = self._target_outcome_for_kind(kind, message)
+            if outcome is None:
+                continue
+            reason_token = None
+            if outcome == "pending_unreal":
+                reason_token = "exported_pending_unreal"
+            elif outcome == "cancelled":
+                reason_token = "operator_cancelled"
+            elif outcome != "completed":
+                reason_token = str(
+                    error.get("reason_token")
+                    or result.get("reason_token")
+                    or kind
+                    or outcome
+                )
+            evidence = {
+                "durable_kind": kind,
+                "status_column": column,
+            }
+            if message:
+                evidence["message"] = message
+            for source in (error, result):
+                for key, value in source.items():
+                    if key not in {"time", "kind", "message", "reason_token"}:
+                        evidence[key] = copy.deepcopy(value)
+            return {
+                "target": str(iid),
+                "target_name": Path(str(iid)).name,
+                "outcome": outcome,
+                "reason_token": reason_token,
+                "evidence": evidence,
+            }
+        return None
+
+    @staticmethod
+    def _count_target_outcomes(outcomes):
+        return {
+            "completed_count": sum(
+                row.get("outcome") == "completed" for row in outcomes
+            ),
+            "pending_count": sum(
+                row.get("outcome") == "pending_unreal" for row in outcomes
+            ),
+            "cancelled_count": sum(
+                row.get("outcome") == "cancelled" for row in outcomes
+            ),
+            "blocked_count": sum(
+                row.get("outcome") in {"blocked", "planned_excluded"}
+                for row in outcomes
+            ),
+            "owner_lost_count": sum(
+                row.get("outcome") == "owner_lost" for row in outcomes
+            ),
+            "failed_count": sum(
+                row.get("outcome") == "failed" for row in outcomes
+            ),
+        }
+
+    def _summarize_phase_targets(self, targets, phase=None):
         """Build the persisted queue result for a non-pipeline phase."""
         failed_ids = set(
             getattr(self, "_phase_failed_items", set()) or ()
@@ -4806,6 +8784,14 @@ class App:
             iid = str(item["spm"])
             name = Path(iid).name
             if iid not in failed_ids:
+                authoritative = self._target_authoritative_result(iid, phase)
+                if authoritative and authoritative["outcome"] in {
+                    "pending_unreal",
+                    "cancelled",
+                    "owner_lost",
+                }:
+                    outcomes.append(authoritative)
+                    continue
                 outcomes.append({
                     "target": iid,
                     "target_name": name,
@@ -4813,6 +8799,10 @@ class App:
                     "reason_token": None,
                     "evidence": {},
                 })
+                continue
+            authoritative = self._target_authoritative_result(iid, phase)
+            if authoritative is not None:
+                outcomes.append(authoritative)
                 continue
             reason_token, evidence = self._target_failure_result(iid)
             failure_kind = self._target_failure_kind(iid)
@@ -4827,22 +8817,14 @@ class App:
                 "reason_token": reason_token,
                 "evidence": evidence,
             })
-        completed_count = sum(
-            row["outcome"] == "completed" for row in outcomes
-        )
-        blocked_count = sum(
-            row["outcome"] == "planned_excluded" for row in outcomes
-        )
-        failed_count = sum(
-            row["outcome"] == "failed" for row in outcomes
-        )
+        counts = self._count_target_outcomes(outcomes)
         return {
             "selected_count": len(outcomes),
-            "completed_count": completed_count,
-            "blocked_count": blocked_count,
-            "planned_excluded_count": blocked_count,
+            **counts,
+            "planned_excluded_count": sum(
+                row["outcome"] == "planned_excluded" for row in outcomes
+            ),
             "dependency_blocked_count": 0,
-            "failed_count": failed_count,
             "target_outcomes": outcomes,
             "shared_failures": [],
         }
@@ -4889,6 +8871,18 @@ class App:
                 (*dependency_map.get(key, ()), *value)
             ))
         for iid in selected:
+            authoritative = self._target_authoritative_result(
+                iid,
+                getattr(self, "_active_pipeline_terminal_phase", None),
+            )
+            if authoritative and authoritative["outcome"] in {
+                "completed",
+                "pending_unreal",
+                "cancelled",
+                "owner_lost",
+            }:
+                outcomes.append(authoritative)
+                continue
             if iid in planned_ids:
                 outcomes.append(copy.deepcopy(planned[iid]))
                 continue
@@ -4898,15 +8892,50 @@ class App:
                     for value in dependency_map.get(iid, ())
                     if value in root_failed_ids
                 ]
+                recorded_token, recorded_evidence = (
+                    self._target_failure_result(
+                        iid,
+                        default_token=(
+                            "shared_dependency_failed"
+                            if blocked_by
+                            else "dependency_root_reason_missing"
+                        ),
+                    )
+                )
+                artifact_rows = recorded_evidence.get(
+                    "dependency_artifacts"
+                ) or {}
+                artifact_statuses = {
+                    str((row or {}).get("status") or "")
+                    for row in artifact_rows.values()
+                    if isinstance(row, dict)
+                }
+                if "missing" in artifact_statuses:
+                    reason_token = "dependency_output_missing"
+                elif "stale" in artifact_statuses:
+                    reason_token = "dependency_output_stale"
+                else:
+                    reason_token = "dependency_root_reason_missing"
+                evidence = {
+                    "blocked_by": blocked_by,
+                    "declared_dependencies": list(
+                        dependency_map.get(iid, ())
+                    ),
+                    "recorded_wrapper": recorded_token,
+                }
+                evidence.update(recorded_evidence)
                 outcomes.append({
                     "target": iid,
                     "target_name": Path(iid).name,
                     "outcome": "blocked",
-                    "reason_token": "shared_dependency_failed",
-                    "evidence": {"blocked_by": blocked_by},
+                    "reason_token": reason_token,
+                    "evidence": evidence,
                 })
                 continue
             if iid in failed:
+                if authoritative is not None:
+                    outcomes.append(authoritative)
+                    continue
                 reason_token, evidence = self._target_failure_result(
                     iid,
                     default_token=(
@@ -4931,6 +8960,20 @@ class App:
                 "evidence": {},
             })
 
+        reuse_evidence = getattr(
+            self, "_pipeline_dependency_reuse_evidence", {}
+        ) or {}
+        for row in outcomes:
+            reused = reuse_evidence.get(row.get("target"))
+            if not reused:
+                continue
+            row.setdefault("evidence", {})[
+                "dependency_resolution"
+            ] = "current_output_reused"
+            row["evidence"]["dependency_artifacts"] = copy.deepcopy(
+                reused
+            )
+
         shared_failures = []
         for dependency in sorted(set(root_failed_ids) - set(selected)):
             affected = [
@@ -4945,7 +8988,7 @@ class App:
                 continue
             reason_token, evidence = self._target_failure_result(
                 dependency,
-                default_token="shared_dependency_failed",
+                default_token="dependency_root_reason_missing",
             )
             shared_failures.append({
                 "dependency": dependency,
@@ -4955,25 +8998,18 @@ class App:
                 "evidence": evidence,
             })
 
-        completed_count = sum(
-            row["outcome"] == "completed" for row in outcomes
-        )
+        counts = self._count_target_outcomes(outcomes)
         planned_count = sum(
             row["outcome"] == "planned_excluded" for row in outcomes
         )
         dependency_blocked_count = sum(
             row["outcome"] == "blocked" for row in outcomes
         )
-        failed_count = sum(
-            row["outcome"] == "failed" for row in outcomes
-        )
         return {
             "selected_count": len(outcomes),
-            "completed_count": completed_count,
-            "blocked_count": planned_count + dependency_blocked_count,
+            **counts,
             "planned_excluded_count": planned_count,
             "dependency_blocked_count": dependency_blocked_count,
-            "failed_count": failed_count,
             "target_outcomes": outcomes,
             "shared_failures": shared_failures,
         }
@@ -4990,6 +9026,9 @@ class App:
         self._pipeline_root_failed_items = set()
         self._pipeline_blocked_items = set()
         self._pipeline_planned_exclusions = {}
+        self._pipeline_dependency_artifact_cache = {}
+        self._pipeline_dependency_artifact_verdicts = {}
+        self._pipeline_dependency_reuse_evidence = {}
         self._active_pipeline_selected_targets = list(targets)
         self.__dict__.pop("_phase_result_summary", None)
         try:
@@ -5009,6 +9048,9 @@ class App:
                 "_pipeline_blocked_items",
                 "_pipeline_planned_exclusions",
                 "_active_pipeline_selected_targets",
+                "_pipeline_dependency_artifact_cache",
+                "_pipeline_dependency_artifact_verdicts",
+                "_pipeline_dependency_reuse_evidence",
             ):
                 self.__dict__.pop(key, None)
 
@@ -5082,43 +9124,10 @@ class App:
         for phase, scheduled_targets, label in schedule:
             if self.stop_flag.is_set():
                 break
-            stage_blocked = {}
-            if phase == "blender":
-                tree_targets = [
-                    item for item in scheduled_targets
-                    if not is_cluster_source_spm(item["spm"])
-                ]
-                stage_blocked = self._pipeline_dependency_blocks(
-                    tree_targets,
-                    self._active_blender_dependency_map,
-                    root_failed_ids,
-                )
-                for item in tree_targets:
-                    iid = str(item["spm"])
-                    blocked_sources = stage_blocked.get(iid)
-                    if blocked_sources:
-                        self._record_pipeline_dependency_block(
-                            item,
-                            "blend_status",
-                            blocked_sources,
-                            persist=True,
-                            publish_repair_contract=True,
-                        )
-                blocked_consumer_ids.update(stage_blocked)
-                if stage_blocked:
-                    self.log(
-                        f"🌙 {label}: dependency 차단 "
-                        f"{len(stage_blocked)}개 · root 원인 "
-                        f"{len(root_failed_ids)}개"
-                    )
             planned_excluded_ids = set(
                 getattr(self, "_pipeline_planned_exclusions", {}) or {}
             )
-            excluded_ids = (
-                root_failed_ids
-                | blocked_consumer_ids
-                | planned_excluded_ids
-            )
+            excluded_ids = set(planned_excluded_ids)
             eligible_stage = self._filter_pipeline_excluded_targets(
                 scheduled_targets,
                 excluded_ids,
@@ -5127,7 +9136,7 @@ class App:
                 continue
             self._pipeline_root_failed_items = set(root_failed_ids)
             self._pipeline_blocked_items = set(blocked_consumer_ids)
-            self._pipeline_upstream_failed_items = set(excluded_ids)
+            self._pipeline_upstream_failed_items = set()
             self.log(f"🌙 {label} 시작")
             phase_ok = self._run_batch(
                 phase, eligible_stage, emit_done=False
@@ -5164,21 +9173,14 @@ class App:
             )
             if new_root_failures:
                 root_failed_ids.update(new_root_failures)
-                self.log(
-                    f"🌙 {label}: root 실패 "
-                    f"{len(new_root_failures)}개는 다음 단계로 넘기지 않습니다."
-                )
             self.log(f"🌙 {label} 종료")
             if not phase_ok:
                 pipeline_abort = getattr(self, "_phase_abort_reason", None)
-                break
+                if pipeline_abort or self.stop_flag.is_set():
+                    break
+                # Item-local failures do not suppress later target stages.
         planned_excluded_ids = set(
             getattr(self, "_pipeline_planned_exclusions", {}) or {}
-        )
-        excluded_ids = (
-            root_failed_ids
-            | blocked_consumer_ids
-            | planned_excluded_ids
         )
         summary = self._build_pipeline_result_summary(
             getattr(self, "_active_pipeline_selected_targets", targets),
@@ -5186,32 +9188,64 @@ class App:
             blocked_consumer_ids,
             pipeline_abort,
         )
+        excluded_ids = {
+            str(row.get("target") or "")
+            for row in summary["target_outcomes"]
+            if row.get("outcome") in {
+                "failed", "blocked", "planned_excluded", "owner_lost",
+            }
+        }
+        excluded_ids.discard("")
         self._phase_result_summary = copy.deepcopy(summary)
-        if self.stop_flag.is_set():
+        all_completed = bool(summary["selected_count"]) and (
+            summary["completed_count"] == summary["selected_count"]
+        )
+        actual_issue_count = (
+            summary["failed_count"]
+            + summary["blocked_count"]
+            + summary.get("owner_lost_count", 0)
+        )
+        if all_completed:
+            final_text = "전체 자동 완료"
+        elif self.stop_flag.is_set() or summary.get("cancelled_count", 0):
             final_text = "중지됨"
         elif pipeline_abort:
             final_text = f"전체 자동 중단 — {pipeline_abort}"
-        elif excluded_ids:
+        elif actual_issue_count:
             final_text = (
                 "전체 자동 종료 — "
                 f"completed {summary['completed_count']} · "
                 f"blocked {summary['blocked_count']} · "
+                f"owner_lost {summary.get('owner_lost_count', 0)} · "
                 f"failed {summary['failed_count']}"
+            )
+        elif summary.get("pending_count", 0):
+            final_text = (
+                "전체 자동 Unreal 대기 — "
+                f"pending {summary['pending_count']}"
             )
         else:
             final_text = "전체 자동 완료"
         if selected_scope:
             terminal_label = phase_labels[terminal_phase]
-            if self.stop_flag.is_set():
+            if all_completed:
+                final_text = f"{terminal_label} 연계 실행 완료"
+            elif self.stop_flag.is_set() or summary.get("cancelled_count", 0):
                 final_text = f"{terminal_label} 연계 실행 중지됨"
             elif pipeline_abort:
                 final_text = f"{terminal_label} 연계 실행 중단 · {pipeline_abort}"
-            elif excluded_ids:
+            elif actual_issue_count:
                 final_text = (
                     f"{terminal_label} 연계 실행 종료 · "
                     f"completed {summary['completed_count']} · "
                     f"blocked {summary['blocked_count']} · "
+                    f"owner_lost {summary.get('owner_lost_count', 0)} · "
                     f"failed {summary['failed_count']}"
+                )
+            elif summary.get("pending_count", 0):
+                final_text = (
+                    f"{terminal_label} 연계 실행 Unreal 대기 · "
+                    f"pending {summary['pending_count']}"
                 )
             else:
                 final_text = f"{terminal_label} 연계 실행 완료"
@@ -5224,7 +9258,7 @@ class App:
         self.__dict__.pop("_active_blender_dependency_map", None)
         self.__dict__.pop("_pipeline_upstream_failed_items", None)
         self.log(f"🌙 {final_text}")
-        return not (
+        return all_completed or not (
             self.stop_flag.is_set()
             or pipeline_abort
             or excluded_ids
@@ -5237,6 +9271,10 @@ class App:
         shared_runtime = getattr(self, "shared_queue_runtime", None)
         if shared_runtime is not None:
             for job in pending_jobs:
+                tracker = self._retry_tracker_for_job(job)
+                partition = str(
+                    (job.get("retry_metadata") or {}).get("partition") or ""
+                )
                 shared_job_id = job.get("shared_queue_job_id")
                 if not shared_job_id:
                     continue
@@ -5245,6 +9283,12 @@ class App:
                         shared_job_id,
                         reason="sk_batch_local_queue_cancelled",
                     )
+                    if tracker is not None and partition:
+                        tracker.mark_partition_terminal(
+                            partition,
+                            RETRY_STAGE_CANCELLED,
+                            "operator cancelled before shared queue claim",
+                        )
                 except Exception:
                     # A job that acquired its lease between the snapshot and
                     # this cancellation is owned by the worker and is released
@@ -5254,6 +9298,30 @@ class App:
         with self._recovery_commit_lock:
             resume_commit = copy.deepcopy(self._recovery_resume_commit)
             self.stop_flag.set()
+        planning_tracker = getattr(self, "_active_retry_progress", None)
+        if planning_tracker is not None:
+            planning = planning_tracker.snapshot(evaluate=False).get(
+                "planning"
+            ) or {}
+            if planning.get("status") in {"active", "ready", "committing"}:
+                planning_tracker.finish_planning(
+                    RETRY_STAGE_CANCELLED,
+                    "operator cancelled retry planning",
+                )
+        active_tracker = self._retry_tracker_for_job(
+            getattr(self, "active_batch_job", None)
+        )
+        if active_tracker is not None:
+            snapshot = active_tracker.snapshot(evaluate=False)
+            current_id = snapshot.get("current_target_id")
+            if current_id:
+                active_tracker.observe_process(
+                    current_id,
+                    diagnostic=(
+                        "operator cancellation requested; stopping exact "
+                        "owned process tree"
+                    ),
+                )
         # Worker polling performs the tree kill. Keeping it in one place avoids
         # racing a direct parent-only kill that would orphan SpeedTree children.
         suffix = f" · 대기 작업 {pending}개 취소" if pending else ""
@@ -5278,30 +9346,119 @@ class App:
     def shutdown_shared_queue(self):
         runtime = getattr(self, "shared_queue_runtime", None)
         if runtime is not None:
-            runtime.shutdown()
+            # Persist the operator-close event before the GUI process can
+            # disappear. A later lease recovery remains owner_lost, but its
+            # receipt proves that it followed this close request.
+            runtime.shutdown(operator_close=True)
+        with self._recovery_commit_lock:
+            self._app_open = False
+            tracker = self._retry_tracker_for_job(
+                getattr(self, "active_batch_job", None)
+            )
+            planning = any(
+                worker.is_alive()
+                for worker in getattr(self, "_retry_planning_workers", ())
+            )
+            if tracker is None and planning:
+                tracker = getattr(self, "_active_retry_progress", None)
+            if tracker is not None:
+                tracker.record_operator_close(
+                    "operator closed the SK Batch window; shutdown requested"
+                )
+            self.stop_batch()
 
     def _record_phase_status(
         self, iid, column, status_text, kind, reason, details=None, persist=True
     ):
         """Write the same structured item outcome to GUI and persistent state."""
+        if kind in {"cancelled", "stopped"}:
+            terminal_stage = RETRY_STAGE_CANCELLED
+        elif kind == "owner_lost":
+            terminal_stage = RETRY_STAGE_OWNER_LOST
+        elif kind == "automatic_repair_pending":
+            terminal_stage = RETRY_STAGE_BLOCKED
+        elif kind in PLANNED_EXCLUSION_KINDS or kind in {
+                "dependency_blocked",
+                "manual_required",
+                "not_run",
+                "not_run_unreal",
+                "recovery_blocked",
+        }:
+            terminal_stage = RETRY_STAGE_BLOCKED
+        else:
+            terminal_stage = RETRY_STAGE_FAILED
+        self._retry_transition(
+            iid,
+            terminal_stage,
+            reason,
+            terminal_reason=str(kind),
+            outcome=terminal_stage,
+        )
         self.ui_queue.put(("cell", (iid, column, status_text)))
         with self.state_lock:
             state_entry = self.state.setdefault(iid, {})
             state_entry[column] = status_text
             state_entry[f"{column}_kind"] = kind
-            error_entry = {
+            durable_entry = {
                 "time": datetime.now().isoformat(timespec="seconds"),
                 "kind": kind,
                 "message": reason,
             }
             if details:
-                error_entry.update(details)
-            state_entry[f"{column}_error"] = error_entry
+                durable_entry.update(details)
+            durable_entry.update(
+                self._bind_failure_record(iid, kind, reason, details)
+            )
+            if kind in {"cancelled", "stopped"}:
+                durable_entry["outcome"] = "cancelled"
+                state_entry[f"{column}_result"] = durable_entry
+                state_entry.pop(f"{column}_error", None)
+            else:
+                state_entry[f"{column}_error"] = durable_entry
+                state_entry.pop(f"{column}_result", None)
             if persist:
                 save_state(self.state)
 
+    def _begin_phase_state_save_batch(self):
+        """Defer routine state snapshots until the active phase completes."""
+        with self.state_lock:
+            self._phase_state_save_batch_depth = (
+                int(getattr(self, "_phase_state_save_batch_depth", 0)) + 1
+            )
+
+    def _save_state_after_phase_update(self):
+        """Persist now unless an active phase can safely coalesce this update.
+
+        Callers hold ``state_lock`` while updating ``self.state``.  Terminal
+        failures (and in-flight cancellations) continue to call ``save_state``
+        directly; deferred cancellation rows are captured by the forced phase
+        flush.
+        """
+        if getattr(self, "_phase_state_save_batch_depth", 0) > 0:
+            self._phase_state_save_batch_dirty = True
+            return
+        save_state(self.state)
+
+    def _end_phase_state_save_batch(self, *, force=False):
+        """Flush a coalesced phase state snapshot, including exceptional exits."""
+        with self.state_lock:
+            depth = int(getattr(self, "_phase_state_save_batch_depth", 0))
+            if depth > 1:
+                self._phase_state_save_batch_depth = depth - 1
+                return
+            if force or getattr(self, "_phase_state_save_batch_dirty", False):
+                save_state(self.state)
+            self._phase_state_save_batch_depth = 0
+            self._phase_state_save_batch_dirty = False
+
     @staticmethod
     def _failure_status_text(reason, kind):
+        if kind in {"cancelled", "stopped"}:
+            return f"중지: {reason}"
+        if kind == "automatic_repair_pending":
+            return f"자동 복구 대기: {reason}"
+        if kind == "automatic_repair_failed":
+            return f"자동 복구 실패: {reason}"
         if kind == "manual_required":
             return reason
         if kind in PUSH_ABORT_KINDS:
@@ -5309,9 +9466,25 @@ class App:
         return f"실패: {reason}"
 
     def _run_batch(self, phase, targets, emit_done=True):
+        # SPM and Blender state writes are UI/progress snapshots.  They can be
+        # committed once at the phase boundary. Item failures stay immediate;
+        # deferred cancellation rows are committed by the final flush.
+        if phase not in {"spm", "blender"}:
+            return self._run_batch_impl(phase, targets, emit_done=emit_done)
+        self._begin_phase_state_save_batch()
+        try:
+            return self._run_batch_impl(phase, targets, emit_done=emit_done)
+        finally:
+            # Force one final snapshot even when a revision fence or another
+            # exceptional path exits before the normal phase tail.
+            self._end_phase_state_save_batch(force=True)
+
+    def _run_batch_impl(self, phase, targets, emit_done=True):
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         self._phase_abort_reason = None
         self._phase_failed_items = set()
+        if phase in {"blender", "push"}:
+            self._pipeline_dependency_artifact_cache = {}
         requested_targets = list(targets)
         self._active_push_dependency_map = {}
         self._active_push_auto_added_ids = set()
@@ -5319,93 +9492,103 @@ class App:
         if phase == "spm":
             targets = sorted(targets, key=self._spm_schedule_key)
         if phase == "push":
-            try:
-                stage_dependency_contracts = {}
-                repair_contracts = getattr(
-                    self,
-                    "_active_repair_stage_contracts",
-                    None,
+            requested_ids = {
+                str(item["spm"]) for item in requested_targets
+            }
+            targets, preflight_abort = self._push_preflight(
+                requested_targets
+            )
+            ready_requested_ids = {
+                str(item["spm"]) for item in targets
+            }
+            preflight_skipped = requested_ids - ready_requested_ids
+            self._phase_failed_items.update(preflight_skipped)
+            if preflight_abort:
+                self._phase_failed_items.update(requested_ids)
+                self._phase_abort_reason = preflight_abort
+                if emit_done:
+                    self.ui_queue.put(
+                        (
+                            "progress",
+                            f"Unreal Push 중단 — {preflight_abort}",
+                        )
+                    )
+                    self.ui_queue.put(("done", None))
+                return False
+            if not targets:
+                excluded = len(preflight_skipped)
+                reason = (
+                    f"준비 검사 통과 항목 없음 · {excluded}개 제외"
+                    if excluded
+                    else "준비 검사 통과 항목 없음"
                 )
-                if isinstance(repair_contracts, dict):
-                    with self.state_lock:
-                        for root, repair_contract in repair_contracts.items():
-                            if not isinstance(repair_contract, dict):
-                                continue
+                self.log(
+                    f"Unreal Push 실행 항목 없음 — {reason}. "
+                    "각 대상의 현재 준비 결과만 유지합니다."
+                )
+                if emit_done:
+                    self.ui_queue.put(("progress", reason))
+                    self.ui_queue.put(("done", None))
+                return True
+
+            stage_dependency_contracts = {}
+            ready_requested_contract_keys = {
+                _normalized_path(
+                    speedtree_output_spm_for(item["spm"])
+                )
+                for item in targets
+            }
+            repair_contracts = getattr(
+                self,
+                "_active_repair_stage_contracts",
+                None,
+            )
+            if isinstance(repair_contracts, dict):
+                with self.state_lock:
+                    for root, repair_contract in repair_contracts.items():
+                        if (
+                            _normalized_path(root)
+                            not in ready_requested_contract_keys
+                            or not isinstance(repair_contract, dict)
+                        ):
+                            continue
+                        try:
                             if repair_contract.get("ready") is True:
                                 self._validate_repair_stage_contract(
                                     None,
                                     repair_contract,
                                 )
-                            dependency_contract = repair_contract.get(
-                                "push_dependency_contract"
+                        except RepairPushEvidenceError as exc:
+                            self.log(
+                                "Push dependency same-run evidence ignored; "
+                                f"current output audit remains authoritative: "
+                                f"{Path(root).name}: {exc}"
                             )
-                            if isinstance(dependency_contract, dict):
-                                stage_dependency_contracts[root] = (
-                                    copy.deepcopy(dependency_contract)
-                                )
+                            continue
+                        dependency_contract = repair_contract.get(
+                            "push_dependency_contract"
+                        )
+                        if isinstance(dependency_contract, dict):
+                            stage_dependency_contracts[root] = (
+                                copy.deepcopy(dependency_contract)
+                            )
+
+            inventory = self._batch_job_inventory() or {
+                str(item["spm"]): item for item in targets
+            }
+            try:
                 (
                     targets,
                     self._active_push_dependency_map,
                     self._active_push_auto_added_ids,
-                ) = expand_push_targets(
+                    dependency_issues,
+                ) = partition_push_targets(
                     targets,
-                    self._batch_job_inventory()
-                    or {str(item["spm"]): item for item in targets},
+                    inventory,
                     stage_dependency_contracts=(
                         stage_dependency_contracts or None
                     ),
                 )
-                upstream_root_failed = set(
-                    getattr(self, "_pipeline_root_failed_items", set())
-                )
-                upstream_blocked = set(
-                    getattr(self, "_pipeline_blocked_items", set())
-                )
-                upstream_excluded = upstream_root_failed | upstream_blocked
-                if upstream_excluded:
-                    expanded_by_id = {
-                        str(item["spm"]): item for item in targets
-                    }
-                    for iid in sorted(upstream_blocked):
-                        item = expanded_by_id.get(iid)
-                        if item is not None:
-                            blocked_sources = tuple(
-                                dependency
-                                for dependency in (
-                                    self._active_blender_dependency_map.get(
-                                        iid, ()
-                                    )
-                                )
-                                if dependency in upstream_root_failed
-                            )
-                            if blocked_sources:
-                                self._record_pipeline_dependency_block(
-                                    item,
-                                    "push_status",
-                                    blocked_sources,
-                                    persist=True,
-                                )
-                    removed_roots = {
-                        iid for iid in upstream_root_failed
-                        if iid in expanded_by_id
-                    }
-                    targets = self._filter_pipeline_excluded_targets(
-                        targets,
-                        upstream_excluded,
-                    )
-                    self._active_push_auto_added_ids.difference_update(
-                        upstream_excluded
-                    )
-                    if removed_roots:
-                        self.log(
-                            "Tree Push dependency: upstream root 실패 "
-                            f"{len(removed_roots)}개 재도입 차단"
-                        )
-                    if upstream_blocked:
-                        self.log(
-                            "Tree Push dependency: blocked consumer "
-                            f"{len(upstream_blocked)}개 Push 제외"
-                        )
             except (
                 PushDependencyError,
                 RepairPushEvidenceError,
@@ -5413,29 +9596,224 @@ class App:
                 TypeError,
                 ValueError,
             ) as exc:
-                reason = compact_error_message(exc)
-                requested_ids = {
-                    str(item["spm"]) for item in requested_targets
+                # Dependency discovery is orchestration metadata.  A current,
+                # preflight-ready export remains runnable when that metadata
+                # cannot be read; the Push job itself still validates its
+                # exact live files item by item.
+                dependency_issues = {}
+                self._active_push_dependency_map = {
+                    str(item["spm"]): () for item in targets
                 }
-                self._phase_failed_items.update(requested_ids)
-                self._phase_abort_reason = reason
-                for item in requested_targets:
+                self._active_push_auto_added_ids = set()
+                self.log(
+                    "Push dependency metadata unavailable; continuing exact "
+                    "preflight-ready targets without inferred dependencies: "
+                    + compact_error_message(exc)
+                )
+
+            dependency_blocked_roots = set()
+            metadata_issue_count = 0
+            metadata_issue_details = []
+            for root, issue in dependency_issues.items():
+                if not issue.concrete_missing:
+                    metadata_issue_count += 1
+                    metadata_issue_details.append(
+                        f"{Path(root).name}: {issue}"
+                    )
+                    continue
+                dependency_blocked_roots.add(str(root))
+                preflight_skipped.add(str(root))
+                dependency_path = str(issue.dependency_path or "")
+                evidence = {
+                    "scope": "exact_root",
+                    "scheduling_error": str(issue),
+                    "dependency_path": dependency_path,
+                }
+                self._record_phase_status(
+                    str(root),
+                    "push_status",
+                    "건너뜀: 필요한 Cluster SPM 파일 없음",
+                    "dependency_blocked",
+                    str(issue),
+                    details={
+                        "reason_token": "dependency_output_missing",
+                        "blocked_by": (
+                            [dependency_path] if dependency_path else []
+                        ),
+                        "evidence": evidence,
+                    },
+                    persist=False,
+                )
+            if metadata_issue_count:
+                self.log(
+                    "Push dependency metadata nonblocking: "
+                    f"{metadata_issue_count}개 current-ready target 계속"
+                    + (
+                        " — " + " | ".join(metadata_issue_details[:3])
+                        if metadata_issue_details
+                        else ""
+                    )
+                    + (
+                        f" | 외 {metadata_issue_count - 3}개"
+                        if metadata_issue_count > 3
+                        else ""
+                    )
+                )
+
+            actual_auto_added_ids = (
+                self._active_push_auto_added_ids - requested_ids
+            )
+            auto_items = [
+                item
+                for item in targets
+                if (
+                    str(item["spm"])
+                    in actual_auto_added_ids
+                )
+            ]
+            ready_auto_ids = set()
+            if auto_items:
+                ready_auto, auto_abort = self._push_preflight(auto_items)
+                if auto_abort:
+                    self._phase_failed_items.update(requested_ids)
+                    self._phase_abort_reason = auto_abort
+                    if emit_done:
+                        self.ui_queue.put(
+                            (
+                                "progress",
+                                f"Unreal Push 중단 — {auto_abort}",
+                            )
+                        )
+                        self.ui_queue.put(("done", None))
+                    return False
+                ready_auto_ids = {
+                    str(item["spm"]) for item in ready_auto
+                }
+
+            reusable_current_dependencies = set()
+            reusable_waiting_dependencies = set()
+            unavailable_dependencies = {}
+            for dependency in (
+                actual_auto_added_ids - ready_auto_ids
+            ):
+                verdict = self._dependency_artifact_verdict(
+                    dependency,
+                    phase="push",
+                )
+                status = str(verdict.get("status") or "")
+                if status == "current":
+                    if getattr(self, "force_rerun", False):
+                        ready_auto_ids.add(dependency)
+                    else:
+                        reusable_current_dependencies.add(dependency)
+                    continue
+                if status == "waiting":
+                    reusable_waiting_dependencies.add(dependency)
+                    continue
+                unavailable_dependencies[dependency] = verdict
+
+            dependency_reuse = self.__dict__.setdefault(
+                "_pipeline_dependency_reuse_evidence",
+                {},
+            )
+            for root, dependencies in list(
+                self._active_push_dependency_map.items()
+            ):
+                if root in dependency_blocked_roots:
+                    continue
+                unavailable = [
+                    dependency
+                    for dependency in dependencies
+                    if dependency in unavailable_dependencies
+                ]
+                if unavailable:
+                    dependency_blocked_roots.add(root)
+                    preflight_skipped.add(root)
+                    artifact_rows = {
+                        dependency: copy.deepcopy(
+                            unavailable_dependencies[dependency]
+                        )
+                        for dependency in unavailable
+                    }
+                    reason_token = (
+                        "dependency_output_missing"
+                        if any(
+                            row.get("status") == "missing"
+                            for row in artifact_rows.values()
+                        )
+                        else "dependency_output_stale"
+                    )
+                    reason = (
+                        "필요한 Cluster Push 산출물이 현재 없거나 낡음: "
+                        + ", ".join(
+                            Path(value).name for value in unavailable
+                        )
+                    )
                     self._record_phase_status(
-                        str(item["spm"]),
+                        root,
                         "push_status",
-                        self._failure_status_text(reason, "data_error"),
-                        "data_error",
+                        f"건너뜀: {reason}",
+                        "dependency_blocked",
                         reason,
+                        details={
+                            "reason_token": reason_token,
+                            "blocked_by": unavailable,
+                            "dependency_artifacts": artifact_rows,
+                            "evidence": {
+                                "scope": "exact_root",
+                                "dependency_artifacts": artifact_rows,
+                            },
+                        },
                         persist=False,
                     )
-                self.log(f"Unreal Push dependency scheduling failed — {reason}")
-                if emit_done:
-                    self.ui_queue.put(
-                        ("progress", f"Unreal Push 중단 — {reason}")
+                    continue
+                reused = {
+                    dependency: copy.deepcopy(
+                        self._dependency_artifact_verdict(
+                            dependency,
+                            phase="push",
+                        )
                     )
-                    self.ui_queue.put(("done", None))
-                return False
-            requested_targets = list(targets)
+                    for dependency in dependencies
+                    if dependency in (
+                        reusable_current_dependencies
+                        | reusable_waiting_dependencies
+                    )
+                }
+                if reused:
+                    dependency_reuse[root] = reused
+
+            filtered_dependency_map = {}
+            for root, dependencies in self._active_push_dependency_map.items():
+                if root in dependency_blocked_roots:
+                    continue
+                filtered_dependency_map[root] = tuple(
+                    dependency
+                    for dependency in dependencies
+                    if dependency not in reusable_current_dependencies
+                )
+            self._active_push_dependency_map = filtered_dependency_map
+            required_dependency_ids = {
+                dependency
+                for dependencies in filtered_dependency_map.values()
+                for dependency in dependencies
+            }
+            targets = [
+                item
+                for item in targets
+                if (
+                    str(item["spm"]) not in dependency_blocked_roots
+                    and (
+                        str(item["spm"]) in ready_requested_ids
+                        or str(item["spm"]) in required_dependency_ids
+                    )
+                )
+            ]
+            self._active_push_auto_added_ids = (
+                required_dependency_ids - requested_ids
+            )
+            self._phase_failed_items.update(preflight_skipped)
+
             if self._active_push_auto_added_ids:
                 names = sorted(
                     Path(iid).name
@@ -5445,30 +9823,20 @@ class App:
                     "Tree Push dependency: Cluster "
                     f"{len(names)}개 자동 포함 — {', '.join(names)}"
                 )
-            requested_ids = {str(item["spm"]) for item in requested_targets}
-            targets, preflight_abort = self._push_preflight(targets)
-            ready_ids = {str(item["spm"]) for item in targets}
-            preflight_skipped = requested_ids - ready_ids
-            self._phase_failed_items.update(preflight_skipped)
-            if preflight_abort:
-                self._phase_failed_items.update(requested_ids)
-                self._phase_abort_reason = preflight_abort
-                if emit_done:
-                    self.ui_queue.put(("progress", f"Unreal Push 중단 — {preflight_abort}"))
-                    self.ui_queue.put(("done", None))
-                return False
             if not targets:
                 excluded = len(preflight_skipped)
                 reason = (
                     f"준비 검사 통과 항목 없음 · {excluded}개 제외"
                     if excluded else "준비 검사 통과 항목 없음"
                 )
-                self._phase_abort_reason = reason
-                self.log(f"Unreal Push 중단 — {reason}. 표의 준비 검사 결과를 확인하세요.")
+                self.log(
+                    f"Unreal Push 실행 항목 없음 — {reason}. "
+                    "각 대상의 현재 결과만 유지합니다."
+                )
                 if emit_done:
-                    self.ui_queue.put(("progress", f"Unreal Push 중단 — {reason}"))
+                    self.ui_queue.put(("progress", reason))
                     self.ui_queue.put(("done", None))
-                return False
+                return True
         titles = {"check": "검사", "spm": "SPM 본 세팅", "blender": "Blender Repair", "push": "Unreal Push"}
         column_by_phase = {"check": "spm_status", "spm": "spm_status",
                            "blender": "blend_status", "push": "push_status"}
@@ -5486,25 +9854,6 @@ class App:
         phase_abort = threading.Event()
         attempted = set()
         failed_items = set(preflight_skipped)
-        blender_dependency_map = (
-            getattr(self, "_active_blender_dependency_map", None)
-            if phase == "blender"
-            else None
-        )
-        if phase == "blender" and blender_dependency_map is None:
-            (
-                _expanded,
-                blender_dependency_map,
-                _auto_added,
-            ) = expand_blender_repair_targets(
-                targets,
-                self._batch_job_inventory()
-                or {str(item["spm"]): item for item in targets},
-            )
-        blender_dependency_map = blender_dependency_map or {}
-        upstream_failed_items = set(
-            getattr(self, "_pipeline_upstream_failed_items", set())
-        )
 
         def run_one(item):
             if self.stop_flag.is_set():
@@ -5519,45 +9868,23 @@ class App:
             self.ui_queue.put(
                 ("progress", f"{title} {done}/{total} · 실행 중 {active}개")
             )
+            retry_context = getattr(self, "_retry_thread_context", None)
+            retry_stage = (
+                RETRY_STAGE_UNREAL
+                if phase == "push"
+                else RETRY_STAGE_BLENDER
+            )
+            if retry_context is not None:
+                retry_context.target_id = iid
+                retry_context.stage = retry_stage
+            self._retry_transition(
+                iid,
+                retry_stage,
+                f"{title} started",
+                progress=True,
+                heartbeat=True,
+            )
             try:
-                if phase == "push":
-                    dependencies = self._active_push_dependency_map.get(
-                        iid, ()
-                    )
-                    blocked = [
-                        dependency
-                        for dependency in dependencies
-                        if dependency in failed_items
-                    ]
-                    if blocked:
-                        raise BatchItemError(
-                            "required Cluster Push did not complete: "
-                            + ", ".join(
-                                sorted(Path(value).name for value in blocked)
-                            ),
-                            kind="dependency_blocked",
-                        )
-                if phase == "blender" and not is_cluster_source_spm(spm):
-                    blocked_sources = [
-                        dependency
-                        for dependency in blender_dependency_map.get(iid, ())
-                        if (
-                            dependency in failed_items
-                            or dependency in upstream_failed_items
-                        )
-                    ]
-                    if blocked_sources:
-                        raise BatchItemError(
-                            "Cluster source Repair failed, so downstream "
-                            "Repair was not run: "
-                            + ", ".join(
-                                sorted(
-                                    Path(value).name
-                                    for value in blocked_sources
-                                )
-                            ),
-                            kind="dependency_blocked",
-                        )
                 if phase == "check":
                     self._job_check(iid, spm)
                 elif phase == "spm":
@@ -5566,10 +9893,23 @@ class App:
                     self._job_blender(iid, spm, item)
                 else:
                     self._job_push(iid, spm)
+                self._retry_transition(
+                    iid,
+                    RETRY_STAGE_POST_CHECK,
+                    f"{title} post-check",
+                    progress=True,
+                    heartbeat=True,
+                )
+            except CodeRevisionRestartRequired:
+                raise
             except Exception as exc:
                 full_reason = str(exc)
                 reason = compact_error_message(full_reason)
                 kind = getattr(exc, "kind", "data_error")
+                if self.stop_flag.is_set() or kind in {"cancelled", "stopped"}:
+                    kind = "cancelled"
+                    reason = reason or "사용자 중지"
+                    full_reason = full_reason or reason
                 if phase == "blender":
                     self._publish_repair_stage_contract(
                         spm,
@@ -5582,6 +9922,9 @@ class App:
                     reason = "Push 작업 시간 초과 — Unreal/RPC 상태 확인 필요"
                 status_text = self._failure_status_text(reason, kind)
                 tag = {
+                    "cancelled": "중지",
+                    "automatic_repair_pending": "자동 복구 대기",
+                    "automatic_repair_failed": "자동 복구 실패",
                     "manual_required": "수동",
                     "unreal_crash": "Unreal 중단",
                     "unreal_unavailable": "Unreal 중단",
@@ -5594,6 +9937,24 @@ class App:
                     details["log"] = str(exc.log_file)
                 if getattr(exc, "report_file", None):
                     details["report"] = str(exc.report_file)
+                exception_report = copy.deepcopy(
+                    getattr(exc, "report", {}) or {}
+                )
+                if exception_report:
+                    details["failure_report"] = exception_report
+                    for report_key in (
+                        "reason_token",
+                        "evidence",
+                        "issues",
+                        "repair_disposition",
+                        "reason_ko",
+                        "action_ko",
+                        "stage",
+                    ):
+                        if report_key in exception_report:
+                            details[report_key] = copy.deepcopy(
+                                exception_report[report_key]
+                            )
                 self._record_phase_status(
                     iid,
                     column,
@@ -5603,8 +9964,9 @@ class App:
                     details=details,
                     persist=phase != "check",
                 )
-                with self.state_lock:
-                    failed_items.add(iid)
+                if kind != "cancelled":
+                    with self.state_lock:
+                        failed_items.add(iid)
                 if phase == "push" and kind in PUSH_ABORT_KINDS:
                     self._phase_abort_reason = reason
                     phase_abort.set()
@@ -5612,6 +9974,9 @@ class App:
                         "[Push 단계 중단] Unreal/RPC 상태가 안전하지 않아 남은 항목을 실행하지 않습니다."
                     )
             finally:
+                if retry_context is not None:
+                    retry_context.target_id = None
+                    retry_context.stage = None
                 with self.state_lock:
                     self._batch_active -= 1
                     self._batch_done += 1
@@ -5710,11 +10075,24 @@ class App:
                     persist=False,
                 )
                 self.log(f"[미실행] {item['spm'].name}: {deferred_reason}")
+        if self.stop_flag.is_set():
+            for item in targets:
+                iid = str(item["spm"])
+                if iid in attempted:
+                    continue
+                self._record_phase_status(
+                    iid,
+                    column,
+                    "중지: 사용자 중지로 미실행",
+                    "cancelled",
+                    "사용자 중지로 미실행",
+                    persist=False,
+                )
 
         with self.state_lock:
             self._phase_failed_items = set(failed_items)
             if phase != "check":
-                save_state(self.state)
+                self._save_state_after_phase_update()
         if emit_done:
             progress = (
                 f"{title} 중단 — {self._phase_abort_reason}"
@@ -5770,6 +10148,16 @@ class App:
         ]
         return offset, remainder, lines
 
+    @staticmethod
+    def _retry_output_is_progress(line):
+        value = str(line or "").lstrip()
+        return value.startswith((
+            "SK_BATCH_",
+            "PROGRESS",
+            "progress",
+            "[progress]",
+        ))
+
     def _run_limited(
         self,
         cmd,
@@ -5788,10 +10176,15 @@ class App:
             log_file=str(log_file),
             affinity=affinity,
             env=env,
+            cooperative_cancel=self.stop_flag.set,
         )
         with self.procs_lock:
             self.active_procs.add(proc)
         try:
+            retry_tracker = self._retry_tracker_for_job()
+            retry_context = getattr(self, "_retry_thread_context", None)
+            retry_target_id = getattr(retry_context, "target_id", None)
+            retry_stage = getattr(retry_context, "stage", None)
             started = time.monotonic()
             deadline = (
                 None if timeout is None else started + timeout
@@ -5822,13 +10215,54 @@ class App:
             latest_line = ""
             latest_progress_line = ""
             next_progress = 0.0
+            next_retry_heartbeat = 0.0
             while proc.poll() is None:
+                active_lease = getattr(
+                    self, "_active_shared_queue_lease", None
+                )
+                if (
+                    retry_tracker is not None
+                    and active_lease is not None
+                    and active_lease.heartbeat_error is not None
+                ):
+                    partition = str(
+                        (
+                            getattr(self, "_active_retry_metadata", {}) or {}
+                        ).get("partition")
+                        or ""
+                    )
+                    if partition:
+                        retry_tracker.mark_partition_terminal(
+                            partition,
+                            RETRY_STAGE_OWNER_LOST,
+                            "shared queue lease heartbeat lost while owned "
+                            "process was active",
+                        )
+                    tree_stopped = terminate_process_tree(proc)
+                    detail = (
+                        ""
+                        if tree_stopped
+                        else " (exact owned tree termination unconfirmed)"
+                    )
+                    owner_error = RuntimeError(
+                        "shared queue owner_lost" + detail
+                    )
+                    owner_error.kind = "owner_lost"
+                    raise owner_error
                 if self.stop_flag.is_set():
                     tree_stopped = terminate_process_tree(proc)
                     detail = "" if tree_stopped else " (자식 프로세스 종료 확인 실패)"
-                    raise RuntimeError("사용자 중지" + detail)
+                    raise BatchItemError(
+                        "사용자 중지" + detail,
+                        kind="cancelled",
+                    )
                 now = time.monotonic()
-                if progress_callback is not None or progress_rules:
+                new_lines = []
+                if (
+                    progress_callback is not None
+                    or progress_rules
+                    or (retry_tracker is not None and retry_target_id)
+                ):
                     (
                         log_offset,
                         log_remainder,
@@ -5853,6 +10287,26 @@ class App:
                                 else now + marker_timeout
                             )
                             break
+                    if retry_tracker is not None and retry_target_id and new_lines:
+                        marker_stage = retry_stage
+                        marker_progress = False
+                        for line in new_lines:
+                            mapped = stage_for_send2ue_marker(
+                                line, marker_stage
+                            )
+                            marker_progress = marker_progress or (
+                                mapped != marker_stage
+                                or self._retry_output_is_progress(line)
+                            )
+                            marker_stage = mapped
+                        retry_stage = marker_stage
+                        retry_tracker.observe_process(
+                            retry_target_id,
+                            stage=retry_stage,
+                            diagnostic=new_lines[-1],
+                            output=True,
+                            progress=marker_progress,
+                        )
                 if deadline is not None and now > deadline:
                     tree_stopped = terminate_process_tree(proc)
                     detail = "" if tree_stopped else " — 자식 프로세스 종료 확인 실패"
@@ -5889,6 +10343,16 @@ class App:
                         ),
                     )
                     next_progress = now + 1.0
+                if (
+                    retry_tracker is not None
+                    and retry_target_id
+                    and now >= next_retry_heartbeat
+                ):
+                    retry_tracker.observe_process(
+                        retry_target_id,
+                        stage=retry_stage,
+                    )
+                    next_retry_heartbeat = now + 1.0
                 interval = float(self.cfg.get("process_poll_interval", 0.2))
                 time.sleep(max(0.05, min(interval, 1.0)))
         finally:
@@ -5913,10 +10377,12 @@ class App:
         return proc.returncode, log_file
 
     @staticmethod
-    def _repair_contract_current(spm):
+    def _repair_contract_current(spm, pipeline_out=None):
         """Prove the saved blend/report came from the current SPM content."""
         try:
             report = load_current_repair_pipeline_report(spm)
+            if isinstance(pipeline_out, dict):
+                pipeline_out["payload"] = report
             if (report.get("handoff_preflight") or {}).get("status") not in {
                 "ok", "source_review",
             }:
@@ -6149,7 +10615,13 @@ class App:
 
     def _repair_runtime_addon_dir(self):
         """Installed BWR addon folder, derived identically for read and write."""
-        return addon_dir_from_config(getattr(self, "cfg", {}) or {})
+        planning = self._failed_retry_planning_context()
+        cfg = (
+            planning.cfg_snapshot
+            if planning is not None
+            else getattr(self, "cfg", {}) or {}
+        )
+        return addon_dir_from_config(cfg)
 
     @staticmethod
     def _repair_runtime_code_paths(addon_dir):
@@ -6191,11 +10663,12 @@ class App:
                 getattr(self, "cfg", {}) or {},
                 addon_dir=addon_dir,
                 code_state=state,
+                blend=blend_path_for(spm),
             )
         except OSError as exc:
             self.log(f"  [② 경고] Repair 런타임 기록 실패: {spm.name}: {exc}")
 
-    def _repair_runtime_fresh(self, spm):
+    def _repair_runtime_fresh(self, spm, content_contract_out=None):
         """Gate only on an explicit saved-output contract revision.
 
         Producer source hashes are retained in the receipt for diagnostics,
@@ -6221,7 +10694,60 @@ class App:
                 candidate = json.loads(receipt_path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 candidate = None
+        # This loader owns the narrow structural-semantic migration for
+        # texture-path-only SPM rewrites. Run it before exact v2 pipeline proof
+        # so a supported migration can refresh the report identity first.
+        pipeline_probe = {}
+        content_contract_current = self._repair_contract_current(
+            spm,
+            pipeline_out=pipeline_probe,
+        )
+        if isinstance(content_contract_out, dict):
+            content_contract_out["current"] = content_contract_current
+        pipeline_payload = pipeline_probe.get("payload")
+        if not isinstance(pipeline_payload, dict):
+            try:
+                pipeline_payload = _read_repair_pipeline_json(report_path)
+            except (OSError, ValueError):
+                pipeline_payload = None
+        pipeline_contract = repair_pipeline_output_contract(
+            pipeline_payload,
+            spm=spm,
+            blend=blend,
+            source_identity_already_validated=content_contract_current,
+        )
         saved_contract = repair_runtime_output_contract(candidate)
+        pipeline_proved_upgrade = False
+        if pipeline_contract != REPAIR_OUTPUT_CONTRACT_VERSION:
+            return False, (
+                "Blender Repair report does not prove the current "
+                "Default/empty-material cleanup output contract; rerun "
+                "Blender Repair"
+            )
+        if saved_contract not in {
+            None,
+            LEGACY_REPAIR_OUTPUT_CONTRACT_VERSION,
+            REPAIR_OUTPUT_CONTRACT_VERSION,
+        }:
+            return False, (
+                "Blender Repair saved-output contract changed; rerun "
+                "Blender Repair "
+                f"({saved_contract} -> "
+                f"{REPAIR_OUTPUT_CONTRACT_VERSION})"
+            )
+        if saved_contract in {
+            None,
+            LEGACY_REPAIR_OUTPUT_CONTRACT_VERSION,
+        }:
+            if not content_contract_current:
+                return False, (
+                    "Blender Repair cleanup evidence does not match the "
+                    "current source/output contract; rerun Blender Repair"
+                )
+            saved_contract = pipeline_contract
+            pipeline_proved_upgrade = True
+        if saved_contract is None:
+            saved_contract = pipeline_contract
         if (
             saved_contract is not None
             and saved_contract != REPAIR_OUTPUT_CONTRACT_VERSION
@@ -6240,8 +10766,15 @@ class App:
         # stale, and an old receipt can never bless stale artifacts.
         if (
             repair_runtime_receipt_needs_migration(candidate)
-            and self._repair_contract_current(spm)
+            and (
+                pipeline_proved_upgrade
+                or content_contract_current
+            )
         ):
+            planning = self._failed_retry_planning_context()
+            if planning is not None:
+                planning.counters["runtime_receipt_migrations_deferred"] += 1
+                return True, ""
             try:
                 migrate_repair_runtime_receipt(
                     spm,
@@ -6274,9 +10807,13 @@ class App:
 
     def _repair_output_state_scoped(self, spm):
         """One semantic decision shared by row status and the ② queue gate."""
+        speedtree_spm = speedtree_output_spm_for(spm)
+        leaf_projection = {}
         leaf_ok, leaf_reason = self._leaf_reference_ready(
-            speedtree_output_spm_for(spm)
+            speedtree_spm,
+            contract_out=leaf_projection,
         )
+        leaf_contract = leaf_projection.get("contract")
         if not leaf_ok:
             return {
                 "current": False,
@@ -6292,7 +10829,11 @@ class App:
                 "kind": "missing_blend",
                 "reason": "생성 필요 — blend 없음 → ② Blender Repair",
             }
-        runtime_fresh, runtime_reason = self._repair_runtime_fresh(spm)
+        content_contract_probe = {}
+        runtime_fresh, runtime_reason = self._repair_runtime_fresh(
+            spm,
+            content_contract_out=content_contract_probe,
+        )
         if not runtime_fresh:
             return {
                 "current": False,
@@ -6300,7 +10841,9 @@ class App:
                 "kind": "output_contract",
                 "reason": runtime_reason,
             }
-        receipt_current = self._repair_contract_current(spm)
+        receipt_current = content_contract_probe.get("current")
+        if not isinstance(receipt_current, bool):
+            receipt_current = self._repair_contract_current(spm)
         assembly_state = None
         assembly_dependency_contract = {}
 
@@ -6358,7 +10901,9 @@ class App:
                 return state
 
         material_ok, material_reason = self._material_export_ready(
-            spm, content_receipt_current=receipt_current
+            spm,
+            content_receipt_current=receipt_current,
+            leaf_contract=leaf_contract,
         )
         if not material_ok:
             return {
@@ -6519,14 +11064,24 @@ class App:
         return repair_contract
 
     @staticmethod
-    def _leaf_reference_ready(spm):
+    def _leaf_reference_ready(spm, contract_out=None):
         contract = inspect_spm_leaf_contract(spm)
+        if isinstance(contract_out, dict):
+            contract_out["contract"] = contract
         return leaf_contract_user_message(contract)
 
     @staticmethod
-    def _material_export_ready(spm, content_receipt_current=False):
+    def _material_export_ready(
+        spm,
+        content_receipt_current=False,
+        leaf_contract=None,
+    ):
         speedtree_spm = speedtree_output_spm_for(spm)
-        contract = inspect_spm_leaf_contract(speedtree_spm)
+        contract = (
+            leaf_contract
+            if isinstance(leaf_contract, dict)
+            else inspect_spm_leaf_contract(speedtree_spm)
+        )
         exported = inspect_speedtree_material_export(speedtree_spm, contract)
         all_exported = inspect_all_speedtree_material_export(speedtree_spm)
         if all_exported.get("status") not in {"ok", "not_applicable"}:
@@ -6579,63 +11134,6 @@ class App:
                 )
             return False, f"텍스처 정규화 보고서 오류: {exc}"
         normalization = report.get("texture_normalization") or {}
-        missing = list(normalization.get("missing", []))
-        def recorded_file_missing(value):
-            try:
-                candidate = Path(value) if value else None
-                return not candidate or not candidate.is_file() or candidate.stat().st_size <= 0
-            except OSError:
-                return True
-
-        # A report can outlive one of its local T_ files. Re-check recorded
-        # paths cheaply so deletion/OneDrive placeholders cannot pass on a
-        # stale "ok" label. Preserved Cluster rows carry their own source-file
-        # map and are validated the same way.
-        for material in normalization.get("materials", []):
-            material_status = str(material.get("status") or "")
-            if material_status not in {
-                "ok",
-                "preserved_cluster",
-                "needs_pcg_generation",
-            }:
-                continue
-            files = (
-                material.get("files")
-                or material.get("preserved_files")
-                or material.get("source_maps")
-                or material.get("source_paths")
-                or {}
-            )
-            missing_roles = [
-                role for role, value in files.items()
-                if recorded_file_missing(value)
-            ]
-            if material_status == "needs_pcg_generation" and not files:
-                missing_roles = list(material.get("source_roles") or ["source"])
-            if missing_roles:
-                missing.append(
-                    {
-                        "material": material.get("material", "?"),
-                        "expected_texture_base": (
-                            material.get("texture_base")
-                            or material.get("expected_texture_base")
-                            or "보존 Cluster"
-                        ),
-                        "missing_roles": missing_roles,
-                    }
-                )
-        if missing:
-            details = []
-            for item in missing:
-                roles = ",".join(item.get("missing_roles", [])) or "대응 세트"
-                details.append(
-                    f"{item.get('material', '?')}→"
-                    f"{item.get('expected_texture_base', 'T_?')}[{roles}]"
-                )
-            return False, (
-                "텍스처 준비 안 됨: " + " | ".join(details)
-                + " → PCG ③ 또는 ② Repair 확인"
-            )
         normalization_status = str(normalization.get("status") or "")
         fallback_rows = [
             material
@@ -6653,42 +11151,45 @@ class App:
                 for material in fallback_rows
             )
         )
-        if (
-            normalization_status not in {"ok", "preserved_cluster"}
-            and not source_fallback_ready
-        ):
-            return False, "텍스처 정규화 미완료 → ② 필요"
         handoff = report.get("handoff_preflight")
         if not isinstance(handoff, dict):
             return False, "② 사전검사 정보 없음 → ② Blender Repair 다시 실행"
-        if handoff.get("status") != "ok":
-            slots = handoff.get("empty_material_slots") or []
-            outputs = handoff.get("missing_outputs") or []
-            materials = (
-                handoff.get("missing_materials")
-                or (handoff.get("material_export") or {}).get("missing_materials")
-                or []
-            )
-            vertex_contract = handoff.get("vertex_color_contract") or {}
-            payload_contract = handoff.get("vertex_payload_contract") or {}
-            reasons = []
-            if slots:
-                reasons.append(
-                    "머티리얼 빈 슬롯 "
-                    + ", ".join(
-                        f"{item.get('object', '?')}[{item.get('slot', '?')}]"
-                        for item in slots
-                    )
+        slots = handoff.get("empty_material_slots") or []
+        outputs = handoff.get("missing_outputs") or []
+        materials = (
+            handoff.get("missing_materials")
+            or (handoff.get("material_export") or {}).get("missing_materials")
+            or []
+        )
+        collections = handoff.get("export_collection_issues") or []
+        vertex_contract = handoff.get("vertex_color_contract") or {}
+        payload_contract = handoff.get("vertex_payload_contract") or {}
+        leaf_contract = handoff.get("leaf_reference_contract") or {}
+        reasons = []
+        if slots:
+            reasons.append(
+                "머티리얼 빈 슬롯 "
+                + ", ".join(
+                    f"{item.get('object', '?')}[{item.get('slot', '?')}]"
+                    for item in slots
                 )
-            if outputs:
-                reasons.append("핸드오프 파일 누락 " + ", ".join(map(str, outputs)))
-            if materials:
-                reasons.append("SpeedTree export 재질 누락 " + ", ".join(materials))
-            if vertex_contract.get("status") == "blocked":
-                reasons.append("버텍스 컬러 검사 실패")
-            if payload_contract.get("status") == "blocked":
-                reasons.append("AO/Nanite UV payload 검사 실패")
-            return False, "② 사전검사 차단: " + (" | ".join(reasons) or "보고서 확인")
+            )
+        if outputs:
+            reasons.append("핸드오프 파일 누락 " + ", ".join(map(str, outputs)))
+        if materials:
+            reasons.append("SpeedTree export 재질 누락 " + ", ".join(materials))
+        if collections:
+            reasons.append("Export collection 오류 " + ", ".join(map(str, collections)))
+        if vertex_contract.get("status") == "blocked":
+            reasons.append("버텍스 컬러 검사 실패")
+        if payload_contract.get("status") == "blocked":
+            reasons.append("AO/Nanite UV payload 검사 실패")
+        if leaf_contract.get("status") in {"blocked", "replacement_needed"}:
+            reasons.append("SPM leaf 참조 실패")
+        if reasons:
+            return False, "② 사전검사 차단: " + " | ".join(reasons)
+        if handoff.get("status") not in {"ok", "source_review", "blocked"}:
+            return False, "② 사전검사 미완료 → Blender Repair 다시 실행"
         preserved_count = sum(
             1 for item in normalization.get("materials", [])
             if item.get("status") == "preserved_cluster"
@@ -6701,7 +11202,7 @@ class App:
                 "canonical T_* 미생성 "
                 f"{len(fallback_rows)}세트"
             )
-        return True, "텍스처 정규화 완료"
+        return True, "머티리얼 준비 완료 · 텍스처 선택 연결"
 
     @staticmethod
     def _blend_status_from_repair_state(state):
@@ -6747,8 +11248,19 @@ class App:
         self.ui_queue.put(("cell", (iid, "blend_status", text)))
         if persist:
             with self.state_lock:
-                self.state.setdefault(iid, {})["blend_status"] = text
-                save_state(self.state)
+                entry = self.state.setdefault(iid, {})
+                entry["blend_status"] = text
+                if (
+                    isinstance(repair_state, dict)
+                    and repair_state.get("current") is True
+                ):
+                    # Fresh live Repair evidence supersedes an older persisted
+                    # failure. Keeping data_error beside a current status made
+                    # retry planning strand already-repaired providers.
+                    entry["blend_status_kind"] = "ok"
+                    entry.pop("blend_status_error", None)
+                    entry.pop("blend_status_result", None)
+                self._save_state_after_phase_update()
         return text
 
     def _job_check(self, iid, spm):
@@ -6854,6 +11366,199 @@ class App:
             )
         return Path(result.get("canonical_spm") or spm)
 
+    def _run_inline_atlas_manifest_repair(
+        self,
+        spm,
+        failure_report,
+        repair_action=ATLAS_MANIFEST_MIRROR_REPAIR,
+    ):
+        """Run one exact PCG/Atlas repair under the owned batch lease."""
+
+        from pcg_st9_texture_batch.exact_target_repair import (
+            execute_step3_standard,
+        )
+
+        spm = Path(spm).expanduser().absolute()
+        lease = getattr(self, "_active_shared_queue_lease", None)
+        if lease is None or getattr(lease, "finished", False):
+            raise BatchItemError(
+                "Atlas manifest 자동 복구에 필요한 현재 공용 대기열 소유권이 없습니다.",
+                kind="automatic_repair_pending",
+                report=copy.deepcopy(failure_report),
+            )
+        key = (
+            str(repair_action).casefold()
+            + "\0"
+            + os.path.normcase(os.path.abspath(str(spm))).casefold()
+        )
+        # Known before any stage runs, and the only thing on this path that
+        # says what the repair was for.  The failure branch below has to carry
+        # it onto the durable row; the cached path never reaches the block
+        # that used to compute it.
+        root_reason_codes = sorted(set(
+            evidence_reason_codes(failure_report)
+            or ["atlas_manifest_mirror_conflict_repairable"]
+        ))
+        with _INLINE_ATLAS_REPAIR_LOCK:
+            memo = self.__dict__.setdefault("_inline_atlas_repair_results", {})
+            cached = memo.get(key)
+            if cached is not None:
+                cached_status = str(
+                    cached.get("terminal_status")
+                    or cached.get("status")
+                    or ""
+                )
+                if cached_status != "completed":
+                    terminal = copy.deepcopy(cached)
+                elif repair_action == ATLAS_MANIFEST_MIRROR_REPAIR:
+                    current_plan = atlas_manifest_mirror_repair_plan(spm)
+                    if current_plan.get("status") == "not_needed":
+                        terminal = copy.deepcopy(cached)
+                    else:
+                        # A later producer can make the same mirror stale again
+                        # during one long batch. Current evidence, not the earlier
+                        # successful receipt, decides whether another exact repair
+                        # is required.
+                        cached = None
+                else:
+                    terminal = copy.deepcopy(cached)
+            if cached is None:
+                active_job = getattr(self, "active_batch_job", None) or {}
+                retry_metadata = copy.deepcopy(
+                    getattr(self, "_active_retry_metadata", {}) or {}
+                )
+                queue_identity = str(
+                    active_job.get("shared_queue_job_id")
+                    or active_job.get("id")
+                    or "direct-batch"
+                )
+                request_hash = hashlib.sha256(
+                    (queue_identity + "\0" + key).encode("utf-8")
+                ).hexdigest()[:16]
+                request_id = f"inline-atlas-{request_hash}"
+                receipt = LOG_DIR / f"exact_repair_{request_id}.json"
+                parent_retry_id = str(
+                    retry_metadata.get("progress_run_id")
+                    or active_job.get("shared_queue_job_id")
+                    or f"sk-batch-{active_job.get('id') or 'direct'}"
+                )
+                reason_codes = list(root_reason_codes)
+                request = build_exact_target_request(
+                    tool=PCG_TEXTURE_TOOL,
+                    repair_action=repair_action,
+                    target_spms=[spm],
+                    repair_stage=(
+                        "atlas_manifest_repair"
+                        if repair_action == ATLAS_MANIFEST_MIRROR_REPAIR
+                        else "pcg_texture"
+                    ),
+                    provenance={
+                        "reason_codes": reason_codes,
+                        "source": "sk_batch.inline_atlas_preflight",
+                    },
+                    parent_retry_id=parent_retry_id,
+                    request_id=request_id,
+                    receipt=receipt,
+                )
+
+                def on_progress(payload):
+                    stage = str(
+                        payload.get("current_stage")
+                        or "Atlas manifest 자동 복구"
+                    )
+                    self.ui_queue.put((
+                        "progress",
+                        f"{spm.name} · {stage}",
+                    ))
+                    self._retry_transition(
+                        str(spm),
+                        RETRY_STAGE_BLENDER,
+                        stage,
+                        progress=bool(payload.get("completed")),
+                        output=True,
+                        heartbeat=True,
+                    )
+
+                terminal = run_exact_target_request(
+                    request,
+                    execute_step3_standard,
+                    inherited_lease=lease,
+                    cancel_event=self.stop_flag,
+                    on_progress=on_progress,
+                )
+                memo[key] = copy.deepcopy(terminal)
+            terminal_status = str(
+                terminal.get("terminal_status")
+                or terminal.get("status")
+                or ""
+            )
+            if terminal_status == "cancelled":
+                raise BatchItemError(
+                    "Atlas manifest 자동 복구가 취소되었습니다.",
+                    kind="cancelled",
+                    report=terminal,
+                )
+            if terminal_status != "completed":
+                raw_error = str(
+                    terminal.get("error")
+                    or (terminal.get("result") or {}).get("reason")
+                    or "exact BAT Atlas manifest 복구 실패"
+                )
+                diagnostic = {
+                    "status": "diagnostic_only",
+                    "mutation_authorized": False,
+                    "reason_codes": list(root_reason_codes),
+                    "repair_attempt": {
+                        "status": "failed",
+                        "error": compact_error_message(raw_error, 320),
+                        "receipt": copy.deepcopy(terminal),
+                    },
+                    "original_failure": copy.deepcopy(failure_report),
+                }
+                # This refresh writes metadata. Its process result is not
+                # authority over a valid live SpeedTree graph. The caller
+                # still performs a fresh audit and only concrete content from
+                # that audit may stop export.
+                self.log(
+                    "[Atlas metadata diagnostic] exact refresh did not "
+                    "complete; export remains admitted to fresh content "
+                    f"audit: {spm.name} "
+                    f"({diagnostic['repair_attempt']['error']})"
+                )
+                return diagnostic
+            result = copy.deepcopy(terminal.get("result") or {})
+            if repair_action == STEP3_STANDARD:
+                try:
+                    return refresh_atlas_manifests_for_spm(
+                        spm,
+                        require_complete=True,
+                    )
+                except CanonicalOutputManifestError as exc:
+                    diagnostic = {
+                        "status": "diagnostic_only",
+                        "mutation_authorized": False,
+                        "reason_codes": list(root_reason_codes),
+                        "repair_attempt": {
+                            "status": "completed_but_reaudit_unresolved",
+                            "receipt": copy.deepcopy(terminal),
+                        },
+                        "fresh_reaudit": copy.deepcopy(
+                            getattr(exc, "report", {}) or {}
+                        ),
+                        "original_failure": copy.deepcopy(failure_report),
+                    }
+                    self.log(
+                        "[Canonical mapping diagnostic] exact PCG refresh "
+                        "completed but metadata mapping remains unresolved; "
+                        f"fresh live audit continues: {spm.name}"
+                    )
+                    return diagnostic
+            self.log(
+                "[자동 복구 완료] Canonical PCG → Atlas manifest · "
+                f"{spm.name}"
+            )
+            return copy.deepcopy(result.get("canonical_refresh") or {})
+
     def _refresh_canonical_atlas_manifests(self, spm):
         """Synchronize canonical PCG output into Atlas before Blender starts."""
         spm = Path(spm)
@@ -6873,15 +11578,69 @@ class App:
                 require_complete=True,
             )
         except CanonicalOutputManifestError as exc:
+            failure_report = copy.deepcopy(getattr(exc, "report", {}) or {})
+            decision = repair_ui_decision(failure_report)
+            automatic = decision["status"] == REPAIR_UI_AUTOMATIC
+            failure_stage = str(failure_report.get("stage") or "")
+            atlas_metadata_only = failure_stage == "atlas_manifest_resolution"
+            canonical_mapping_repair = (
+                failure_stage == "canonical_material_mapping"
+            )
+            if automatic and (
+                atlas_metadata_only or canonical_mapping_repair
+            ):
+                return self._run_inline_atlas_manifest_repair(
+                    spm,
+                    {
+                        "status": "automatic_repair_pending",
+                        "stage": "canonical_atlas_manifest_preflight",
+                        "spm": str(spm),
+                        "error": str(exc),
+                        "repair_disposition": decision["status"],
+                        "reason_ko": decision["reason"],
+                        "action_ko": decision["action"],
+                        **failure_report,
+                    },
+                    repair_action=(
+                        STEP3_STANDARD
+                        if canonical_mapping_repair
+                        else ATLAS_MANIFEST_MIRROR_REPAIR
+                    ),
+                )
+            if atlas_metadata_only:
+                # Canonical publication is a metadata mutation. Multiple or
+                # disagreeing Providers do not invalidate current SpeedTree
+                # content, so skip only this write and continue into the fresh
+                # material/Cluster audit. Concrete canonical texture failures
+                # use another stage and remain actionable errors below.
+                diagnostic = {
+                    "status": "diagnostic_only",
+                    "mutation_authorized": False,
+                    "target_spm": str(spm),
+                    "canonical_manifest": None,
+                    "updated": [],
+                    "current": [],
+                    "pending": [],
+                    "atlas_manifest_diagnostic": failure_report,
+                }
+                self.log(
+                    "[Atlas metadata diagnostic] canonical publication "
+                    f"skipped; live audit continues: {spm.name}"
+                )
+                return diagnostic
             raise BatchItemError(
-                "Canonical PCG → Atlas manifest preflight failed: "
-                + str(exc),
+                "최종 차단: Canonical PCG → Atlas 사전 검사 · "
+                f"원인: {decision['reason']} · 조치: {decision['action']}",
                 kind="data_error",
                 report={
                     "status": "failed",
                     "stage": "canonical_atlas_manifest_preflight",
                     "spm": str(spm),
                     "error": str(exc),
+                    "repair_disposition": decision["status"],
+                    "reason_ko": decision["reason"],
+                    "action_ko": decision["action"],
+                    **failure_report,
                 },
             ) from exc
         if result["updated"]:
@@ -6890,6 +11649,107 @@ class App:
                 f"{Path(spm).name} · {len(result['updated'])} file(s)"
             )
         return result
+
+    def _material_preflight_cache_context(self, fbx_ini, speedtree_cli):
+        cached = self.__dict__.get("_material_preflight_cache_context_value")
+        if isinstance(cached, dict):
+            return cached
+        # Re-export is an asset operation, not a source-code migration.  The
+        # cache module's explicit contract version is the opt-in migration
+        # boundary for intentional semantic changes; hashing implementation
+        # .py files here made every ordinary code edit re-run the expensive
+        # SpeedTree FBX/STMAT export for unchanged data.  Only the actual
+        # export preset and installed SpeedTree identity belong in this
+        # automatic runtime signature.  A user force-run still bypasses the
+        # cache through the existing path.
+        semantic_files = (Path(fbx_ini),)
+        cache_dir = Path(
+            self.cfg.get("material_preflight_cache_dir")
+            or (TOOL_DIR / "cache" / "material_preflight")
+        ).expanduser()
+        try:
+            runtime_signature = material_preflight_runtime_signature(
+                semantic_files=semantic_files,
+                speedtree_exe=self.cfg["speedtree_exe"],
+            )
+        except OSError:
+            # Missing test/development inputs disable this optimization.  The
+            # existing child process remains the authority for its own error.
+            runtime_signature = None
+        context = {
+            "cache_dir": cache_dir,
+            "runtime_signature": runtime_signature,
+        }
+        self._material_preflight_cache_context_value = context
+        return context
+
+    def _material_preflight_seed_candidates(self, spm):
+        index = self.__dict__.get("_material_preflight_seed_index")
+        if not isinstance(index, dict):
+            index = {}
+            try:
+                paths = LOG_DIR.glob("*_material_preflight_*.json")
+                for path in paths:
+                    stem = path.name.split("_material_preflight_", 1)[0]
+                    index.setdefault(stem.casefold(), []).append(path)
+            except OSError:
+                index = {}
+            def candidate_mtime(path):
+                try:
+                    return path.stat().st_mtime_ns
+                except OSError:
+                    return -1
+            for candidates in index.values():
+                candidates.sort(
+                    key=candidate_mtime,
+                    reverse=True,
+                )
+            self._material_preflight_seed_index = index
+        return index.get(Path(spm).stem.casefold(), ())
+
+    def _load_or_seed_material_preflight_cache(
+        self,
+        cache_context,
+        spm,
+        speedtree_spm,
+    ):
+        cached = load_material_preflight_cache(
+            cache_context["cache_dir"],
+            spm,
+            speedtree_spm,
+            runtime_signature=cache_context["runtime_signature"],
+        )
+        if cached is not None:
+            return cached
+        # Adopt an existing successful report once.  Current source/STMAT/FBX
+        # content validation is identical to an ordinary durable cache load;
+        # foreign, stale, failed or corrupt historical reports are silent
+        # misses and never become asset failures.
+        for candidate in self._material_preflight_seed_candidates(spm):
+            report = load_job_report(candidate)
+            try:
+                store_material_preflight_cache(
+                    cache_context["cache_dir"],
+                    spm,
+                    speedtree_spm,
+                    report,
+                    runtime_signature=cache_context["runtime_signature"],
+                )
+            except (OSError, TypeError, ValueError, RuntimeError):
+                continue
+            cached = load_material_preflight_cache(
+                cache_context["cache_dir"],
+                spm,
+                speedtree_spm,
+                runtime_signature=cache_context["runtime_signature"],
+            )
+            if cached is not None:
+                self.log(
+                    "기존 재질 사전검사 성공 보고서를 재사용 영수증으로 등록: "
+                    f"{Path(spm).name}"
+                )
+                return cached
+        return None
 
     def _execute_material_preflight(
         self,
@@ -6913,10 +11773,36 @@ class App:
                 f"SpeedTree export helper 없음: {speedtree_cli}",
                 kind="data_error",
             )
+        cache_context = self._material_preflight_cache_context(
+            fbx_ini,
+            speedtree_cli,
+        )
         material_report = LOG_DIR / (
             f"{spm.stem}_material_preflight_{stamp}.json"
         )
         material_log_name = f"{spm.stem}_material_preflight_{stamp}.log"
+        if (
+            not getattr(self, "force_rerun", False)
+            and cache_context["runtime_signature"]
+        ):
+            cached = self._load_or_seed_material_preflight_cache(
+                cache_context,
+                spm,
+                speedtree_spm,
+            )
+            if cached is not None:
+                self.log(
+                    "재질 사전검사 건너뜀 (동일 입력 성공 영수증): "
+                    f"{spm.name}"
+                )
+                return {
+                    "code": 0,
+                    "report": cached["report_path"],
+                    "run_report": material_report,
+                    "log": cached["receipt_path"],
+                    "result": cached["report"],
+                    "cache_hit": True,
+                }
         export_timeout = max(1, int(
             self.cfg.get("speedtree_material_preflight_timeout", 900)
         ))
@@ -6999,11 +11885,34 @@ class App:
             ),
         )
         material_result = load_job_report(material_report)
+        if (
+            material_code == 0
+            and material_result.get("status") == "ok"
+            and cache_context["runtime_signature"]
+        ):
+            try:
+                store_material_preflight_cache(
+                    cache_context["cache_dir"],
+                    spm,
+                    speedtree_spm,
+                    material_result,
+                    runtime_signature=cache_context["runtime_signature"],
+                )
+            except (OSError, TypeError, ValueError, RuntimeError) as exc:
+                # Cache publication is an optimization.  The authoritative
+                # just-completed report still proceeds to Blender Repair.
+                self.log(
+                    "  [캐시 기록 경고] 재질 사전검사 결과는 유효하지만 "
+                    f"재사용 영수증을 기록하지 못함: {spm.name} · "
+                    f"{compact_error_message(exc)}"
+                )
         return {
             "code": material_code,
             "report": material_report,
+            "run_report": material_report,
             "log": material_log,
             "result": material_result,
+            "cache_hit": False,
         }
 
     def _refresh_cluster_source_relations(self, spm, item):
@@ -7025,9 +11934,40 @@ class App:
         state = cluster_relation_refresh_state(spm, targets)
         if state["current"]:
             return {
-                "status": "ok",
+                "status": (
+                    "pass_through"
+                    if state.get("metadata_diagnostic_targets")
+                    else "ok"
+                ),
                 "no_change": True,
                 "targets": state["targets"],
+                "reason": (
+                    "provider_metadata_diagnostic_only"
+                    if state.get("metadata_diagnostic_targets")
+                    else "already_current"
+                ),
+                "metadata_diagnostic_targets": list(
+                    state.get("metadata_diagnostic_targets") or ()
+                ),
+            }
+        actionable_targets = state.get("actionable_targets")
+        if actionable_targets is None:
+            # Compatibility for older cached/test projections.  Current
+            # production states always publish the exact mutation subset.
+            actionable_targets = targets
+        actionable_targets = [
+            Path(value).expanduser().absolute()
+            for value in actionable_targets
+        ]
+        if not actionable_targets:
+            return {
+                "status": "pass_through",
+                "no_change": True,
+                "reason": "provider_metadata_diagnostic_only",
+                "targets": state.get("targets") or [],
+                "metadata_diagnostic_targets": list(
+                    state.get("metadata_diagnostic_targets") or ()
+                ),
             }
         self.log(
             f"Cluster Normalizer/Atlas 자동 재생성: {Path(spm).name}"
@@ -7037,7 +11977,7 @@ class App:
             with cluster_relation_owner_lock(spm):
                 result = run_cluster_relation_transaction(
                     blend_path_for(spm),
-                    targets,
+                    actionable_targets,
                     enabled=True,
                     blender_exe=Path(self.cfg["blender_exe"]),
                     unit_probe_path=Path(self.cfg["cluster_unit_probe"]),
@@ -7050,20 +11990,109 @@ class App:
                     ),
                 )
         except Exception as exc:
-            raise BatchItemError(
-                "Cluster Normalizer/Atlas 자동 재생성 실패: " + str(exc),
-                kind="data_error",
-            ) from exc
+            diagnostic = {
+                "status": "pass_through",
+                "no_change": True,
+                "reason": "cluster_refresh_orchestration_diagnostic",
+                "targets": state["targets"],
+                "attempted": True,
+                "error": compact_error_message(exc),
+                "asset_failure": False,
+            }
+            self.log(
+                "Cluster Normalizer/Atlas 자동 재생성은 진단으로만 남기고 "
+                f"fresh pipeline을 계속합니다: {Path(spm).name} · "
+                f"{diagnostic['error']}"
+            )
+            return diagnostic
         verified = cluster_relation_refresh_state(spm, targets)
         if not verified["current"]:
-            raise BatchItemError(
-                "Cluster Normalizer/Atlas 재생성 후 실제 출력 검증 실패: "
-                + verified["reason"],
-                kind="data_error",
-                report=result,
+            diagnostic = {
+                "status": "pass_through",
+                "no_change": True,
+                "reason": "cluster_refresh_reaudit_diagnostic",
+                "targets": verified["targets"],
+                "attempted": True,
+                "result": result,
+                "fresh_audit": verified,
+                "asset_failure": False,
+            }
+            self.log(
+                "Cluster Normalizer/Atlas fresh audit는 현재 live content "
+                f"pipeline으로 이관합니다: {Path(spm).name} · "
+                f"{verified['reason']}"
             )
+            return diagnostic
         self.log(f"Cluster Normalizer/Atlas 갱신 완료: {Path(spm).name}")
         return result
+
+    def _migrate_cached_positive_spm_receipt(
+        self,
+        spm,
+        snapshot,
+        cache,
+        summary,
+    ):
+        """Write a durable positive receipt once without reparsing an SPM.
+
+        A GUI calibration cache is already bound to the exact full-file
+        fingerprint in ``snapshot``. Fresh reports retain the semantic bone
+        fingerprint produced for those same final bytes, so later cache hits
+        can migrate the small durable receipt without opening a large SPM
+        again. Legacy cache rows fall back to one semantic read and then
+        retain that result for future hits in this session.
+        """
+
+        status = str((cache or {}).get("status") or "")
+        if status not in {"calibrated", "already-ok"}:
+            return
+        semantic_fingerprint = str(
+            (cache or {}).get("bone_semantic_fingerprint") or ""
+        ).strip()
+        try:
+            if not semantic_fingerprint:
+                semantic_fingerprint = current_bone_semantic_fingerprint(spm)
+                cache["bone_semantic_fingerprint"] = semantic_fingerprint
+            receipt_key = (
+                _normalized_path(spm),
+                str(snapshot["fingerprint"]),
+                str(self.spm_calibration_signature),
+                str(SPM_BONE_CONTRACT_VERSION),
+                semantic_fingerprint,
+            )
+            with self.state_lock:
+                written = self.__dict__.setdefault(
+                    "_positive_calibration_receipt_memo",
+                    set(),
+                )
+                if receipt_key in written:
+                    return
+            receipt = write_positive_calibration_receipt(
+                spm,
+                getattr(self, "cfg", {}).get("spm_calibration_receipt_dir")
+                or (TOOL_DIR / "cache" / "spm_calibration"),
+                bone_semantic_fingerprint_value=semantic_fingerprint,
+                settings_signature=self.spm_calibration_signature,
+                bone_contract_version=SPM_BONE_CONTRACT_VERSION,
+                report={
+                    "status": status,
+                    "cached_display_summary": summary,
+                    "calibration": {
+                        "mode": "migrated_positive_gui_cache",
+                    },
+                },
+            )
+            if receipt is not None:
+                with self.state_lock:
+                    self.__dict__.setdefault(
+                        "_positive_calibration_receipt_memo",
+                        set(),
+                    ).add(receipt_key)
+        except Exception as exc:
+            self.log(
+                "  [캐시 경고] SPM bone receipt migration failed: "
+                f"{Path(spm).name}: {exc}"
+            )
 
     def _job_spm(self, iid, spm):
         spm = Path(spm)
@@ -7079,7 +12108,7 @@ class App:
             self.ui_queue.put(("cell", (iid, "spm_status", summary)))
             with self.state_lock:
                 entry["spm_status"] = summary
-                save_state(self.state)
+                self._save_state_after_phase_update()
             reason = "source read-only" if read_only else "Cluster 전용 정책"
             self.log(f"SPM 본 보정 건너뜀 ({reason}): {spm.name}")
             return
@@ -7089,7 +12118,7 @@ class App:
             self.ui_queue.put(("cell", (iid, "spm_status", summary)))
             with self.state_lock:
                 entry["spm_status"] = summary
-                save_state(self.state)
+                self._save_state_after_phase_update()
             self.log(f"본 세팅 건너뜀 (수동 본 유지): {spm.name}")
             return
 
@@ -7113,35 +12142,18 @@ class App:
             cached_text = f"{summary} ✓ (변경 없음)"
             if cache.get("status") == "not-sk-ready":
                 raise RuntimeError(f"SK 미제작: {cache.get('error', '본 설정 필요')} (캐시)")
+            self._migrate_cached_positive_spm_receipt(
+                spm,
+                snapshot,
+                cache,
+                summary,
+            )
             self.ui_queue.put(("cell", (iid, "spm_status", cached_text)))
             with self.state_lock:
                 cache["settings_signature"] = self.spm_calibration_signature
                 entry["spm_status"] = cached_text
                 entry["spm_summary"] = summary
-                save_state(self.state)
-            try:
-                write_positive_calibration_receipt(
-                    spm,
-                    getattr(self, "cfg", {}).get("spm_calibration_receipt_dir")
-                    or (TOOL_DIR / "cache" / "spm_calibration"),
-                    bone_semantic_fingerprint_value=(
-                        current_bone_semantic_fingerprint(spm)
-                    ),
-                    settings_signature=self.spm_calibration_signature,
-                    bone_contract_version=SPM_BONE_CONTRACT_VERSION,
-                    report={
-                        "status": cache.get("status"),
-                        "cached_display_summary": summary,
-                        "calibration": {
-                            "mode": "migrated_positive_gui_cache",
-                        },
-                    },
-                )
-            except Exception as exc:
-                self.log(
-                    "  [캐시 경고] SPM bone receipt migration failed: "
-                    f"{spm.name}: {exc}"
-                )
+                self._save_state_after_phase_update()
             self.log(f"본 세팅 건너뜀 (SPM/옵션 변경 없음): {spm.name}")
             return
 
@@ -7245,7 +12257,7 @@ class App:
         )
         with self.state_lock:
             if cacheable and final_snapshot:
-                entry["calibration_cache"] = {
+                calibration_cache = {
                     "version": CALIBRATION_CACHE_VERSION,
                     "spm_fingerprint": final_snapshot["fingerprint"],
                     "settings_signature": self.spm_calibration_signature,
@@ -7255,11 +12267,19 @@ class App:
                     "probe_cache_hit": bool((rep.get("calibration") or {}).get("probe_cache_hit")),
                     "completed_at": datetime.now().isoformat(timespec="seconds"),
                 }
+                semantic_fingerprint = str(
+                    rep.get("bone_semantic_fingerprint") or ""
+                ).strip()
+                if semantic_fingerprint:
+                    calibration_cache["bone_semantic_fingerprint"] = (
+                        semantic_fingerprint
+                    )
+                entry["calibration_cache"] = calibration_cache
             entry["spm_last_duration_seconds"] = round(duration, 3)
             entry["spm_status"] = f"{summary}{warn}"
             entry["spm_summary"] = summary
             entry["blend_status"] = blend_status
-            save_state(self.state)
+            self._save_state_after_phase_update()
         self.ui_queue.put(("cell", (iid, "blend_status", entry["blend_status"])))
         if status == "not-sk-ready":
             raise RuntimeError(f"SK 미제작: {rep.get('error', '보이는 Branch의 본 설정이 모두 꺼져 있음')}")
@@ -7272,11 +12292,12 @@ class App:
             self.log(f"본 세팅 완료: {spm.name} — {summary}")
 
     def _reset_cluster_receipt_refresh_memo(self):
-        """Start one process-local Cluster audit memo generation.
+        """Discard the process-local Cluster live-audit memo.
 
-        One local queue drain owns one generation.  A hit is never trusted by
-        age alone: every caller re-fingerprints the production inputs and live
-        artifacts before reuse, and the memo is discarded when the queue drains.
+        The memo lives for the GUI verification session and is reset only for
+        an explicit scan (or when the app exits).  A hit is never trusted by
+        age alone: every caller re-fingerprints production inputs and live
+        artifacts before reuse.
         """
         self._cluster_receipt_refresh_memo_lock = threading.Lock()
         self._cluster_receipt_refresh_memo = {}
@@ -7485,7 +12506,7 @@ class App:
 
         for candidate in owner.rglob("*.spm"):
             if (
-                candidate.is_file()
+                is_live_spm(candidate)
                 and not is_temporary_contract_path(candidate)
             ):
                 paths.add(candidate.resolve())
@@ -7637,7 +12658,7 @@ class App:
         spm,
         stamp,
     ):
-        """Reuse one hash-current live audit inside the active queue drain.
+        """Reuse one hash-current live audit within this GUI session.
 
         Successful raw audits only are memoized. Concurrent callers for the
         same owner/input share one Future; an execution exception reaches all
@@ -7645,7 +12666,9 @@ class App:
         retry.
         """
         spm = Path(spm).resolve()
-        self._assert_active_production_source_manifest()
+        production_manifest = self._assert_active_production_source_manifest()
+        production_source_revision = str(production_manifest.content_hash)
+        force_rerun = bool(getattr(self, "force_rerun", False))
         if not (spm.parent / "Cluster").is_dir():
             return self._refresh_stale_cluster_receipt_uncached(
                 spm,
@@ -7658,7 +12681,11 @@ class App:
         cached_raw_audit = None
         while True:
             with self._cluster_receipt_refresh_memo_lock:
-                cached = self._cluster_receipt_refresh_memo.get(scope)
+                cached = (
+                    None
+                    if force_rerun
+                    else self._cluster_receipt_refresh_memo.get(scope)
+                )
                 cached_live_artifact_paths = (
                     (cached or {}).get("live_artifact_paths") or ()
                 )
@@ -7694,10 +12721,16 @@ class App:
                 # immutable cache entry while hashes were calculated. Validate
                 # that entry outside the lock instead of accepting or
                 # overwriting it based on the older snapshot.
-                if self._cluster_receipt_refresh_memo.get(scope) is not cached:
+                if (
+                    not force_rerun
+                    and self._cluster_receipt_refresh_memo.get(scope)
+                    is not cached
+                ):
                     continue
                 if (
                     cached is not None
+                    and cached.get("production_source_revision")
+                    == production_source_revision
                     and cached.get("input_fingerprint")
                     == current_cache_fingerprint
                     and cached.get("discovery_fingerprint")
@@ -7709,8 +12742,19 @@ class App:
                     flight_key = None
                     flight = None
                     owns_flight = False
+                elif force_rerun:
+                    # A force run must execute an independent live audit.
+                    # Keep the existing retry/stability wrapper, but neither
+                    # consume nor publish a session memo or shared flight.
+                    flight_key = None
+                    flight = Future()
+                    owns_flight = True
                 else:
-                    flight_key = (scope, pre_discovery_fingerprint)
+                    flight_key = (
+                        scope,
+                        production_source_revision,
+                        pre_discovery_fingerprint,
+                    )
                     flight = self._cluster_receipt_refresh_flights.get(
                         flight_key
                     )
@@ -7749,15 +12793,32 @@ class App:
             attempt_pre_fingerprint = pre_discovery_fingerprint
             attempt_pre_records = pre_discovery_records
             for attempt in range(2):
-                raw_audit = self._refresh_stale_cluster_receipt_uncached(
-                    spm,
-                    (
-                        stamp
-                        if attempt == 0
-                        else f"{stamp}_retry{attempt}"
-                    ),
-                    _raw_only=True,
+                audit_stamp = (
+                    stamp
+                    if attempt == 0
+                    else f"{stamp}_retry{attempt}"
                 )
+                try:
+                    raw_audit = self._refresh_stale_cluster_receipt_uncached(
+                        spm,
+                        audit_stamp,
+                        _raw_only=True,
+                    )
+                except InlineAtlasRepairRequested as repair_request:
+                    self._run_inline_atlas_manifest_repair(
+                        repair_request.target_spm,
+                        repair_request.report,
+                    )
+                    # The read-only audit consumes Atlas disagreement as
+                    # diagnostics while retaining the identity-bound Assembly
+                    # graph.  Even if the optional exact metadata refresh did
+                    # not change anything, this second run returns real live
+                    # contract evidence rather than a synthetic pass-through.
+                    raw_audit = self._refresh_stale_cluster_receipt_uncached(
+                        spm,
+                        f"{audit_stamp}_atlas_repaired",
+                        _raw_only=True,
+                    )
                 post_discovery_records = []
                 post_discovery_fingerprint = (
                     self._cluster_receipt_refresh_input_fingerprint(
@@ -7813,15 +12874,31 @@ class App:
                         and final_artifacts_match
                     )
                     if stable:
-                        self._assert_active_production_source_manifest()
-                        cache_entry = {
-                            "input_fingerprint": post_cache_fingerprint,
-                            "discovery_fingerprint": (
-                                final_discovery_fingerprint
-                            ),
-                            "live_artifact_paths": live_artifact_paths,
-                            "raw_audit": copy.deepcopy(raw_audit),
-                        }
+                        final_manifest = (
+                            self._assert_active_production_source_manifest()
+                        )
+                        final_revision = str(final_manifest.content_hash)
+                        if (
+                            not force_rerun
+                            and final_revision == production_source_revision
+                        ):
+                            cache_entry = {
+                                "production_source_revision": (
+                                    production_source_revision
+                                ),
+                                "input_fingerprint": post_cache_fingerprint,
+                                "discovery_fingerprint": (
+                                    final_discovery_fingerprint
+                                ),
+                                "live_artifact_paths": live_artifact_paths,
+                                "raw_audit": copy.deepcopy(raw_audit),
+                            }
+                        elif final_revision != production_source_revision:
+                            self.log(
+                                "Cluster Assembly live audit memo not "
+                                "published after production source revision "
+                                f"changed: {spm.name}"
+                            )
                         break
                     artifact_errors = final_artifact_errors
                     observed_discovery_records = final_discovery_records
@@ -7864,7 +12941,11 @@ class App:
         publish_error = completion_error
         with self._cluster_receipt_refresh_memo_lock:
             try:
-                if publish_error is None and cache_entry is not None:
+                if (
+                    publish_error is None
+                    and not force_rerun
+                    and cache_entry is not None
+                ):
                     self._cluster_receipt_refresh_memo[scope] = cache_entry
                 if publish_error is None:
                     flight.set_result(copy.deepcopy(raw_audit))
@@ -7885,7 +12966,8 @@ class App:
                         pass
             finally:
                 if (
-                    self._cluster_receipt_refresh_flights.get(flight_key)
+                    flight_key is not None
+                    and self._cluster_receipt_refresh_flights.get(flight_key)
                     is flight
                 ):
                     self._cluster_receipt_refresh_flights.pop(
@@ -8090,10 +13172,56 @@ class App:
                 and persistence.get("live_audit_complete") is True
             )
             if code != 0 and not persistence_only_failure:
+                failure_report = copy.deepcopy(
+                    (payload or {}).get("failure") or {}
+                )
+                failure_token = str(
+                    failure_report.get("reason_token") or ""
+                )
+                if failure_token.startswith("atlas_manifest_"):
+                    decision = repair_ui_decision(failure_report)
+                    repair_evidence = failure_report.get("evidence") or {}
+                    repair_target = str(
+                        repair_evidence.get("target_spm") or ""
+                    )
+                    if (
+                        decision["status"] == REPAIR_UI_AUTOMATIC
+                        and repair_target
+                    ):
+                        raise InlineAtlasRepairRequested(
+                            repair_target,
+                            {
+                                "status": "automatic_repair_pending",
+                                "stage": "cluster_assembly_live_audit",
+                                "owner_spm": str(spm),
+                                "repair_disposition": decision["status"],
+                                "reason_ko": decision["reason"],
+                                "action_ko": decision["action"],
+                                **failure_report,
+                            },
+                            log_file=log_file,
+                            report_file=audit_report,
+                        )
+                    raise BatchItemError(
+                        "Cluster Assembly child returned a strict Atlas "
+                        "metadata failure instead of a diagnostic live "
+                        f"contract: {spm.name}",
+                        kind="internal_error",
+                        report={
+                            "stage": "cluster_assembly_live_audit",
+                            "asset_failure": False,
+                            "unexpected_strict_atlas_failure": copy.deepcopy(
+                                failure_report
+                            ),
+                        },
+                        log_file=log_file,
+                        report_file=audit_report,
+                    )
                 raise BatchItemError(
                     "Cluster Assembly live audit process failed: "
                     f"{spm.name} (exit {code})",
                     kind="internal_error",
+                    report=payload if isinstance(payload, dict) else None,
                     log_file=log_file,
                     report_file=audit_report,
                 )
@@ -8201,10 +13329,75 @@ class App:
         actual_failure = cluster_issue_summary(live_issues)
 
         if actual_failure:
+            decision = repair_ui_decision({"issues": live_issues})
+            # This gate used to print 자동 복구 대상 and then terminate the
+            # target without ever consulting the planner (#160).  A block the
+            # registry can act on now leaves through the same typed exclusion
+            # the repair path admits; everything else stays terminal.
+            selected = raw_audit.get("selected_contract")
+            if not isinstance(selected, dict):
+                try:
+                    from cluster_assembly_handoff_contract import (
+                        select_cluster_contract,
+                    )
+                    selected = select_cluster_contract(payload, spm)
+                except (ImportError, ValueError):
+                    selected = None
+            audit_producer, audit_block = cluster_live_audit_target_block(
+                selected if isinstance(selected, dict) else {},
+                spm,
+            )
+            if (
+                audit_block
+                and audit_producer is not None
+                and has_repair_contract_evidence({"issues": live_issues})
+            ):
+                evidence = {
+                    "audit_report": str(audit_report),
+                    "target_spm": audit_block["target_spm"],
+                    "target_name": audit_block["target_name"],
+                    "delivery_mode": audit_block["delivery_mode"],
+                    "delivery_errors": audit_block["delivery_errors"],
+                    "delivery_remedy": audit_block["delivery_remedy"],
+                    "stale_node_table_target_mesh_ids": audit_block[
+                        "stale_node_table_target_mesh_ids"
+                    ],
+                    "live_node_table": audit_block["live_node_table"],
+                    "issue_codes": sorted({
+                        str(issue.get("code") or "")
+                        for issue in live_issues
+                        if isinstance(issue, dict) and issue.get("code")
+                    }),
+                    "issues": copy.deepcopy(live_issues),
+                    "gate": "cluster_assembly_live_audit",
+                }
+                raise TargetPlannedExclusionError(
+                    "현재 Cluster Assembly 전달이 차단됨: "
+                    + target_planned_exclusion_summary(
+                        spm,
+                        audit_block["reason_token"],
+                        evidence,
+                    ),
+                    reason_token=audit_block["reason_token"],
+                    target_spm=spm,
+                    producer_spm=audit_producer,
+                    evidence=evidence,
+                    log_file=log_file,
+                    report_file=audit_report,
+                )
             raise BatchItemError(
-                "Cluster Assembly actual data audit failed: "
-                + actual_failure,
+                f"최종 차단: {spm.name} Cluster Assembly 데이터 검사 · "
+                f"원인: {decision['reason']} · 조치: {decision['action']}",
                 kind="data_error",
+                report={
+                    "stage": "cluster_assembly_live_audit",
+                    "spm": str(spm),
+                    "repair_disposition": decision["status"],
+                    "reason_ko": decision["reason"],
+                    "action_ko": decision["action"],
+                    "issues": copy.deepcopy(live_issues),
+                    "internal_summary": actual_failure,
+                },
                 log_file=log_file,
                 report_file=audit_report,
             )
@@ -8395,25 +13588,10 @@ class App:
             for issue in owned_issues
             if str(issue.get("code") or "") not in normalizable_codes
         ]
-        blocking = (
-            global_issues + owned_issues
-            if require_normalized
-            else global_issues + unexpected_owned
-        )
-        normalized_variants = dependency.get("normalized_variants")
-        variants_required = bool(
-            dependency.get("normalized_variants_required")
-        )
-        if (
-            require_normalized
-            and variants_required
-            and not normalized_variants
-            and not owned_issues
-        ):
-            blocking.append({
-                "code": "NORMALIZED_VARIANTS_REQUIRED",
-                "spm": str(producer),
-            })
+        # Historical normalization rows are maintenance evidence. They do not
+        # override the fresh live handoff or turn a completed repair attempt
+        # into an asset failure. Only other current, scoped issues remain.
+        blocking = global_issues + unexpected_owned
         if blocking:
             target_block = cluster_target_delivery_block(
                 contract,
@@ -8425,14 +13603,20 @@ class App:
                 for issue in blocking
                 if isinstance(issue, dict)
             }
+            # Admission is the registry's call, not a per-gate allowlist.
+            # The old `blocking_codes <= {two codes}` guard meant every new
+            # repairable reason -- canonical_bark_normalization_required,
+            # normalized_variants_required, normalized_variants_stale --
+            # printed 자동 복구 대상 and then terminated the target, because
+            # nobody remembered to widen this set (#160).
+            # `not global_issues` stays: target-local isolation (#16).
+            # Disposition authority stays with build_exact_target_repair_plan(),
+            # which returns unsupported for anything it cannot act on, and the
+            # exclusion then propagates as a visible planned exclusion.
             if (
                 target_block
                 and not global_issues
-                and blocking_codes
-                <= {
-                    "NORMALIZED_GENERATOR_DELIVERY_INCOMPLETE",
-                    "NORMALIZED_GENERATOR_NODE_TABLE_STALE",
-                }
+                and has_repair_contract_evidence({"issues": blocking})
             ):
                 reason_token = target_block["reason_token"]
                 evidence = {
@@ -8464,8 +13648,7 @@ class App:
                     evidence,
                 )
                 raise TargetPlannedExclusionError(
-                    "Cluster normalization target excluded by current live "
-                    f"delivery: {summary}",
+                    "현재 Generator 전달이 차단됨: " + summary,
                     reason_token=reason_token,
                     target_spm=target,
                     producer_spm=producer,
@@ -8474,10 +13657,26 @@ class App:
                     report_file=audit_report,
                 )
             summary = cluster_issue_summary(blocking)
-            stage = "output" if require_normalized else "input"
+            stage = "출력" if require_normalized else "입력"
+            decision = repair_ui_decision({"issues": blocking})
+            # Reaching here means no repair will run for this row, so it may
+            # not claim one is coming.  A row cannot be labelled 자동 복구 대상
+            # and be terminal at the same time (#160).
             raise BatchItemError(
-                f"Cluster normalization {stage} validation failed: {summary}",
+                f"최종 차단: {target.name} Cluster 정규화 {stage} 검사 · "
+                f"원인: {decision['reason']} · 조치: {decision['action']}",
                 kind="data_error",
+                report={
+                    "stage": "cluster_normalization_validation",
+                    "validation_side": stage,
+                    "target_spm": str(target),
+                    "producer_spm": str(producer),
+                    "repair_disposition": decision["status"],
+                    "reason_ko": decision["reason"],
+                    "action_ko": decision["action"],
+                    "issues": copy.deepcopy(blocking),
+                    "internal_summary": summary,
+                },
                 log_file=log_file,
                 report_file=audit_report,
             )
@@ -8537,6 +13736,430 @@ class App:
             runnable_relation_targets.append(target)
         return runnable_relation_targets, live_target_contracts
 
+    def _attempt_registered_relation_repair(
+        self,
+        exclusion,
+        stamp,
+        producer_spm,
+        *,
+        require_normalized,
+        reaudit=None,
+    ):
+        """Run a relation gate's registered repair under its current lease.
+
+        The relation audit and failed-retry button share the same plan builder
+        and exact executor.  An unsupported reason remains a visible target
+        exclusion; cancellation or lost queue ownership remains a lifecycle
+        terminal and is never relabelled as damaged target data.
+        """
+
+        target = Path(exclusion.target_spm).resolve(strict=False)
+        producer = Path(producer_spm).resolve(strict=False)
+        durable_evidence = copy.deepcopy(exclusion.evidence)
+        durable_evidence.pop("repair_attempt", None)
+        repair_evidence = {
+            "reason_token": str(exclusion.reason_token),
+            "target_spm": str(target),
+            "producer_spm": str(producer),
+            "evidence": durable_evidence,
+        }
+        reason_codes = set(evidence_reason_codes(repair_evidence))
+        if not reason_codes or not has_repair_contract_evidence(
+            repair_evidence
+        ):
+            return None
+
+        def attach_attempt(payload):
+            attempt = copy.deepcopy(payload)
+            exclusion.evidence["repair_attempt"] = attempt
+            report = getattr(exclusion, "report", None)
+            if isinstance(report, dict):
+                report.setdefault("evidence", {})["repair_attempt"] = (
+                    copy.deepcopy(attempt)
+                )
+
+        if self.stop_flag.is_set():
+            raise BatchItemError(
+                "Generator/Cluster 자동 복구가 사용자에 의해 취소되었습니다.",
+                kind="cancelled",
+                report={
+                    "reason_token": "operator_cancelled",
+                    "target_spm": str(target),
+                    "producer_spm": str(producer),
+                },
+            )
+
+        active_job = getattr(self, "active_batch_job", None)
+        if not isinstance(active_job, dict) or not active_job.get("id"):
+            attach_attempt({
+                "status": "not_started",
+                "reason_token": "initiating_job_context_missing",
+                "reason_codes": sorted(reason_codes),
+            })
+            return None
+
+        inventory_paths = []
+        seen_inventory = set()
+
+        def add_inventory(value):
+            if not value:
+                return
+            path = Path(value).resolve(strict=False)
+            key = os.path.normcase(os.path.abspath(str(path))).casefold()
+            if key not in seen_inventory:
+                seen_inventory.add(key)
+                inventory_paths.append(path)
+
+        add_inventory(target)
+        add_inventory(producer)
+        for source_name in ("_active_batch_inventory", "items"):
+            source = getattr(self, source_name, None)
+            if not isinstance(source, dict):
+                continue
+            for iid, item in source.items():
+                add_inventory(
+                    item.get("spm") if isinstance(item, dict) else iid
+                )
+
+        retry_metadata = copy.deepcopy(
+            getattr(self, "_active_retry_metadata", {}) or {}
+        )
+        queue_identity = str(
+            active_job.get("shared_queue_job_id")
+            or active_job.get("id")
+        )
+        parent_retry_id = str(
+            retry_metadata.get("progress_run_id")
+            or active_job.get("shared_queue_job_id")
+            or f"sk-batch-{active_job['id']}"
+        )
+        request_digest = hashlib.sha256(json.dumps(
+            {
+                "queue_identity": queue_identity,
+                "target_spm": str(target),
+                "producer_spm": str(producer),
+                "reason_codes": sorted(reason_codes),
+                "evidence": repair_evidence,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")).hexdigest()[:16]
+        request_id = f"cluster-relation-{request_digest}"
+
+        try:
+            repair_plan = build_exact_target_repair_plan(
+                target,
+                repair_evidence,
+                inventory_paths=inventory_paths,
+                parent_retry_id=parent_retry_id,
+                request_id=request_id,
+            )
+        except (FileNotFoundError, TypeError, ValueError) as exc:
+            attach_attempt({
+                "status": "not_started",
+                "reason_token": "exact_target_plan_invalid",
+                "reason_codes": sorted(reason_codes),
+                "error": compact_error_message(exc, 320),
+            })
+            return None
+
+        plan = repair_plan.metadata()
+        if not repair_plan.supported:
+            attach_attempt({
+                "status": "unsupported",
+                "reason_token": "registered_reason_has_no_exact_action",
+                "reason_codes": list(plan.get("reason_codes") or ()),
+                "reason_ko": repair_plan.friendly_reason,
+                "action_ko": repair_plan.remaining_action,
+                REPAIR_FAILURE_KEY: build_repair_failure(
+                    request_id=request_id,
+                    plan_metadata=plan,
+                    failure_code="registered_reason_has_no_exact_action",
+                ),
+            })
+            return None
+
+        lease = getattr(self, "_active_shared_queue_lease", None)
+        captured_shared_job_id = active_job.get("shared_queue_job_id")
+        lease_job_id = getattr(lease, "job_id", None)
+        if (
+            lease is None
+            or getattr(lease, "finished", False)
+            or (
+                captured_shared_job_id
+                and lease_job_id != captured_shared_job_id
+            )
+        ):
+            raise BatchItemError(
+                "Generator/Cluster 자동 복구의 공용 대기열 소유권이 없습니다.",
+                kind="owner_lost",
+                report={
+                    "reason_token": "shared_queue_lease_owner_lost",
+                    "target_spm": str(target),
+                    "producer_spm": str(producer),
+                    "request_id": request_id,
+                },
+            )
+        renew = getattr(lease, "renew_and_check_current", None)
+        if renew is not None and not renew():
+            raise BatchItemError(
+                "Generator/Cluster 자동 복구의 공용 대기열 lease가 만료되었습니다.",
+                kind="owner_lost",
+                report={
+                    "reason_token": "shared_queue_lease_owner_lost",
+                    "target_spm": str(target),
+                    "producer_spm": str(producer),
+                    "request_id": request_id,
+                },
+            )
+
+        def observe_fresh():
+            # The live-audit gate re-resolves a receipt, not a normalization
+            # observation.  Both admit repair through this one executor, so
+            # the caller supplies the shape its own gate returns (#160).
+            if reaudit is not None:
+                return reaudit()
+            return self._cluster_normalization_stage_observation(
+                target,
+                f"{stamp}_registered_repair_reaudit",
+                producer,
+                require_normalized=require_normalized,
+            )
+
+        def fresh_reaudit(attempted_stages):
+            try:
+                return observe_fresh()
+            except TargetPlannedExclusionError as fresh_exclusion:
+                fresh_attempt = {
+                    "status": "repaired_but_reaudit_blocked",
+                    "request_id": request_id,
+                    "reason_codes": list(plan.get("reason_codes") or ()),
+                    "attempted_stages": copy.deepcopy(attempted_stages),
+                }
+                fresh_exclusion.evidence["repair_attempt"] = fresh_attempt
+                if isinstance(fresh_exclusion.report, dict):
+                    fresh_exclusion.report.setdefault("evidence", {})[
+                        "repair_attempt"
+                    ] = copy.deepcopy(fresh_attempt)
+                raise
+
+        with _REGISTERED_RELATION_REPAIR_LOCK:
+            memo = self.__dict__.setdefault(
+                "_registered_relation_repair_results", {}
+            )
+            cached = copy.deepcopy(memo.get(request_id))
+            if cached is not None:
+                cached_status = str(cached.get("status") or "")
+                if cached_status == "completed":
+                    return fresh_reaudit(cached.get("attempted_stages") or ())
+                if cached_status == "cancelled":
+                    raise BatchItemError(
+                        "Generator/Cluster 자동 복구가 사용자에 의해 취소되었습니다.",
+                        kind="cancelled",
+                        report=cached,
+                    )
+                if cached_status == "owner_lost":
+                    raise BatchItemError(
+                        "Generator/Cluster 자동 복구의 실행 소유권을 잃었습니다.",
+                        kind="owner_lost",
+                        report=cached,
+                    )
+                attach_attempt(cached)
+                return None
+
+            attempted = []
+            planned_stages = list(plan.get("stages") or ())
+            modeler_live_resolution = None
+            self.ui_queue.put((
+                "progress",
+                f"{target.name} · Generator/Cluster exact 자동 복구 시작",
+            ))
+            self.log(
+                "[자동 복구 시작] Generator/Cluster exact target · "
+                f"{target.name} · provider={producer.name} · "
+                f"reasons={','.join(sorted(reason_codes))}"
+            )
+            for stage_index, stage in enumerate(planned_stages, 1):
+                if self.stop_flag.is_set():
+                    cancelled = {
+                        "status": "cancelled",
+                        "reason_token": "operator_cancelled",
+                        "request_id": request_id,
+                        "attempted_stages": copy.deepcopy(attempted),
+                    }
+                    memo[request_id] = copy.deepcopy(cancelled)
+                    raise BatchItemError(
+                        "Generator/Cluster 자동 복구가 사용자에 의해 취소되었습니다.",
+                        kind="cancelled",
+                        report=cancelled,
+                    )
+                receipt = LOG_DIR / (
+                    f"exact_repair_{request_id}_{stage_index}.json"
+                )
+
+                def on_progress(payload, asset=target.name):
+                    self.ui_queue.put((
+                        "progress",
+                        f"{asset} · "
+                        f"{payload.get('current_stage') or stage['stage']}",
+                    ))
+
+                terminal = self._execute_exact_repair_stage(
+                    plan,
+                    stage,
+                    lease,
+                    stage_index=stage_index,
+                    receipt=receipt,
+                    provenance_source="sk_batch.cluster_relation",
+                    on_progress=on_progress,
+                )
+                terminal_status = str(
+                    terminal.get("terminal_status")
+                    or terminal.get("status")
+                    or ""
+                )
+                terminal_result = terminal.get("result") or {}
+                if (
+                    len(planned_stages) == 1
+                    and stage.get("repair_action")
+                    == MODELER_NODE_TABLE_RECOVERY
+                    and isinstance(
+                        terminal_result.get("live_resolution"), dict
+                    )
+                ):
+                    modeler_live_resolution = copy.deepcopy(
+                        terminal_result["live_resolution"]
+                    )
+                attempted.append({
+                    "stage": stage["stage"],
+                    "tool": stage["tool"],
+                    "repair_action": stage["repair_action"],
+                    "targets": list(stage["target_spms"]),
+                    "receipt": str(receipt),
+                    "status": terminal_status,
+                })
+                if terminal_status == "cancelled":
+                    cancelled = {
+                        "status": "cancelled",
+                        "reason_token": "operator_cancelled",
+                        "request_id": request_id,
+                        "attempted_stages": copy.deepcopy(attempted),
+                    }
+                    memo[request_id] = copy.deepcopy(cancelled)
+                    raise BatchItemError(
+                        "Generator/Cluster 자동 복구가 사용자에 의해 취소되었습니다.",
+                        kind="cancelled",
+                        report=cancelled,
+                    )
+                if terminal_status != "completed":
+                    if terminal.get("failure_kind") == "owner_lost":
+                        owner_lost = {
+                            "reason_token": "shared_queue_lease_owner_lost",
+                            "request_id": request_id,
+                            "attempted_stages": copy.deepcopy(attempted),
+                            "error": compact_error_message(
+                                terminal.get("error")
+                                or "exact repair owner lost",
+                                320,
+                            ),
+                        }
+                        memo[request_id] = {
+                            "status": "owner_lost",
+                            **copy.deepcopy(owner_lost),
+                        }
+                        raise BatchItemError(
+                            "Generator/Cluster 자동 복구의 실행 소유권을 잃었습니다.",
+                            kind="owner_lost",
+                            report=owner_lost,
+                        )
+                    raw_error = compact_error_message(
+                        terminal.get("error")
+                        or (terminal.get("result") or {}).get("reason")
+                        or "exact BAT repair failed",
+                        320,
+                    )
+                    failed = {
+                        "status": "failed",
+                        "reason_token": "exact_relation_repair_failed",
+                        "request_id": request_id,
+                        "reason_codes": list(plan.get("reason_codes") or ()),
+                        "attempted_stages": copy.deepcopy(attempted),
+                        "error": raw_error,
+                        # Survives the process; the memo above does not (#167).
+                        REPAIR_FAILURE_KEY: build_repair_failure(
+                            request_id=request_id,
+                            plan_metadata=plan,
+                            attempted_stages=attempted,
+                            failed_stage=stage["stage"],
+                            failure_code="exact_relation_repair_failed",
+                            failure_report=str(receipt),
+                            error=raw_error,
+                        ),
+                    }
+                    memo[request_id] = copy.deepcopy(failed)
+                    attach_attempt(failed)
+                    return None
+
+            completed = {
+                "status": "completed",
+                "request_id": request_id,
+                "reason_codes": list(plan.get("reason_codes") or ()),
+                "attempted_stages": copy.deepcopy(attempted),
+            }
+            memo[request_id] = copy.deepcopy(completed)
+            self.ui_queue.put((
+                "progress",
+                f"{target.name} · exact 자동 복구 완료 · live 재검증 중",
+            ))
+            if modeler_live_resolution is not None:
+                return modeler_live_resolution
+            return fresh_reaudit(attempted)
+
+    def _cluster_receipt_with_recovery(self, spm, stamp):
+        """Resolve one owner receipt, repairing a registered target block.
+
+        The direct Cluster Assembly run reached the live-audit gate with no
+        repair frame at all: the row said 자동 복구 대상 and the target died
+        (#160).  It now uses the same admission, executor and lease the
+        normalization gate uses, and re-resolves the receipt afterwards.
+        """
+        try:
+            return self._refresh_stale_cluster_receipt(spm, stamp)
+        except TargetPlannedExclusionError as exc:
+            if self.stop_flag.is_set():
+                raise BatchItemError(
+                    "Cluster Assembly 검사가 사용자에 의해 취소되었습니다.",
+                    kind="cancelled",
+                    report={
+                        "reason_token": "operator_cancelled",
+                        "target_spm": str(spm),
+                    },
+                )
+            recovered = self._attempt_registered_relation_repair(
+                exc,
+                stamp,
+                exc.producer_spm,
+                require_normalized=True,
+                reaudit=lambda: self._refresh_stale_cluster_receipt(
+                    spm,
+                    f"{stamp}_after_registered_repair",
+                ),
+            )
+            if recovered is not None:
+                return recovered
+            if self.stop_flag.is_set():
+                raise BatchItemError(
+                    "Cluster Assembly 자동 복구가 사용자에 의해 취소되었습니다.",
+                    kind="cancelled",
+                    report={
+                        "reason_token": "operator_cancelled",
+                        "target_spm": str(spm),
+                    },
+                )
+            raise
+
     def _cluster_normalization_stage_with_recovery(
         self,
         target_spm,
@@ -8554,15 +14177,35 @@ class App:
                 require_normalized=require_normalized,
             )
         except TargetPlannedExclusionError as exc:
-            recovered = self._attempt_stale_node_table_recovery(
+            if self.stop_flag.is_set():
+                raise BatchItemError(
+                    "Generator/Cluster 검사가 사용자에 의해 취소되었습니다.",
+                    kind="cancelled",
+                    report={
+                        "reason_token": "operator_cancelled",
+                        "target_spm": str(target_spm),
+                        "producer_spm": str(producer_spm),
+                    },
+                )
+            recovered = self._attempt_registered_relation_repair(
                 exc,
                 stamp,
                 producer_spm,
                 require_normalized=require_normalized,
             )
-            if recovered is None:
-                raise
-            return recovered
+            if recovered is not None:
+                return recovered
+            if self.stop_flag.is_set():
+                raise BatchItemError(
+                    "Generator/Cluster 자동 복구가 사용자에 의해 취소되었습니다.",
+                    kind="cancelled",
+                    report={
+                        "reason_token": "operator_cancelled",
+                        "target_spm": str(target_spm),
+                        "producer_spm": str(producer_spm),
+                    },
+                )
+            raise
 
     def _attempt_stale_node_table_recovery(
         self,
@@ -8572,7 +14215,7 @@ class App:
         *,
         require_normalized,
     ):
-        """Run one sealed manual-Save recovery inside the active job lease."""
+        """Run one sealed semantic-Save recovery inside the active job lease."""
         scope = (
             exclusion.evidence.get("stale_node_table_recovery")
             if isinstance(exclusion.evidence, dict)
@@ -8593,12 +14236,18 @@ class App:
                 "status": "not_started",
                 "reason_token": "initiating_job_cancelled",
             }
-            return None
+            raise BatchItemError(
+                "SpeedTree Node table 자동 복구가 사용자에 의해 취소되었습니다.",
+                kind="cancelled",
+                report=copy.deepcopy(exclusion.evidence["recovery_attempt"]),
+            )
 
         from pcg_st9_texture_batch.stale_node_table_recovery import (
             StaleNodeTableRecoveryError,
-            launch_modeler_for_manual_save,
             recover_stale_node_table,
+        )
+        from pcg_st9_texture_batch.speedtree_modeler_uia import (
+            SpeedTreeModelerRecoverySession,
         )
 
         target = Path(scope["target_spm"]).resolve(strict=False)
@@ -8639,22 +14288,6 @@ class App:
             "is_queue_current": is_queue_current,
         }
 
-        def launch_with_instruction(executable, spm):
-            self.ui_queue.put((
-                "modeler_recovery",
-                {
-                    "target_spm": str(spm),
-                    "scope_sha256": scope["scope_sha256"],
-                    "expected_mesh_ids": list(scope["expected_mesh_ids"]),
-                },
-            ))
-            self.log(
-                "Modeler launch requested for exact recovery target: "
-                f"{spm} | verify the path, then choose File > Save; "
-                "Save As/incremental Save are not accepted"
-            )
-            return launch_modeler_for_manual_save(executable, spm)
-
         def retry_stage(continuation):
             self.ui_queue.put((
                 "progress",
@@ -8688,15 +14321,39 @@ class App:
         ))
         self.log(
             "Stale Node-table recovery scope sealed from live audit: "
-            f"{target} | Mesh IDs "
-            + ",".join(str(value) for value in scope["expected_mesh_ids"])
+            f"{target} | Authoring Mesh IDs "
+            + ",".join(str(value) for value in scope["authoring_mesh_ids"])
+            + " | required-live Mesh IDs "
+            + ",".join(
+                str(value) for value in scope["required_live_mesh_ids"]
+            )
             + f" | scope={scope['scope_sha256']}"
         )
+        executable = self.cfg.get("speedtree_exe") or ""
+        modeler_session = self._stale_node_table_modeler_session
+        if (
+            modeler_session is None
+            or not modeler_session.is_compatible(executable)
+        ):
+            modeler_session = SpeedTreeModelerRecoverySession(executable)
+            self._stale_node_table_modeler_session = modeler_session
+        self.ui_queue.put((
+            "modeler_recovery",
+            {
+                "target_spm": str(target),
+                "scope_sha256": scope["scope_sha256"],
+                "authoring_mesh_ids": list(scope["authoring_mesh_ids"]),
+                "required_live_mesh_ids": list(
+                    scope["required_live_mesh_ids"]
+                ),
+            },
+        ))
         try:
             result = recover_stale_node_table(
                 target,
-                self.cfg.get("speedtree_exe") or "",
-                scope["expected_mesh_ids"],
+                executable,
+                authoring_mesh_ids=scope["authoring_mesh_ids"],
+                required_live_mesh_ids=scope["required_live_mesh_ids"],
                 timeout=7200,
                 poll_interval=2.0,
                 stable_reads=3,
@@ -8707,11 +14364,35 @@ class App:
                 expected_preimage_raw_sha256=scope[
                     "target_preimage_raw_sha256"
                 ],
-                launch_fn=launch_with_instruction,
+                modeler_session=modeler_session,
                 continuation_commit_lock=self._recovery_commit_lock,
                 on_continuation_claimed=mark_resume_committed,
             )
         except StaleNodeTableRecoveryError as exc:
+            if exc.reason_token in {
+                "initiating_job_cancelled",
+                "initiating_app_closed",
+            }:
+                raise BatchItemError(
+                    "SpeedTree Node table 자동 복구가 취소되었습니다.",
+                    kind="cancelled",
+                    report={
+                        "reason_token": exc.reason_token,
+                        "evidence": copy.deepcopy(exc.evidence),
+                    },
+                ) from exc
+            if exc.reason_token in {
+                "initiating_job_generation_stale",
+                "initiating_queue_lease_lost",
+            }:
+                raise BatchItemError(
+                    "SpeedTree Node table 자동 복구의 실행 소유권을 잃었습니다.",
+                    kind="owner_lost",
+                    report={
+                        "reason_token": exc.reason_token,
+                        "evidence": copy.deepcopy(exc.evidence),
+                    },
+                ) from exc
             continuation_failed = exc.reason_token in {
                 "continuation_callback_failed",
                 "continuation_claim_publish_failed",
@@ -8739,7 +14420,8 @@ class App:
                 self.log(
                     "Stale Node-table recovery stopped fail-closed: "
                     f"{target.name} | reason={exc.reason_token}. "
-                    "Modeler was not closed. Start a fresh live audit before retry."
+                    "No unrelated Modeler process was touched. Start a fresh "
+                    "live audit before retry."
                 )
             return None
         except OSError as exc:
@@ -8750,7 +14432,7 @@ class App:
             self.log(
                 "Stale Node-table recovery I/O failed closed: "
                 f"{target.name} | {compact_error_message(exc)}. "
-                "Modeler was not closed."
+                "No unrelated Modeler process was touched."
             )
             return None
 
@@ -8775,15 +14457,75 @@ class App:
             return None
         self.log(
             "Stale Node-table recovery verified and original stage resumed "
-            f"once: {target.name} | after={result.get('after_raw_sha256')}"
+            f"once: {target.name} | after={result.get('after_raw_sha256')} | "
+            "semantic exact-document Close verified; owned session retained"
         )
         return live_resolution
+
+    def _publish_current_repair_skip(self, iid, spm, repair_state):
+        """Publish one exact current Repair result without rediscovering work."""
+        if not isinstance(repair_state, dict) or not repair_state.get("current"):
+            return False
+        stage_evidence = None
+        if repair_state.get("push_ready"):
+            try:
+                stage_evidence = self._repair_stage_evidence_if_active(
+                    spm,
+                    repair_state.get("push_dependency_contract"),
+                )
+            except (
+                OSError,
+                TypeError,
+                ValueError,
+                RepairPushEvidenceError,
+            ) as exc:
+                self.log(
+                    "Current Repair output has no v2 stage evidence; "
+                    "rebuilding instead of falling through to standalone "
+                    f"Push: {Path(spm).name} · {compact_error_message(exc)}"
+                )
+                return False
+        self._record_live_blend_status(
+            iid,
+            spm,
+            repair_state=repair_state,
+        )
+        suffix = (
+            " · Unreal Push 차단 상태 유지"
+            if not repair_state.get("push_ready")
+            else ""
+        )
+        self._publish_repair_stage_contract(
+            spm,
+            ready=repair_state.get("push_ready") is True,
+            reason=repair_state.get("reason"),
+            kind=repair_state.get("kind"),
+            push_dependency_contract=repair_state.get(
+                "push_dependency_contract"
+            ),
+            evidence_bundle=stage_evidence,
+        )
+        self.log(f"건너뜀 (blend 최신{suffix}): {Path(spm).name}")
+        return True
 
     def _job_blender(self, iid, spm, item):
         from spm_audit import audit_spm, sk_readiness
 
         spm = self._prepare_pair_for_job(spm)
         cluster_source = is_cluster_source_spm(spm)
+        if not self.force_rerun:
+            # The shared Repair decision already validates the exact SPM,
+            # blend, BWR report, material/wind output and exact dependency
+            # artifacts.  Consult it before Atlas refresh, consumer audits or
+            # material preflight for both owner Trees and Cluster providers.
+            # Explicit force rebuild deliberately bypasses this fast path.
+            repair_state = self._repair_output_state(spm)
+            if self._publish_current_repair_skip(
+                iid,
+                spm,
+                repair_state,
+            ):
+                return
         self._refresh_canonical_atlas_manifests(spm)
         producer_spm = speedtree_output_spm_for(spm)
         speedtree_spm = producer_spm
@@ -8941,15 +14683,11 @@ class App:
             nonlocal cluster_receipt_resolution, cluster_receipt_resolved
             if not cluster_receipt_resolved:
                 cluster_receipt_resolution = (
-                    self._refresh_stale_cluster_receipt(speedtree_spm, stamp)
+                    self._cluster_receipt_with_recovery(speedtree_spm, stamp)
                 )
                 cluster_receipt_resolved = True
             return cluster_receipt_resolution
 
-        if not cluster_source:
-            # A current blend is not enough for an owner Tree.  Resolve the
-            # live Cluster relationship before authorizing an early Repair skip.
-            resolve_cluster_receipt_once()
         if not self.force_rerun:
             live_contract = cluster_receipt_resolution_uses_live_audit(
                 cluster_receipt_resolution
@@ -9076,55 +14814,11 @@ class App:
                         )
                         if relation_outputs_changed:
                             repair_state = self._repair_output_state(spm)
-                    stage_evidence = None
-                    if (
-                        repair_state["current"]
-                        and repair_state["push_ready"]
+                    if self._publish_current_repair_skip(
+                        iid,
+                        spm,
+                        repair_state,
                     ):
-                        try:
-                            stage_evidence = (
-                                self._repair_stage_evidence_if_active(
-                                    spm,
-                                    repair_state.get(
-                                        "push_dependency_contract"
-                                    ),
-                                )
-                            )
-                        except (
-                            OSError,
-                            TypeError,
-                            ValueError,
-                            RepairPushEvidenceError,
-                        ) as exc:
-                            repair_state["current"] = False
-                            self.log(
-                                "Current Repair output has no v2 stage "
-                                "evidence; rebuilding instead of falling "
-                                f"through to standalone Push: {spm.name} · "
-                                f"{compact_error_message(exc)}"
-                            )
-                    if repair_state["current"]:
-                        self._record_live_blend_status(
-                            iid,
-                            spm,
-                            repair_state=repair_state,
-                        )
-                        suffix = (
-                            " · Unreal Push 차단 상태 유지"
-                            if not repair_state["push_ready"]
-                            else ""
-                        )
-                        self._publish_repair_stage_contract(
-                            spm,
-                            ready=repair_state["push_ready"],
-                            reason=repair_state["reason"],
-                            kind=repair_state.get("kind"),
-                            push_dependency_contract=repair_state.get(
-                                "push_dependency_contract"
-                            ),
-                            evidence_bundle=stage_evidence,
-                        )
-                        self.log(f"건너뜀 (blend 최신{suffix}): {spm.name}")
                         return
                     self.log(
                         "Cluster 관계 산출물 갱신 후 Repair 상태가 변경되어 "
@@ -9186,9 +14880,10 @@ class App:
                 log_file=material_log,
                 report_file=material_report,
             )
-        # Cluster sources resolve here; owner Trees reuse the result that
-        # was already required for the Repair-current decision.  The local
-        # resolver guarantees one runtime live-audit resolution per item.
+        # Resolve the hash-current persisted Cluster receipt only after the
+        # material contract is available.  A durable preflight cache hit keeps
+        # its old run-specific live marker disabled, so this is a cheap receipt
+        # lookup unless exact recovery is genuinely required.
         cluster_receipt_resolution = resolve_cluster_receipt_once()
         if cluster_receipt_resolution_uses_live_audit(
             cluster_receipt_resolution
@@ -9222,6 +14917,11 @@ class App:
                         "",
                     ),
                 }
+                if artifact.get("cache_hit"):
+                    # Never mutate the durable cache report with run-specific
+                    # live evidence.  Materialize a report only for the rare
+                    # exact-recovery run that actually needs new embedding.
+                    material_report = artifact["run_report"]
                 atomic_write_json(material_report, material_result)
             except (OSError, TypeError, ValueError) as exc:
                 raise BatchItemError(
@@ -9322,12 +15022,18 @@ class App:
                 "--cluster-source-build-only",
             )
         parallel = self.cfg.get("blender_parallel_jobs", 2) > 1
-        code, log_file = self._run_limited(
-            cmd,
-            f"{spm.stem}_bwr_{stamp}.log",
-            self.cfg.get("blender_job_timeout", 3600),
-            affinity=not parallel,
-        )
+        self._assert_active_production_source_manifest()
+        try:
+            code, log_file = self._run_limited(
+                cmd,
+                f"{spm.stem}_bwr_{stamp}.log",
+                self.cfg.get("blender_job_timeout", 3600),
+                affinity=not parallel,
+            )
+        finally:
+            # A code change while Blender is running is a restart route, never
+            # evidence that this asset failed its repair contract.
+            self._assert_active_production_source_manifest()
         result = load_job_report(job_report)
         if code != 0 or result.get("status") != "ok":
             if cluster_source:
@@ -9478,15 +15184,11 @@ class App:
             spm,
             state_out=handoff_state,
         )
-        blend_status = (
-            self._blend_status_from_repair_state(handoff_state)
-            if handoff_state
-            else self._blend_status_text(spm)
+        blend_status = self._record_live_blend_status(
+            iid,
+            spm,
+            repair_state=handoff_state or None,
         )
-        self.ui_queue.put(("cell", (iid, "blend_status", blend_status)))
-        with self.state_lock:
-            entry["blend_status"] = blend_status
-            save_state(self.state)
         source_review = bool(
             result.get("source_review_required")
             or (result.get("handoff_preflight") or {}).get("status")
@@ -9551,7 +15253,7 @@ class App:
                 entry["push_status"] = push_status
                 entry["push_status_kind"] = "ready"
                 entry.pop("push_status_error", None)
-                save_state(self.state)
+                self._save_state_after_phase_update()
         if cluster_blend_backup is not None:
             try:
                 cluster_blend_backup.unlink(missing_ok=True)
@@ -9685,8 +15387,10 @@ class App:
 
     @staticmethod
     def _unreal_running():
-        result = subprocess.run(
+        result = owned_run(
             ["tasklist", "/FI", "IMAGENAME eq UnrealEditor.exe", "/NH"],
+            source="sk_batch.sk_batch_gui.tasklist_observation",
+            run_factory=subprocess.run,
             capture_output=True,
             creationflags=0x08000000,
         )
@@ -9698,6 +15402,17 @@ class App:
         return b"UnrealEditor.exe" in (result.stdout or b"")
 
     def _set_push_state(self, iid, kind, status_text, details=None, message=None):
+        progress_message = message or status_text
+        non_error_kinds = {
+            "completed",
+            "ready",
+            "exported_pending_unreal",
+            "importing",
+            "imported_ok",
+            "cancelled",
+            "stopped",
+            "dependency_waiting",
+        }
         self.ui_queue.put(("cell", (iid, "push_status", status_text)))
         with self.state_lock:
             entry = self.state.setdefault(iid, {})
@@ -9708,7 +15423,7 @@ class App:
                 and entry.get("push_status_kind") == kind
                 and (not details or entry.get("push_paths") == details)
                 and (
-                    kind in {"exported_pending_unreal", "importing", "imported_ok"}
+                    kind in non_error_kinds
                     or (
                         existing_error.get("kind") == kind
                         and existing_error.get("message") == error_message
@@ -9719,8 +15434,20 @@ class App:
                 return
             entry["push_status"] = status_text
             entry["push_status_kind"] = kind
-            if kind in {"exported_pending_unreal", "importing", "imported_ok"}:
+            if kind in non_error_kinds:
                 entry.pop("push_status_error", None)
+                if kind in {"cancelled", "stopped"}:
+                    result = {
+                        "time": datetime.now().isoformat(timespec="seconds"),
+                        "kind": "cancelled",
+                        "outcome": "cancelled",
+                        "message": error_message,
+                    }
+                    if details:
+                        result.update(details)
+                    entry["push_status_result"] = result
+                else:
+                    entry.pop("push_status_result", None)
             else:
                 error = {
                     "time": datetime.now().isoformat(timespec="seconds"),
@@ -9729,13 +15456,94 @@ class App:
                 }
                 if details:
                     error.update(details)
+                error.update(
+                    self._bind_failure_record(
+                        iid,
+                        kind,
+                        error_message,
+                        details,
+                    )
+                )
                 entry["push_status_error"] = error
+                entry.pop("push_status_result", None)
             if details:
                 entry["push_paths"] = details
             save_state(self.state)
+        # Receipt completion follows the durable target state. If the process
+        # exits in this narrow gap, restart either reconciles the exact queue
+        # result or re-runs the normal #79/#89 provenance checks; it never
+        # treats a receipt alone as asset verification.
+        if kind == "exported_pending_unreal":
+            self._retry_transition(
+                iid,
+                RETRY_STAGE_POST_CHECK,
+                progress_message,
+                progress=True,
+                heartbeat=True,
+            )
+        elif kind == "importing":
+            self._retry_transition(
+                iid,
+                RETRY_STAGE_UNREAL,
+                progress_message,
+                heartbeat=True,
+            )
+        elif kind == "imported_ok":
+            self._retry_transition(
+                iid,
+                RETRY_STAGE_POST_CHECK,
+                progress_message,
+                progress=True,
+                heartbeat=True,
+            )
+            self._retry_transition(
+                iid,
+                RETRY_STAGE_COMPLETE,
+                "Unreal post-check complete",
+                terminal_reason="completed",
+                outcome=RETRY_STAGE_COMPLETE,
+            )
+        elif kind in {"cancelled", "stopped"}:
+            self._retry_transition(
+                iid,
+                RETRY_STAGE_CANCELLED,
+                progress_message,
+                terminal_reason="operator_cancelled",
+                outcome=RETRY_STAGE_CANCELLED,
+            )
+        elif kind == "dependency_waiting":
+            self._retry_transition(
+                iid,
+                RETRY_STAGE_POST_CHECK,
+                progress_message,
+                progress=True,
+                heartbeat=True,
+            )
+        else:
+            terminal_stage = (
+                RETRY_STAGE_BLOCKED
+                if kind in PLANNED_EXCLUSION_KINDS
+                or kind in {
+                    "dependency_blocked",
+                    "manual_required",
+                    "not_run",
+                    "not_run_unreal",
+                    "recovery_blocked",
+                }
+                else RETRY_STAGE_FAILED
+            )
+            self._retry_transition(
+                iid,
+                terminal_stage,
+                progress_message,
+                terminal_reason=str(kind),
+                outcome=terminal_stage,
+            )
 
     def _push_dependency_paths(self):
-        send2ue_dir = Path(self.cfg["send2ue_dir"])
+        planning = self._failed_retry_planning_context()
+        cfg = planning.cfg_snapshot if planning is not None else self.cfg
+        send2ue_dir = Path(cfg["send2ue_dir"])
         return [
             TOOL_DIR / "jobs" / "send2ue_push_job.py",
             TOOL_DIR / "jobs" / "vertex_color_contract.py",
@@ -9760,7 +15568,9 @@ class App:
 
     def _push_unreal_code_paths(self):
         """Code executed or consumed by the current Unreal ingest contract."""
-        send2ue_dir = Path(self.cfg["send2ue_dir"])
+        planning = self._failed_retry_planning_context()
+        cfg = planning.cfg_snapshot if planning is not None else self.cfg
+        send2ue_dir = Path(cfg["send2ue_dir"])
         return [
             TOOL_DIR / "unreal_ingest.py",
             send2ue_dir / "dependencies" / "unreal.py",
@@ -9771,23 +15581,28 @@ class App:
         ]
 
     def _push_rebindable_unreal_code_paths(self):
-        """Runtime code whose derived bindings can be rebuilt without Blender."""
-        paths = self._push_unreal_code_paths()
-        # Dynamic-wind policy resolves Blender object facts while exporting;
-        # changing it requires a full Push.  The remaining modules consume the
-        # frozen artifact/sidecar contract or are regenerated below.
-        return [
-            path
-            for path in paths
-            if Path(path).name != "dynamic_wind_handoff_policy.py"
-        ]
+        """Code drift allowed after the immutable export is proven current.
+
+        Every path returned by ``_push_dependency_paths`` is executable code,
+        not per-asset source data.  Once the parent FBX/JSON/handoff artifacts
+        pass their exact content-identity checks, later exporter-code changes
+        cannot retroactively change them.  Recovery records that drift and
+        rebinds the existing artifacts to the current Unreal runtime.  The
+        blend and per-asset Repair report remain outside this set, so an actual
+        source-data change still requires a full Push.
+        """
+        return list(dict.fromkeys(self._push_dependency_paths()))
 
     def _push_source_dependency_paths(self, spm=None):
-        """Return code plus the per-asset Repair/Assembly contract."""
-        paths = list(self._push_dependency_paths())
-        if spm is not None:
-            paths.append(repair_pipeline_report_path(Path(spm)))
-        return paths
+        """Return only content that can change an asset's exported payload.
+
+        Executable code is tracked separately for diagnostics and Unreal
+        rebinding. Editing code must not invalidate every immutable FBX/JSON
+        export in the batch.
+        """
+        if spm is None:
+            return []
+        return [repair_pipeline_report_path(Path(spm))]
 
     @staticmethod
     def _push_material_contract(spm):
@@ -9893,8 +15708,10 @@ class App:
             )
         except (OSError, ValueError, KeyError):
             return "Push 재확인 필요 — 입력 파일 확인"
-        if source_cache.get("snapshot") != current_snapshot:
-            return "Push 재확인 필요 — Blender/파이프라인 변경"
+        if not push_source_cache_matches_snapshot(
+            source_cache, current_snapshot
+        ):
+            return "Push 재확인 필요 — Blender/콘텐츠 계약 변경"
         if export_cache.get("source_fingerprint") != source_cache.get(
             "fingerprint"
         ):
@@ -9909,21 +15726,54 @@ class App:
             return "완료 (현재 최신)"
         return "export 완료 · Unreal 대기"
 
-    def _source_push_fingerprint(self, blend, iid=None):
+    def _source_push_fingerprint(
+        self,
+        blend,
+        iid=None,
+        *,
+        return_record=False,
+    ):
         """Hash a large source blend once, then reuse its stable stat cache."""
-        state_entry = self.state.setdefault(iid, {}) if iid else {}
+        planning = self._failed_retry_planning_context()
+        if iid:
+            if planning is not None:
+                cache = copy.deepcopy(
+                    planning.entry(iid).get("push_source_fingerprint_cache")
+                )
+            else:
+                with self.state_lock:
+                    cache = copy.deepcopy(
+                        self.state.get(iid, {}).get(
+                            "push_source_fingerprint_cache"
+                        )
+                    )
+        else:
+            cache = None
         fingerprint, record, cache_hit = cached_push_source_fingerprint(
             blend,
             self._push_source_dependency_paths(iid),
-            cache=state_entry.get("push_source_fingerprint_cache"),
+            cache=cache,
         )
-        if iid:
+        if iid and planning is None:
             with self.state_lock:
                 self.state.setdefault(iid, {})[
                     "push_source_fingerprint_cache"
                 ] = record
-        if cache_hit:
+        if planning is not None:
+            planning.counters[
+                "source_fingerprint_cache_hits"
+                if cache_hit
+                else "source_fingerprint_cache_misses"
+            ] += 1
+        if cache_hit and planning is None:
             self.log(f"[source hash cache] {Path(blend).name}: 재사용")
+        if return_record:
+            # Retry planning owns an immutable state snapshot, so a cache
+            # miss cannot publish the newly computed record back through
+            # ``planning.entry``.  Return the fingerprint and its exact
+            # record as one value pair; reading the old snapshot record here
+            # falsely routes a current Unreal-only retry through Blender.
+            return fingerprint, copy.deepcopy(record)
         return fingerprint
 
     def _cached_manifest_item(self, iid, source_fingerprint):
@@ -10051,16 +15901,22 @@ class App:
         disk_export_timeout = max(1, int(
             self.cfg.get("push_job_timeout", 1800)
         ))
-        code, log_file = self._run_limited(
-            cmd,
-            export_log_name,
-            None,
-            affinity=self.cfg.get("blender_parallel_jobs", 2) <= 1,
-            inactivity_timeout=disk_export_timeout,
-            inactivity_timeout_by_marker=send2ue_inactivity_rules(
-                stage_timeout, disk_export_timeout
-            ),
-        )
+        self._assert_active_production_source_manifest()
+        try:
+            code, log_file = self._run_limited(
+                cmd,
+                export_log_name,
+                None,
+                affinity=self.cfg.get("blender_parallel_jobs", 2) <= 1,
+                inactivity_timeout=disk_export_timeout,
+                inactivity_timeout_by_marker=send2ue_inactivity_rules(
+                    stage_timeout, disk_export_timeout
+                ),
+            )
+        finally:
+            # Send2UE output produced across two code revisions is discarded by
+            # the parent restart fence and must not create an asset failure.
+            self._assert_active_production_source_manifest()
         result = load_job_report(export_report)
         if code != 0 or result.get("status") != "exported_pending_unreal":
             reason = summarize_job_failure(result, log_file)
@@ -10111,7 +15967,13 @@ class App:
         )
         return item
 
-    def _sync_headless_checkpoint(self, checkpoint_path, item_by_id, log_file=None):
+    def _sync_headless_checkpoint(
+        self,
+        checkpoint_path,
+        item_by_id,
+        log_file=None,
+        observed_line=None,
+    ):
         try:
             checkpoint = json.loads(Path(checkpoint_path).read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -10129,6 +15991,32 @@ class App:
                 continue
             status = result.get("status", "not_run")
             message = result.get("message") or labels.get(status, status)
+            if status == "importing":
+                versions = self.__dict__.setdefault(
+                    "_retry_checkpoint_versions", {}
+                )
+                version = str(result.get("updated_at") or "")
+                progressed = bool(version and versions.get(queue_id) != version)
+                if version:
+                    versions[queue_id] = version
+                last_lines = self.__dict__.setdefault(
+                    "_retry_checkpoint_output_lines", {}
+                )
+                output_changed = bool(
+                    observed_line
+                    and last_lines.get(queue_id) != str(observed_line)
+                )
+                if output_changed:
+                    last_lines[queue_id] = str(observed_line)
+                tracker = self._retry_tracker_for_job()
+                if tracker is not None:
+                    tracker.observe_process(
+                        queue_id,
+                        stage=RETRY_STAGE_UNREAL,
+                        diagnostic=observed_line or message,
+                        output=output_changed,
+                        progress=progressed,
+                    )
             text = labels.get(status, status)
             if status in {"data_error", "manual_required", "unreal_crash", "not_run"}:
                 text = f"{text}: {compact_error_message(message, 80)}"
@@ -10364,6 +16252,8 @@ class App:
                         f"{prepared_selected}/{total}",
                     )
                 )
+            except CodeRevisionRestartRequired:
+                raise
             except Exception as exc:
                 reason = compact_error_message(exc)
                 for queue_id in request_selected:
@@ -10497,13 +16387,37 @@ class App:
                 return index, None
             spm = item["spm"]
             iid = str(spm)
+            retry_context = getattr(self, "_retry_thread_context", None)
+            if retry_context is not None:
+                retry_context.target_id = iid
+                retry_context.stage = RETRY_STAGE_SEND2UE
+            self._retry_transition(
+                iid,
+                RETRY_STAGE_SEND2UE,
+                "Send2UE export started",
+                progress=True,
+                heartbeat=True,
+            )
             self.ui_queue.put(("cell", (iid, "push_status", "Send2UE export 중...")))
             try:
                 return index, self._export_manifest_item(iid, spm, batch_stamp)
+            except CodeRevisionRestartRequired:
+                raise
             except Exception as exc:
                 reason = compact_error_message(exc)
                 kind = getattr(exc, "kind", "data_error")
                 details = {}
+                failure_report = getattr(exc, "report", None)
+                if isinstance(failure_report, dict) and failure_report:
+                    details["failure_report"] = copy.deepcopy(failure_report)
+                    if failure_report.get("reason_token"):
+                        details["reason_token"] = str(
+                            failure_report["reason_token"]
+                        )
+                    if isinstance(failure_report.get("evidence"), dict):
+                        details["evidence"] = copy.deepcopy(
+                            failure_report["evidence"]
+                        )
                 if getattr(exc, "log_file", None):
                     details["log"] = str(exc.log_file)
                 if getattr(exc, "report_file", None):
@@ -10519,6 +16433,10 @@ class App:
                 with self.state_lock:
                     failed_items.add(iid)
                 return index, None
+            finally:
+                if retry_context is not None:
+                    retry_context.target_id = None
+                    retry_context.stage = None
 
         completed = 0
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -10546,48 +16464,6 @@ class App:
             for item in exported
             if item.get("queue_id")
         }
-        dependency_blocked_ids = set()
-        for item in exported:
-            iid = str(item.get("queue_id") or "")
-            unavailable = [
-                dependency
-                for dependency in dependency_map.get(iid, ())
-                if dependency not in exported_ids
-            ]
-            if not unavailable:
-                continue
-            details = []
-            for dependency in unavailable:
-                provider_state = self.state.get(dependency, {})
-                provider_reason = (
-                    (provider_state.get("push_status_error") or {}).get(
-                        "message"
-                    )
-                    or provider_state.get("push_status")
-                    or "export 산출물 없음"
-                )
-                details.append(
-                    f"{Path(dependency).name} ({compact_error_message(provider_reason, 80)})"
-                )
-            reason = (
-                "required Cluster export did not complete: "
-                + ", ".join(details)
-            )
-            self._set_push_state(
-                iid,
-                "dependency_blocked",
-                self._failure_status_text(reason, "dependency_blocked"),
-                message=reason,
-            )
-            failed_items.add(iid)
-            dependency_blocked_ids.add(iid)
-        if dependency_blocked_ids:
-            exported = [
-                item
-                for item in exported
-                if str(item.get("queue_id") or "")
-                not in dependency_blocked_ids
-            ]
 
         if self.stop_flag.is_set():
             for item in targets:
@@ -10595,7 +16471,7 @@ class App:
                 if self.state.get(iid, {}).get("push_status_kind") not in {
                     "exported_pending_unreal", "imported_ok", "data_error", "manual_required"
                 }:
-                    self._set_push_state(iid, "not_run", "미실행: 사용자 중지")
+                    self._set_push_state(iid, "cancelled", "중지: 사용자 중지")
             if emit_done:
                 self.ui_queue.put(("progress", "중지됨"))
                 self.ui_queue.put(("done", None))
@@ -10605,9 +16481,11 @@ class App:
         pending = []
         for item in exported:
             iid = str(item["queue_id"])
-            item["depends_on_queue_ids"] = list(
-                dependency_map.get(iid, ())
-            )
+            item["depends_on_queue_ids"] = [
+                dependency
+                for dependency in dependency_map.get(iid, ())
+                if dependency in exported_ids
+            ]
             entry = self.state.setdefault(iid, {})
             import_cache_matches = (
                 not self.force_rerun
@@ -10758,10 +16636,17 @@ class App:
                         checkpoint_path,
                         item_by_id,
                         attempt_log,
+                        observed_line=_line,
                     ),
                     env=env,
                 )
             except Exception as exc:
+                if (
+                    self.stop_flag.is_set()
+                    or getattr(exc, "kind", "") in {"cancelled", "stopped"}
+                ):
+                    self.log(f"[headless 중지] {exc}")
+                    break
                 code = -1
                 self.log(f"[headless watchdog] {exc}")
             checkpoint = self._sync_headless_checkpoint(
@@ -10784,6 +16669,48 @@ class App:
             self.log(
                 f"[headless watchdog] commandlet 종료 code={code}; checkpoint 재개"
             )
+
+        if self.stop_flag.is_set():
+            checkpoint = self._sync_headless_checkpoint(
+                checkpoint_path,
+                item_by_id,
+                last_log,
+            )
+            actual_failure_kinds = {
+                "data_error",
+                "manual_required",
+                "unreal_crash",
+                "owner_lost",
+            }
+            for iid in item_by_id:
+                item_status = str(
+                    ((checkpoint.get("items") or {}).get(iid) or {}).get(
+                        "status"
+                    )
+                    or ""
+                )
+                if item_status == "imported_ok":
+                    continue
+                if item_status in actual_failure_kinds:
+                    failed_items.add(str(iid))
+                    continue
+                self._set_push_state(
+                    iid,
+                    "cancelled",
+                    "중지: 사용자 중지",
+                    details={
+                        "manifest": str(manifest_path),
+                        "checkpoint": str(checkpoint_path),
+                        "log": str(last_log or ""),
+                    },
+                )
+            with self.state_lock:
+                self._phase_failed_items = set(failed_items)
+                save_state(self.state)
+            if emit_done:
+                self.ui_queue.put(("progress", f"{progress_label} 중지됨"))
+                self.ui_queue.put(("done", None))
+            return False
 
         if not complete:
             checkpoint = self._sync_headless_checkpoint(
@@ -10964,6 +16891,20 @@ class App:
         }
         entry.pop("push_status_error", None)
         save_state(self.state)
+        self._retry_transition(
+            iid,
+            RETRY_STAGE_POST_CHECK,
+            "Unreal RPC post-check complete",
+            progress=True,
+            heartbeat=True,
+        )
+        self._retry_transition(
+            iid,
+            RETRY_STAGE_COMPLETE,
+            "Unreal RPC retry complete",
+            terminal_reason="completed",
+            outcome=RETRY_STAGE_COMPLETE,
+        )
         self.log(f"push 완료: {result.get('unreal_folder', '?')}{result.get('unit_name', '')}")
 
 
@@ -10976,9 +16917,6 @@ def main():
     app = App(root)
 
     def close():
-        with app._recovery_commit_lock:
-            app._app_open = False
-            app.stop_batch()
         app.shutdown_shared_queue()
         root.destroy()
 

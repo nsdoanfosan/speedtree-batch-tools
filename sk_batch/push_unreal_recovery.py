@@ -176,10 +176,11 @@ def validate_source_snapshots(
     *,
     rebindable_code_paths,
 ):
-    """Prove source/export inputs stayed fixed while allowing runtime code drift.
+    """Prove source data stayed fixed while allowing explicit code rebinding.
 
     Legacy Push receipts store exact size/mtime observations for the blend and
-    dependency set.  Runtime-only code is the sole allowed difference.  New
+    dependency set.  Only paths explicitly identified as executable code may
+    differ after the immutable export artifacts have been validated.  New
     recovery manifests retain both snapshots and fresh artifact content hashes.
     """
     parent_records = _snapshot_records(parent_snapshot)
@@ -192,20 +193,20 @@ def validate_source_snapshots(
             f"removed={removed} added={added}"
         )
     rebindable = {_normalized_path(path) for path in rebindable_code_paths}
-    changed_runtime = []
+    changed_code = []
     for key in sorted(parent_records):
         before = parent_records[key]
         after = current_records[key]
         if before == after:
             continue
         if key in rebindable:
-            changed_runtime.append(str(after.get("path") or before.get("path")))
+            changed_code.append(str(after.get("path") or before.get("path")))
             continue
         raise PushUnrealRecoveryError(
             "Push source/export-time dependency changed; full Push required: "
             + str(after.get("path") or before.get("path") or key)
         )
-    return changed_runtime
+    return changed_code
 
 
 def code_file_identity(path):
@@ -257,14 +258,19 @@ def code_revision(records):
     return stable_fingerprint(identities)
 
 
-def load_parent_manifest(path):
+def load_parent_manifest(path, *, manifest_payload=None):
     manifest_path = Path(path)
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise PushUnrealRecoveryError(
-            f"parent Push manifest could not be read: {manifest_path}: {exc}"
-        ) from exc
+    if manifest_payload is None:
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise PushUnrealRecoveryError(
+                f"parent Push manifest could not be read: {manifest_path}: {exc}"
+            ) from exc
+    else:
+        manifest = manifest_payload
+    if not isinstance(manifest, dict):
+        raise PushUnrealRecoveryError("parent Push manifest is not an object")
     if manifest.get("schema_version") != PUSH_MANIFEST_SCHEMA_VERSION:
         raise PushUnrealRecoveryError(
             "parent Push manifest schema is incompatible: "
@@ -428,13 +434,13 @@ def validate_unreal_only_recovery_evidence(
     _validate_immutable_source_files(
         (parent_item.get("recovery") or {}).get("immutable_source_files")
     )
-    validate_source_snapshots(
+    validate_item_artifacts(parent_item)
+    rebound_source_code_paths = validate_source_snapshots(
         parent_source_record.get("snapshot"),
         current_source_record.get("snapshot"),
         rebindable_code_paths=rebindable_code_paths,
     )
-    validate_item_artifacts(parent_item)
-    return True
+    return rebound_source_code_paths
 
 
 def recover_manifest_item(
@@ -459,7 +465,7 @@ def recover_manifest_item(
         current_source_record if isinstance(current_source_record, dict) else {}
     )
     parent_fingerprint = str(parent_item.get("source_fingerprint") or "")
-    validate_unreal_only_recovery_evidence(
+    rebound_source_code_paths = validate_unreal_only_recovery_evidence(
         parent_item,
         parent_source_record=parent_source_record,
         current_source_record=current_source_record,
@@ -513,6 +519,7 @@ def recover_manifest_item(
         "old_production_source_revision": old_code_revision,
         "new_production_source_revision": new_code_revision,
         "selected_for_retry": bool(selected),
+        "rebound_source_code_paths": list(rebound_source_code_paths or []),
         "depends_on_queue_ids": list(
             recovered.get("depends_on_queue_ids") or []
         ),

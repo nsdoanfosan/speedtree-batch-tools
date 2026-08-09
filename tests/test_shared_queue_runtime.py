@@ -370,6 +370,25 @@ class SharedQueueRuntimeTests(unittest.TestCase):
         self.assertEqual(second_lease.job_id, second["id"])
         second_lease.finish()
 
+    def test_running_owner_can_finish_as_cancelled_without_failed_status(self):
+        runtime = self.runtime()
+        job = runtime.enqueue("operator stop", {"value": 1})
+        lease = runtime.wait_for_turn(job["id"])
+
+        cancelled = lease.finish(
+            result={
+                "outcome": "stopped",
+                "error": "사용자 중지",
+                "failed_count": 0,
+            },
+            terminal_status="cancelled",
+        )
+
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["result"]["outcome"], "stopped")
+        self.assertEqual(cancelled["result"]["failed_count"], 0)
+        self.assertEqual(cancelled["cancel_reason"], "사용자 중지")
+
     def test_context_manager_records_failure_and_releases_next_job(self):
         runtime = self.runtime()
         first = runtime.enqueue("context failure", {})
@@ -426,10 +445,16 @@ class SharedQueueRuntimeTests(unittest.TestCase):
                 accepted_apps={"app-b"},
             )
         )
-        time.sleep(0.04)
-        heartbeat_after = first_runtime.queue.get(first["id"])["lease"][
-            "heartbeat_at"
-        ]
+        heartbeat_after = heartbeat_before
+        heartbeat_deadline = time.monotonic() + 1.0
+        while (
+            heartbeat_after <= heartbeat_before
+            and time.monotonic() < heartbeat_deadline
+        ):
+            time.sleep(0.01)
+            heartbeat_after = first_runtime.queue.get(first["id"])["lease"][
+                "heartbeat_at"
+            ]
         self.assertGreater(heartbeat_after, heartbeat_before)
 
         # The caller has now stopped/joined its real worker and may release.
@@ -442,6 +467,39 @@ class SharedQueueRuntimeTests(unittest.TestCase):
             poll_interval=0.01,
         )
         next_lease.finish()
+
+    def test_operator_close_shutdown_records_active_lease_before_exit(self):
+        runtime = self.runtime(
+            "sk-batch",
+            lease_seconds=0.5,
+            heartbeat_interval=0.05,
+        )
+        job = runtime.enqueue("retry running", {"targets": 83})
+        lease = runtime.wait_for_turn(job["id"])
+
+        runtime.shutdown(operator_close=True)
+
+        running = runtime.queue.get(job["id"])
+        self.assertEqual(running["status"], "running")
+        events = running["termination_audit"]["events"]
+        self.assertEqual(
+            [event["kind"] for event in events],
+            ["operator_close_requested"],
+        )
+        self.assertEqual(events[0]["batch_outcome_at_event"], "running")
+        self.assertNotIn("token", events[0]["owner"])
+        with self.assertRaises(RuntimeClosed):
+            runtime.enqueue("after close", {})
+
+        # Shutdown does not release the live worker; its normal finally path
+        # still owns that transition if the process remains alive long enough.
+        cancelled = lease.finish(
+            success=False,
+            result={"outcome": "stopped"},
+            terminal_status="cancelled",
+        )
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertNotIn("failure_reason", cancelled)
 
 
 if __name__ == "__main__":

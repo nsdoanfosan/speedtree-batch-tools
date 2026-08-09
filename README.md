@@ -105,6 +105,18 @@ GitHub/
 
 개인 PC 경로가 들어가는 설정 JSON, 실행 상태, 로그, 생성 리포트는 로컬에는 유지되지만 Git에는 포함되지 않습니다.
 
+실패 Blender/Unreal 재시도의 단계, liveness 시계, durable receipt, 안전 취소
+경계는 [RETRY_PROGRESS_LIVENESS.md](RETRY_PROGRESS_LIVENESS.md)에 정리되어
+있습니다. Sanitized before/after 증적은
+[ISSUE_107_RETRY_PROGRESS_EVIDENCE.md](ISSUE_107_RETRY_PROGRESS_EVIDENCE.md)를
+참조하세요.
+
+## Blender 애드온 API 경계
+
+BAT/GUI, Blender worker, 외부 애드온의 책임과 capability/source-identity
+협상 규칙은 [BLENDER_ADDON_API.md](BLENDER_ADDON_API.md)에 정의되어 있습니다.
+모든 외부 애드온 활성화와 구현 operation 해석은 공용 gateway만 수행합니다.
+
 ## 테스트
 
 통합 GUI와 SK Batch 직접 GUI는 실제 창을 import하기 전에 다음 빠른 코드·계약

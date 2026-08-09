@@ -25,31 +25,44 @@ class PCGTextureAuditProductionRevisionTests(unittest.TestCase):
         ):
             return audit.main()
 
-    def test_mismatched_batch_revision_fails_before_asset_audit(self):
+    def test_mismatched_batch_revision_warns_and_runs_asset_audit(self):
         with tempfile.TemporaryDirectory() as temporary:
             report_path = Path(temporary) / "audit.json"
+            report = {
+                "generated_at": "test",
+                "status": "ok",
+                "summary": {"total": 1, "by_status": {"ready": 1}},
+                "items": [{"name": "tree", "status": "ready"}],
+            }
             with mock.patch.object(
                 audit,
                 "load_config",
+                return_value={},
             ) as load_config, mock.patch.object(
                 audit,
                 "make_report",
-            ) as make_report:
-                with self.assertRaises(SystemExit) as raised:
-                    self._run_main(
-                        "--expected-production-source-revision",
-                        "0" * 64,
-                        "--json",
-                        str(report_path),
-                    )
-            self.assertEqual(raised.exception.code, 2)
-            load_config.assert_not_called()
-            make_report.assert_not_called()
+                return_value=report,
+            ) as make_report, mock.patch.object(
+                audit,
+                "save_spm_analysis_cache",
+            ):
+                self._run_main(
+                    "--expected-production-source-revision",
+                    "0" * 64,
+                    "--no-receipt",
+                    "--json",
+                    str(report_path),
+                )
+            load_config.assert_called_once()
+            make_report.assert_called_once()
             payload = json.loads(report_path.read_text(encoding="utf-8"))
-            self.assertEqual(payload["stage"], "production_source_revision")
+            self.assertEqual(payload["status"], "ok")
             self.assertFalse(
                 payload["production_source_revision"]["matches_expected"]
             )
+            warning = payload["production_source_revision_warning"]
+            self.assertEqual(warning["severity"], "warning")
+            self.assertFalse(warning["asset_failure"])
 
     def test_matching_batch_revision_is_written_to_child_report(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -99,7 +112,7 @@ class PCGTextureAuditProductionRevisionTests(unittest.TestCase):
             self.assertTrue(revision["matches_expected"])
             self.assertTrue(revision["stable"])
 
-    def test_source_change_during_audit_fails_before_receipt_persistence(self):
+    def test_source_change_during_audit_warns_and_keeps_results(self):
         with tempfile.TemporaryDirectory() as temporary:
             report_path = Path(temporary) / "audit.json"
             started = audit._PROCESS_PRODUCTION_SOURCE_MANIFEST
@@ -135,16 +148,14 @@ class PCGTextureAuditProductionRevisionTests(unittest.TestCase):
                 audit,
                 "save_spm_analysis_cache",
             ) as save_cache:
-                with self.assertRaises(SystemExit) as raised:
-                    self._run_main(
-                        "--expected-production-source-revision",
-                        started.content_hash,
-                        "--json",
-                        str(report_path),
-                    )
-            self.assertEqual(raised.exception.code, 2)
-            persist.assert_not_called()
-            save_cache.assert_not_called()
+                self._run_main(
+                    "--expected-production-source-revision",
+                    started.content_hash,
+                    "--json",
+                    str(report_path),
+                )
+            persist.assert_called_once()
+            save_cache.assert_called_once()
             payload = json.loads(report_path.read_text(encoding="utf-8"))
             revision = payload["production_source_revision"]
             self.assertEqual(
@@ -156,6 +167,60 @@ class PCGTextureAuditProductionRevisionTests(unittest.TestCase):
                 finished.content_hash,
             )
             self.assertFalse(revision["stable"])
+            warning = payload["production_source_revision_warning"]
+            self.assertEqual(warning["severity"], "warning")
+            self.assertFalse(warning["asset_failure"])
+
+    def test_asset_audit_failure_keeps_revision_and_exact_repair_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            report_path = Path(temporary) / "audit.json"
+            expected = audit._PROCESS_PRODUCTION_SOURCE_MANIFEST.content_hash
+            target = Path(temporary) / "Cluster" / "SK_leaf_test_01.spm"
+            failure = audit.AtlasManifestResolutionError(
+                "sanitized stale mirror conflict",
+                {"target_spm": str(target)},
+            )
+            repair_plan = {
+                "status": "repairable",
+                "reason_code": "atlas_manifest_mirror_conflict_repairable",
+                "target_spm": str(target),
+                "authority": str(Path(temporary) / "authority.json"),
+                "mirrors": [str(Path(temporary) / "stale.json")],
+            }
+
+            with mock.patch.object(
+                audit,
+                "load_config",
+                return_value={},
+            ), mock.patch.object(
+                audit,
+                "make_report",
+                side_effect=failure,
+            ), mock.patch.object(
+                audit,
+                "atlas_manifest_mirror_repair_plan",
+                return_value=repair_plan,
+            ):
+                with self.assertRaises(audit.AtlasManifestResolutionError):
+                    self._run_main(
+                        "--expected-production-source-revision",
+                        expected,
+                        "--no-receipt",
+                        "--json",
+                        str(report_path),
+                    )
+
+            payload = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["status"], "failed")
+            self.assertEqual(payload["stage"], "asset_audit")
+            self.assertTrue(
+                payload["production_source_revision"]["matches_expected"]
+            )
+            self.assertEqual(
+                payload["failure"]["reason_token"],
+                "atlas_manifest_mirror_conflict_repairable",
+            )
+            self.assertEqual(payload["failure"]["evidence"], repair_plan)
 
     def test_cli_publishes_folder_progress_and_stage_markers(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -215,6 +280,126 @@ class PCGTextureAuditProductionRevisionTests(unittest.TestCase):
                 progress,
             )
             self.assertIn(audit.CLUSTER_LIVE_AUDIT_DONE_MARKER, progress)
+
+    def test_completed_single_folder_failure_keeps_exact_reason_and_exit_code(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            report_path = Path(temporary) / "audit.json"
+            expected = audit._PROCESS_PRODUCTION_SOURCE_MANIFEST.content_hash
+            failure = {
+                "scope": "folder",
+                "reason_token": "atlas_manifest_ownership_conflict",
+                "evidence": {
+                    "folder": str(Path(temporary) / "Tree_failed"),
+                    "target_spm": str(
+                        Path(temporary) / "Tree_failed" / "SK_failed.spm"
+                    ),
+                },
+            }
+            report = {
+                "generated_at": "test",
+                "status": "failed",
+                "stage": "asset_audit",
+                "failure": failure,
+                "failures": [failure],
+                "summary": {
+                    "total": 1,
+                    "by_status": {"audit_failed": 1},
+                    "failed_folder_count": 1,
+                    "completed_folder_count": 0,
+                },
+                "items": [{
+                    "name": "Tree_failed",
+                    "status": "audit_failed",
+                    "audit_complete": False,
+                    "failure": failure,
+                }],
+            }
+            output = io.StringIO()
+            with mock.patch.object(
+                audit, "load_config", return_value={}
+            ), mock.patch.object(
+                audit, "make_report", return_value=report
+            ), mock.patch.object(
+                audit, "save_spm_analysis_cache"
+            ), redirect_stdout(output):
+                with self.assertRaises(SystemExit) as raised:
+                    self._run_main(
+                        "--expected-production-source-revision",
+                        expected,
+                        "--no-receipt",
+                        "--json",
+                        str(report_path),
+                    )
+
+            self.assertEqual(raised.exception.code, 2)
+            payload = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["failure"], failure)
+            self.assertFalse(
+                payload["cluster_assembly_receipt_persistence"]
+                ["live_audit_complete"]
+            )
+            progress = output.getvalue()
+            self.assertIn(audit.CLUSTER_LIVE_AUDIT_FAILED_MARKER, progress)
+            self.assertIn(
+                f"{audit.CLUSTER_LIVE_AUDIT_DONE_MARKER} status=failed",
+                progress,
+            )
+
+    def test_partial_report_finishes_after_recording_failed_folder(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            report_path = Path(temporary) / "audit.json"
+            expected = audit._PROCESS_PRODUCTION_SOURCE_MANIFEST.content_hash
+            failure = {
+                "scope": "folder",
+                "reason_token": "atlas_manifest_ownership_conflict",
+                "evidence": {"folder": "Tree_failed"},
+            }
+            report = {
+                "generated_at": "test",
+                "status": "partial",
+                "failures": [failure],
+                "summary": {
+                    "total": 2,
+                    "by_status": {"ready": 1, "audit_failed": 1},
+                    "failed_folder_count": 1,
+                    "completed_folder_count": 1,
+                },
+                "items": [
+                    {"name": "Tree_ready", "status": "ready"},
+                    {
+                        "name": "Tree_failed",
+                        "status": "audit_failed",
+                        "audit_complete": False,
+                        "failure": failure,
+                    },
+                ],
+            }
+            output = io.StringIO()
+            with mock.patch.object(
+                audit, "load_config", return_value={}
+            ), mock.patch.object(
+                audit, "make_report", return_value=report
+            ), mock.patch.object(
+                audit, "save_spm_analysis_cache"
+            ), redirect_stdout(output):
+                self._run_main(
+                    "--expected-production-source-revision",
+                    expected,
+                    "--no-receipt",
+                    "--json",
+                    str(report_path),
+                )
+
+            payload = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["status"], "partial")
+            self.assertFalse(
+                payload["cluster_assembly_receipt_persistence"]
+                ["live_audit_complete"]
+            )
+            self.assertIn(
+                f"{audit.CLUSTER_LIVE_AUDIT_DONE_MARKER} status=partial",
+                output.getvalue(),
+            )
 
 
 if __name__ == "__main__":

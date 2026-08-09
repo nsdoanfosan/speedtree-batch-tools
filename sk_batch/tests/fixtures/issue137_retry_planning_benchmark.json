@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "issue": 137,
+  "sanitized": true,
+  "target_count": 154,
+  "large_report_bytes": 1048576,
+  "categories": {
+    "current": 100,
+    "stale_repair": 24,
+    "send2ue_failure": 10,
+    "shared_parent_unreal_failure": 10,
+    "ambiguous": 10
+  },
+  "shared_report_count": 2,
+  "shared_parent_count": 1,
+  "notes": [
+    "All paths and payloads are generated under a temporary test directory.",
+    "No production drive, DCC executable, BAT file, or running process is accessed.",
+    "Checked state alternates so complete-inventory inclusion covers unchecked rows."
+  ]
+}

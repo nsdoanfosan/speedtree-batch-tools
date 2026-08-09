@@ -13,6 +13,7 @@ from __future__ import annotations
 import copy
 from collections import Counter
 import functools
+import hashlib
 import json
 import os
 import re
@@ -35,8 +36,17 @@ from pcg_st9_texture_batch.pcg_texture_audit import (  # noqa: E402
     save_spm_analysis_cache,
     visible_material_ids,
 )
+from atlas_manifest_resolver import (  # noqa: E402
+    resolution_evidence,
+    resolve_atlas_manifests,
+    resolve_manifest_material_ownership,
+)
 from speedtree_pipeline_contract import open_spm_binary  # noqa: E402
 from speedtree_texture_contract import normalize_material_key  # noqa: E402
+try:  # Package import from repository root.
+    from .atlas_consumer_integrity import audit_atlas_consumer_integrity
+except ImportError:  # Direct SK Batch script execution.
+    from atlas_consumer_integrity import audit_atlas_consumer_integrity  # noqa: E402
 
 
 def _normalized_generator_type(value):
@@ -111,11 +121,38 @@ def _atlas_replacement_required(
     )
 
 
-def _managed_ownership_provenance(managed_materials):
-    """Expose that the fast status path has marker evidence, not repair proof."""
+def _managed_ownership_provenance(managed_materials, proof=None):
+    """Require resolver-selected material/mesh/source proof beyond a marker."""
     names = [str(item.get("name") or "") for item in managed_materials]
     if not names:
         return {"status": "not_applicable", "material_names": []}
+    if (proof or {}).get("status") == "proven":
+        materials = []
+        for row in proof.get("materials") or []:
+            materials.append({
+                key: copy.deepcopy(value)
+                for key, value in row.items()
+                if key != "material_group"
+            })
+        return {
+            "status": "manifest_proven",
+            "material_names": names,
+            "materials": materials,
+            "reason": (
+                "Resolver-selected exact target receipts prove every managed "
+                "material ID, cutout mesh set, and connected source_signature"
+            ),
+        }
+    if (proof or {}).get("status") == "manifest_conflict":
+        return {
+            "status": "manifest_conflict",
+            "material_names": names,
+            "issue_code": "ATLAS_MANIFEST_CANDIDATE_CONFLICT",
+            "reason": str(proof.get("reason") or "Atlas manifest conflict"),
+            "atlas_manifest_resolution": copy.deepcopy(
+                proof.get("atlas_manifest_resolution") or {}
+            ),
+        }
     return {
         "status": "marker_only",
         "material_names": names,
@@ -185,6 +222,43 @@ def _file_key(path):
     candidate = Path(path)
     stat = candidate.stat()
     return os.path.normcase(os.path.abspath(str(candidate))), stat.st_size, stat.st_mtime_ns
+
+
+def _atlas_manifest_signature(spm_path):
+    """Content signature for receipt changes independent of SPM mtime."""
+    spm_path = Path(spm_path)
+    rows = []
+    for directory_name in (
+        ".atlas_leaf_speedtree_targets",
+        ".atlas_leaf_speedtree_scopes",
+    ):
+        directory = spm_path.parent / directory_name
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.glob("*.json")):
+            try:
+                payload = path.read_bytes()
+            except OSError:
+                continue
+            rows.append((
+                f"{directory_name}/{path.name}".casefold(),
+                hashlib.sha256(payload).hexdigest(),
+            ))
+    for path in sorted(
+        [spm_path.parent / "speedtree_import_manifest.json"]
+        + list(spm_path.parent.glob("speedtree_import_manifest_M_*.json"))
+    ):
+        if not path.is_file():
+            continue
+        try:
+            payload = path.read_bytes()
+        except OSError:
+            continue
+        rows.append((
+            path.name.casefold(),
+            hashlib.sha256(payload).hexdigest(),
+        ))
+    return tuple(rows)
 
 
 def _load_spm_root(path):
@@ -479,6 +553,7 @@ def _inspect_spm_fast_cached(path_text, _size, _mtime_ns):
             "name": str(row.get("material_name") or ""),
             "managed": bool(row.get("managed_leaf_output")),
             "mesh_ids": cutout_ids,
+            "refs": list(row.get("refs") or []),
         }
 
     slots = []
@@ -611,6 +686,7 @@ def _inspect_spm_fast_cached(path_text, _size, _mtime_ns):
         "managed_ownership_provenance": _managed_ownership_provenance(
             managed_materials
         ),
+        "_managed_materials": copy.deepcopy(managed_materials),
         "expected_visible_material_names": expected_visible_material_names,
         "slots": slots,
     }
@@ -630,7 +706,21 @@ def inspect_spm_leaf_contract(spm_path):
             "replacement_needed": False,
             "expected_visible_material_names": [],
         }
-    return copy.deepcopy(_inspect_spm_fast_cached(path_text, size, mtime_ns))
+    contract = copy.deepcopy(_inspect_spm_fast_cached(path_text, size, mtime_ns))
+    managed_materials = contract.pop("_managed_materials", [])
+    if not managed_materials:
+        return contract
+    resolution = resolve_atlas_manifests(path, diagnostic_only=True)
+    proof = resolve_manifest_material_ownership(
+        resolution,
+        managed_materials,
+        target_spm=path,
+    )
+    proof["atlas_manifest_resolution"] = resolution_evidence(resolution)
+    contract["managed_ownership_provenance"] = (
+        _managed_ownership_provenance(managed_materials, proof)
+    )
+    return contract
 
 
 def leaf_contract_user_message(contract):
@@ -714,27 +804,46 @@ def _spm_mesh_reference_states(root):
                 if value is not None and value >= 0:
                     mesh_ids.add(value)
         managed = _atlas_managed_material_node(material)
+        material_id = _integer(material.attrib.get("ID"))
         for mesh_id in mesh_ids:
             material_references.setdefault(mesh_id, []).append(
-                (managed, len(mesh_ids))
+                (managed, len(mesh_ids), material_id)
             )
     generator_references = set()
-    for prop in root.iter("Property"):
-        name = str(prop.findtext("Name") or "").strip().casefold()
-        if not name.endswith(":mesh"):
+    default_cutout_materials = set()
+    for generator in root.iter("Generator"):
+        properties = generator.find("Properties")
+        if properties is None:
             continue
-        value = _integer(prop.findtext("Value"))
-        if value is not None and value >= 0:
-            generator_references.add(value)
+        values = {
+            str(prop.findtext("Name") or "").strip().casefold(): _integer(
+                prop.findtext("Value")
+            )
+            for prop in list(properties)
+            if str(prop.findtext("Name") or "").strip()
+        }
+        for name, material_id in values.items():
+            if not name.endswith(":material"):
+                continue
+            mesh_id = values.get(name[:-len(":material")] + ":mesh")
+            if mesh_id is not None and mesh_id >= 0:
+                generator_references.add(mesh_id)
+            elif mesh_id == -10 and material_id is not None and material_id > 0:
+                default_cutout_materials.add(material_id)
     live = set(generator_references)
     managed_orphans = set()
     for mesh_id, material_states in material_references.items():
         removable_from_all_materials = all(
             managed and mesh_count > 1
-            for managed, mesh_count in material_states
+            for managed, mesh_count, _material_id in material_states
+        )
+        default_cutout = any(
+            material_id in default_cutout_materials
+            for _managed, _mesh_count, material_id in material_states
         )
         if (
             mesh_id in generator_references
+            or default_cutout
             or not removable_from_all_materials
         ):
             live.add(mesh_id)
@@ -745,11 +854,17 @@ def _spm_mesh_reference_states(root):
         "managed_orphans": managed_orphans,
         "generator": generator_references,
         "material": set(material_references),
+        "default_cutout_materials": default_cutout_materials,
     }
 
 
 @functools.lru_cache(maxsize=512)
-def _mesh_file_references_cached(path_text, _size, _mtime_ns):
+def _mesh_file_references_cached(
+    path_text,
+    _size,
+    _mtime_ns,
+    _manifest_signature,
+):
     path = Path(path_text)
     try:
         root = _load_spm_root(path)
@@ -767,6 +882,39 @@ def _mesh_file_references_cached(path_text, _size, _mtime_ns):
     missing = []
     orphan_missing = []
     reference_states = _spm_mesh_reference_states(root)
+    atlas_integrity = audit_atlas_consumer_integrity(path, root)
+    integrity_usage = {}
+    for row in atlas_integrity.get("managed_meshes") or []:
+        classification = row["classification"]
+        if classification in {
+            "current_reachable",
+            "current_default_cutout",
+        }:
+            usage = "active"
+        elif classification in {
+            "superseded_with_proven_successor",
+            "ambiguous",
+        }:
+            # Preserve the historical final-mesh safety boundary: an orphan
+            # candidate which is the only Mesh owned by a Material remains a
+            # blocking external reference even while integrity review is
+            # required. Multi-Mesh stale generations remain managed orphans.
+            usage = (
+                "active"
+                if row["mesh_id"] in reference_states["live"]
+                else "managed_orphan"
+            )
+        else:
+            usage = classification
+        integrity_usage[row["mesh_id"]] = usage
+    integrity_usage.update({
+        row["mesh_id"]: (
+            "protected_manual"
+            if row.get("owner_material_ids")
+            else "orphan"
+        )
+        for row in atlas_integrity.get("protected_manual_meshes") or []
+    })
     for mesh in root.iter("Mesh"):
         if mesh.attrib.get("ID") is None:
             continue
@@ -792,13 +940,18 @@ def _mesh_file_references_cached(path_text, _size, _mtime_ns):
                 if os.path.isabs(filename)
                 else path.parent / filename
             )
-            usage = (
-                "active"
-                if mesh_id in reference_states["live"]
-                else "managed_orphan"
-                if mesh_id in reference_states["managed_orphans"]
-                else "orphan"
-            )
+            usage = integrity_usage.get(mesh_id)
+            if usage in {"protected_foreign", "protected_manual"}:
+                if mesh_id in reference_states["generator"]:
+                    usage = "active"
+            elif usage is None:
+                usage = (
+                    "active"
+                    if mesh_id in reference_states["live"]
+                    else "managed_orphan"
+                    if mesh_id in reference_states["managed_orphans"]
+                    else "orphan"
+                )
             row = {
                 "mesh_id": mesh_id,
                 "mesh_name": str(mesh.attrib.get("Name") or ""),
@@ -816,15 +969,23 @@ def _mesh_file_references_cached(path_text, _size, _mtime_ns):
             }
             references.append(row)
             if not row["exists"]:
-                if row["referenced"]:
+                if row["referenced"] or usage == (
+                    "current_preserved_unreferenced"
+                ):
+                    # A coherent current variant is allowed to be unselected,
+                    # but its authority still declares the external Mesh.  A
+                    # missing file remains a real preflight failure rather
+                    # than being hidden by the non-stale classification.
                     missing.append(row)
-                else:
+                elif usage in {"managed_orphan", "orphan"}:
                     orphan_missing.append(row)
     status = (
         "missing_mesh_files"
         if missing
         else "orphan_missing_mesh_assets"
         if orphan_missing
+        else "managed_asset_integrity_error"
+        if atlas_integrity.get("blocking")
         else "ok"
     )
     return {
@@ -834,6 +995,7 @@ def _mesh_file_references_cached(path_text, _size, _mtime_ns):
         "references": references,
         "missing": missing,
         "orphan_missing": orphan_missing,
+        "atlas_consumer_integrity": atlas_integrity,
     }
 
 
@@ -855,7 +1017,12 @@ def inspect_spm_mesh_file_references(spm_path):
             "checked_references": 0,
             "missing": [],
         }
-    return copy.deepcopy(_mesh_file_references_cached(path_text, size, mtime_ns))
+    return copy.deepcopy(_mesh_file_references_cached(
+        path_text,
+        size,
+        mtime_ns,
+        _atlas_manifest_signature(path),
+    ))
 
 
 def save_leaf_contract_cache():
@@ -1058,7 +1225,7 @@ def inspect_all_speedtree_material_export(spm_path):
 
 
 def inspect_speedtree_texture_sources(spm_path):
-    """Validate every texture Source declared by the current SpeedTree STMAT."""
+    """Describe usable texture Sources without deciding pipeline admission."""
     spm = Path(spm_path)
     stmat = speedtree_stmat_path(spm)
     result = {
@@ -1067,6 +1234,8 @@ def inspect_speedtree_texture_sources(spm_path):
         "stmat": str(stmat),
         "source_count": 0,
         "missing_sources": [],
+        "availability_status": "unavailable",
+        "affects_pipeline_outcome": False,
     }
     try:
         path_text, size, mtime_ns = _file_key(stmat)
@@ -1085,19 +1254,8 @@ def inspect_speedtree_texture_sources(spm_path):
             result["error"] = names_error
             return result
         if names:
-            result["status"] = "missing_sources"
-            result["classification"] = "asset_texture_source_undeclared"
-            result["error"] = (
-                "Exported STMAT materials declare no texture Source entries"
-            )
-            result["failure_reason"] = (
-                "The source SPM exported one or more materials, but those "
-                "materials do not declare any texture Source path"
-            )
-            result["remediation"] = (
-                "Assign the intended texture maps to the material in "
-                "SpeedTree Modeler, then save and export the SPM again"
-            )
+            result["status"] = "ok"
+            result["availability_status"] = "textureless"
             result["missing_sources"] = [
                 {
                     "material": name,
@@ -1123,25 +1281,20 @@ def inspect_speedtree_texture_sources(spm_path):
             missing.append({**row, "resolved": str(resolved)})
     result["missing_sources"] = missing
     if missing:
-        result["status"] = "missing_sources"
-        result["classification"] = "asset_texture_source_path_missing"
-        result["error"] = (
-            f"{len(missing)} texture Source path(s) declared by the "
-            "exported STMAT do not resolve to a non-empty file"
-        )
-        result["failure_reason"] = (
-            "The source SPM material stores stale or missing texture file "
-            "paths; Blender Repair cannot prove the intended texture content"
-        )
-        result["remediation"] = (
-            "Relink the listed Source paths in SpeedTree Modeler to the "
-            "intended files, then save and export the SPM again"
+        result["status"] = "ok"
+        result["availability_status"] = (
+            "partial" if len(missing) < len(rows) else "textureless"
         )
     else:
-        try:
-            result["status"] = (
-                "stale" if stmat.stat().st_mtime_ns < spm.stat().st_mtime_ns else "ok"
-            )
-        except OSError:
-            result["status"] = "ok"
+        result["status"] = "ok"
+        result["availability_status"] = "complete" if rows else "textureless"
+    try:
+        result["source_snapshot"] = (
+            "stale" if stmat.stat().st_mtime_ns < spm.stat().st_mtime_ns else "current"
+        )
+    except OSError as exc:
+        result["source_snapshot"] = "unknown"
+        result["texture_diagnostics"] = [
+            {"kind": "metadata_io", "message": str(exc)}
+        ]
     return result

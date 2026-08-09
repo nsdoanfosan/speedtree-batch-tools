@@ -62,6 +62,33 @@ def call_lines(tree, function_name):
 
 
 class SourceReviewPolicyTests(unittest.TestCase):
+    def test_material_contract_is_required_before_blender_mutation(self):
+        material_arguments = [
+            node
+            for node in ast.walk(job_tree())
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "add_argument"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == "--material-contract"
+            )
+        ]
+        self.assertEqual(len(material_arguments), 1)
+        required = next(
+            (
+                keyword.value.value
+                for keyword in material_arguments[0].keywords
+                if (
+                    keyword.arg == "required"
+                    and isinstance(keyword.value, ast.Constant)
+                )
+            ),
+            None,
+        )
+        self.assertIs(required, True)
+
     def test_only_reachable_policies_are_declared(self):
         policies = assigned_string_values(job_tree(), "source_review_policy")
         self.assertEqual(policies, {"strict"})
@@ -121,6 +148,9 @@ class SourceReviewPolicyTests(unittest.TestCase):
         material_validation_lines = call_lines(
             tree, "validate_preflight_report"
         )
+        exact_export_refresh_lines = call_lines(
+            tree, "refresh_preflight_report_after_exact_export"
+        )
         assembly_inspection_lines = call_lines(
             tree, "inspect_cluster_assembly_fbx"
         )
@@ -128,7 +158,12 @@ class SourceReviewPolicyTests(unittest.TestCase):
 
         self.assertEqual(len(export_lines), 2)
         self.assertEqual(len(material_validation_lines), 2)
+        self.assertEqual(len(exact_export_refresh_lines), 1)
         self.assertLess(material_validation_lines[0], export_lines[0])
+        self.assertGreater(exact_export_refresh_lines[0], max(export_lines))
+        self.assertLess(
+            exact_export_refresh_lines[0], material_validation_lines[1]
+        )
         self.assertGreater(material_validation_lines[1], max(export_lines))
         self.assertEqual(len(assembly_inspection_lines), 1)
         self.assertGreater(assembly_inspection_lines[0], max(export_lines))
@@ -144,8 +179,16 @@ class SourceReviewPolicyTests(unittest.TestCase):
                 node
                 for node in ast.walk(job_tree())
                 if isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "run_speedtree_cli_export"
+                and (
+                    (
+                        isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "run_speedtree_cli_export"
+                    )
+                    or (
+                        isinstance(node.func, ast.Name)
+                        and node.func.id == "run_speedtree_cli_export"
+                    )
+                )
             ),
             key=lambda node: node.lineno,
         )

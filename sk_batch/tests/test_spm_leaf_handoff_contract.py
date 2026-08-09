@@ -22,7 +22,9 @@ from spm_leaf_handoff_contract import (  # noqa: E402
 )
 
 
-def add_material(assets, material_id, name, mesh_ids, managed=False):
+def add_material(
+    assets, material_id, name, mesh_ids, managed=False, refs=()
+):
     material = ET.SubElement(
         assets, "Material_v8", ID=str(material_id), Name=name
     )
@@ -38,6 +40,8 @@ def add_material(assets, material_id, name, mesh_ids, managed=False):
         })
     for mesh_id in mesh_ids:
         ET.SubElement(assets, "Mesh", ID=str(mesh_id), Name=f"mesh_{mesh_id}")
+    for ref in refs:
+        ET.SubElement(material, "TexFilename").text = str(ref)
 
 
 def add_generator(
@@ -134,6 +138,63 @@ class SpmLeafHandoffContractTests(unittest.TestCase):
                 contract["managed_ownership_provenance"]["status"],
                 "marker_only",
             )
+
+    def test_exact_manifest_proves_managed_material_source_signature(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cluster = root / "cluster"
+            cluster.mkdir()
+            color = cluster / "leaf_main.tga"
+            opacity = cluster / "leaf_main_Opacity.tga"
+            color.write_bytes(b"color")
+            opacity.write_bytes(b"opacity")
+            spm = root / "SK_tree_birch_sample_03.spm"
+            write_spm(
+                spm,
+                [(
+                    17,
+                    "M_leaf_main",
+                    [35],
+                    True,
+                    [str(color), str(opacity)],
+                )],
+                [(17, 35)],
+            )
+            scopes = root / ".atlas_leaf_speedtree_scopes"
+            scopes.mkdir()
+            (scopes / f"scope-leaf-main__{spm.stem}.json").write_text(
+                json.dumps({
+                    "atlas_manifest_schema_version": 1,
+                    "spm": str(spm),
+                    "blend_file": str(cluster / "SK_leaf_main.blend"),
+                    "source_collection": "Atlas_Cluster_Cards",
+                    "export_scope_id": "scope-leaf-main",
+                    "material_groups": [{
+                        "material": "M_leaf_main",
+                        "material_id": 17,
+                        "mesh_ids": [35],
+                        "blender_cluster_bake_texture": {
+                            "files": {
+                                "albedo": str(color),
+                                "alpha": str(opacity),
+                            },
+                        },
+                    }],
+                    "generator_connection": {
+                        "requested": True,
+                        "complete": True,
+                        "bindings": [],
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+            contract = inspect_spm_leaf_contract(spm)
+
+            ownership = contract["managed_ownership_provenance"]
+            self.assertEqual(ownership["status"], "manifest_proven")
+            self.assertEqual(ownership["materials"][0]["material_id"], "17")
+            self.assertEqual(ownership["materials"][0]["mesh_ids"], ["35"])
 
     def test_source_slots_with_managed_outputs_require_replacement(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -400,7 +461,7 @@ class SpmLeafHandoffContractTests(unittest.TestCase):
             self.assertEqual(contract["expected_visible_material_names"], ["M_leaf_real_01"])
             self.assertEqual(exported["status"], "missing_materials")
 
-    def test_stmat_declared_texture_sources_are_checked_before_blender(self):
+    def test_missing_declared_texture_source_is_nonblocking_availability(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             spm = root / "SK_tree_texture_source.spm"
@@ -413,20 +474,18 @@ class SpmLeafHandoffContractTests(unittest.TestCase):
             os.utime(stmat, ns=(now + 1, now + 1))
 
             missing = inspect_speedtree_texture_sources(spm)
-            self.assertEqual(missing["status"], "missing_sources")
-            self.assertEqual(
-                missing["classification"],
-                "asset_texture_source_path_missing",
-            )
+            self.assertEqual(missing["status"], "ok")
+            self.assertEqual(missing["availability_status"], "textureless")
+            self.assertFalse(missing["affects_pipeline_outcome"])
             self.assertEqual(missing["missing_sources"][0]["map"], "Color")
-            self.assertIn("Relink", missing["remediation"])
 
             texture.parent.mkdir()
             texture.write_bytes(b"pixels")
             ready = inspect_speedtree_texture_sources(spm)
             self.assertEqual(ready["status"], "ok")
+            self.assertEqual(ready["availability_status"], "complete")
 
-    def test_textureless_stmat_material_remains_blocking(self):
+    def test_textureless_stmat_material_is_a_normal_state(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             spm = root / "SK_reed_textureless_01.spm"
@@ -439,11 +498,9 @@ class SpmLeafHandoffContractTests(unittest.TestCase):
 
             contract = inspect_speedtree_texture_sources(spm)
 
-            self.assertEqual(contract["status"], "missing_sources")
-            self.assertEqual(
-                contract["classification"],
-                "asset_texture_source_undeclared",
-            )
+            self.assertEqual(contract["status"], "ok")
+            self.assertEqual(contract["availability_status"], "textureless")
+            self.assertFalse(contract["affects_pipeline_outcome"])
             self.assertEqual(contract["source_count"], 0)
             self.assertEqual(
                 contract["missing_sources"][0]["material"],

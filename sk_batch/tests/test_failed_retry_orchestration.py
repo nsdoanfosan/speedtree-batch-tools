@@ -1,0 +1,1134 @@
+import copy
+import queue
+import sys
+import tempfile
+import threading
+import unittest
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+from pathlib import Path
+from unittest import mock
+
+
+SK_BATCH_DIR = Path(__file__).resolve().parents[1]
+REPO_DIR = SK_BATCH_DIR.parent
+sys.path.insert(0, str(SK_BATCH_DIR))
+sys.path.insert(0, str(REPO_DIR))
+
+
+def load_gui_module():
+    path = SK_BATCH_DIR / "sk_batch_gui.pyw"
+    loader = SourceFileLoader("sk_batch_failed_retry_orchestration_test", str(path))
+    spec = spec_from_loader(loader.name, loader)
+    module = module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+class Lease:
+    finished = False
+
+    @staticmethod
+    def renew_and_check_current():
+        return True
+
+
+class FailedRetryOrchestrationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.first = self.root / "SK_first.spm"
+        self.second = self.root / "SK_second.spm"
+        self.first.write_bytes(b"first")
+        self.second.write_bytes(b"second")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    @staticmethod
+    def app(gui):
+        app = gui.App.__new__(gui.App)
+        app.stop_flag = threading.Event()
+        app.ui_queue = queue.Queue()
+        app.state = {}
+        app.state_lock = threading.RLock()
+        app.log = mock.Mock()
+        app._job_check = mock.Mock()
+        app._execute_material_preflight = mock.Mock(return_value={
+            "code": 0,
+            "result": {"status": "ok"},
+            "report": "fresh_material_preflight.json",
+        })
+        app._cluster_normalization_stage_observation = mock.Mock(return_value={
+            "status": "normalized",
+        })
+        app._failed_retry_repair_state = mock.Mock(return_value={
+            "current": False,
+            "kind": "stale_content",
+            "reason": "Blender rebuild follows BAT repair",
+        })
+        return app
+
+    @staticmethod
+    def plan(path, request_id):
+        return {
+            "schema_version": 1,
+            "request_id": request_id,
+            "parent_retry_id": "parent-118",
+            "exact_spm": str(path),
+            "evidence_sha256": "a" * 64,
+            "reason_codes": ["texture_set_incomplete"],
+            "stages": [{
+                "stage": "pcg_texture",
+                "tool": "pcg_st9_texture_batch",
+                "repair_action": "step3-standard",
+                "target_spms": [str(path)],
+            }],
+            "supported": True,
+            "initial_status": "automatic_repair_pending",
+        }
+
+    @staticmethod
+    def generator_cluster_plan(path, provider, request_id):
+        return {
+            "schema_version": 1,
+            "request_id": request_id,
+            "parent_retry_id": "parent-125",
+            "exact_spm": str(path),
+            "evidence_sha256": "b" * 64,
+            "reason_codes": ["generator_connection_contract_incomplete"],
+            "stages": [{
+                "stage": "generator_sync_and_cluster",
+                "tool": "spm_generator_sync",
+                "repair_action": "generator-sync-and-cluster",
+                "target_spms": [str(path), str(provider)],
+            }],
+            "supported": True,
+            "initial_status": "automatic_repair_pending",
+        }
+
+    def test_success_transitions_through_reaudit_and_pipeline(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+        target = {"spm": self.first}
+        app._run_full_pipeline = mock.Mock(side_effect=lambda *_args, **_kwargs: setattr(
+            app,
+            "_phase_result_summary",
+            {
+                "target_outcomes": [{
+                    "target": str(self.first),
+                    "target_name": self.first.name,
+                    "outcome": "completed",
+                    "reason_token": None,
+                    "evidence": {},
+                }],
+                "completed_count": 1,
+                "blocked_count": 0,
+                "failed_count": 0,
+            },
+        ))
+        job = {
+            "targets": [target],
+            "repair_plans": [self.plan(self.first, "one")],
+        }
+        with mock.patch.object(gui, "save_state"), mock.patch.object(
+            gui,
+            "run_exact_target_request",
+            return_value={"status": "completed", "result": {}},
+        ) as run:
+            ok = app._run_failed_retry_repair_job(job, Lease())
+
+        self.assertTrue(ok)
+        run.assert_called_once()
+        app._job_check.assert_called_once_with(str(self.first), self.first)
+        app._run_full_pipeline.assert_called_once()
+        automation = app.state[str(self.first)]["failed_retry_automation"]
+        self.assertEqual(automation["status"], "automatic_repair_completed")
+        self.assertEqual(app._phase_result_summary["completed_count"], 1)
+
+    def test_multi_stage_plan_runs_every_exact_action_before_broad_reaudit(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+        plan = self.plan(self.first, "two-stage")
+        plan["stages"].append({
+            "stage": "generator_sync_and_cluster",
+            "tool": "spm_generator_sync",
+            "repair_action": "generator-sync-and-cluster",
+            "target_spms": [str(self.first)],
+        })
+
+        def complete_pipeline(*_args, **_kwargs):
+            app._phase_result_summary = {
+                "target_outcomes": [{
+                    "target": str(self.first),
+                    "target_name": self.first.name,
+                    "outcome": "completed",
+                    "reason_token": None,
+                    "evidence": {},
+                }],
+                "completed_count": 1,
+                "blocked_count": 0,
+                "failed_count": 0,
+            }
+
+        app._execute_exact_repair_stage = mock.Mock(return_value={
+            "status": "completed",
+            "terminal_status": "completed",
+            "result": {},
+        })
+        app._fresh_reaudit_after_exact_repair = mock.Mock(return_value={
+            "status": "current",
+        })
+        app._run_full_pipeline = mock.Mock(side_effect=complete_pipeline)
+        job = {
+            "targets": [{"spm": self.first}],
+            "repair_plans": [plan],
+        }
+
+        with mock.patch.object(gui, "save_state"):
+            ok = app._run_failed_retry_repair_job(job, Lease())
+
+        self.assertTrue(ok)
+        self.assertEqual(app._execute_exact_repair_stage.call_count, 2)
+        app._fresh_reaudit_after_exact_repair.assert_called_once_with(
+            job["targets"][0],
+            plan["stages"][1],
+        )
+        attempted = app.state[str(self.first)]["failed_retry_automation"][
+            "attempted_stages"
+        ]
+        self.assertEqual(
+            attempted[0]["fresh_reaudit"],
+            {
+                "status": "deferred_until_remaining_exact_stages",
+                "remaining_stage_count": 1,
+            },
+        )
+        self.assertEqual(
+            attempted[1]["fresh_reaudit"],
+            {"status": "current"},
+        )
+
+    def test_completed_pipeline_wins_over_repair_receipt_bookkeeping_mismatch(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+        target = {"spm": self.first}
+
+        def completed_pipeline(*_args, **_kwargs):
+            app._phase_result_summary = {
+                "target_outcomes": [{
+                    "target": str(self.first),
+                    "target_name": self.first.name,
+                    "outcome": "completed",
+                    "reason_token": None,
+                    "evidence": {},
+                }],
+                "completed_count": 1,
+                "blocked_count": 0,
+                "failed_count": 0,
+            }
+
+        app._run_full_pipeline = mock.Mock(side_effect=completed_pipeline)
+        job = {
+            "targets": [target],
+            "repair_plans": [self.plan(self.first, "receipt-mismatch")],
+        }
+        with mock.patch.object(gui, "save_state"), mock.patch.object(
+            gui,
+            "run_exact_target_request",
+            return_value={"status": "completed", "result": {}},
+        ), mock.patch.object(
+            gui,
+            "fresh_repair_receipt_authoritative",
+            return_value=False,
+        ):
+            ok = app._run_failed_retry_repair_job(job, Lease())
+
+        self.assertTrue(ok)
+        outcome = app._phase_result_summary["target_outcomes"][0]
+        self.assertEqual(outcome["outcome"], "completed")
+        diagnostic = outcome["evidence"][
+            "automatic_repair_receipt_diagnostic"
+        ]
+        self.assertFalse(diagnostic["asset_failure"])
+        self.assertEqual(
+            diagnostic["fresh_pipeline_outcome"],
+            "completed",
+        )
+
+    def test_repaired_cluster_resumes_blocked_consumer_in_same_pipeline(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+        captured_targets = []
+
+        def complete_pipeline(targets, **_kwargs):
+            captured_targets.extend(str(item["spm"]) for item in targets)
+            app._phase_result_summary = {
+                "target_outcomes": [
+                    {
+                        "target": str(item["spm"]),
+                        "target_name": Path(item["spm"]).name,
+                        "outcome": "completed",
+                        "reason_token": None,
+                        "evidence": {},
+                    }
+                    for item in targets
+                ],
+                "completed_count": len(targets),
+                "blocked_count": 0,
+                "failed_count": 0,
+            }
+            return True
+
+        app._run_full_pipeline = mock.Mock(side_effect=complete_pipeline)
+        job = {
+            "targets": [{"spm": self.first}, {"spm": self.second}],
+            "repair_plans": [self.plan(self.first, "cluster")],
+            "resume_after_repairs": {
+                str(self.second): [str(self.first)],
+            },
+        }
+
+        with mock.patch.object(gui, "save_state"), mock.patch.object(
+            gui,
+            "run_exact_target_request",
+            return_value={"status": "completed", "result": {}},
+        ):
+            ok = app._run_failed_retry_repair_job(job, Lease())
+
+        self.assertTrue(ok)
+        self.assertEqual(
+            captured_targets,
+            [str(self.first), str(self.second)],
+        )
+        self.assertEqual(app._phase_result_summary["completed_count"], 2)
+        self.assertTrue(any(
+            "필수 Cluster 복구 후 Blender 재개" in str(call.args[0])
+            for call in app.log.call_args_list
+        ))
+
+    def test_failed_cluster_repair_returns_to_fresh_pipeline_for_both_targets(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+        captured_targets = []
+
+        def complete_pipeline(targets, **_kwargs):
+            captured_targets.extend(str(item["spm"]) for item in targets)
+            for item in targets:
+                app.state.setdefault(str(item["spm"]), {}).update({
+                    "push_status": "완료 (headless)",
+                    "push_status_kind": "imported_ok",
+                })
+            app._phase_result_summary = {
+                "target_outcomes": [
+                    {
+                        "target": str(item["spm"]),
+                        "target_name": Path(item["spm"]).name,
+                        "outcome": "completed",
+                        "reason_token": "completed",
+                        "evidence": {},
+                    }
+                    for item in targets
+                ],
+                "completed_count": len(targets),
+                "blocked_count": 0,
+                "failed_count": 0,
+            }
+
+        app._run_full_pipeline = mock.Mock(side_effect=complete_pipeline)
+        job = {
+            "targets": [{"spm": self.first}, {"spm": self.second}],
+            "repair_plans": [self.plan(self.first, "cluster-failed")],
+            "resume_after_repairs": {
+                str(self.second): [str(self.first)],
+            },
+        }
+
+        with mock.patch.object(gui, "save_state"), mock.patch.object(
+            gui,
+            "run_exact_target_request",
+            return_value={"status": "failed", "error": "sanitized failure"},
+        ):
+            ok = app._run_failed_retry_repair_job(job, Lease())
+
+        self.assertTrue(ok)
+        app._run_full_pipeline.assert_called_once()
+        self.assertEqual(
+            captured_targets,
+            [str(self.first), str(self.second)],
+        )
+        outcomes = {
+            row["target"]: row for row in app._phase_result_summary["target_outcomes"]
+        }
+        self.assertEqual(outcomes[str(self.first)]["outcome"], "completed")
+        self.assertEqual(
+            outcomes[str(self.first)]["evidence"][
+                "automatic_repair_attempt"
+            ]["reason_token"],
+            "automatic_repair_failed",
+        )
+        self.assertEqual(outcomes[str(self.second)]["outcome"], "completed")
+        self.assertEqual(
+            app.state[str(self.first)].get("push_status_kind"),
+            "imported_ok",
+        )
+
+    def test_exact_repair_wrapper_exception_still_runs_fresh_pipeline(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+        captured_targets = []
+
+        def complete_pipeline(targets, **_kwargs):
+            captured_targets.extend(str(item["spm"]) for item in targets)
+            app.state.setdefault(str(self.first), {}).update({
+                "push_status": "완료 (headless)",
+                "push_status_kind": "imported_ok",
+            })
+            app._phase_result_summary = {
+                "target_outcomes": [{
+                    "target": str(self.first),
+                    "target_name": self.first.name,
+                    "outcome": "completed",
+                    "reason_token": "completed",
+                    "evidence": {},
+                }],
+                "completed_count": 1,
+                "blocked_count": 0,
+                "failed_count": 0,
+            }
+
+        app._run_full_pipeline = mock.Mock(side_effect=complete_pipeline)
+        app._execute_exact_repair_stage = mock.Mock(
+            side_effect=RuntimeError("sanitized request construction bug")
+        )
+        job = {
+            "targets": [{"spm": self.first}],
+            "repair_plans": [self.plan(self.first, "wrapper-exception")],
+        }
+
+        with mock.patch.object(gui, "save_state"):
+            ok = app._run_failed_retry_repair_job(job, Lease())
+
+        self.assertTrue(ok)
+        self.assertEqual(captured_targets, [str(self.first)])
+        app._run_full_pipeline.assert_called_once()
+        outcome = app._phase_result_summary["target_outcomes"][0]
+        self.assertEqual(outcome["outcome"], "completed")
+        self.assertEqual(
+            outcome["evidence"]["automatic_repair_attempt"]["reason_token"],
+            "automatic_repair_failed",
+        )
+        self.assertEqual(
+            app.state[str(self.first)]["push_status_kind"],
+            "imported_ok",
+        )
+
+    def test_fresh_pipeline_content_failure_keeps_its_exact_reason(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+
+        def content_blocked(_targets, **_kwargs):
+            app._phase_result_summary = {
+                "target_outcomes": [
+                    {
+                        "target": str(self.first),
+                        "target_name": self.first.name,
+                        "outcome": "failed",
+                        "reason_token": "asset_external_mesh_path_missing",
+                        "evidence": {"missing": ["meshes/missing.fbx"]},
+                    },
+                    {
+                        "target": str(self.second),
+                        "target_name": self.second.name,
+                        "outcome": "blocked",
+                        "reason_token": "dependency_blocked",
+                        "evidence": {"blocked_by": [str(self.first)]},
+                    },
+                ],
+                "completed_count": 0,
+                "blocked_count": 1,
+                "failed_count": 1,
+            }
+
+        app._run_full_pipeline = mock.Mock(side_effect=content_blocked)
+        job = {
+            "targets": [{"spm": self.first}, {"spm": self.second}],
+            "repair_plans": [self.plan(self.first, "cluster-failed-content")],
+            "resume_after_repairs": {
+                str(self.second): [str(self.first)],
+            },
+        }
+
+        with mock.patch.object(gui, "save_state"), mock.patch.object(
+            gui,
+            "run_exact_target_request",
+            return_value={"status": "failed", "error": "worker transport"},
+        ):
+            ok = app._run_failed_retry_repair_job(job, Lease())
+
+        self.assertFalse(ok)
+        outcomes = {
+            row["target"]: row
+            for row in app._phase_result_summary["target_outcomes"]
+        }
+        self.assertEqual(
+            outcomes[str(self.first)]["reason_token"],
+            "asset_external_mesh_path_missing",
+        )
+        self.assertEqual(
+            outcomes[str(self.second)]["reason_token"],
+            "dependency_blocked",
+        )
+        self.assertNotEqual(
+            app.state[str(self.first)].get("push_status_kind"),
+            "automatic_repair_failed",
+        )
+
+    def test_cancelled_cluster_repair_cancels_consumer_resumably(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+        app._run_full_pipeline = mock.Mock()
+        job = {
+            "targets": [{"spm": self.first}, {"spm": self.second}],
+            "repair_plans": [self.plan(self.first, "cluster-cancelled")],
+            "resume_after_repairs": {
+                str(self.second): [str(self.first)],
+            },
+        }
+
+        with mock.patch.object(gui, "save_state"), mock.patch.object(
+            gui,
+            "run_exact_target_request",
+            return_value={"status": "cancelled"},
+        ):
+            ok = app._run_failed_retry_repair_job(job, Lease())
+
+        self.assertFalse(ok)
+        app._run_full_pipeline.assert_not_called()
+        outcomes = {
+            row["target"]: row for row in app._phase_result_summary["target_outcomes"]
+        }
+        self.assertEqual(outcomes[str(self.first)]["outcome"], "cancelled")
+        self.assertEqual(outcomes[str(self.second)]["outcome"], "cancelled")
+        self.assertEqual(
+            outcomes[str(self.second)]["reason_token"],
+            "required_cluster_repair_cancelled",
+        )
+        self.assertEqual(
+            app.state[str(self.second)]["push_status_kind"],
+            "cancelled",
+        )
+
+    def test_live_atlas_conflict_enters_structured_repair_evidence(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+        app._failed_retry_repair_state = mock.Mock(return_value={
+            "current": False,
+            "push_ready": False,
+            "kind": "material",
+            "reason": "current Atlas conflict",
+        })
+        app.state[str(self.first)] = {
+            "blend_status_kind": "data_error",
+            "blend_status_error": {
+                "kind": "data_error",
+                "message": "sanitized prior preflight failure",
+            },
+        }
+        repair = {
+            "status": "repairable",
+            "reason_code": "atlas_manifest_mirror_conflict_repairable",
+            "target_spm": str(self.first),
+            "authority": str(self.root / "authority.json"),
+            "mirrors": [str(self.root / "stale.json")],
+        }
+
+        with mock.patch.object(
+            gui, "atlas_manifest_mirror_repair_plan", return_value=repair
+        ):
+            evidence = app._failed_retry_durable_evidence(
+                str(self.first),
+                repair_state=app._failed_retry_repair_state(str(self.first)),
+            )
+
+        self.assertEqual(evidence["current_atlas_manifest_repair"], repair)
+        self.assertTrue(gui.has_repair_contract_evidence(evidence))
+        plan = gui.build_exact_target_repair_plan(
+            self.first,
+            evidence,
+            inventory_paths=[self.first, self.second],
+            parent_retry_id="parent-atlas",
+            request_id="request-atlas",
+        )
+        self.assertTrue(plan.supported)
+        self.assertEqual(
+            plan.stages[0]["repair_action"],
+            "atlas-manifest-mirror-repair",
+        )
+
+    def test_generator_cluster_reaudit_uses_only_evidence_provider(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+        target = {"spm": self.first}
+        app._run_full_pipeline = mock.Mock(side_effect=lambda *_args, **_kwargs: setattr(
+            app,
+            "_phase_result_summary",
+            {
+                "target_outcomes": [{
+                    "target": str(self.first),
+                    "target_name": self.first.name,
+                    "outcome": "ready",
+                    "reason_token": None,
+                    "evidence": {},
+                }],
+                "completed_count": 1,
+                "blocked_count": 0,
+                "failed_count": 0,
+            },
+        ))
+        job = {
+            "targets": [target],
+            "repair_plans": [self.generator_cluster_plan(
+                self.first,
+                self.second,
+                "generator-cluster",
+            )],
+        }
+
+        def complete_with_unit_progress(*_args, **kwargs):
+            callback = kwargs["on_progress"]
+            callback({
+                "current_stage": "Generator Sync 중",
+                "unit_stage": "generator_sync",
+            })
+            callback({
+                "current_stage": "Cluster 갱신 중",
+                "unit_stage": "cluster_refresh",
+            })
+            return {"status": "completed", "result": {}}
+
+        with mock.patch.object(gui, "save_state"), mock.patch.object(
+            gui,
+            "run_exact_target_request",
+            side_effect=complete_with_unit_progress,
+        ):
+            ok = app._run_failed_retry_repair_job(job, Lease())
+
+        self.assertTrue(ok)
+        app._cluster_normalization_stage_observation.assert_called_once()
+        args = app._cluster_normalization_stage_observation.call_args.args
+        self.assertEqual(args[0], self.first)
+        self.assertEqual(args[2], self.second)
+        self.assertTrue(
+            app._cluster_normalization_stage_observation.call_args.kwargs[
+                "require_normalized"
+            ]
+        )
+        status_cells = [
+            payload[2]
+            for kind, payload in list(app.ui_queue.queue)
+            if kind == "cell" and payload[1] == "push_status"
+        ]
+        self.assertIn("Generator Sync 중", status_cells)
+        self.assertIn("Cluster 갱신 중", status_cells)
+
+    def test_multiple_stage_failures_return_to_fresh_pipeline(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+
+        def complete_pipeline(targets, **_kwargs):
+            for item in targets:
+                app.state.setdefault(str(item["spm"]), {}).update({
+                    "push_status": "완료 (headless)",
+                    "push_status_kind": "imported_ok",
+                })
+            app._phase_result_summary = {
+                "target_outcomes": [
+                    {
+                        "target": str(item["spm"]),
+                        "target_name": Path(item["spm"]).name,
+                        "outcome": "completed",
+                        "reason_token": "completed",
+                        "evidence": {},
+                    }
+                    for item in targets
+                ],
+                "completed_count": len(targets),
+                "blocked_count": 0,
+                "failed_count": 0,
+            }
+
+        app._run_full_pipeline = mock.Mock(side_effect=complete_pipeline)
+        job = {
+            "targets": [{"spm": self.first}, {"spm": self.second}],
+            "repair_plans": [
+                self.plan(self.first, "one"),
+                self.plan(self.second, "two"),
+            ],
+        }
+        terminals = [
+            {"status": "failed", "error": "render failed"},
+            {"status": "failed", "error": "queue failed"},
+        ]
+        with mock.patch.object(gui, "save_state"), mock.patch.object(
+            gui, "run_exact_target_request", side_effect=terminals
+        ):
+            ok = app._run_failed_retry_repair_job(job, Lease())
+
+        self.assertTrue(ok)
+        app._run_full_pipeline.assert_called_once()
+        self.assertEqual(app._phase_result_summary["completed_count"], 2)
+        for path in (self.first, self.second):
+            automation = app.state[str(path)]["failed_retry_automation"]
+            self.assertEqual(automation["status"], gui.STATUS_COMPLETED)
+            self.assertEqual(
+                app.state[str(path)].get("push_status_kind"),
+                "imported_ok",
+            )
+
+    def test_cancel_is_resumable_and_not_promoted_to_final_failed(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+        app.stop_flag.set()
+        app._run_full_pipeline = mock.Mock()
+        job = {
+            "targets": [{"spm": self.first}],
+            "repair_plans": [self.plan(self.first, "cancel")],
+        }
+        with mock.patch.object(gui, "save_state"), mock.patch.object(
+            gui, "run_exact_target_request"
+        ) as run:
+            ok = app._run_failed_retry_repair_job(job, Lease())
+
+        self.assertFalse(ok)
+        run.assert_not_called()
+        self.assertEqual(
+            app.state[str(self.first)]["failed_retry_automation"]["status"],
+            "cancelled",
+        )
+        self.assertNotEqual(
+            app.state[str(self.first)]["push_status_kind"],
+            "automatic_repair_failed",
+        )
+
+    def test_downstream_cancel_is_resumable_and_filtered_from_failure(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+
+        def cancel_pipeline(*_args, **_kwargs):
+            app.stop_flag.set()
+            app._phase_result_summary = {
+                "target_outcomes": [{
+                    "target": str(self.first),
+                    "target_name": self.first.name,
+                    "outcome": "cancelled",
+                    "reason_token": "operator_stopped",
+                    "evidence": {},
+                }],
+                "completed_count": 0,
+                "blocked_count": 0,
+                "failed_count": 0,
+            }
+
+        app._run_full_pipeline = mock.Mock(side_effect=cancel_pipeline)
+        job = {
+            "targets": [{"spm": self.first}],
+            "repair_plans": [self.plan(self.first, "downstream-cancel")],
+        }
+        with mock.patch.object(gui, "save_state"), mock.patch.object(
+            gui,
+            "run_exact_target_request",
+            return_value={"status": "completed", "result": {}},
+        ):
+            ok = app._run_failed_retry_repair_job(job, Lease())
+
+        self.assertFalse(ok)
+        automation = app.state[str(self.first)]["failed_retry_automation"]
+        self.assertEqual(automation["status"], "cancelled")
+        self.assertEqual(app._phase_result_summary["failed_count"], 0)
+        self.assertEqual(app._phase_result_summary["cancelled_count"], 1)
+
+    def test_downstream_pending_unreal_is_waiting_not_final_failure(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+
+        def pending_pipeline(*_args, **_kwargs):
+            app.state.setdefault(str(self.first), {}).update({
+                "push_status": "Unreal import pending",
+                "push_status_kind": "exported_pending_unreal",
+            })
+            app._phase_result_summary = {
+                "target_outcomes": [{
+                    "target": str(self.first),
+                    "target_name": self.first.name,
+                    "outcome": "pending_unreal",
+                    "reason_token": "exported_pending_unreal",
+                    "evidence": {},
+                }],
+                "completed_count": 0,
+                "pending_count": 1,
+                "blocked_count": 0,
+                "failed_count": 0,
+            }
+
+        app._run_full_pipeline = mock.Mock(side_effect=pending_pipeline)
+        job = {
+            "targets": [{"spm": self.first}],
+            "repair_plans": [self.plan(self.first, "downstream-wait")],
+        }
+        with mock.patch.object(gui, "save_state"), mock.patch.object(
+            gui,
+            "run_exact_target_request",
+            return_value={
+                "status": "completed",
+                "terminal_status": "completed",
+                "result": {},
+            },
+        ):
+            ok = app._run_failed_retry_repair_job(job, Lease())
+
+        self.assertTrue(ok)
+        automation = app.state[str(self.first)]["failed_retry_automation"]
+        self.assertEqual(automation["status"], "blender_unreal_retry_running")
+        self.assertEqual(
+            app.state[str(self.first)]["push_status_kind"],
+            "exported_pending_unreal",
+        )
+        self.assertEqual(app._phase_result_summary["pending_count"], 1)
+        self.assertEqual(app._phase_result_summary["failed_count"], 0)
+
+    def test_normalized_current_outcomes_do_not_reuse_stale_failure_evidence(self):
+        gui = load_gui_module()
+        for normalized, disposition in (
+            ("completed", "current_success"),
+            ("pending_unreal", "current_wait"),
+            ("cancelled", "current_cancelled"),
+        ):
+            with self.subTest(normalized=normalized):
+                app = self.app(gui)
+                app._target_authoritative_result = mock.Mock(return_value={
+                    "outcome": normalized,
+                })
+                app.state[str(self.first)] = {
+                    "push_status_kind": "legacy raw state is #107-owned",
+                    "push_status_error": {
+                        "kind": "data_error",
+                        "reason_code": "texture_set_incomplete",
+                        "time": "2026-07-01T00:00:00",
+                    },
+                }
+                evidence = app._failed_retry_durable_evidence(
+                    str(self.first),
+                    {"current": True, "kind": "ready", "reason": "current"},
+                )
+                self.assertEqual(
+                    evidence["terminal_disposition"],
+                    disposition,
+                )
+                self.assertEqual(evidence["current_phase_errors"], {})
+                self.assertEqual(
+                    evidence["selected_failure"]["reason_token"],
+                    disposition,
+                )
+
+    def test_exact_repair_plan_is_returned_then_committed_on_ui_thread(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+        iid = str(self.first)
+        app._failed_retry_durable_evidence = mock.Mock(return_value={
+            "reason_code": "texture_set_incomplete",
+            "canonical_spm": iid,
+        })
+        app._snapshot_batch_request = mock.Mock(return_value=(
+            {iid: {"spm": self.first}},
+            [{"spm": self.first}],
+        ))
+        app._enqueue_batch_job = mock.Mock(return_value=1)
+        app._retry_planning_workers = set()
+        app._ui_thread_ident = threading.get_ident()
+        app.active_batch_job = None
+        app.pending_batch_jobs = gui.deque()
+        app._set_batch_queue_controls = mock.Mock()
+        tracker = mock.Mock()
+        tracker.run_id = "exact-repair-progress"
+        tracker.path = self.root / "retry-progress.json"
+        tracker.claim_planning_commit.side_effect = [True, False]
+        repair_plan = mock.Mock()
+        repair_plan.supported = True
+        repair_plan.metadata.return_value = self.plan(self.first, "planned")
+
+        with mock.patch.object(gui, "save_state"), mock.patch.object(
+            gui,
+            "has_repair_contract_evidence",
+            return_value=True,
+        ), mock.patch.object(
+            gui,
+            "build_exact_target_repair_plan",
+            return_value=repair_plan,
+        ):
+            built = app._build_failed_retry_plan(
+                [iid],
+                {"push_transport": "rpc"},
+                tracker=tracker,
+            )
+
+        app._enqueue_batch_job.assert_not_called()
+        self.assertEqual(len(built["jobs"]), 1)
+        job = built["jobs"][0]
+        self.assertEqual(job["mode"], "failed_retry_repair")
+        self.assertEqual(job["targets"], [{"spm": self.first}])
+        self.assertEqual(
+            job["retry_metadata"]["partition"],
+            "exact_bat_repair",
+        )
+        self.assertIs(job["_retry_progress_tracker"], tracker)
+        tracker.assign_partition.assert_called_once_with(
+            "exact_bat_repair",
+            [iid],
+            "exact_bat_then_fresh_reaudit_then_blender_unreal",
+        )
+
+        with mock.patch.object(gui, "save_config"):
+            committed = app._commit_failed_retry_plan(built)
+            duplicate = app._commit_failed_retry_plan(built)
+
+        self.assertEqual(committed, [1])
+        self.assertIsNone(duplicate)
+        app._enqueue_batch_job.assert_called_once_with(job)
+        tracker.complete_planning_commit.assert_called_once_with()
+
+    def test_unsupported_metadata_repair_keeps_fresh_pipeline_route(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+        iid = str(self.first)
+        app._failed_retry_durable_evidence = mock.Mock(return_value={
+            "reason_code": "managed_mesh_owner_ambiguous",
+            "canonical_spm": iid,
+        })
+        inventory = {iid: {"spm": self.first}}
+
+        built = app._build_failed_retry_plan(
+            [iid],
+            {"push_transport": "rpc"},
+            inventory_snapshot=inventory,
+        )
+
+        self.assertEqual(len(built["jobs"]), 1)
+        self.assertEqual(built["jobs"][0]["mode"], "pipeline")
+        self.assertTrue(built["jobs"][0]["force_rerun"])
+        self.assertEqual(built["skipped"], [])
+        self.assertEqual(built["deferred_status_updates"], [])
+        self.assertTrue(any(
+            "managed_mesh_owner_ambiguous" in row
+            for row in built["deferred_logs"]
+        ))
+
+    def test_atlas_receipt_and_lineage_blocks_enter_exact_cluster_refresh(self):
+        gui = load_gui_module()
+        inventory = {str(self.first): {"spm": self.first}}
+        for reason_code in (
+            "atlas_manifest_authority_missing",
+            "atlas_manifest_resolution_conflict",
+            "lineage_unproven",
+        ):
+            with self.subTest(reason_code=reason_code):
+                app = self.app(gui)
+                app._failed_retry_durable_evidence = mock.Mock(return_value={
+                    "reason_code": reason_code,
+                    "canonical_spm": str(self.first),
+                })
+
+                built = app._build_failed_retry_plan(
+                    [str(self.first)],
+                    {"push_transport": "rpc"},
+                    inventory_snapshot=inventory,
+                )
+
+                self.assertEqual(len(built["jobs"]), 1)
+                self.assertEqual(built["skipped"], [])
+                plan = built["jobs"][0]["repair_plans"][0]
+                self.assertEqual(
+                    [stage["repair_action"] for stage in plan["stages"]],
+                    ["cluster-refresh"],
+                )
+                self.assertEqual(
+                    plan["stages"][0]["target_spms"],
+                    [str(self.first)],
+                )
+
+    def test_planner_keeps_dependency_blocked_consumer_with_cluster_repair(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+        cluster_iid = str(self.first)
+        consumer_iid = str(self.second)
+        app.state = {
+            cluster_iid: {
+                "push_status_kind": "data_error",
+                "push_status_error": {
+                    "kind": "data_error",
+                    "reason_code": "generator_connection_contract_incomplete",
+                    "message": "sanitized cluster failure",
+                },
+            },
+            consumer_iid: {
+                "blend_status_kind": "dependency_blocked",
+                "blend_status_error": {
+                    "kind": "dependency_blocked",
+                    "message": "sanitized dependency block",
+                    "blocked_by": [cluster_iid],
+                },
+            },
+        }
+        app.state[cluster_iid]["push_status_error"].update(
+            app._bind_failure_record(
+                cluster_iid,
+                "data_error",
+                "sanitized cluster failure",
+                {"reason_code": "generator_connection_contract_incomplete"},
+            )
+        )
+        consumer_details = {
+            "blocked_by": [cluster_iid],
+            "dependency_artifacts": {
+                cluster_iid: {
+                    "status": "missing",
+                    "phase": "blender",
+                    "reason": "sanitized missing provider output",
+                    "artifact_identity": app._dependency_artifact_identity(
+                        self.first,
+                        "blender",
+                        {},
+                    ),
+                },
+            },
+        }
+        app.state[consumer_iid]["blend_status_error"].update(
+            copy.deepcopy(consumer_details)
+        )
+        app.state[consumer_iid]["blend_status_error"].update(
+            app._bind_failure_record(
+                consumer_iid,
+                "dependency_blocked",
+                "sanitized dependency block",
+                consumer_details,
+            )
+        )
+
+        def evidence(iid, _repair_state=None, **_kwargs):
+            if iid == cluster_iid:
+                return {
+                    "reason_code": "generator_connection_contract_incomplete",
+                    "canonical_spm": iid,
+                }
+            return {
+                "selected_failure": {
+                    "reason_token": "shared_dependency_failed",
+                    "evidence": {"blocked_by": [cluster_iid]},
+                },
+            }
+
+        app._failed_retry_durable_evidence = mock.Mock(side_effect=evidence)
+        repair_plan = mock.Mock()
+        repair_plan.supported = True
+        repair_plan.metadata.return_value = self.plan(self.first, "planned")
+        inventory = {
+            cluster_iid: {"spm": self.first},
+            consumer_iid: {"spm": self.second},
+        }
+
+        with mock.patch.object(
+            gui,
+            "build_exact_target_repair_plan",
+            return_value=repair_plan,
+        ):
+            built = app._build_failed_retry_plan(
+                [cluster_iid, consumer_iid],
+                {"push_transport": "rpc"},
+                inventory_snapshot=inventory,
+            )
+
+        self.assertEqual(len(built["jobs"]), 1)
+        job = built["jobs"][0]
+        self.assertEqual(job["mode"], "failed_retry_repair")
+        self.assertEqual(
+            [str(item["spm"]) for item in job["targets"]],
+            [cluster_iid, consumer_iid],
+        )
+        self.assertEqual(
+            job["resume_after_repairs"],
+            {consumer_iid: [cluster_iid]},
+        )
+        self.assertEqual(len(job["repair_plans"]), 1)
+
+    def test_planning_cancel_wins_before_commit_without_enqueue(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+        app._ui_thread_ident = threading.get_ident()
+        app.active_batch_job = None
+        app.pending_batch_jobs = gui.deque()
+        app._retry_planning_workers = set()
+        app._set_batch_queue_controls = mock.Mock()
+        app._enqueue_batch_job = mock.Mock()
+        app.stop_flag.set()
+        tracker = mock.Mock()
+        plan = {
+            "tracker": tracker,
+            "selected_iids": [str(self.first)],
+            "cfg": {},
+            "jobs": [{"label": "must not enqueue"}],
+        }
+
+        committed = app._commit_failed_retry_plan(plan)
+
+        self.assertIsNone(committed)
+        app._enqueue_batch_job.assert_not_called()
+        tracker.finish_planning.assert_called_once_with(
+            gui.RETRY_STAGE_CANCELLED,
+            "operator cancelled during retry planning",
+        )
+        tracker.claim_planning_commit.assert_not_called()
+
+    def test_invalid_exact_identity_is_final_fail_closed_not_legacy_retry(self):
+        gui = load_gui_module()
+        app = self.app(gui)
+        missing = self.root / "missing exact.spm"
+        app.items = {str(missing): {}}
+        app._close_cell_editor = mock.Mock()
+        app._collect_cfg = mock.Mock(return_value={})
+        app._set_batch_queue_controls = mock.Mock()
+        app.active_batch_job = None
+        app.pending_batch_jobs = gui.deque()
+        app._enqueue_batch_job = mock.Mock()
+        app._failed_retry_repair_state = mock.Mock(return_value={
+            "current": False,
+            "kind": "stale_content",
+            "reason": "repair evidence",
+        })
+        app._failed_retry_durable_evidence = mock.Mock(return_value={
+            "reason_code": "generator_connection_contract_incomplete",
+            "canonical_spm": str(missing),
+        })
+
+        with mock.patch.object(gui, "save_state"), mock.patch.object(
+            gui, "save_config"
+        ), mock.patch.object(
+            gui.messagebox,
+            "showinfo",
+        ):
+            app.start_failed_results_retry()
+
+        app._enqueue_batch_job.assert_not_called()
+        entry = app.state[str(missing)]
+        self.assertEqual(
+            entry["failed_retry_automation"]["status"],
+            "final_failed",
+        )
+        self.assertEqual(entry["push_status_kind"], "automatic_repair_failed")
+        self.assertIn(
+            "generator_connection_contract_incomplete",
+            entry["push_status_error"]["reason_codes"],
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

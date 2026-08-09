@@ -6,12 +6,22 @@ import queue
 import tempfile
 import threading
 import unittest
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
+from atlas_target_registry import TargetRegistryError
+from sk_batch.repair_runtime_contract import (
+    RepairPipelineEvidenceError,
+    repair_pipeline_output_contract,
+    repair_runtime_receipt_path,
+    validate_unassigned_geometry_cleanup_evidence,
+    write_repair_runtime_receipt,
+)
 from speedtree_pipeline_contract import build_preflight_envelope, source_identity
 
 
@@ -421,6 +431,11 @@ class BlendLiveStatusTests(unittest.TestCase):
             report.write_text(
                 json.dumps({
                     "speedtree_pipeline_contract": {},
+                    "unassigned_geometry_cleanup": {
+                        "status": "not_applicable",
+                        "policy": "discard_unassigned_geometry_before_repair",
+                        "cleanup_contract_version": 1,
+                    },
                     "texture_normalization": {"status": "ok", "missing": []},
                     "handoff_preflight": {"status": "ok"},
                 }),
@@ -433,8 +448,41 @@ class BlendLiveStatusTests(unittest.TestCase):
             wind.parent.mkdir()
             write_valid_wind(wind)
             self.set_time(blend, 3_000_000_000)
+            self._write_cleanup_contract_evidence(spm)
             with mock.patch.object(gui, "validate_preflight_envelope"):
                 self.assertEqual(app._blend_status_text(spm), "최신 ✓")
+
+    def test_current_live_repair_status_clears_saved_blend_failure(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        iid = str(Path("SK_branch_elm_01.spm").absolute())
+        app.state[iid] = {
+            "blend_status": "old failure",
+            "blend_status_kind": "data_error",
+            "blend_status_error": {
+                "kind": "data_error",
+                "message": "stale preflight failure",
+            },
+            "blend_status_result": {"outcome": "failed"},
+        }
+        repair_state = {
+            "current": True,
+            "push_ready": True,
+            "kind": "ready",
+            "reason": "current live Repair output",
+            "texture_reason": "",
+        }
+
+        with mock.patch.object(gui, "save_state"):
+            app._record_live_blend_status(
+                iid,
+                Path(iid),
+                repair_state=repair_state,
+            )
+
+        self.assertEqual(app.state[iid]["blend_status_kind"], "ok")
+        self.assertNotIn("blend_status_error", app.state[iid])
+        self.assertNotIn("blend_status_result", app.state[iid])
 
     def test_legacy_report_without_pipeline_contract_requires_repair(self):
         gui = load_gui_module()
@@ -631,7 +679,7 @@ class BlendLiveStatusTests(unittest.TestCase):
 
             self.assertEqual(report.read_bytes(), before)
 
-    def test_legacy_material_report_with_unresolved_bindings_never_migrates(
+    def test_legacy_material_report_with_unresolved_textures_migrates(
         self,
     ):
         gui = load_gui_module()
@@ -653,8 +701,6 @@ class BlendLiveStatusTests(unittest.TestCase):
             report.write_text(json.dumps(payload), encoding="utf-8")
             self.set_time(blend, 1_000_000_000)
             self.set_time(report, 2_000_000_000)
-            before = report.read_bytes()
-
             with mock.patch.object(
                 gui,
                 "build_preflight_envelope",
@@ -664,13 +710,18 @@ class BlendLiveStatusTests(unittest.TestCase):
                         "texture_source_mode": "unresolved",
                     }],
                 },
-            ), self.assertRaisesRegex(
-                ValueError,
-                "cannot prove material texture bindings",
             ):
-                gui.load_current_repair_pipeline_report(spm)
+                migrated = gui.load_current_repair_pipeline_report(spm)
 
-            self.assertEqual(report.read_bytes(), before)
+            self.assertEqual(
+                migrated["speedtree_pipeline_contract"]["material_intents"][0]
+                ["texture_source_mode"],
+                "unresolved",
+            )
+            self.assertEqual(
+                migrated["report_contract_migration"]["kind"],
+                "legacy_content_identity_upgrade",
+            )
 
     def test_cluster_contract_uses_canonical_sk_output_and_stmat(self):
         gui = load_gui_module()
@@ -709,7 +760,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.assertEqual(gui.speedtree_output_spm_for(canonical), canonical)
             self.assertEqual(
                 app._texture_normalization_ready(canonical),
-                (True, "텍스처 정규화 완료"),
+                (True, "머티리얼 준비 완료 · 텍스처 선택 연결"),
             )
 
     def test_content_receipt_keeps_touch_only_spm_current(self):
@@ -728,6 +779,11 @@ class BlendLiveStatusTests(unittest.TestCase):
             report.write_text(
                 json.dumps({
                     "speedtree_pipeline_contract": {},
+                    "unassigned_geometry_cleanup": {
+                        "status": "not_applicable",
+                        "policy": "discard_unassigned_geometry_before_repair",
+                        "cleanup_contract_version": 1,
+                    },
                     "texture_normalization": {"status": "ok", "missing": []},
                     "handoff_preflight": {"status": "ok"},
                 }),
@@ -742,6 +798,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.set_time(blend, 1_000_000_000)
             self.set_time(report, 1_000_000_000)
             self.set_time(spm, 2_000_000_000)
+            self._write_cleanup_contract_evidence(spm)
 
             with mock.patch.object(gui, "validate_preflight_envelope"):
                 status = app._blend_status_text(spm)
@@ -765,6 +822,11 @@ class BlendLiveStatusTests(unittest.TestCase):
             report.write_text(
                 json.dumps({
                     "speedtree_pipeline_contract": {},
+                    "unassigned_geometry_cleanup": {
+                        "status": "not_applicable",
+                        "policy": "discard_unassigned_geometry_before_repair",
+                        "cleanup_contract_version": 1,
+                    },
                     "texture_normalization": {
                         "status": "preserved_cluster",
                         "missing": [],
@@ -783,6 +845,15 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.set_time(spm, 1_000_000_000)
             self.set_time(blend, 2_000_000_000)
             self.set_time(report, 2_000_000_000)
+            pipeline = self._cleanup_contract_evidence(spm, blend=blend)
+            pipeline["handoff_preflight"] = {
+                "status": "source_review",
+                "unreal_push_ready": False,
+                "empty_material_slots": [
+                    {"object": "branch_elm_01", "slot": 0}
+                ],
+            }
+            report.write_text(json.dumps(pipeline), encoding="utf-8")
             app._leaf_reference_ready = mock.Mock(return_value=(True, "정상"))
 
             with mock.patch.object(gui, "validate_preflight_envelope"):
@@ -824,7 +895,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             app._run_limited.assert_not_called()
             app._record_live_blend_status.assert_called_once()
 
-    def test_live_pass_through_invalidates_saved_ready_assembly_skip(self):
+    def test_current_owner_receipt_skips_redundant_live_pass_through_audit(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as temporary:
@@ -832,66 +903,33 @@ class BlendLiveStatusTests(unittest.TestCase):
             owner.mkdir()
             spm = owner / "SK_Tree_relation_off_01.spm"
             write_empty_spm(spm)
-            report = owner / "reports" / (
-                "SK_Tree_relation_off_01_"
-                "speedtree_repair_pipeline_report_codex.json"
-            )
-            report.parent.mkdir()
-            report.write_text(
-                json.dumps({
-                    "cluster_assembly_manifest": {
-                        "status": "ready",
-                    },
-                }),
-                encoding="utf-8",
-            )
-            live_report = Path(temporary) / "live_audit.json"
-            live_report.write_text(
-                json.dumps({
-                    "items": [{
-                        "cluster_assembly": {
-                            "tree_source_identities": [{
-                                "target_spm": {"path": str(spm)},
-                            }],
-                            "handoff": {
-                                "status": "pass_through",
-                                "cluster_dependencies": [],
-                                "roles": [],
-                            },
-                        },
-                    }],
-                }),
-                encoding="utf-8",
-            )
             app.force_rerun = False
             app.log = mock.Mock()
-            app._leaf_reference_ready = mock.Mock(
-                return_value=(True, "ok")
+            app._refresh_stale_cluster_receipt = mock.Mock(
+                side_effect=AssertionError(
+                    "current receipt must not trigger a new live audit"
+                )
             )
-            app._refresh_stale_cluster_receipt = mock.Mock(return_value={
-                "policy": "live_audit_authoritative",
-                "live_audit_report": str(live_report),
-            })
             app._repair_output_state = mock.Mock(return_value={
                 "current": True,
                 "push_ready": True,
                 "kind": "ready",
                 "reason": "ready",
             })
+            app._publish_current_repair_skip = mock.Mock(return_value=True)
 
-            with mock.patch.object(
-                gui,
-                "blender_open_file_window_titles",
-                side_effect=RuntimeError("rerun reached"),
-            ), self.assertRaisesRegex(RuntimeError, "rerun reached"):
-                app._job_blender(
-                    str(spm),
-                    spm,
-                    {
-                        "manual_bones_locked": False,
-                        "wind_override": "auto",
-                    },
-                )
+            app._job_blender(
+                str(spm),
+                spm,
+                {
+                    "manual_bones_locked": False,
+                    "wind_override": "auto",
+                },
+            )
+
+            app._repair_output_state.assert_called_once_with(spm)
+            app._publish_current_repair_skip.assert_called_once()
+            app._refresh_stale_cluster_receipt.assert_not_called()
 
     def test_repair_code_newer_than_saved_outputs_does_not_force_rerun(self):
         gui = load_gui_module()
@@ -921,6 +959,8 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.set_time(core, 3_000_000_000)
             app.cfg = {"fbx_ini": str(fbx_ini)}
             app._leaf_reference_ready = mock.Mock(return_value=(True, "정상"))
+            self._write_cleanup_contract_evidence(spm)
+            app._write_repair_runtime_receipt(spm)
 
             ready, reason = app._repair_runtime_fresh(spm)
 
@@ -950,7 +990,211 @@ class BlendLiveStatusTests(unittest.TestCase):
         self.set_time(core, 3_000_000_000)
         return spm, core, fbx_ini
 
-    def test_missing_runtime_receipt_does_not_force_a_rerun(self):
+    @staticmethod
+    def _cleanup_contract_record(spm, fbx, *, status):
+        spm_identity = source_identity(spm)
+        stmat = Path(fbx).with_suffix(".stmat")
+        stmat.parent.mkdir(parents=True, exist_ok=True)
+        if not stmat.is_file():
+            stmat.write_bytes(b"strict stmat fixture")
+        stmat_identity = source_identity(stmat)
+        live_identity = {
+            "spm": {
+                key: spm_identity[key]
+                for key in ("canonical_path", "sha256", "size")
+            },
+            "stmat": [{
+                key: stmat_identity[key]
+                for key in ("canonical_path", "sha256", "size")
+            }],
+        }
+        live_fingerprint = hashlib.sha256(
+            json.dumps(
+                live_identity,
+                sort_keys=True,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        common = {
+            "status": status,
+            "policy": "discard_unassigned_geometry_before_repair",
+            "cleanup_contract_version": 2,
+            "cleanup_authorized": True,
+            "strict_speedtree_pipeline_contract": True,
+            "live_source_identity_validated": True,
+            "live_source_identity": live_identity,
+            "live_source_identity_fingerprint": live_fingerprint,
+            "source_identity": str(Path(spm).resolve()),
+            "source_fbx": str(Path(fbx).resolve()),
+        }
+        if status == "not_applicable":
+            return {
+                **common,
+                "inspected_mesh_object_count": 1,
+                "changed_object_count": 0,
+                "removed_object_count": 0,
+                "removed_face_count": 0,
+                "removed_edge_count": 0,
+                "removed_vertex_count": 0,
+                "removed_material_slot_count": 0,
+                "objects": [],
+                "removed_objects": [],
+            }
+        if status != "applied":
+            raise ValueError(f"unsupported cleanup fixture status: {status}")
+        row = {
+            "object": "TreeWithDefaultCap",
+            "removed_object": False,
+            "faces_before": 2,
+            "faces_after": 1,
+            "removed_face_count": 1,
+            "edges_before": 6,
+            "edges_after": 3,
+            "removed_edge_count": 3,
+            "vertices_before": 6,
+            "vertices_after": 3,
+            "removed_vertex_count": 3,
+            "material_slots_before": 2,
+            "material_slots_after": 1,
+            "removed_material_slots": [{
+                "slot": 0,
+                "material": "Default",
+                "reason": "canonical_default_placeholder",
+            }],
+            "removed_face_reasons": {
+                "canonical_default_placeholder": 1,
+            },
+        }
+        return {
+            **common,
+            "inspected_mesh_object_count": 1,
+            "changed_object_count": 1,
+            "removed_object_count": 0,
+            "removed_face_count": 1,
+            "removed_edge_count": 3,
+            "removed_vertex_count": 3,
+            "removed_material_slot_count": 1,
+            "objects": [row],
+            "removed_objects": [],
+        }
+
+    @staticmethod
+    def _export_postcondition():
+        unsigned = {
+            "kind": "sk_batch_export_object_postcondition",
+            "schema_version": 2,
+            "coverage": "exact_export_collection_all_objects",
+            "objects": [{
+                "name": "Tree",
+                "type": "MESH",
+                "mesh": {
+                    "polygon_count": 1,
+                    "material_index_counts": [{
+                        "material_index": 0,
+                        "polygon_count": 1,
+                    }],
+                    "materials": [{"name": "M_Bark"}],
+                },
+            }],
+            "empty_material_slots": [],
+        }
+        digest = hashlib.sha256(
+            json.dumps(
+                unsigned,
+                sort_keys=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return {**unsigned, "content_sha256": digest}
+
+    @classmethod
+    def _cleanup_contract_evidence(
+        cls,
+        spm,
+        *,
+        cleanup_status="applied",
+        blend=None,
+    ):
+        spm = Path(spm)
+        blend = Path(blend) if blend is not None else spm.with_suffix(".blend")
+        fbx = spm.with_suffix(".fbx")
+        blend_stat = blend.stat()
+        cleanup = cls._cleanup_contract_record(
+            spm,
+            fbx,
+            status=cleanup_status,
+        )
+        renderable = {
+            "status": "ok",
+            "mesh_object_count": 1,
+            "face_count": 1,
+        }
+        return {
+            "status": "done",
+            "repair_output_contract_version": 2,
+            "unassigned_geometry_cleanup": cleanup,
+            "unassigned_geometry_cleanup_recheck": (
+                cls._cleanup_contract_record(
+                    spm,
+                    fbx,
+                    status="not_applicable",
+                )
+            ),
+            "import": {
+                "source_fbx": str(fbx.resolve()),
+                "source_identity": str(spm.resolve()),
+                "unassigned_geometry_cleanup": cleanup,
+                "renderable_geometry": dict(renderable),
+            },
+            "renderable_geometry_after_cleanup": dict(renderable),
+            "material_slot_validation": {
+                "status": "ok",
+                "placeholder_cleanup_authorized": True,
+                "material_count": 1,
+                "assigned_slot_indices": [0],
+                "canonical_default_slot_indices": [],
+            },
+            "speedtree_live_source_identity": {
+                "spm": source_identity(spm),
+                "stmat": cleanup["live_source_identity"]["stmat"],
+            },
+            "source_blend_identity": {
+                "path": str(blend.resolve()),
+                "exists": True,
+                "size": blend_stat.st_size,
+                "mtime_ns": blend_stat.st_mtime_ns,
+                "sha256": hashlib.sha256(blend.read_bytes()).hexdigest(),
+            },
+            "handoff_preflight": {"status": "ok"},
+            "repair_push_export_postcondition": cls._export_postcondition(),
+        }
+
+    @classmethod
+    def _write_cleanup_contract_evidence(
+        cls,
+        spm,
+        *,
+        cleanup_status="applied",
+        blend=None,
+    ):
+        report = Path(spm).parent / "reports" / (
+            f"{Path(spm).stem}_speedtree_repair_pipeline_report_codex.json"
+        )
+        report.parent.mkdir(parents=True, exist_ok=True)
+        payload = cls._cleanup_contract_evidence(
+            spm,
+            cleanup_status=cleanup_status,
+            blend=blend,
+        )
+        report.write_text(
+            json.dumps(payload),
+            encoding="utf-8",
+        )
+        return payload
+
+    def test_missing_runtime_receipt_for_legacy_output_forces_rerun(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as temporary:
@@ -960,14 +1204,34 @@ class BlendLiveStatusTests(unittest.TestCase):
             app._leaf_reference_ready = mock.Mock(return_value=(True, "정상"))
             app.log = mock.Mock()
 
-            self.assertTrue(app._repair_runtime_fresh(spm)[0])
-
-            app._write_repair_runtime_receipt(spm)
-
-            self.assertTrue(app._repair_runtime_receipt_path(spm).is_file())
             fresh, reason = app._repair_runtime_fresh(spm)
+            self.assertFalse(fresh)
+            self.assertIn("Blender Repair", reason)
+            self.assertFalse(app._repair_runtime_receipt_path(spm).is_file())
+
+    def test_missing_runtime_receipt_migrates_only_with_cleanup_evidence(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm, _core, fbx_ini = self._runtime_stale_fixture(root)
+            self._write_cleanup_contract_evidence(spm)
+            app.cfg = {"fbx_ini": str(fbx_ini)}
+            app.log = mock.Mock()
+            app._repair_contract_current = mock.Mock(return_value=True)
+
+            fresh, reason = app._repair_runtime_fresh(spm)
+
             self.assertTrue(fresh, reason)
-            self.assertEqual(reason, "")
+            receipt = json.loads(
+                app._repair_runtime_receipt_path(spm).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                receipt["output_contract_version"],
+                gui.REPAIR_OUTPUT_CONTRACT_VERSION,
+            )
 
     def test_runtime_receipt_stays_current_when_addon_code_changes(self):
         gui = load_gui_module()
@@ -977,6 +1241,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             spm, core, fbx_ini = self._runtime_stale_fixture(root)
             app.cfg = {"fbx_ini": str(fbx_ini)}
             app.log = mock.Mock()
+            self._write_cleanup_contract_evidence(spm)
             app._write_repair_runtime_receipt(spm)
             self.assertTrue(app._repair_runtime_fresh(spm)[0])
 
@@ -999,6 +1264,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             app._repair_runtime_code_paths = mock.Mock(
                 return_value=[core, producer]
             )
+            self._write_cleanup_contract_evidence(spm)
             app._write_repair_runtime_receipt(spm)
             self.assertTrue(app._repair_runtime_fresh(spm)[0])
 
@@ -1016,6 +1282,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             spm, _core, fbx_ini = self._runtime_stale_fixture(root)
             app.cfg = {"fbx_ini": str(fbx_ini)}
             app.log = mock.Mock()
+            self._write_cleanup_contract_evidence(spm)
             app._write_repair_runtime_receipt(spm)
             receipt_path = app._repair_runtime_receipt_path(spm)
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -1027,14 +1294,19 @@ class BlendLiveStatusTests(unittest.TestCase):
             fresh, reason = app._repair_runtime_fresh(spm)
 
             self.assertFalse(fresh)
-            self.assertIn("Blender Repair 산출물 계약이 변경됨", reason)
+            self.assertEqual(
+                json.loads(receipt_path.read_text(encoding="utf-8")),
+                receipt,
+            )
+            self.assertIn("saved-output contract changed", reason)
 
-    def test_version_one_runtime_receipt_migrates_without_rerun(self):
+    def test_version_one_runtime_receipt_migrates_with_current_v2_pipeline(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             spm, _core, fbx_ini = self._runtime_stale_fixture(root)
+            self._write_cleanup_contract_evidence(spm)
             app.cfg = {"fbx_ini": str(fbx_ini)}
             receipt_path = app._repair_runtime_receipt_path(spm)
             receipt_path.write_text(
@@ -1056,21 +1328,74 @@ class BlendLiveStatusTests(unittest.TestCase):
             fresh, reason = app._repair_runtime_fresh(spm)
 
             self.assertTrue(fresh, reason)
-            self.assertEqual(reason, "")
             migrated = json.loads(receipt_path.read_text(encoding="utf-8"))
-            self.assertEqual(
-                migrated["version"],
-                gui.REPAIR_RUNTIME_RECEIPT_VERSION,
-            )
+            self.assertEqual(migrated["version"], 2)
             self.assertEqual(
                 migrated["output_contract_version"],
                 gui.REPAIR_OUTPUT_CONTRACT_VERSION,
             )
-            self.assertEqual(
-                migrated["code"],
-                {"addon/core.py": "legacy-diagnostic-hash"},
-            )
             app._repair_runtime_code_state.assert_not_called()
+
+    def test_version_one_runtime_receipt_reruns_when_artifact_is_not_current(
+        self,
+    ):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm, _core, fbx_ini = self._runtime_stale_fixture(root)
+            self._write_cleanup_contract_evidence(spm)
+            app.cfg = {"fbx_ini": str(fbx_ini)}
+            receipt_path = app._repair_runtime_receipt_path(spm)
+            legacy = {
+                "kind": "sk_repair_runtime",
+                "version": 1,
+                "code": {"addon/core.py": "legacy-diagnostic-hash"},
+            }
+            receipt_path.write_text(json.dumps(legacy), encoding="utf-8")
+            app.log = mock.Mock()
+            app._repair_contract_current = mock.Mock(return_value=False)
+
+            fresh, reason = app._repair_runtime_fresh(spm)
+
+            self.assertFalse(fresh)
+            self.assertIn("current source/output contract", reason)
+            self.assertEqual(
+                json.loads(receipt_path.read_text(encoding="utf-8")),
+                legacy,
+            )
+
+    def test_current_receipt_cannot_bless_legacy_pipeline_evidence(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm, _core, fbx_ini = self._runtime_stale_fixture(root)
+            self._write_cleanup_contract_evidence(spm)
+            app.cfg = {"fbx_ini": str(fbx_ini)}
+            app.log = mock.Mock()
+            app._write_repair_runtime_receipt(spm)
+            receipt_path = app._repair_runtime_receipt_path(spm)
+            current_receipt = receipt_path.read_bytes()
+            report = root / "reports" / (
+                f"{spm.stem}_speedtree_repair_pipeline_report_codex.json"
+            )
+            report.write_text(
+                json.dumps({
+                    "status": "done",
+                    "unassigned_geometry_cleanup": {
+                        "status": "not_applicable",
+                        "cleanup_contract_version": 0,
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+            fresh, reason = app._repair_runtime_fresh(spm)
+
+            self.assertFalse(fresh)
+            self.assertIn("does not prove", reason)
+            self.assertEqual(receipt_path.read_bytes(), current_receipt)
 
     def test_invalid_runtime_receipt_is_rewritten_only_for_current_artifacts(
         self,
@@ -1088,9 +1413,10 @@ class BlendLiveStatusTests(unittest.TestCase):
 
             fresh, reason = app._repair_runtime_fresh(spm)
 
-            self.assertTrue(fresh, reason)
+            self.assertFalse(fresh)
             self.assertEqual(receipt_path.read_text(encoding="utf-8"), "{broken")
 
+            self._write_cleanup_contract_evidence(spm)
             app._repair_contract_current.return_value = True
             fresh, reason = app._repair_runtime_fresh(spm)
 
@@ -1100,6 +1426,314 @@ class BlendLiveStatusTests(unittest.TestCase):
                 migrated["output_contract_version"],
                 gui.REPAIR_OUTPUT_CONTRACT_VERSION,
             )
+
+    def test_runtime_receipt_writer_rejects_missing_or_partial_pipeline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_tree_unproven.spm"
+            blend = spm.with_suffix(".blend")
+            addon_dir = root / "addon"
+            write_empty_spm(spm)
+            blend.write_bytes(b"blend")
+            addon_dir.mkdir()
+            receipt = repair_runtime_receipt_path(spm)
+            writer_args = {
+                "addon_dir": addon_dir,
+                "code_state": {"addon/core.py": "diagnostic-hash"},
+                "blend": blend,
+            }
+
+            missing = write_repair_runtime_receipt(
+                spm,
+                {},
+                pipeline=None,
+                **writer_args,
+            )
+            self.assertIsNone(missing)
+            self.assertFalse(receipt.exists())
+
+            partial = write_repair_runtime_receipt(
+                spm,
+                {},
+                pipeline={
+                    "status": "done",
+                    "unassigned_geometry_cleanup": {
+                        "status": "not_applicable",
+                        "policy": (
+                            "discard_unassigned_geometry_before_repair"
+                        ),
+                        "cleanup_contract_version": 1,
+                    },
+                },
+                **writer_args,
+            )
+            self.assertIsNone(partial)
+            self.assertFalse(receipt.exists())
+
+    def test_cleanup_evidence_validator_is_strict_and_pure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm, _core, _fbx_ini = self._runtime_stale_fixture(root)
+            fbx = spm.with_suffix(".fbx")
+            applied = self._cleanup_contract_evidence(
+                spm,
+                cleanup_status="applied",
+            )
+            not_applicable = self._cleanup_contract_evidence(
+                spm,
+                cleanup_status="not_applicable",
+            )
+
+            for label, valid in (
+                ("applied", applied),
+                ("not_applicable", not_applicable),
+            ):
+                with self.subTest(valid=label):
+                    result = validate_unassigned_geometry_cleanup_evidence(
+                        valid,
+                        expected_spm=spm,
+                        expected_fbx=fbx,
+                    )
+                    self.assertIs(
+                        result,
+                        valid["unassigned_geometry_cleanup"],
+                    )
+
+            def clone():
+                return json.loads(json.dumps(applied))
+
+            invalid = {}
+            candidate = clone()
+            candidate.pop("unassigned_geometry_cleanup")
+            invalid["missing cleanup"] = candidate
+            candidate = clone()
+            candidate["unassigned_geometry_cleanup"].pop("policy")
+            invalid["missing policy"] = candidate
+            candidate = clone()
+            candidate["unassigned_geometry_cleanup"]["policy"] = "keep"
+            invalid["wrong policy"] = candidate
+            candidate = clone()
+            candidate["unassigned_geometry_cleanup"].pop(
+                "cleanup_contract_version"
+            )
+            invalid["missing version"] = candidate
+            candidate = clone()
+            candidate["unassigned_geometry_cleanup"][
+                "cleanup_contract_version"
+            ] = 0
+            invalid["wrong version"] = candidate
+            candidate = clone()
+            candidate["unassigned_geometry_cleanup"][
+                "cleanup_contract_version"
+            ] = 1
+            invalid["legacy cleanup version"] = candidate
+            candidate = clone()
+            candidate["unassigned_geometry_cleanup"].pop("status")
+            invalid["missing status"] = candidate
+            candidate = clone()
+            candidate["unassigned_geometry_cleanup"]["status"] = "failed"
+            invalid["wrong status"] = candidate
+            candidate = clone()
+            candidate["unassigned_geometry_cleanup"].pop(
+                "strict_speedtree_pipeline_contract"
+            )
+            invalid["missing strict flag"] = candidate
+            candidate = clone()
+            candidate["unassigned_geometry_cleanup"][
+                "strict_speedtree_pipeline_contract"
+            ] = False
+            invalid["wrong strict flag"] = candidate
+            candidate = clone()
+            candidate["unassigned_geometry_cleanup"][
+                "cleanup_authorized"
+            ] = False
+            invalid["cleanup not authorized"] = candidate
+            candidate = clone()
+            candidate["unassigned_geometry_cleanup"][
+                "live_source_identity_validated"
+            ] = False
+            invalid["live identity not validated"] = candidate
+            candidate = clone()
+            candidate["unassigned_geometry_cleanup"][
+                "live_source_identity_fingerprint"
+            ] = "0" * 64
+            invalid["wrong live identity fingerprint"] = candidate
+            candidate = clone()
+            candidate["speedtree_live_source_identity"]["stmat"][0][
+                "sha256"
+            ] = "0" * 64
+            invalid["cleanup identity not bound to material input"] = candidate
+            candidate = clone()
+            candidate["unassigned_geometry_cleanup"]["source_identity"] = (
+                str(root / "different.spm")
+            )
+            invalid["wrong source path"] = candidate
+            candidate = clone()
+            candidate["import"]["source_fbx"] = str(root / "different.fbx")
+            invalid["wrong import path"] = candidate
+            candidate = clone()
+            candidate["import"]["unassigned_geometry_cleanup"][
+                "removed_face_count"
+            ] += 1
+            invalid["nested import cleanup mismatch"] = candidate
+            candidate = clone()
+            candidate["unassigned_geometry_cleanup"][
+                "removed_face_count"
+            ] += 1
+            invalid["inconsistent aggregate count"] = candidate
+            candidate = clone()
+            candidate.pop("unassigned_geometry_cleanup_recheck")
+            invalid["missing recheck"] = candidate
+            candidate = clone()
+            candidate["unassigned_geometry_cleanup_recheck"]["status"] = (
+                "applied"
+            )
+            invalid["nonzero recheck status"] = candidate
+            candidate = clone()
+            candidate["import"]["renderable_geometry"]["face_count"] = 0
+            invalid["no import renderable geometry"] = candidate
+            candidate = clone()
+            candidate.pop("renderable_geometry_after_cleanup")
+            invalid["missing final renderable geometry"] = candidate
+            candidate = clone()
+            candidate.pop("material_slot_validation")
+            invalid["missing final material validation"] = candidate
+            candidate = clone()
+            candidate["material_slot_validation"][
+                "canonical_default_slot_indices"
+            ] = [0]
+            invalid["remaining final Default material"] = candidate
+            candidate = clone()
+            candidate["material_slot_validation"][
+                "placeholder_cleanup_authorized"
+            ] = False
+            invalid["final Default assertion unauthorized"] = candidate
+            candidate = clone()
+            candidate["material_slot_validation"]["material_count"] = 0
+            invalid["final material count missing"] = candidate
+            candidate = clone()
+            candidate["material_slot_validation"][
+                "assigned_slot_indices"
+            ] = [1]
+            invalid["final assigned slot out of range"] = candidate
+
+            for label, candidate in invalid.items():
+                with self.subTest(invalid=label):
+                    with self.assertRaises(RepairPipelineEvidenceError):
+                        validate_unassigned_geometry_cleanup_evidence(
+                            candidate,
+                            expected_spm=spm,
+                            expected_fbx=fbx,
+                        )
+
+    def test_v2_pipeline_rejects_incomplete_export_material_assignments(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "Tree.spm"
+            blend = root / "Tree.blend"
+            write_empty_spm(spm)
+            blend.write_bytes(b"blend")
+            valid = self._cleanup_contract_evidence(spm, blend=blend)
+
+            def clone():
+                return json.loads(json.dumps(valid))
+
+            invalid = {}
+            candidate = clone()
+            mesh = candidate["repair_push_export_postcondition"][
+                "objects"
+            ][0]["mesh"]
+            mesh["materials"] = []
+            invalid["no materials"] = candidate
+            candidate = clone()
+            mesh = candidate["repair_push_export_postcondition"][
+                "objects"
+            ][0]["mesh"]
+            mesh["material_index_counts"][0]["material_index"] = 1
+            invalid["out-of-range material index"] = candidate
+            candidate = clone()
+            mesh = candidate["repair_push_export_postcondition"][
+                "objects"
+            ][0]["mesh"]
+            mesh["material_index_counts"][0]["polygon_count"] = 0
+            invalid["uncovered polygon"] = candidate
+
+            for label, candidate in invalid.items():
+                unsigned = dict(candidate["repair_push_export_postcondition"])
+                unsigned.pop("content_sha256", None)
+                candidate["repair_push_export_postcondition"][
+                    "content_sha256"
+                ] = hashlib.sha256(
+                    json.dumps(
+                        unsigned,
+                        sort_keys=True,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                with self.subTest(invalid=label):
+                    self.assertEqual(
+                        repair_pipeline_output_contract(
+                            candidate,
+                            spm=spm,
+                            blend=blend,
+                            source_fbx=spm.with_suffix(".fbx"),
+                        ),
+                        1,
+                    )
+
+    def test_v2_pipeline_requires_complete_cluster_pending_contract(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "Tree.spm"
+            blend = root / "Tree.blend"
+            write_empty_spm(spm)
+            blend.write_bytes(b"blend")
+            valid = self._cleanup_contract_evidence(spm, blend=blend)
+            valid["paths"] = {"merged_name": "Tree_Codex_Merged"}
+            valid["handoff_preflight"] = {
+                "status": "cluster_export_pending",
+                "unreal_push_ready": False,
+            }
+            valid["cluster_source_build_contract"] = {
+                "status": "ready",
+                "mode": "raw_source_for_cluster_normalizer",
+                "deferred_export_issues": [
+                    "cluster_missing_normalized_export_pivot"
+                ],
+                "final_export_required": True,
+                "source_blend_committed": True,
+                "source_object": "Tree_Codex_Merged",
+            }
+            self.assertEqual(
+                repair_pipeline_output_contract(
+                    valid,
+                    spm=spm,
+                    blend=blend,
+                    source_fbx=spm.with_suffix(".fbx"),
+                ),
+                2,
+            )
+
+            for field in (
+                "mode",
+                "deferred_export_issues",
+                "final_export_required",
+                "source_blend_committed",
+                "source_object",
+            ):
+                candidate = json.loads(json.dumps(valid))
+                candidate["cluster_source_build_contract"].pop(field)
+                with self.subTest(missing=field):
+                    self.assertEqual(
+                        repair_pipeline_output_contract(
+                            candidate,
+                            spm=spm,
+                            blend=blend,
+                            source_fbx=spm.with_suffix(".fbx"),
+                        ),
+                        1,
+                    )
 
     def test_runtime_receipt_tracks_its_shared_contract_module(self):
         gui = load_gui_module()
@@ -1661,7 +2295,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.assertIn("재질이 SpeedTree FBX에서 빠짐", status)
             self.assertIn("M_leaf_atlas_01", status)
 
-    def test_texture_preflight_rechecks_recorded_files_and_handoff_slots(self):
+    def test_texture_preflight_ignores_files_but_keeps_structural_slot_gate(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as temporary:
@@ -1707,8 +2341,8 @@ class BlendLiveStatusTests(unittest.TestCase):
             texture.unlink()
             with mock.patch.object(gui, "validate_preflight_envelope"):
                 ready, reason = app._texture_normalization_ready(spm)
-            self.assertFalse(ready)
-            self.assertIn("텍스처 준비 안 됨", reason)
+            self.assertTrue(ready, reason)
+            self.assertIn("텍스처 선택 연결", reason)
 
     def test_legacy_material_failure_is_not_waived_by_a_different_live_check(self):
         gui = load_gui_module()
@@ -1893,11 +2527,9 @@ class BlendLiveStatusTests(unittest.TestCase):
             with mock.patch.object(gui, "validate_preflight_envelope"):
                 ready, reason = app._handoff_ready(spm)
 
-            self.assertFalse(ready)
-            self.assertIn("텍스처 준비 안 됨", reason)
-            self.assertIn("M_leaf_silky_dogwood_atlas_01_green", reason)
+            self.assertTrue(ready, reason)
 
-    def test_unrecognized_needs_pcg_status_does_not_bypass_handoff(self):
+    def test_unrecognized_texture_status_does_not_gate_handoff(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as temporary:
@@ -1935,8 +2567,8 @@ class BlendLiveStatusTests(unittest.TestCase):
             with mock.patch.object(gui, "validate_preflight_envelope"):
                 ready, reason = app._texture_normalization_ready(spm)
 
-            self.assertFalse(ready)
-            self.assertIn("텍스처 정규화 미완료", reason)
+            self.assertTrue(ready, reason)
+            self.assertIn("텍스처 선택 연결", reason)
 
     def test_live_signature_tracks_reported_texture_deletion(self):
         gui = load_gui_module()
@@ -2483,6 +3115,184 @@ class BlendLiveStatusTests(unittest.TestCase):
             for call in app.log.call_args_list
         ))
 
+    def test_cluster_live_audit_memo_survives_queue_boundaries(self):
+        gui = load_gui_module()
+        app = gui.App.__new__(gui.App)
+        app.pending_batch_jobs = deque()
+        app.active_batch_job = None
+        app.batch_job_sequence = 0
+        app.batch_job_failures = []
+        app.shared_queue_runtime = None
+        app.log = mock.Mock()
+        app._reset_cluster_receipt_refresh_memo = mock.Mock()
+        app._set_batch_queue_controls = mock.Mock()
+        app._start_next_batch_job = mock.Mock()
+
+        app._enqueue_batch_job({
+            "label": "first queue",
+            "cfg": {},
+            "force_rerun": False,
+            "push_transport": "rpc",
+            "targets": [],
+            "inventory": {},
+        })
+
+        app.active_batch_job = {"id": 1, "label": "first queue"}
+        app.pending_batch_jobs.clear()
+        app.worker = None
+        app.progress_var = mock.Mock()
+        app._finish_batch_job({"id": 1, "status": "completed"})
+
+        app._reset_cluster_receipt_refresh_memo.assert_not_called()
+
+    def test_explicit_scan_resets_cluster_live_audit_memo(self):
+        gui = load_gui_module()
+        app = gui.App.__new__(gui.App)
+        app._scan_generation = 0
+        app.root = mock.Mock()
+        app.root_var = FakeVar("C:/fixture-root")
+        app.state = {}
+        app.state_lock = threading.RLock()
+        app._collect_cfg = mock.Mock(return_value={})
+        app._set_scan_controls = mock.Mock()
+        app._reset_cluster_receipt_refresh_memo = mock.Mock()
+        app.ui_queue = queue.Queue()
+
+        with mock.patch.object(gui, "save_config"), mock.patch.object(
+            gui.threading,
+            "Thread",
+        ) as thread:
+            app.scan()
+
+        app._reset_cluster_receipt_refresh_memo.assert_called_once()
+        thread.return_value.start.assert_called_once()
+
+    def test_cluster_live_audit_memo_binds_production_revision(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        app.force_rerun = False
+        revision = {"value": "production-revision-a"}
+        app._assert_active_production_source_manifest = mock.Mock(
+            side_effect=lambda: SimpleNamespace(
+                content_hash=revision["value"],
+            )
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            spm = Path(temporary) / "Tree_elm" / "SK_Tree_elm_01.spm"
+            (spm.parent / "Cluster").mkdir(parents=True)
+            spm.write_bytes(b"tree")
+            runs = {"count": 0}
+
+            def run_uncached(*_args, **_kwargs):
+                runs["count"] += 1
+                return {
+                    "payload": {},
+                    "audit_report": str(
+                        Path(temporary) / f"audit-{runs['count']}.json"
+                    ),
+                    "audit": runs["count"],
+                }
+
+            app._refresh_stale_cluster_receipt_uncached = mock.Mock(
+                side_effect=run_uncached,
+            )
+            app._cluster_receipt_refresh_input_fingerprint = mock.Mock(
+                return_value="same-input-fingerprint",
+            )
+            app._cluster_receipt_live_artifacts_match = mock.Mock(
+                return_value=(True, ()),
+            )
+            app._cluster_receipt_live_artifact_paths = mock.Mock(
+                return_value=(),
+            )
+            app._evaluate_cluster_receipt_live_audit = mock.Mock(
+                side_effect=lambda _spm, raw: raw,
+            )
+
+            first = app._refresh_stale_cluster_receipt(
+                spm, "20260806_010101"
+            )
+            second = app._refresh_stale_cluster_receipt(
+                spm, "20260806_010102"
+            )
+            revision["value"] = "production-revision-b"
+            third = app._refresh_stale_cluster_receipt(
+                spm, "20260806_010103"
+            )
+
+        self.assertEqual(first["audit"], 1)
+        self.assertEqual(second["audit"], 1)
+        self.assertEqual(third["audit"], 2)
+        self.assertEqual(
+            app._refresh_stale_cluster_receipt_uncached.call_count,
+            2,
+        )
+        scope = app._cluster_receipt_refresh_scope(spm)
+        self.assertEqual(
+            app._cluster_receipt_refresh_memo[scope][
+                "production_source_revision"
+            ],
+            "production-revision-b",
+        )
+
+    def test_cluster_live_audit_force_rerun_bypasses_session_memo(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        app.force_rerun = False
+        with tempfile.TemporaryDirectory() as temporary:
+            spm = Path(temporary) / "Tree_elm" / "SK_Tree_elm_01.spm"
+            (spm.parent / "Cluster").mkdir(parents=True)
+            spm.write_bytes(b"tree")
+            runs = {"count": 0}
+
+            def run_uncached(*_args, **_kwargs):
+                runs["count"] += 1
+                return {
+                    "payload": {},
+                    "audit_report": str(
+                        Path(temporary) / f"audit-{runs['count']}.json"
+                    ),
+                    "audit": runs["count"],
+                }
+
+            app._refresh_stale_cluster_receipt_uncached = mock.Mock(
+                side_effect=run_uncached,
+            )
+            app._cluster_receipt_refresh_input_fingerprint = mock.Mock(
+                return_value="same-input-fingerprint",
+            )
+            app._cluster_receipt_live_artifacts_match = mock.Mock(
+                return_value=(True, ()),
+            )
+            app._cluster_receipt_live_artifact_paths = mock.Mock(
+                return_value=(),
+            )
+            app._evaluate_cluster_receipt_live_audit = mock.Mock(
+                side_effect=lambda _spm, raw: raw,
+            )
+
+            first = app._refresh_stale_cluster_receipt(
+                spm, "20260806_020101"
+            )
+            app.force_rerun = True
+            forced = app._refresh_stale_cluster_receipt(
+                spm, "20260806_020102"
+            )
+            app.force_rerun = False
+            cached = app._refresh_stale_cluster_receipt(
+                spm, "20260806_020103"
+            )
+
+        self.assertEqual(first["audit"], 1)
+        self.assertEqual(forced["audit"], 2)
+        self.assertEqual(cached["audit"], 1)
+        self.assertEqual(
+            app._refresh_stale_cluster_receipt_uncached.call_count,
+            2,
+        )
+
     def test_cluster_live_artifact_cache_fingerprint_uses_bounded_reads(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -2836,18 +3646,24 @@ class BlendLiveStatusTests(unittest.TestCase):
             cluster.mkdir(parents=True)
             spm = owner / "SK_Tree_elm_01.spm"
             producer = cluster / "SK_cluster_elm_01.spm"
+            explorer_copy = owner / "SK_Tree_elm_01 - 복사본.spm"
+            ordinary_copy_name = owner / "SK_copycat_elm_01.spm"
             manifest = (
                 cluster
                 / "SK_cluster_elm_01.atlas_leaf_targets.json"
             )
             spm.write_bytes(b"tree")
             producer.write_bytes(b"cluster")
+            explorer_copy.write_bytes(b"manual backup")
+            ordinary_copy_name.write_bytes(b"authored asset")
             manifest.write_text('{"version": 1}', encoding="utf-8")
 
             inputs = app._cluster_receipt_discovery_input_paths(spm)
 
         self.assertIn(spm.resolve(), inputs)
         self.assertIn(producer.resolve(), inputs)
+        self.assertIn(ordinary_copy_name.resolve(), inputs)
+        self.assertNotIn(explorer_copy.resolve(), inputs)
         self.assertIn(manifest.resolve(), inputs)
         self.assertNotIn(Path(gui.__file__).resolve(), inputs)
         self.assertNotIn(
@@ -2859,24 +3675,24 @@ class BlendLiveStatusTests(unittest.TestCase):
             inputs,
         )
 
-    def test_cluster_live_audit_worker_revision_mismatch_is_not_asset_retry(
+    def test_cluster_live_audit_worker_revision_mismatch_is_nonblocking_warning(
         self,
     ):
         gui = load_gui_module()
         app = self.make_app(gui)
         app.log = mock.Mock()
-        app.cfg = {"cluster_receipt_refresh_timeout": 321}
-        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
-            gui,
-            "LOG_DIR",
-            Path(temporary) / "logs",
-        ):
-            owner = Path(temporary) / "Tree_elm"
-            cluster = owner / "Cluster"
-            cluster.mkdir(parents=True)
-            spm = owner / "SK_Tree_elm_01.spm"
-            spm.write_bytes(b"tree")
-
+        app.progress_var = mock.Mock()
+        app._present_code_revision_restart_required = (
+            gui.App._present_code_revision_restart_required.__get__(
+                app, gui.App
+            )
+        )
+        app._require_child_production_source_manifest = (
+            gui.App._require_child_production_source_manifest.__get__(
+                app, gui.App
+            )
+        )
+        with tempfile.TemporaryDirectory() as temporary:
             expected_root = Path(temporary) / "expected_code"
             actual_root = Path(temporary) / "actual_code"
             expected_root.mkdir()
@@ -2891,45 +3707,88 @@ class BlendLiveStatusTests(unittest.TestCase):
             )
             expected = gui.production_source_manifest(expected_root)
             actual = gui.production_source_manifest(actual_root)
-            app._active_production_source_manifest = expected
-            app._assert_active_production_source_manifest = (
-                gui.App._assert_active_production_source_manifest.__get__(
-                    app,
-                    gui.App,
-                )
-            )
-            app._require_child_production_source_manifest = (
-                gui.App._require_child_production_source_manifest
+            payload = {
+                "status": "ok",
+                "production_source_revision": {
+                    "manifest_schema_version": expected.schema_version,
+                    "expected_content_hash": expected.content_hash,
+                    "started": actual.as_dict(),
+                    "finished": actual.as_dict(),
+                    "matches_expected": False,
+                    "stable": True,
+                },
+                "items": [{"name": "Tree_elm", "status": "ready"}],
+            }
+
+            result = app._require_child_production_source_manifest(
+                payload,
+                expected,
+                report_file=Path(temporary) / "audit.json",
+                log_file=Path(temporary) / "audit.log",
             )
 
+        self.assertFalse(result["matches_expected"])
+        warning_text = "\n".join(
+            str(call.args[0]) for call in app.log.call_args_list
+        )
+        self.assertIn("code_revision_warning", warning_text)
+        self.assertIn("worker.py", warning_text)
+        self.assertFalse(hasattr(app, "_code_revision_restart_required"))
+
+    def test_cluster_live_audit_asset_failure_requests_exact_atlas_repair(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        app.cfg = {
+            "cluster_receipt_refresh_timeout": 321,
+            "child_stage_inactivity_timeout": 30,
+        }
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            gui, "LOG_DIR", Path(temporary) / "logs"
+        ):
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            spm = owner / "SK_Tree_elm_01.spm"
+            target = cluster / "SK_leaf_elm_01.spm"
+            spm.write_bytes(b"tree")
+            target.write_bytes(b"leaf")
+            expected = gui._PROCESS_PRODUCTION_SOURCE_MANIFEST
+            app._active_production_source_manifest = expected
+
             def run_audit(command, *_args, **_kwargs):
-                self.assertEqual(
-                    command[
-                        command.index(
-                            "--expected-production-source-revision"
-                        ) + 1
-                    ],
-                    expected.content_hash,
-                )
                 report = Path(command[command.index("--json") + 1])
                 report.parent.mkdir(parents=True, exist_ok=True)
-                report.write_text(
-                    json.dumps({
-                        "status": "failed",
-                        "stage": "production_source_revision",
-                        "production_source_revision": {
-                            "manifest_schema_version": expected.schema_version,
-                            "expected_content_hash": expected.content_hash,
-                            "started": actual.as_dict(),
-                            "finished": actual.as_dict(),
-                            "matches_expected": False,
-                            "stable": True,
+                revision = {
+                    "manifest_schema_version": expected.schema_version,
+                    "expected_content_hash": expected.content_hash,
+                    "started": expected.as_dict(),
+                    "finished": expected.as_dict(),
+                    "matches_expected": True,
+                    "stable": True,
+                }
+                report.write_text(json.dumps({
+                    "status": "failed",
+                    "stage": "asset_audit",
+                    "error": "sanitized stale mirror conflict",
+                    "production_source_revision": revision,
+                    "failure": {
+                        "reason_token": (
+                            "atlas_manifest_mirror_conflict_repairable"
+                        ),
+                        "evidence": {
+                            "status": "repairable",
+                            "reason_code": (
+                                "atlas_manifest_mirror_conflict_repairable"
+                            ),
+                            "target_spm": str(target),
+                            "authority": str(cluster / "authority.json"),
+                            "mirrors": [str(cluster / "stale.json")],
                         },
-                        "items": [],
-                    }),
-                    encoding="utf-8",
-                )
-                return 2, Path(temporary) / "revision_mismatch.log"
+                    },
+                    "items": [],
+                }), encoding="utf-8")
+                return 1, Path(temporary) / "asset_audit.log"
 
             app._run_limited = mock.Mock(side_effect=run_audit)
             with mock.patch.object(
@@ -2939,28 +3798,207 @@ class BlendLiveStatusTests(unittest.TestCase):
             ), mock.patch.object(
                 gui,
                 "cluster_assembly_receipt_resolution",
-                return_value={
-                    "selected_receipt": str(
-                        Path(temporary) / "receipt.json"
-                    )
-                },
-            ), self.assertRaises(gui.BatchItemError) as raised:
-                app._refresh_stale_cluster_receipt(
+                side_effect=FileNotFoundError,
+            ), self.assertRaises(gui.InlineAtlasRepairRequested) as raised:
+                app._refresh_stale_cluster_receipt_uncached(
                     spm,
-                    "20260730_120000",
+                    "20260803_120000",
+                    _raw_only=True,
                 )
 
-        self.assertEqual(raised.exception.kind, "internal_error")
-        self.assertIn(
-            "revision mismatch",
-            str(raised.exception).casefold(),
+        self.assertEqual(raised.exception.target_spm, target)
+        self.assertEqual(
+            raised.exception.report["reason_token"],
+            "atlas_manifest_mirror_conflict_repairable",
         )
-        self.assertEqual(app._run_limited.call_count, 1)
-        self.assertFalse(app._cluster_receipt_refresh_memo)
-        self.assertFalse(any(
-            "retrying once" in call.args[0]
-            for call in app.log.call_args_list
-        ))
+        self.assertNotIn("revision mismatch", str(raised.exception).casefold())
+
+    def test_cluster_live_audit_repairs_then_retries_inside_same_batch(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            spm = owner / "SK_Tree_elm_01.spm"
+            target = cluster / "SK_leaf_elm_01.spm"
+            spm.write_bytes(b"tree")
+            target.write_bytes(b"leaf")
+            request = gui.InlineAtlasRepairRequested(
+                target,
+                {
+                    "reason_token": (
+                        "atlas_manifest_mirror_conflict_repairable"
+                    ),
+                    "evidence": {
+                        "status": "repairable",
+                        "target_spm": str(target),
+                    },
+                },
+            )
+            raw_audit = {
+                "requested_spm": str(spm),
+                "payload": {"items": [{"status": "ok"}]},
+                "audit_report": str(Path(temporary) / "audit.json"),
+            }
+            app._cluster_receipt_refresh_input_fingerprint = mock.Mock(
+                return_value="stable-input"
+            )
+            app._cluster_receipt_live_artifacts_match = mock.Mock(
+                return_value=(True, ())
+            )
+            app._cluster_receipt_live_artifact_paths = mock.Mock(
+                return_value=()
+            )
+            app._refresh_stale_cluster_receipt_uncached = mock.Mock(
+                side_effect=[request, raw_audit]
+            )
+            app._run_inline_atlas_manifest_repair = mock.Mock(
+                return_value={"status": "updated"}
+            )
+            app._evaluate_cluster_receipt_live_audit = mock.Mock(
+                return_value={"status": "ready"}
+            )
+
+            result = app._refresh_stale_cluster_receipt(
+                spm,
+                "20260803_120000",
+            )
+
+        self.assertEqual(result, {"status": "ready"})
+        app._run_inline_atlas_manifest_repair.assert_called_once_with(
+            target,
+            request.report,
+        )
+        self.assertEqual(
+            app._refresh_stale_cluster_receipt_uncached.call_count,
+            2,
+        )
+
+    def test_inline_atlas_command_failure_is_diagnostic_not_export_gate(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        app.stop_flag = threading.Event()
+        app._retry_transition = mock.Mock()
+        app._active_shared_queue_lease = mock.Mock(finished=False)
+        app.active_batch_job = {"id": 17}
+        app._active_retry_metadata = {}
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            gui,
+            "LOG_DIR",
+            Path(temporary) / "logs",
+        ):
+            spm = Path(temporary) / "SK_leaf_test_01.spm"
+            spm.write_bytes(b"spm")
+            with mock.patch.object(
+                gui,
+                "run_exact_target_request",
+                return_value={
+                    "status": "failed",
+                    "terminal_status": "failed",
+                    "error": "sanitized metadata refresh error",
+                    "request_id": "inline-atlas-test",
+                },
+            ):
+                result = app._run_inline_atlas_manifest_repair(
+                    spm,
+                    {
+                        "reason_token": (
+                            "atlas_manifest_mirror_conflict_repairable"
+                        ),
+                    },
+                )
+
+        self.assertEqual(result["status"], "diagnostic_only")
+        self.assertFalse(result["mutation_authorized"])
+        self.assertEqual(result["repair_attempt"]["status"], "failed")
+        self.assertNotIn("automatic_repair_failed", json.dumps(result))
+
+    def test_failed_atlas_refresh_still_returns_fresh_live_contract(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            spm = owner / "SK_Tree_elm_01.spm"
+            target = cluster / "SK_leaf_elm_01.spm"
+            spm.write_bytes(b"tree")
+            target.write_bytes(b"leaf")
+            report = {
+                "reason_token": "atlas_manifest_mirror_conflict_repairable",
+                "evidence": {
+                    "status": "repairable",
+                    "target_spm": str(target),
+                },
+            }
+            first = gui.InlineAtlasRepairRequested(target, report)
+            live_contract = {
+                "tree_source_identities": [{
+                    "target_spm": {"path": str(spm)},
+                }],
+                "dependencies": [{
+                    "target_spm": str(target),
+                    "delivery_mode": "live_cluster",
+                }],
+                "handoff": {"status": "ready", "errors": [], "issues": []},
+            }
+            payload = {
+                "items": [{
+                    "cluster_assembly": {
+                        "handoff": {
+                            "status": "ready",
+                            "errors": [],
+                            "issues": [],
+                        },
+                    },
+                }],
+            }
+            raw_audit = {
+                "requested_spm": str(spm),
+                "payload": payload,
+                "selected_contract": live_contract,
+                "audit_report": str(Path(temporary) / "audit.json"),
+                "persistence": {},
+            }
+            app._cluster_receipt_refresh_input_fingerprint = mock.Mock(
+                return_value="stable-input"
+            )
+            app._cluster_receipt_live_artifacts_match = mock.Mock(
+                return_value=(True, ())
+            )
+            app._cluster_receipt_live_artifact_paths = mock.Mock(
+                return_value=()
+            )
+            app._refresh_stale_cluster_receipt_uncached = mock.Mock(
+                side_effect=[first, raw_audit]
+            )
+            app._run_inline_atlas_manifest_repair = mock.Mock(
+                return_value={
+                    "status": "diagnostic_only",
+                    "mutation_authorized": False,
+                }
+            )
+            with mock.patch.object(
+                gui,
+                "cluster_assembly_receipt_resolution",
+                side_effect=FileNotFoundError,
+            ):
+                result = app._cluster_receipt_with_recovery(
+                    spm,
+                    "20260805_120000",
+                )
+
+        self.assertEqual(
+            result["policy"],
+            "live_audit_authoritative",
+        )
+        self.assertEqual(result["selected_contract"], live_contract)
+        self.assertEqual(result["live_audit_payload"], payload)
+        self.assertTrue(gui.cluster_receipt_resolution_uses_live_audit(result))
 
     def test_cluster_live_audit_ignores_new_bwr_runtime_report(self):
         gui = load_gui_module()
@@ -3273,6 +4311,10 @@ class BlendLiveStatusTests(unittest.TestCase):
             app._refresh_stale_cluster_receipt_uncached = run_uncached
             with mock.patch.object(
                 gui,
+                "cluster_assembly_receipt_resolution",
+                return_value={"selected_receipt": str(report)},
+            ), mock.patch.object(
+                gui,
                 "Future",
                 ObservableFuture,
             ), ThreadPoolExecutor(max_workers=2) as pool:
@@ -3526,8 +4568,8 @@ class BlendLiveStatusTests(unittest.TestCase):
         self.assertEqual(app._run_limited.call_count, 1)
         self.assertEqual(first_raised.exception.kind, "data_error")
         self.assertEqual(second_raised.exception.kind, "data_error")
-        self.assertIn("NORMALIZED_VARIANTS_REQUIRED", str(first_raised.exception))
-        self.assertIn("NORMALIZED_VARIANTS_REQUIRED", str(second_raised.exception))
+        self.assertIn("필수 정규화 Cluster variant", str(first_raised.exception))
+        self.assertIn("필수 정규화 Cluster variant", str(second_raised.exception))
 
     def test_cluster_normalization_stage_partitions_producer_owned_work(
         self,
@@ -3768,6 +4810,10 @@ class BlendLiveStatusTests(unittest.TestCase):
             app._refresh_stale_cluster_receipt_uncached = run_uncached
             with mock.patch.object(
                 gui,
+                "cluster_assembly_receipt_resolution",
+                return_value={"selected_receipt": str(report)},
+            ), mock.patch.object(
+                gui,
                 "Future",
                 ObservableFuture,
             ), ThreadPoolExecutor(max_workers=2) as pool:
@@ -3879,7 +4925,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                                 "dependencies": [{"role": "branch"}],
                                 "handoff": {
                                     "errors": [{
-                                        "code": "CLUSTER_TGA_BASENAME_INVALID",
+                                        "code": "CLUSTER_TEXTURE_REFERENCE_MISSING",
                                         "role": "branch",
                                         "details": {
                                             "status": "missing",
@@ -3907,10 +4953,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 )
 
             self.assertEqual(raised.exception.kind, "data_error")
-            self.assertIn(
-                "CLUSTER_TGA_BASENAME_INVALID",
-                str(raised.exception),
-            )
+            self.assertIn("Cluster가 참조하는 이미지 파일이 없습니다", str(raised.exception))
             self.assertIn("missing.tga", str(raised.exception))
 
     def _run_producer_normalization_stage(
@@ -4027,7 +5070,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 gui,
                 exit_code=0,
                 extra_issues=[{
-                    "code": "CLUSTER_TGA_BASENAME_INVALID",
+                    "code": "CLUSTER_TEXTURE_REFERENCE_MISSING",
                     "role": "branch",
                     "details": {
                         "status": "missing",
@@ -4038,9 +5081,10 @@ class BlendLiveStatusTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.kind, "data_error")
         self.assertIn(
-            "CLUSTER_TGA_BASENAME_INVALID",
+            "Cluster가 참조하는 이미지 파일이 없습니다",
             str(raised.exception),
         )
+        self.assertIn("missing.tga", str(raised.exception))
 
     def test_normalization_stage_rejects_issue_outside_contract(self):
         gui = load_gui_module()
@@ -4052,10 +5096,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             )
 
         self.assertEqual(raised.exception.kind, "data_error")
-        self.assertIn(
-            "NORMALIZED_VARIANTS_REQUIRED",
-            str(raised.exception),
-        )
+        self.assertIn("필수 정규화 Cluster variant", str(raised.exception))
 
     def test_receipt_ambiguity_after_clean_audit_uses_live_contract(self):
         gui = load_gui_module()
@@ -5076,7 +6117,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 [],
             )
 
-    def test_current_cluster_bwr_refreshes_only_stale_relation(self):
+    def test_current_cluster_bwr_skips_relation_rediscovery(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as temporary:
@@ -5088,56 +6129,35 @@ class BlendLiveStatusTests(unittest.TestCase):
             blend = spm.with_suffix(".blend")
             for path in (spm, target, blend):
                 path.touch()
-            from atlas_target_registry import save_target_registry
-
-            save_target_registry(blend, [target])
-            blender = Path(temporary) / "blender.exe"
-            unit_probe = Path(temporary) / "unit.json"
-            blender.touch()
-            unit_probe.touch()
             app.force_rerun = False
-            app.cfg = {
-                "blender_exe": str(blender),
-                "cluster_unit_probe": str(unit_probe),
-                "cluster_capture_resolution": 1024,
-                "blender_job_timeout": 30,
-            }
-            app._leaf_reference_ready = mock.Mock(
-                return_value=(True, "ok")
-            )
             app._repair_output_state = mock.Mock(return_value={
                 "current": True,
                 "push_ready": True,
-                "kind": "current",
-                "reason": "",
+                "kind": "ready",
+                "reason": "준비됨 ✓",
+                "push_dependency_contract": {"status": "current"},
             })
             app._record_live_blend_status = mock.Mock()
+            app._publish_repair_stage_contract = mock.Mock()
+            app._refresh_canonical_atlas_manifests = mock.Mock()
+            app._cluster_relation_input_plan = mock.Mock(
+                side_effect=AssertionError(
+                    "current Cluster BWR must not rediscover consumers"
+                )
+            )
+            app._refresh_cluster_source_relations = mock.Mock(
+                side_effect=AssertionError(
+                    "current Cluster BWR must not rewrite relations"
+                )
+            )
+            app._cluster_normalization_stage_with_recovery = mock.Mock(
+                side_effect=AssertionError(
+                    "current Cluster BWR must not rerun normalization audits"
+                )
+            )
             app._run_limited = mock.Mock(
                 side_effect=AssertionError("BWR must not run")
             )
-            app._cluster_normalization_stage_observation = mock.Mock(
-                return_value={
-                    "status": "current",
-                    "live_audit_report": str(
-                        Path(temporary) / "normalization.json"
-                    ),
-                    "selected_contract": {
-                        "dependencies": [{"spm": str(spm)}],
-                        "handoff": {"errors": []},
-                    },
-                }
-            )
-            states = [
-                {
-                    "current": False,
-                    "reason": (
-                        "SK_Tree_elm_01.spm:refresh_required"
-                        "(target_scope_changed)"
-                    ),
-                    "targets": [],
-                },
-                {"current": True, "reason": "", "targets": []},
-            ]
             item = {
                 "spm": spm,
                 "wind_override": "auto",
@@ -5147,18 +6167,274 @@ class BlendLiveStatusTests(unittest.TestCase):
             with mock.patch.object(
                 gui,
                 "cluster_relation_refresh_state",
-                side_effect=states,
+                side_effect=AssertionError(
+                    "current Cluster BWR must not inspect relation metadata"
+                ),
             ) as refresh_state, mock.patch(
                 "cluster_blend_sync.run_cluster_relation_transaction",
-                return_value={"status": "ok"},
+                side_effect=AssertionError(
+                    "current Cluster BWR must not run relation transaction"
+                ),
             ) as relation:
                 app._job_blender(str(spm), spm, item)
 
-            self.assertEqual(refresh_state.call_count, 2)
-            relation.assert_called_once()
-            self.assertEqual(relation.call_args.args[1], [target.absolute()])
-            self.assertEqual(app._repair_output_state.call_count, 2)
+            refresh_state.assert_not_called()
+            relation.assert_not_called()
+            app._cluster_relation_input_plan.assert_not_called()
+            app._refresh_cluster_source_relations.assert_not_called()
+            app._cluster_normalization_stage_with_recovery.assert_not_called()
+            app._repair_output_state.assert_called_once_with(spm)
             app._run_limited.assert_not_called()
+            app._publish_repair_stage_contract.assert_called_once_with(
+                spm,
+                ready=True,
+                reason="준비됨 ✓",
+                kind="ready",
+                push_dependency_contract={"status": "current"},
+                evidence_bundle=None,
+            )
+
+    def test_current_owner_bwr_skips_atlas_refresh_and_material_preflight(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_chestnut"
+            owner.mkdir(parents=True)
+            spm = owner / "SK_tree_chestnut_01.spm"
+            blend = spm.with_suffix(".blend")
+            for path in (spm, blend):
+                path.touch()
+            app.force_rerun = False
+            app._repair_output_state = mock.Mock(return_value={
+                "current": True,
+                "push_ready": True,
+                "kind": "ready",
+                "reason": "준비됨 ✓",
+                "push_dependency_contract": {"status": "current"},
+            })
+            app._record_live_blend_status = mock.Mock()
+            app._publish_repair_stage_contract = mock.Mock()
+            app._refresh_canonical_atlas_manifests = mock.Mock(
+                side_effect=AssertionError(
+                    "current owner must not refresh Atlas manifests"
+                )
+            )
+            app._cluster_receipt_with_recovery = mock.Mock(
+                side_effect=AssertionError(
+                    "current owner must not rerun Cluster live audit"
+                )
+            )
+            app._execute_material_preflight = mock.Mock(
+                side_effect=AssertionError(
+                    "current owner must not rerun material preflight"
+                )
+            )
+            app._run_limited = mock.Mock(
+                side_effect=AssertionError("BWR must not run")
+            )
+            item = {
+                "spm": spm,
+                "wind_override": "auto",
+                "referenced_by_spms": (),
+            }
+
+            app._job_blender(str(spm), spm, item)
+
+            app._repair_output_state.assert_called_once_with(spm)
+            app._refresh_canonical_atlas_manifests.assert_not_called()
+            app._cluster_receipt_with_recovery.assert_not_called()
+            app._execute_material_preflight.assert_not_called()
+            app._run_limited.assert_not_called()
+
+    def test_provider_metadata_disagreement_is_not_relation_refresh_gate(self):
+        gui = load_gui_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            spm = cluster / "SK_branch_elm_01.spm"
+            blend = spm.with_suffix(".blend")
+            target = owner / "SK_Tree_elm_01.spm"
+            for path in (spm, blend, target):
+                path.touch()
+            from atlas_target_registry import save_target_registry
+
+            save_target_registry(blend, [target])
+            for reason in (
+                "target_scope_changed",
+                "canonical_source_changed",
+                "source_fbx_changed",
+                "source_fbx_missing",
+                "physical_capture_changed",
+                "physical_capture_missing",
+            ):
+                diagnostic_state = {
+                    "status": "attention",
+                    "refresh_reasons": [reason],
+                    "atlas_manifest_resolution": {
+                        "diagnostic_only": True,
+                        "mutation_authorized": False,
+                    },
+                }
+                with self.subTest(reason=reason), mock.patch(
+                    "cluster_blend_sync.inspect_cluster_target",
+                    return_value=diagnostic_state,
+                ):
+                    state = gui.cluster_relation_refresh_state(spm, [target])
+
+                    self.assertTrue(state["current"])
+                    self.assertFalse(state["mutation_authorized"])
+                    self.assertEqual(
+                        state["metadata_diagnostic_targets"],
+                        [str(target.absolute())],
+                    )
+
+    def test_mixed_provider_refresh_mutates_only_authorized_target(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        spm = Path("Tree_elm/Cluster/SK_branch_elm_01.spm")
+        authorized = Path("Tree_elm/SK_Tree_elm_01.spm").absolute()
+        disputed = Path("Tree_elm/SK_Tree_elm_03.spm").absolute()
+        app.cfg = {
+            "blender_exe": "blender.exe",
+            "cluster_unit_probe": "unit.json",
+        }
+        item = {"referenced_by_spms": [authorized, disputed]}
+        initial = {
+            "current": False,
+            "reason": "authorized target is stale",
+            "targets": [
+                {"target_spm": str(authorized), "status": "attention"},
+                {"target_spm": str(disputed), "status": "attention"},
+            ],
+            "actionable_targets": [str(authorized)],
+            "metadata_diagnostic_targets": [str(disputed)],
+            "mutation_authorized": False,
+        }
+        verified = {
+            "current": True,
+            "reason": "",
+            "targets": initial["targets"],
+            "actionable_targets": [],
+            "metadata_diagnostic_targets": [str(disputed)],
+            "mutation_authorized": False,
+        }
+        with mock.patch.object(
+            gui,
+            "cluster_relation_output_targets",
+            return_value=[authorized, disputed],
+        ), mock.patch.object(
+            gui,
+            "cluster_relation_refresh_state",
+            side_effect=[initial, verified],
+        ), mock.patch(
+            "cluster_blend_sync.run_cluster_relation_transaction",
+            return_value={"status": "ok"},
+        ) as relation:
+            result = app._refresh_cluster_source_relations(spm, item)
+
+        relation.assert_called_once()
+        self.assertEqual(relation.call_args.args[1], [authorized])
+        self.assertEqual(result["status"], "ok")
+
+    def test_invalid_target_registry_is_diagnostic_without_mutation(self):
+        gui = load_gui_module()
+        target = Path("Tree_elm/SK_Tree_elm_01.spm").absolute()
+        with mock.patch(
+            "atlas_target_registry.load_target_registry",
+            side_effect=TargetRegistryError("invalid registry"),
+        ):
+            state = gui.cluster_relation_refresh_state(
+                Path("Tree_elm/Cluster/SK_branch_elm_01.spm"),
+                [target],
+            )
+
+        self.assertTrue(state["current"])
+        self.assertFalse(state["mutation_authorized"])
+        self.assertEqual(state["actionable_targets"], [])
+        self.assertEqual(
+            state["metadata_diagnostic_targets"],
+            [str(target)],
+        )
+
+    def test_cluster_refresh_exception_is_diagnostic_not_asset_failure(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        spm = Path("Tree_elm/Cluster/SK_branch_elm_01.spm")
+        target = Path("Tree_elm/SK_Tree_elm_01.spm").absolute()
+        app.cfg = {
+            "blender_exe": "blender.exe",
+            "cluster_unit_probe": "unit.json",
+        }
+        item = {"referenced_by_spms": [target]}
+        stale = {
+            "current": False,
+            "reason": "source_fbx_changed",
+            "targets": [{"target_spm": str(target)}],
+        }
+        with mock.patch.object(
+            gui,
+            "cluster_relation_output_targets",
+            return_value=[target],
+        ), mock.patch.object(
+            gui,
+            "cluster_relation_refresh_state",
+            return_value=stale,
+        ), mock.patch(
+            "cluster_blend_sync.run_cluster_relation_transaction",
+            side_effect=RuntimeError("worker receipt unavailable"),
+        ):
+            result = app._refresh_cluster_source_relations(spm, item)
+
+        self.assertEqual(result["status"], "pass_through")
+        self.assertEqual(
+            result["reason"],
+            "cluster_refresh_orchestration_diagnostic",
+        )
+        self.assertFalse(result["asset_failure"])
+
+    def test_cluster_refresh_noncurrent_reaudit_returns_to_live_pipeline(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        spm = Path("Tree_elm/Cluster/SK_branch_elm_01.spm")
+        target = Path("Tree_elm/SK_Tree_elm_01.spm").absolute()
+        app.cfg = {
+            "blender_exe": "blender.exe",
+            "cluster_unit_probe": "unit.json",
+        }
+        item = {"referenced_by_spms": [target]}
+        states = [
+            {
+                "current": False,
+                "reason": "source_fbx_changed",
+                "targets": [{"target_spm": str(target)}],
+            },
+            {
+                "current": False,
+                "reason": "target_scope_changed",
+                "targets": [{"target_spm": str(target)}],
+            },
+        ]
+        with mock.patch.object(
+            gui,
+            "cluster_relation_output_targets",
+            return_value=[target],
+        ), mock.patch.object(
+            gui,
+            "cluster_relation_refresh_state",
+            side_effect=states,
+        ), mock.patch(
+            "cluster_blend_sync.run_cluster_relation_transaction",
+            return_value={"status": "ok"},
+        ):
+            result = app._refresh_cluster_source_relations(spm, item)
+
+        self.assertEqual(result["status"], "pass_through")
+        self.assertEqual(
+            result["reason"],
+            "cluster_refresh_reaudit_diagnostic",
+        )
+        self.assertFalse(result["asset_failure"])
 
 
 class ClusterBarkRepairSkipGateTests(unittest.TestCase):

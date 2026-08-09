@@ -141,6 +141,52 @@ class ManualFullRerenderTests(unittest.TestCase):
             },
         )
 
+    def test_force_plan_seal_does_not_reaudit_affected_folders(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "leaf_color.tga"
+            source.write_bytes(b"source")
+            out_dir = root / "texture"
+            out_dir.mkdir()
+            item = {"name": "tree_test", "folder": str(root)}
+            job = {
+                "base": "M_tree_test",
+                "texture_base": "T_tree_test",
+                "out_dir": str(out_dir),
+                "inputs": {"basecolor": str(source)},
+                "item": item,
+            }
+            plan = {
+                "jobs": [job],
+                "sync_files": [],
+                "exact_step3_spms": [],
+                "force_unreal_verify": False,
+                "eligible_row_keys": set(),
+                "pending_manifest_rows": [],
+                "require_all_renders_for_sync": True,
+                "operation_label": "PCG ③ 전체 재추출",
+            }
+            app = self.gui.App.__new__(self.gui.App)
+            app.cfg = {
+                "designer_dir": str(root),
+                "sbsrender_timeout": 12,
+                "unreal_texture_sync_enabled": False,
+            }
+            app._reaudit_and_seal_mutation_items = mock.Mock(
+                side_effect=AssertionError(
+                    "manual full rerender must not run affected-folder audit"
+                )
+            )
+
+            baseline = app._seal_step3_force_execution_plan(plan)
+
+        app._reaudit_and_seal_mutation_items.assert_not_called()
+        self.assertEqual(
+            baseline["action"],
+            "step3_texture_force",
+        )
+        self.assertIs(plan["_exact_mutation_baseline"], baseline)
+
     def test_force_worker_syncs_once_after_all_renders_without_spm_processing(self):
         app = self.gui.App.__new__(self.gui.App)
         app.cfg = {
@@ -184,12 +230,16 @@ class ManualFullRerenderTests(unittest.TestCase):
             app._sync_pending_texture_files = mock.Mock(
                 return_value=sync_report
             )
+            baseline = self.gui.seal_exact_mutation_baseline(
+                [], action="unit_test_force_rerender"
+            )
             app._run_step3(
                 jobs,
                 affected_spms=[],
                 sync_files=[],
                 force_unreal_verify=False,
                 require_all_renders_for_sync=True,
+                exact_mutation_baseline=baseline,
             )
 
         self.assertEqual(render.call_count, 2)
@@ -234,12 +284,16 @@ class ManualFullRerenderTests(unittest.TestCase):
             self.gui, "make_report",
             side_effect=AssertionError("force rerender must not normalize SPMs"),
         ):
+            baseline = self.gui.seal_exact_mutation_baseline(
+                [], action="unit_test_force_rerender_failure"
+            )
             app._run_step3(
                 jobs,
                 affected_spms=[],
                 sync_files=[],
                 force_unreal_verify=False,
                 require_all_renders_for_sync=True,
+                exact_mutation_baseline=baseline,
             )
 
         app._sync_pending_texture_files.assert_not_called()
@@ -301,12 +355,52 @@ class ManualFullRerenderTests(unittest.TestCase):
 
 
 class ManualCookCacheTests(unittest.TestCase):
+    def test_isolated_cook_pins_cluster_dependency_without_editing_source(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sbs = root / "authoring.sbs"
+            relative_dependency = "../shared/Cluster_System_01.sbsar"
+            sbs.write_text(
+                "<package><dependencies><dependency>"
+                f'<filename v="{relative_dependency}" /><uid v="123" />'
+                "</dependency></dependencies>"
+                '<graph><identifier v="T_Test" /></graph></package>',
+                encoding="utf-8",
+            )
+            cluster = root / "configured" / "Cluster_System_01.sbsar"
+            observed = {}
+
+            def fake_run(command, **_kwargs):
+                input_path = Path(command[command.index("--inputs") + 1])
+                observed["isolated"] = input_path.read_text(encoding="utf-8")
+                output_dir = Path(command[command.index("--output-path") + 1])
+                output_dir.mkdir(parents=True, exist_ok=True)
+                (output_dir / f"{input_path.stem}.sbsar").write_bytes(b"cooked")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            cfg = {
+                "designer_dir": r"C:\Designer",
+                "cluster_sbsar": str(cluster),
+            }
+            with mock.patch.object(subprocess, "run", side_effect=fake_run):
+                sbs_auto.cook_sbs_graph_package(
+                    sbs, ["T_Test"], root / "cache", cfg=cfg
+                )
+
+            configured = str(cluster).replace("\\", "/")
+            self.assertIn(f'filename v="{configured}"', observed["isolated"])
+            self.assertIn(
+                f'filename v="{relative_dependency}"',
+                sbs.read_text(encoding="utf-8"),
+            )
+
     def test_manual_recook_bypasses_an_existing_graph_cache(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             sbs = root / "authoring.sbs"
             sbs.write_text(
-                "<package><graph><identifier v=\"T_Test\" /></graph></package>",
+                "<package><dependencies/><graph>"
+                "<identifier v=\"T_Test\" /></graph></package>",
                 encoding="utf-8",
             )
             cache = root / "cache"

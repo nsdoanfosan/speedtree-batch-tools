@@ -49,8 +49,14 @@ from pcg_st9_texture_batch.pcg_texture_audit import (  # noqa: E402
     _unsafe_provisional_source,
     atlas_provisional_source_declarations,
     canonical_material_name as pcg_canonical_material_name,
+    extract_material_image_refs,
     live_generator_delivery_snapshot,
     texture_base_for_material,
+)
+from atlas_manifest_resolver import (  # noqa: E402
+    resolution_evidence,
+    resolve_atlas_manifests,
+    resolve_manifest_material_ownership,
 )
 from pcg_st9_texture_batch.pcg_texture_common import (  # noqa: E402
     DEFAULT_CONFIG as PCG_DEFAULT_CONFIG,
@@ -537,6 +543,35 @@ def augment_texture_readiness_contract(
             _material_contract_key(material.get("material_name")),
             [],
         ).append(material)
+    atlas_manifest_diagnostic = None
+    atlas_resolution = resolve_atlas_manifests(
+        production_spm,
+        diagnostic_only=True,
+    )
+    atlas_ownership = resolve_manifest_material_ownership(
+        atlas_resolution,
+        [
+            row
+            for row in extract_material_image_refs(production_spm)
+            if row.get("managed_leaf_output")
+        ],
+        target_spm=production_spm,
+    )
+    if atlas_resolution.get("mutation_authorized") is False:
+        # Multiple Providers may legitimately claim the same live Material or
+        # Mesh. The disagreement prevents provenance-based mutation, but it is
+        # not a texture/export failure and must not stop preflight.
+        atlas_manifest_diagnostic = {
+            "status": "provider_claim_disagreement",
+            "resolution": resolution_evidence(atlas_resolution),
+            "mutation_authorized": False,
+        }
+    atlas_ownership_by_key = {}
+    for proof in atlas_ownership.get("materials") or []:
+        atlas_ownership_by_key.setdefault(
+            _material_contract_key(proof.get("material_name")),
+            [],
+        ).append(proof)
     asset_root = _production_asset_root(production_spm)
     provisional_declarations = atlas_provisional_source_declarations(
         asset_root
@@ -548,6 +583,8 @@ def augment_texture_readiness_contract(
     )
     warnings = list(readiness.get("warnings") or [])
     missing = list(readiness.get("missing") or [])
+    if atlas_manifest_diagnostic is not None:
+        readiness["atlas_manifest_diagnostic"] = atlas_manifest_diagnostic
     live_evidence = _capture_live_material_export_evidence(
         export_evidence_spm
     )
@@ -573,6 +610,24 @@ def augment_texture_readiness_contract(
             _material_contract_key(binding.get("material")),
             [],
         )
+        ownership_matches = atlas_ownership_by_key.get(
+            _material_contract_key(binding.get("material")),
+            [],
+        )
+        ownership_proof = (
+            ownership_matches[0] if len(ownership_matches) == 1 else None
+        )
+        if ownership_proof is not None:
+            exact_material_id = str(
+                ownership_proof.get("material_id") or ""
+            )
+            exact_spm_matches = [
+                row
+                for row in spm_matches
+                if str(row.get("material_id") or "") == exact_material_id
+            ]
+            if len(exact_spm_matches) == 1:
+                spm_matches = exact_spm_matches
         bake_receipt = {}
         bake_issue = ""
         spm_source_paths = {}
@@ -593,25 +648,33 @@ def augment_texture_readiness_contract(
                 _path_key(path)
                 for path in spm_source_paths.values()
             }:
+                origin_output = {
+                    "slot_files": [
+                        {
+                            "map_index": int(slot.get("map_index", -1)),
+                            "map": str(slot.get("map") or ""),
+                            "role": str(slot.get("role") or ""),
+                            "path": str(slot.get("resolved_ref") or ""),
+                        }
+                        for slot in spm_slots
+                    ],
+                }
+                manifest_group = (
+                    (ownership_proof or {}).get("material_group") or {}
+                )
+                manifest_bake = manifest_group.get(
+                    "blender_cluster_bake_texture"
+                )
+                if isinstance(manifest_bake, dict):
+                    origin_output = {
+                        **manifest_bake,
+                        "slot_files": origin_output["slot_files"],
+                    }
                 bake_receipt, bake_issue = (
                     resolve_blender_cluster_bake_origin(
                         production_spm,
                         spm_material,
-                        {
-                            "slot_files": [
-                                {
-                                    "map_index": int(
-                                        slot.get("map_index", -1)
-                                    ),
-                                    "map": str(slot.get("map") or ""),
-                                    "role": str(slot.get("role") or ""),
-                                    "path": str(
-                                        slot.get("resolved_ref") or ""
-                                    ),
-                                }
-                                for slot in spm_slots
-                            ],
-                        },
+                        origin_output,
                         asset_root,
                         consumption_context=(
                             BLENDER_BAKE_CONSUMPTION_SPEEDTREE_PREVIEW
@@ -652,6 +715,11 @@ def augment_texture_readiness_contract(
                 "origin_state": TEXTURE_ORIGIN_BLENDER_CLUSTER_BAKE,
                 "origin_receipt": bake_receipt,
                 "source_paths": spm_source_paths,
+                "atlas_manifest_ownership": {
+                    key: value
+                    for key, value in (ownership_proof or {}).items()
+                    if key != "material_group"
+                },
             })
             continue
         if (
@@ -895,6 +963,77 @@ def _issue(code, scope, entity, message, severity="error", details=None):
     return row
 
 
+def _atlas_integrity_failure_message(integrity):
+    """Return one Korean cause/action with the exact offending identities."""
+    integrity = integrity or {}
+    issues = list(integrity.get("integrity_issues") or ())
+    duplicate_materials = [
+        row for row in issues if row.get("code") == "duplicate_material_id"
+    ]
+    duplicate_meshes = [
+        row for row in issues if row.get("code") == "duplicate_mesh_id"
+    ]
+    if duplicate_materials or duplicate_meshes:
+        identities = []
+        if duplicate_materials:
+            identities.append(
+                "Material ID "
+                + ", ".join(str(row.get("asset_id")) for row in duplicate_materials)
+            )
+        if duplicate_meshes:
+            identities.append(
+                "Mesh ID "
+                + ", ".join(str(row.get("asset_id")) for row in duplicate_meshes)
+            )
+        return (
+            "표시되는 Generator가 중복 ID를 참조합니다: " + " / ".join(identities),
+            "표시되는 exact Generator가 하나의 Material/Mesh ID만 참조하도록 중복 항목을 정리하세요.",
+        )
+
+    incomplete_slots = [
+        row
+        for row in issues
+        if row.get("code") == "generator_slot_pair_incomplete"
+        and row.get("hidden") is not True
+    ]
+    if incomplete_slots:
+        slots = ", ".join(
+            f"{row.get('generator_name') or '이름 없음'}"
+            f"(Material {row.get('material_id')}, Mesh {row.get('mesh_id')})"
+            for row in incomplete_slots[:8]
+        )
+        return (
+            "표시되는 Generator의 Material/Mesh slot이 불완전합니다: " + slots,
+            "해당 exact Generator에 유효한 Material과 Mesh를 각각 하나씩 지정하세요.",
+        )
+
+    visible_pairs = [
+        row for row in issues
+        if row.get("code") == "generator_cross_group_pair"
+        and row.get("hidden") is not True
+    ]
+    if visible_pairs:
+        pairs = ", ".join(
+            f"{row.get('generator_name') or '이름 없음'}"
+            f"(Material {row.get('material_id')}, Mesh {row.get('mesh_id')})"
+            for row in visible_pairs[:8]
+        )
+        return (
+            "표시되는 Generator의 Material/Mesh 소유 관계가 일치하지 않습니다: "
+            + pairs,
+            "표시된 Generator, Material ID, Mesh ID의 visible 연결을 수정한 뒤 다시 검사하세요.",
+        )
+    exact_rows = ", ".join(
+        f"{row.get('code')}"
+        f"({row.get('asset_kind') or 'slot'} {row.get('asset_id')})"
+        for row in issues[:8]
+    )
+    return (
+        "표시되는 live Material/Mesh 구조에 문제가 있습니다: " + exact_rows,
+        "표시된 exact ID와 Generator slot을 수정한 뒤 다시 검사하세요.",
+    )
+
+
 def preflight_contract_issues(report):
     """Map legacy workflow statuses to stable, additive issue codes."""
     issues = []
@@ -916,22 +1055,10 @@ def preflight_contract_issues(report):
                 or leaf_status,
             )
         )
-    ownership = leaf.get("managed_ownership_provenance") or {}
-    if ownership.get("status") == "marker_only":
-        issues.append(
-            _issue(
-                "ATLAS_OWNERSHIP_PROVENANCE_MISMATCH",
-                "atlas_builder",
-                report.get("spm"),
-                ownership.get("reason")
-                or "Atlas builder ownership provenance is marker-only",
-                severity="warning",
-                details={
-                    "material_names": ownership.get("material_names") or [],
-                    "validation": "shadow_only_no_mutation_change",
-                },
-            )
-        )
+    # Atlas ownership/provenance is authority for an optional cleanup, not for
+    # exporting the live SpeedTree graph. Marker-only ownership, missing or
+    # stale lineage, and simultaneous Provider claims remain in the internal
+    # audit but deliberately emit no user-facing preflight issue.
 
     mesh_files = report.get("mesh_file_reference_contract") or {}
     if mesh_files.get("missing"):
@@ -947,6 +1074,65 @@ def preflight_contract_issues(report):
                         str(row.get("filename") or "")
                         for row in mesh_files.get("missing") or []
                     ],
+                },
+            )
+        )
+    atlas_integrity = mesh_files.get("atlas_consumer_integrity") or {}
+    if atlas_integrity.get(
+        "export_blocking",
+        atlas_integrity.get("blocking"),
+    ):
+        integrity_message, integrity_action = (
+            _atlas_integrity_failure_message(atlas_integrity)
+        )
+        issues.append(
+            _issue(
+                "ATLAS_MANAGED_ASSET_INTEGRITY_STALE",
+                "atlas_builder",
+                report.get("spm"),
+                integrity_message,
+                details={
+                    "operator_action_ko": integrity_action,
+                    "receipt_resolution_error": atlas_integrity.get(
+                        "receipt_resolution_error"
+                    ) or "",
+                    "classification_counts": atlas_integrity.get(
+                        "classification_counts"
+                    )
+                    or {},
+                    "managed_orphan_mesh_count": atlas_integrity.get(
+                        "managed_orphan_mesh_count"
+                    )
+                    or 0,
+                    "managed_orphan_material_count": atlas_integrity.get(
+                        "managed_orphan_material_count"
+                    )
+                    or 0,
+                    "integrity_issues": atlas_integrity.get(
+                        "integrity_issues"
+                    )
+                    or [],
+                    "receipt_resolution": atlas_integrity.get(
+                        "receipt_resolution"
+                    )
+                    or "",
+                    "current_manifest_path": atlas_integrity.get(
+                        "current_manifest_path"
+                    )
+                    or "",
+                    "selected_manifest_paths": atlas_integrity.get(
+                        "selected_manifest_paths"
+                    )
+                    or [],
+                    "selected_scope_ids": atlas_integrity.get(
+                        "selected_scope_ids"
+                    )
+                    or [],
+                    "selected_authorities": atlas_integrity.get(
+                        "selected_authorities"
+                    )
+                    or [],
+                    "repair_input": atlas_integrity.get("repair_input") or {},
                 },
             )
         )
@@ -1020,71 +1206,10 @@ def preflight_contract_issues(report):
             )
         )
 
-    textures = report.get("texture_source_contract") or {}
-    if textures.get("status") not in {None, "", "ok"}:
-        code = {
-            "missing_stmat": "STMAT_MISSING",
-            "invalid_stmat": "STMAT_INVALID",
-            "stale": "STMAT_STALE",
-            "missing_sources": "TEXTURE_SOURCE_MISSING",
-        }.get(str(textures.get("status")), "TEXTURE_SOURCE_INVALID")
-        issues.append(
-            _issue(
-                code,
-                "texture_source",
-                textures.get("stmat"),
-                textures.get("error") or textures.get("status"),
-                details={"missing_sources": textures.get("missing_sources") or []},
-            )
-        )
-
-    readiness = report.get("texture_readiness_contract") or {}
-    for warning in readiness.get("warnings") or []:
-        issues.append(
-            _issue(
-                warning.get("issue_code")
-                or "TEXTURE_SOURCE_FALLBACK_NEEDS_PCG_GENERATION",
-                "material",
-                warning.get("material"),
-                warning.get("warning")
-                or "Original source texture is provisional",
-                severity="warning",
-                details={
-                    "material_index": warning.get("material_index"),
-                    "source_roles": warning.get("source_roles") or [],
-                    "source_paths": warning.get("source_paths") or {},
-                    "expected_texture_base": warning.get(
-                        "expected_texture_base"
-                    )
-                    or "",
-                    "expected_t_paths": warning.get("expected_t_paths")
-                    or {},
-                    "remediation": warning.get("remediation") or "",
-                    "source_rejections": warning.get("source_rejections")
-                    or [],
-                    "export_scope": warning.get("export_scope") or {},
-                },
-            )
-        )
-    for missing in readiness.get("missing") or []:
-        issues.append(
-            _issue(
-                "TEXTURE_SET_INCOMPLETE",
-                "material",
-                missing.get("material"),
-                missing.get("reason") or "managed texture set is incomplete",
-                details={
-                    "material_index": missing.get("material_index"),
-                    "missing_roles": missing.get("missing_roles") or [],
-                    "expected_texture_base": missing.get("expected_texture_base")
-                    or missing.get("texture_base")
-                    or "",
-                    "source_rejections": missing.get("source_rejections")
-                    or [],
-                    "export_scope": missing.get("export_scope") or {},
-                },
-            )
-        )
+    # Texture readiness is intentionally absent from the admission issue list.
+    # The detailed source/binding diagnostics stay in the report, but an empty,
+    # partial, stale, or ambiguous texture set is a normal handoff state. Unreal
+    # may bind a proven candidate later or leave the parameter unassigned.
     if report.get("status") == "failed" and not issues:
         issues.append(
             _issue(
@@ -1163,6 +1288,7 @@ def main():
         mesh_files = inspect_spm_mesh_file_references(speedtree_spm)
         report["mesh_file_reference_contract"] = mesh_files
         missing_mesh_files = list(mesh_files.get("missing") or [])
+        atlas_integrity = mesh_files.get("atlas_consumer_integrity") or {}
         if not leaf_ok:
             report["status"] = "blocked"
             report["error"] = leaf_message
@@ -1209,6 +1335,27 @@ def main():
                 spm=canonical_spm.name,
                 status="blocked",
             )
+        elif atlas_integrity.get(
+            "export_blocking",
+            atlas_integrity.get("blocking"),
+        ):
+            integrity_message, integrity_action = (
+                _atlas_integrity_failure_message(atlas_integrity)
+            )
+            report["status"] = "blocked"
+            report["classification"] = (
+                "atlas_managed_asset_integrity_stale"
+            )
+            report["error"] = integrity_message
+            report["remediation"] = integrity_action
+            report["atlas_consumer_repair_input"] = (
+                atlas_integrity.get("repair_input") or {}
+            )
+            emit_progress_marker(
+                MATERIAL_PREFLIGHT_STATIC_DONE_MARKER,
+                spm=canonical_spm.name,
+                status="blocked",
+            )
         else:
             emit_progress_marker(
                 MATERIAL_PREFLIGHT_STATIC_DONE_MARKER,
@@ -1227,21 +1374,38 @@ def main():
                 speedtree_spm, leaf_contract
             )
             all_material = inspect_all_speedtree_material_export(speedtree_spm)
-            textures = inspect_speedtree_texture_sources(speedtree_spm)
-            texture_readiness = augment_texture_readiness_contract(
-                resolve_texture_bindings(textures.get("stmat")),
-                textures.get("stmat"),
-                canonical_spm,
-                source_texture_roots=(
-                    load_pcg_texture_config().get(
-                        "source_texture_roots"
-                    )
-                    or []
-                ),
-                leaf_contract=leaf_contract,
-                all_material_contract=all_material,
-                export_evidence_spm=speedtree_spm,
-            )
+            try:
+                textures = inspect_speedtree_texture_sources(speedtree_spm)
+                texture_readiness = augment_texture_readiness_contract(
+                    resolve_texture_bindings(textures.get("stmat")),
+                    textures.get("stmat"),
+                    canonical_spm,
+                    source_texture_roots=(
+                        load_pcg_texture_config().get(
+                            "source_texture_roots"
+                        )
+                        or []
+                    ),
+                    leaf_contract=leaf_contract,
+                    all_material_contract=all_material,
+                    export_evidence_spm=speedtree_spm,
+                )
+            except Exception as exc:
+                textures = {
+                    "status": "unassigned",
+                    "stmat": str(contract_stmat_path(speedtree_spm)),
+                    "missing_sources": [],
+                    "diagnostic": f"{type(exc).__name__}: {exc}",
+                }
+                texture_readiness = {
+                    "status": "unassigned",
+                    "stmat": textures["stmat"],
+                    "bindings": [],
+                    "missing": [],
+                    "texture_admission_mode": "runtime_tolerant",
+                    "affects_pipeline_outcome": False,
+                    "diagnostic": textures["diagnostic"],
+                }
             report["material_export_contract"] = material
             report["all_export_material_contract"] = all_material
             report["texture_source_contract"] = textures
@@ -1256,6 +1420,19 @@ def main():
             ))
             missing_sources = list(textures.get("missing_sources") or [])
             missing_sets = list(texture_readiness.get("missing") or [])
+            report["texture_diagnostics"] = {
+                "admission_mode": "runtime_tolerant",
+                "affects_pipeline_outcome": False,
+                "source_status": textures.get("status"),
+                "binding_status": texture_readiness.get("status"),
+                "missing_sources": missing_sources,
+                "unassigned_or_partial": missing_sets,
+                "diagnostic": (
+                    texture_readiness.get("diagnostic")
+                    or textures.get("diagnostic")
+                    or ""
+                ),
+            }
             if textures.get("classification"):
                 report["classification"] = textures["classification"]
                 report["failure_reason"] = textures.get(
@@ -1265,13 +1442,6 @@ def main():
             if (
                 material.get("status") in {"ok", "not_applicable"}
                 and all_material.get("status") in {"ok", "not_applicable"}
-                and textures.get("status") == "ok"
-                and texture_readiness.get("status") in {
-                    "ok",
-                    "not_applicable",
-                    "source_fallback_needs_pcg_generation",
-                    "nonblocking_diagnostics",
-                }
             ):
                 report["status"] = "ok"
             elif missing:
@@ -1323,34 +1493,12 @@ def main():
                     )
             else:
                 report["status"] = "blocked"
-                if missing_sets:
-                    details = ", ".join(
-                        f"{item.get('material', '?')}:"
-                        f"{','.join(item.get('missing_roles') or []) or item.get('reason', '?')}"
-                        for item in missing_sets[:8]
-                    )
-                    report["error"] = (
-                        "SpeedTree managed texture set is incomplete: "
-                        + details
-                    )
-                elif missing_sources:
-                    details = ", ".join(
-                        f"{item.get('material', '?')}:{item.get('map', '?')}"
-                        " -> "
-                        + (
-                            str(item.get("resolved") or "<Source 미지정>")
-                        )
-                        for item in missing_sources[:8]
-                    )
-                    report["error"] = (
-                        "에셋 텍스처 Source 계약 오류 — "
-                        + details
-                    )
-                else:
-                    report["error"] = (
-                        "SpeedTree 텍스처 사전검사 실패 — "
-                        + str(textures.get("status") or "unknown")
-                    )
+                report["error"] = (
+                    "SpeedTree material export preflight failed — material="
+                    + str(material.get("status") or "unknown")
+                    + ", all_material="
+                    + str(all_material.get("status") or "unknown")
+                )
             emit_progress_marker(
                 MATERIAL_PREFLIGHT_INSPECTION_DONE_MARKER,
                 spm=canonical_spm.name,

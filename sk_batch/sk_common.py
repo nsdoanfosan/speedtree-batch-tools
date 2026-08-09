@@ -36,13 +36,25 @@ from cluster_spm_pair_contract import (
     resolve_cluster_spm_pair,
 )
 from shared_job_queue import InterprocessMutex
+from process_lifecycle import (
+    ProcessLifecycleError,
+    complete_owned_process,
+    owned_popen,
+    terminate_owned_process,
+)
+from blender_addon_contract import discover_installed_addon_source
 
 
 def _default_addon_dir():
-    """Locate the separately checked-out Blender add-on repository."""
+    """Use the same BWR source that the newest Blender install will load."""
     override = os.environ.get("SPEEDTREE_BWR_ADDON_DIR")
     if override:
         return Path(override).expanduser()
+    installed = discover_installed_addon_source(
+        "speedtree_bone_weight_repair"
+    )
+    if installed is not None:
+        return installed
     return (
         REPO_ROOT.parent
         / "speedtree-bone-weight-repair-addon"
@@ -61,6 +73,7 @@ STATE_RECOVERY_LOG_PATH = LOG_DIR / "state_recovery.log"
 STATE_RECOVERY_LOG_MAX_BYTES = 64 * 1024
 PUSH_MANIFEST_SCHEMA_VERSION = 1
 PUSH_SOURCE_FINGERPRINT_CACHE_VERSION = 1
+PUSH_SOURCE_FINGERPRINT_CONTRACT = "content_only_v2"
 DEFAULT_SEND2UE_DIR = Path(
     r"C:\Users\PARK\Documents\GitHub\BlenderTools\src\addons\send2ue"
 )
@@ -146,6 +159,10 @@ DEFAULT_CONFIG = {
     "headless_item_crash_retries": 2,
     "headless_batch_max_restarts": 10,
     "headless_job_timeout": 14_400,
+    # Observational warning only: the existing exact-owned process lifecycle
+    # remains the sole termination path for a retry worker tree.
+    "retry_stall_warning_seconds": 120,
+    "retry_owner_lost_seconds": 45,
     "process_poll_interval": 0.2,
 }
 
@@ -577,6 +594,7 @@ def _push_source_fingerprint_record(blend_path, dependency_paths=()):
         ).encode("utf-8")
         return {
             "version": PUSH_SOURCE_FINGERPRINT_CACHE_VERSION,
+            "fingerprint_contract": PUSH_SOURCE_FINGERPRINT_CONTRACT,
             "fingerprint": hashlib.blake2b(encoded, digest_size=16).hexdigest(),
             "snapshot": snapshot,
         }
@@ -584,11 +602,46 @@ def _push_source_fingerprint_record(blend_path, dependency_paths=()):
 
 
 def push_source_fingerprint(blend_path, dependency_paths=()):
-    """Fingerprint the Blender export input and code that defines its contract."""
+    """Fingerprint the Blender export input and per-asset content contracts."""
     return _push_source_fingerprint_record(
         blend_path,
         dependency_paths,
     )["fingerprint"]
+
+
+def _legacy_push_source_snapshot_covers(legacy_snapshot, current_snapshot):
+    """Return whether a pre-v2 snapshot proves the current content-only set."""
+    if not isinstance(legacy_snapshot, dict):
+        return False
+    if legacy_snapshot.get("blend") != current_snapshot.get("blend"):
+        return False
+    legacy_dependencies = legacy_snapshot.get("dependencies")
+    current_dependencies = current_snapshot.get("dependencies")
+    if not isinstance(legacy_dependencies, list) or not isinstance(
+        current_dependencies, list
+    ):
+        return False
+    return all(
+        identity in legacy_dependencies for identity in current_dependencies
+    )
+
+
+def push_source_cache_matches_snapshot(cache, snapshot):
+    """Validate a current cache or a legacy code-inclusive cache safely."""
+    if not isinstance(cache, dict) or not isinstance(snapshot, dict):
+        return False
+    if cache.get("version") != PUSH_SOURCE_FINGERPRINT_CACHE_VERSION:
+        return False
+    fingerprint = cache.get("fingerprint")
+    if not isinstance(fingerprint, str) or not fingerprint:
+        return False
+    cached_snapshot = cache.get("snapshot")
+    if cached_snapshot == snapshot:
+        return True
+    return (
+        not cache.get("fingerprint_contract")
+        and _legacy_push_source_snapshot_covers(cached_snapshot, snapshot)
+    )
 
 
 def cached_push_source_fingerprint(blend_path, dependency_paths=(), cache=None):
@@ -598,14 +651,13 @@ def cached_push_source_fingerprint(blend_path, dependency_paths=(), cache=None):
     cache = cache if isinstance(cache, dict) else {}
     fingerprint = cache.get("fingerprint")
     cache_valid = (
-        cache.get("version") == PUSH_SOURCE_FINGERPRINT_CACHE_VERSION
-        and cache.get("snapshot") == snapshot
-        and isinstance(fingerprint, str)
+        push_source_cache_matches_snapshot(cache, snapshot)
         and re.fullmatch(r"[0-9a-f]{32}", fingerprint) is not None
     )
     if cache_valid:
         return fingerprint, {
             "version": PUSH_SOURCE_FINGERPRINT_CACHE_VERSION,
+            "fingerprint_contract": PUSH_SOURCE_FINGERPRINT_CONTRACT,
             "fingerprint": fingerprint,
             "snapshot": snapshot,
         }, True
@@ -614,14 +666,17 @@ def cached_push_source_fingerprint(blend_path, dependency_paths=(), cache=None):
 
 
 def manifest_item_files_match(item):
-    """Validate all cached source/export fingerprints referenced by one item."""
+    """Validate immutable cached export artifacts referenced by one item.
+
+    ``code_files`` remain in manifests for diagnostics and Unreal recovery, but
+    code edited after export cannot change an already-written FBX or handoff.
+    """
     if not isinstance(item, dict) or not item.get("fingerprint"):
         return False
     groups = (
         item.get("exported_files") or [],
         item.get("handoff_files") or [],
         [item["wind_file"]] if item.get("wind_file") else [],
-        item.get("code_files") or [],
     )
     for group in groups:
         for identity in group:
@@ -1022,14 +1077,15 @@ def scan_sk_spms(root):
     return sorted(out)
 
 
-def _connected_cluster_rows(owner_folder, clusters):
-    """Return PCG's exact final-SPM-to-Cluster texture connections."""
-    from pcg_st9_texture_batch.pcg_texture_audit import cluster_connection_rows
+def _connected_cluster_rows_by_owner(owner_clusters, metrics=None):
+    """Return PCG-equivalent connections from one shared bounded inventory."""
+    from pcg_st9_texture_batch.cluster_connection_index import (
+        cluster_connection_rows_by_owner,
+    )
 
-    return cluster_connection_rows(
-        owner_folder,
-        clusters=clusters,
-        connected_only=True,
+    return cluster_connection_rows_by_owner(
+        owner_clusters,
+        metrics=metrics,
     )
 
 
@@ -1037,7 +1093,7 @@ def _path_key(value):
     return os.path.normcase(os.path.abspath(str(value))).casefold()
 
 
-def scan_cluster_spm_sources(root):
+def scan_cluster_spm_sources(root, metrics=None):
     """Connected Cluster outputs, normalized to one canonical SK row.
 
     A legacy unprefixed file remains a discoverable normalization input only
@@ -1098,16 +1154,25 @@ def scan_cluster_spm_sources(root):
             "legacy_sk_spm": pair["canonical_spm"],
         }
         by_owner.setdefault(row["owner_folder"], []).append(row)
-    for owner_folder, owner_rows in by_owner.items():
-        sources = [
+    sources_by_owner = {
+        owner_folder: [
             row["output_spm"]
             if row["output_spm"].is_file()
             else row["legacy_output_spm"]
             for row in owner_rows
         ]
+        for owner_folder, owner_rows in by_owner.items()
+    }
+    connections_by_owner = _connected_cluster_rows_by_owner(
+        sources_by_owner,
+        metrics=metrics,
+    )
+    for owner_folder, owner_rows in by_owner.items():
         connection_by_source = {
             _path_key(row.get("source_spm") or row.get("authoring_spm")): row
-            for row in _connected_cluster_rows(owner_folder, sources)
+            for row in connections_by_owner.get(
+                Path(owner_folder).absolute(), ()
+            )
         }
         for row in owner_rows:
             connection = connection_by_source.get(
@@ -1164,8 +1229,17 @@ def prepare_cluster_spm_pair_for_job(spm_path):
     )
 
 
-# Wind preset from the file name (checklist item 4). Dead vegetation must not
-# sway at all, so it wins over every other token.
+# Wind preset from the file name (checklist item 4). Dead vegetation maps to
+# the shared NONE response slot, whose default values are zero.
+def normalize_wind_override(value):
+    normalized = str(value or "auto").strip().upper()
+    if normalized == "AUTO":
+        return "auto"
+    if normalized == "GRASS":
+        return "WEED"
+    return normalized if normalized in {"TREE", "BUSH", "WEED", "NONE"} else "auto"
+
+
 def wind_preset_for(stem):
     s = stem.lower()
     if "deadleave" in s or "deadbranch" in s:
@@ -1175,8 +1249,8 @@ def wind_preset_for(stem):
     if "bush" in s:
         return "BUSH"
     if "weed" in s or "grass" in s:
-        return "GRASS"
-    return "GRASS"
+        return "WEED"
+    return "WEED"
 
 
 def wind_preset_for_spm(spm_path):
@@ -1251,140 +1325,36 @@ def set_process_affinity(pid, cores):
         kernel32.CloseHandle(handle)
 
 
-def _create_kill_on_close_job(proc):
-    """Create and assign a Windows Job that owns *proc* and its descendants.
-
-    Closing the returned handle terminates every process still in the Job.  A
-    Job is the only reliable cleanup boundary when the direct Blender/Python
-    parent crashes before the GUI has a chance to run ``taskkill /T``.
-
-    Return ``None`` when Jobs are unavailable or assignment is denied.  Some
-    hosts place children in a non-nestable Job already; callers must retain the
-    existing process-tree fallback for that case.
-    """
-    if os.name != "nt":
-        return None
-
-    import ctypes
-    from ctypes import wintypes
-
-    class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
-        _fields_ = (
-            ("PerProcessUserTimeLimit", ctypes.c_longlong),
-            ("PerJobUserTimeLimit", ctypes.c_longlong),
-            ("LimitFlags", wintypes.DWORD),
-            ("MinimumWorkingSetSize", ctypes.c_size_t),
-            ("MaximumWorkingSetSize", ctypes.c_size_t),
-            ("ActiveProcessLimit", wintypes.DWORD),
-            ("Affinity", ctypes.c_size_t),
-            ("PriorityClass", wintypes.DWORD),
-            ("SchedulingClass", wintypes.DWORD),
-        )
-
-    class IO_COUNTERS(ctypes.Structure):
-        _fields_ = (
-            ("ReadOperationCount", ctypes.c_ulonglong),
-            ("WriteOperationCount", ctypes.c_ulonglong),
-            ("OtherOperationCount", ctypes.c_ulonglong),
-            ("ReadTransferCount", ctypes.c_ulonglong),
-            ("WriteTransferCount", ctypes.c_ulonglong),
-            ("OtherTransferCount", ctypes.c_ulonglong),
-        )
-
-    class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
-        _fields_ = (
-            ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
-            ("IoInfo", IO_COUNTERS),
-            ("ProcessMemoryLimit", ctypes.c_size_t),
-            ("JobMemoryLimit", ctypes.c_size_t),
-            ("PeakProcessMemoryUsed", ctypes.c_size_t),
-            ("PeakJobMemoryUsed", ctypes.c_size_t),
-        )
-
-    job_object_extended_limit_information = 9
-    job_object_limit_kill_on_job_close = 0x00002000
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateJobObjectW.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
-    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
-    kernel32.SetInformationJobObject.argtypes = (
-        wintypes.HANDLE,
-        ctypes.c_int,
-        wintypes.LPVOID,
-        wintypes.DWORD,
-    )
-    kernel32.SetInformationJobObject.restype = wintypes.BOOL
-    kernel32.AssignProcessToJobObject.argtypes = (
-        wintypes.HANDLE,
-        wintypes.HANDLE,
-    )
-    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-    kernel32.CloseHandle.restype = wintypes.BOOL
-
-    job = kernel32.CreateJobObjectW(None, None)
-    if not job:
-        return None
-    assigned = False
-    try:
-        limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-        limits.BasicLimitInformation.LimitFlags = (
-            job_object_limit_kill_on_job_close
-        )
-        if not kernel32.SetInformationJobObject(
-            job,
-            job_object_extended_limit_information,
-            ctypes.byref(limits),
-            ctypes.sizeof(limits),
-        ):
-            return None
-        process_handle = getattr(proc, "_handle", None)
-        if process_handle is None or not kernel32.AssignProcessToJobObject(
-            job, wintypes.HANDLE(process_handle)
-        ):
-            return None
-        assigned = True
-        return job
-    finally:
-        if not assigned:
-            kernel32.CloseHandle(job)
-
-
 def attach_process_kill_job(proc):
-    """Best-effort Job assignment; never prevents a child from launching."""
-    job = None
-    try:
-        job = _create_kill_on_close_job(proc)
-    except Exception:
-        # Sandboxes and inherited non-nestable Jobs can reject assignment.
-        # ``terminate_process_tree`` remains the safe fallback.
-        job = None
+    """Compatibility shim for callers migrated to the shared supervisor."""
+
+    job = getattr(proc, "speedtree_lifecycle_tree_job", None)
     proc.sk_job_handle = job
     return job is not None
 
 
-def _close_windows_handle(handle):
-    import ctypes
-    from ctypes import wintypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    return bool(kernel32.CloseHandle(wintypes.HANDLE(handle)))
-
-
 def close_process_kill_job(proc):
-    """Close a managed Job once, killing any descendants that still survive."""
-    job = getattr(proc, "sk_job_handle", None)
-    proc.sk_job_handle = None
-    if job is None or os.name != "nt":
+    """Finalize a completed shared-supervisor launch and its receipt."""
+
+    if getattr(proc, "speedtree_lifecycle_launch_id", None) is None:
         return False
     try:
-        return _close_windows_handle(job)
-    except Exception:
+        complete_owned_process(proc, reason="sk_worker_complete")
+        proc.sk_job_handle = None
+        return True
+    except ProcessLifecycleError:
         return False
 
 
-def launch_limited(cmd, cfg, log_file=None, cwd=None, affinity=True, env=None):
+def launch_limited(
+    cmd,
+    cfg,
+    log_file=None,
+    cwd=None,
+    affinity=True,
+    env=None,
+    cooperative_cancel=None,
+):
     """Start a background child at reduced priority + optional CPU affinity.
 
     Priority class and affinity are inherited by grandchildren (Blender ->
@@ -1399,8 +1369,11 @@ def launch_limited(cmd, cfg, log_file=None, cwd=None, affinity=True, env=None):
     flags |= CREATE_NO_WINDOW
     handle = open(log_file, "w", encoding="utf-8", errors="replace") if log_file else None
     try:
-        proc = subprocess.Popen(
+        proc = owned_popen(
             cmd,
+            source="sk_batch.sk_common.launch_limited",
+            popen_factory=subprocess.Popen,
+            cooperative_cancel=cooperative_cancel,
             stdout=handle if handle else subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
             cwd=cwd,
@@ -1432,36 +1405,30 @@ def terminate_process_tree(proc, wait_seconds=5.0):
     gone). A direct-process kill remains as a last resort, but returns False
     because descendants could not be confirmed terminated.
     """
+    if getattr(proc, "speedtree_lifecycle_launch_id", None) is not None:
+        try:
+            terminate_owned_process(
+                proc,
+                reason="sk_stop",
+                terminate_grace=min(1.0, max(0.0, float(wait_seconds))),
+                kill_grace=max(0.1, float(wait_seconds)),
+            )
+            return proc.poll() is not None
+        except ProcessLifecycleError:
+            return False
+
+    # Fail closed for legacy/injected process objects: signal only the exact
+    # retained handle and never discover or kill descendants by PID/name.
     if proc.poll() is not None:
         return True
-
-    tree_confirmed = False
-    if os.name == "nt":
-        try:
-            result = subprocess.run(
-                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=max(1.0, float(wait_seconds)),
-                creationflags=CREATE_NO_WINDOW,
-            )
-            tree_confirmed = result.returncode == 0
-        except (OSError, subprocess.SubprocessError):
-            tree_confirmed = False
-    else:
-        try:
-            proc.terminate()
-            tree_confirmed = True
-        except OSError:
-            tree_confirmed = proc.poll() is not None
-
-    if proc.poll() is None:
-        try:
-            proc.wait(timeout=max(0.1, float(wait_seconds)))
-        except subprocess.TimeoutExpired:
+    try:
+        proc.terminate()
+        proc.wait(timeout=max(0.1, float(wait_seconds)))
+    except (OSError, subprocess.TimeoutExpired):
+        if proc.poll() is None:
             try:
                 proc.kill()
                 proc.wait(timeout=max(0.1, float(wait_seconds)))
             except (OSError, subprocess.SubprocessError):
                 pass
-    return tree_confirmed and proc.poll() is not None
+    return False

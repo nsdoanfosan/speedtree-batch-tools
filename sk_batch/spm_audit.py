@@ -57,6 +57,13 @@ BATCH_TOOLS_DIR = Path(__file__).resolve().parent.parent
 if str(BATCH_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(BATCH_TOOLS_DIR))
 
+from process_lifecycle import (
+    ProcessLifecycleError,
+    complete_owned_process,
+    owned_popen,
+    terminate_owned_process,
+)
+
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from sk_common import (
@@ -225,6 +232,16 @@ def _retryable_windows_lock_error(exc):
     )
 
 
+# 1175 is ERROR_UNABLE_TO_REMOVE_REPLACED, which ReplaceFileW returns when it
+# cannot delete the file it is replacing -- an indexer or a virus scanner
+# holding a transient handle on a file that was just written. It is the same
+# class of failure as 5/32/33 and the same answer applies: the call did nothing,
+# so retrying it is safe. Left out deliberately: 1176 and 1177, where the
+# replacement could not be moved and the destination may already have been
+# renamed, which is not a state to retry blindly into.
+_WINDOWS_TRANSIENT_FILE_LOCK_ERRORS = frozenset({5, 32, 33, 1175})
+
+
 def _retryable_file_operation_error(exc):
     return (
         getattr(exc, "errno", None)
@@ -233,7 +250,8 @@ def _retryable_file_operation_error(exc):
             errno.EAGAIN,
             getattr(errno, "EBUSY", errno.EACCES),
         }
-        or getattr(exc, "winerror", None) in {5, 32, 33}
+        or getattr(exc, "winerror", None)
+        in _WINDOWS_TRANSIENT_FILE_LOCK_ERRORS
     )
 
 
@@ -466,16 +484,28 @@ def _replace_file_with_rescue(
         ctypes.c_void_p,
     )
     kernel32.ReplaceFileW.restype = ctypes.c_bool
-    if not kernel32.ReplaceFileW(
-        str(target),
-        str(temporary),
-        str(rescue),
-        0,
-        None,
-        None,
-    ):
-        raise ctypes.WinError(ctypes.get_last_error())
-    return rescue
+    # Every other file operation on this path already retries a transient lock
+    # -- unlink, os.replace, the snapshot reads. This one did not, so a scanner
+    # holding the target for a few milliseconds failed the whole atomic write.
+    # A failed ReplaceFileW has done nothing, so the retry re-enters a clean
+    # state; the caller's fingerprint comparison still decides who won.
+    last_error = None
+    for attempt in range(1, SPM_REPLACE_MAX_ATTEMPTS + 1):
+        if kernel32.ReplaceFileW(
+            str(target),
+            str(temporary),
+            str(rescue),
+            0,
+            None,
+            None,
+        ):
+            return rescue
+        last_error = ctypes.WinError(ctypes.get_last_error())
+        if not _retryable_file_operation_error(last_error):
+            raise last_error
+        if attempt < SPM_REPLACE_MAX_ATTEMPTS:
+            _sleep_file_backoff(attempt)
+    raise last_error
 
 
 def _restore_conflict_rescue(
@@ -2485,21 +2515,20 @@ def backup_spm(path):
 
 
 def _terminate_speedtree_tree(process):
-    """Kill a timed-out Modeler and every descendant it launched."""
-    if os.name == "nt":
+    """Stop the exact receipt-owned Modeler tree without PID discovery."""
+
+    if getattr(process, "speedtree_lifecycle_launch_id", None) is not None:
         try:
-            subprocess.run(
-                ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=30,
-                check=False,
-                creationflags=0x08000000,  # CREATE_NO_WINDOW
+            terminate_owned_process(
+                process,
+                reason="speedtree_timeout",
+                terminate_grace=1.0,
+                kill_grace=10.0,
             )
-        except (OSError, subprocess.SubprocessError):
+            return
+        except ProcessLifecycleError:
             pass
-    else:
+    if process.poll() is None:
         try:
             process.terminate()
         except OSError:
@@ -2718,8 +2747,10 @@ def _run_speedtree_export_attempt_tempfiles(
     with tempfile.TemporaryFile(
         mode="w+b"
     ) as out_file, tempfile.TemporaryFile(mode="w+b") as err_file:
-        process = subprocess.Popen(
+        process = owned_popen(
             cmd,
+            source="sk_batch.spm_audit.tempfile_export",
+            popen_factory=subprocess.Popen,
             stdout=out_file,
             stderr=err_file,
             **popen_kwargs,
@@ -2814,6 +2845,14 @@ def _run_speedtree_export_attempt_tempfiles(
             if returncode is not None:
                 stdout = read_handle(out_file)
                 stderr = read_handle(err_file)
+                cleanup_state = "injected_process_complete"
+                if getattr(
+                    process, "speedtree_lifecycle_launch_id", None
+                ) is not None:
+                    cleanup_state = complete_owned_process(
+                        process,
+                        reason="speedtree_root_exit",
+                    )
                 return (
                     returncode,
                     stdout,
@@ -2822,6 +2861,7 @@ def _run_speedtree_export_attempt_tempfiles(
                         "attempt": attempt,
                         "duration_seconds": round(now - started, 3),
                         "returncode": int(returncode),
+                        "cleanup_state": cleanup_state,
                         "returncode_hex": (
                             f"0x{(int(returncode) & 0xFFFFFFFF):08X}"
                         ),
@@ -3203,7 +3243,7 @@ def write_calibration_marker(spm_path, backup, source_sha256):
     Calibration edits the source SPM in place (Absolute/1 probe, then Relative
     rounds) and restores it afterwards.  Every *exception* path restores, but a
     hard kill has none: Stop and the watchdog timeout both use
-    ``taskkill /T /F``, so a killed run can leave the SPM in its probe state.
+    forced tree termination, so a killed run can leave the SPM in its probe state.
     This marker makes that state detectable and repairable on the next scan
     instead of silently shipping probe bones into ② and ③.
     """

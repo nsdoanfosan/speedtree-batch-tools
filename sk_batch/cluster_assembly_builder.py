@@ -25,19 +25,50 @@ import os
 import re
 import statistics
 import subprocess
+import sys
 from contextlib import contextmanager
 from copy import deepcopy
 from collections import Counter, defaultdict
 from pathlib import Path
 
+REPO_DIR = Path(__file__).resolve().parent.parent
+if str(REPO_DIR) not in sys.path:
+    sys.path.insert(0, str(REPO_DIR))
+
+from process_lifecycle import owned_run
+from artifact_content_key import (
+    artifact_record_content_key,
+    file_content_key_snapshot,
+)
+
 from nanite_assembly_materials import (
     NaniteAssemblyMaterialError,
     normalize_unreal_nanite_assembly_materials,
+)
+from spm_authored_placement import (
+    AUTHORED_NODE_GLOBAL_ASSIGNMENT_TOLERANCE_METERS,
+    SpmAuthoredPlacementError,
+    assign_authored_nodes_to_components,
+    parse_spm_authored_placement,
 )
 
 
 SCHEMA_VERSION = 1
 MANIFEST_KIND = "sk_batch_cluster_nanite_assembly_inputs"
+PLACEMENT_CONTRACT_VERSION = 1
+MAX_ASSEMBLY_RESIDUAL_RELATIVE_RMS = 1.0e-2
+MAX_ASSEMBLY_PIVOT_ERROR_METERS = 1.0e-8
+MAX_NORMALIZED_PLAN_FACE_LOSS_RATIO = 0.20
+MAX_SPEEDTREE_RENDER_FACE_MULTIPLICITY = 2
+MAX_WEIGHT_BINDING_DISTANCE_SPAN_RATIO = 1.0e-2
+MIN_WEIGHT_BINDING_DISTANCE_METERS = 1.0e-2
+# Blender stores imported FBX coordinates as 32-bit floats.  At the meter-scale
+# positions used by this pipeline, one exporter round-trip can separate an
+# authored coincident vertex by roughly 1e-7 m.  Every topology/correspondence
+# stage must share the same floor; deriving a smaller tolerance from one tiny
+# card after the role-level weld makes the same vertex coincident in one stage
+# and ambiguous in the next.
+MIN_FBX_COORDINATE_TOLERANCE_METERS = 1.0e-6
 PASS_THROUGH_PROVENANCE_SCHEMA_VERSION = 1
 PASS_THROUGH_PROVENANCE_REASON = (
     "selected_target_contract_handoff_pass_through"
@@ -74,6 +105,7 @@ def _coalesce_normalized_external_parts(parts):
             passthrough.append(part)
             continue
         role = str(part.get("role") or "").casefold()
+        provider_key = str(part.get("provider_key") or role).casefold()
         asset_name = str(part.get("asset_name") or "")
         relative_folder = str(
             external.get("unreal_relative_folder") or ""
@@ -82,7 +114,12 @@ def _coalesce_normalized_external_parts(parts):
             raise ClusterAssemblyBuildError(
                 "normalized external part cannot be logically grouped"
             )
-        key = (role, relative_folder.casefold(), asset_name.casefold())
+        key = (
+            role,
+            provider_key,
+            relative_folder.casefold(),
+            asset_name.casefold(),
+        )
         incoming_bindings = list(part.get("bindings") or [])
         accumulator = grouped.get(key)
         if accumulator is None:
@@ -115,7 +152,12 @@ def _coalesce_normalized_external_parts(parts):
         accumulator["bindings"].extend(incoming_bindings)
 
     collapsed = []
-    for (role, relative_folder, asset_name), part in grouped.items():
+    for (
+        role,
+        _provider_key,
+        relative_folder,
+        asset_name,
+    ), part in grouped.items():
         external = part["external_source"]
         ordinals = sorted({
             int(value)
@@ -144,21 +186,10 @@ def _coalesce_normalized_external_parts(parts):
             binding["instance"] = instance_index
         fit_rows = part["bindings"]
         if fit_rows:
-            part["fit_summary"] = {
-                "fit_mode": "uniform_similarity_3d_normalized_asset",
-                "trs_relative_rms_median": statistics.median(
-                    row["transform"]["trs_relative_rms"] for row in fit_rows
-                ),
-                "trs_relative_rms_max": max(
-                    row["transform"]["trs_relative_rms"] for row in fit_rows
-                ),
-                "affine_relative_rms_median": statistics.median(
-                    row["transform"]["affine_relative_rms"] for row in fit_rows
-                ),
-                "affine_relative_rms_max": max(
-                    row["transform"]["affine_relative_rms"] for row in fit_rows
-                ),
-            }
+            part["fit_summary"] = _assembly_fit_summary(
+                fit_rows,
+                "uniform_similarity_3d_normalized_asset",
+            )
         collapsed.append(part)
 
     collapsed.extend(passthrough)
@@ -351,6 +382,89 @@ def _short_contract_value(value, max_chars=240):
 def _first_contract_difference(expected, actual, path):
     """Return one deterministic semantic mismatch with its exact field path."""
     if isinstance(expected, dict) and isinstance(actual, dict):
+        expected_is_artifact = bool(
+            expected.get("path")
+            and "exists" in expected
+            and any(
+                key in expected
+                for key in (
+                    "size",
+                    "mtime_ns",
+                    "sha256",
+                    "fingerprint",
+                )
+            )
+        )
+        actual_is_artifact = bool(
+            actual.get("path")
+            and "exists" in actual
+            and any(
+                key in actual
+                for key in (
+                    "size",
+                    "mtime_ns",
+                    "sha256",
+                    "fingerprint",
+                )
+            )
+        )
+        if expected_is_artifact and actual_is_artifact:
+            expected_path = _normalized_contract_path(expected["path"])
+            actual_path = _normalized_contract_path(actual["path"])
+            if expected_path != actual_path:
+                return (
+                    f"{path}.path: expected={expected_path} "
+                    f"actual={actual_path}"
+                )
+            for field in ("exists", "size"):
+                if expected.get(field) != actual.get(field):
+                    return (
+                        f"{path}.{field}: "
+                        f"expected={_short_contract_value(expected.get(field))} "
+                        f"actual={_short_contract_value(actual.get(field))}"
+                    )
+            try:
+                expected_content_key = artifact_record_content_key(expected)
+                actual_content_key = artifact_record_content_key(actual)
+            except (TypeError, ValueError):
+                expected_content_key = None
+                actual_content_key = None
+            if expected_content_key and actual_content_key:
+                if expected_content_key != actual_content_key:
+                    field = str(expected_content_key.get("field") or "content")
+                    return (
+                        f"{path}.{field}: "
+                        f"expected={_short_contract_value(expected_content_key)} "
+                        f"actual={_short_contract_value(actual_content_key)}"
+                    )
+                # mtime is a discovery hint. Once both contracts carry the
+                # same supported content key, a timestamp-only rewrite is not
+                # an artifact change and must not invalidate Push.
+                identity_fields = {
+                    "path",
+                    "exists",
+                    "size",
+                    "mtime_ns",
+                    "sha256",
+                    "fingerprint",
+                    "fingerprint_algorithm",
+                }
+                expected_extra = {
+                    key: value
+                    for key, value in expected.items()
+                    if key not in identity_fields
+                }
+                actual_extra = {
+                    key: value
+                    for key, value in actual.items()
+                    if key not in identity_fields
+                }
+                return _first_contract_difference(
+                    expected_extra,
+                    actual_extra,
+                    path,
+                )
+    if isinstance(expected, dict) and isinstance(actual, dict):
         for key in sorted(set(expected) | set(actual)):
             child_path = f"{path}.{key}"
             if key not in expected:
@@ -443,16 +557,34 @@ def _validate_contract_artifact_record(path, expected):
             f"{path}.size: expected={expected['size']} "
             f"actual={stat.st_size}; artifact={artifact_path}"
         )
-    expected_sha256 = str(expected.get("sha256") or "").casefold()
-    if expected_sha256:
-        actual_sha256 = str(
-            file_fingerprint(artifact_path).get("sha256") or ""
+    try:
+        expected_content_key = artifact_record_content_key(expected)
+    except (TypeError, ValueError) as exc:
+        raise ClusterAssemblyBuildError(
+            "Cluster pass-through artifact fingerprint is invalid at "
+            f"{path}: {exc}; artifact={artifact_path}"
+        ) from exc
+    if expected_content_key:
+        try:
+            actual_snapshot = file_content_key_snapshot(
+                artifact_path,
+                expected_content_key["algorithm"],
+            )
+        except (OSError, ValueError) as exc:
+            raise ClusterAssemblyBuildError(
+                "Cluster pass-through artifact could not be fingerprinted at "
+                f"{path}: {artifact_path}: {exc}"
+            ) from exc
+        actual_digest = str(actual_snapshot.get("digest") or "").casefold()
+        expected_digest = str(
+            expected_content_key.get("digest") or ""
         ).casefold()
-        if actual_sha256 != expected_sha256:
+        if actual_digest != expected_digest:
+            field = str(expected_content_key.get("field") or "content")
             raise ClusterAssemblyBuildError(
                 "Cluster pass-through artifact mismatch at "
-                f"{path}.sha256: expected={expected_sha256} "
-                f"actual={actual_sha256}; artifact={artifact_path}"
+                f"{path}.{field}: expected={expected_digest} "
+                f"actual={actual_digest}; artifact={artifact_path}"
             )
     elif expected.get("mtime_ns") is not None:
         if int(expected["mtime_ns"]) != stat.st_mtime_ns:
@@ -1014,13 +1146,11 @@ def _validate_capture_receipt(contract, role):
         )
     plane = str(frame.get("plane") or "").upper()
     rotation = float(frame.get("rotation_degrees", math.nan))
-    expected_rotation = 90.0 if role == "leaf_side" else 0.0
+    expected_rotation = 0.0 if plane == "XY" else 90.0
     if (
         plane not in {"XY", "XZ", "YZ"}
         or not math.isfinite(rotation)
         or abs(rotation - expected_rotation) > 1.0e-6
-        or (role == "leaf_side" and plane == "XY")
-        or (role != "leaf_side" and plane != "XY")
     ):
         raise ClusterAssemblyBuildError(
             f"{role} physical capture plane/rotation is invalid"
@@ -1238,6 +1368,54 @@ def validate_normalized_prototype_unit_contract(manifest):
 
     parts = list((manifest or {}).get("parts") or [])
     variants = list((manifest or {}).get("registered_variants") or [])
+    placement_contract = (manifest or {}).get("placement_contract")
+    placement_v1 = placement_contract is not None
+    authored_nodes_available = False
+    if placement_v1:
+        authored_table_summary = (
+            placement_contract.get("authored_node_table") or {}
+        )
+        authored_nodes_available = bool(
+            authored_table_summary.get("available")
+        )
+        try:
+            residual_gate_contract = (
+                placement_contract.get("residual_ready_gate") or {}
+            )
+            placement_threshold = float(
+                residual_gate_contract.get("threshold")
+            )
+            placement_pivot_threshold = float(
+                residual_gate_contract.get(
+                    "authored_pivot_error_threshold_meters"
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise ClusterAssemblyBuildError(
+                "Assembly placement residual ready gate is invalid"
+            ) from exc
+        if (
+            placement_contract.get("version") != PLACEMENT_CONTRACT_VERSION
+            or placement_contract.get("status") != "ready"
+            or placement_contract.get(
+                "node_fields_do_not_serialize_rotation_or_uniform_scale"
+            ) is not True
+            or abs(
+                placement_threshold - MAX_ASSEMBLY_RESIDUAL_RELATIVE_RMS
+            ) > 1.0e-15
+            or abs(
+                placement_pivot_threshold - MAX_ASSEMBLY_PIVOT_ERROR_METERS
+            ) > 1.0e-15
+            or (
+                placement_contract.get("residual_ready_gate") or {}
+            ).get("status") not in {
+                "pass",
+                "pass_with_quality_warnings",
+            }
+        ):
+            raise ClusterAssemblyBuildError(
+                "Assembly placement contract is invalid or ungated"
+            )
     prepared_unused = list(
         (manifest or {}).get("prepared_unused_roles") or []
     )
@@ -1275,15 +1453,18 @@ def validate_normalized_prototype_unit_contract(manifest):
     prototype_ids = set()
     asset_names = set()
     role_ordinals = defaultdict(list)
+    provider_role_ordinals = defaultdict(list)
     for part in parts:
         role = str(part.get("role") or "").casefold()
+        provider_key = str(part.get("provider_key") or role).casefold()
         ordinal = _part_ordinal(part)
         prototype_id = str(part.get("prototype_id") or "")
         asset_name = str(part.get("asset_name") or "")
         external = part.get("external_source") or {}
-        key = (role, ordinal)
+        key = (provider_key, role, ordinal)
         if (
             role not in ROLE_ORDER
+            or not provider_key
             or ordinal <= 0
             or not prototype_id
             or not asset_name
@@ -1310,16 +1491,23 @@ def validate_normalized_prototype_unit_contract(manifest):
             similarity_relative_rms = transform.get(
                 "similarity_relative_rms"
             )
+            scale_values = None
+            if isinstance(scale, (list, tuple)) and len(scale) == 3:
+                try:
+                    scale_values = [float(value) for value in scale]
+                except (TypeError, ValueError):
+                    scale_values = None
             if (
                 not fit_mode.startswith("uniform_similarity_3d")
                 or "attachment_locked" not in fit_mode
                 or transform.get("attachment_pivot_error") is None
                 or similarity_relative_rms is None
-                or not isinstance(scale, (list, tuple))
-                or len(scale) != 3
-                or max(float(value) for value in scale)
-                - min(float(value) for value in scale)
-                > 1.0e-7
+                or scale_values is None
+                or any(
+                    not math.isfinite(value) or value <= 0.0
+                    for value in scale_values
+                )
+                or max(scale_values) - min(scale_values) > 1.0e-7
             ):
                 raise ClusterAssemblyBuildError(
                     "normalized prototype instances require uniform-similarity transforms"
@@ -1348,21 +1536,76 @@ def validate_normalized_prototype_unit_contract(manifest):
                 raise ClusterAssemblyBuildError(
                     "normalized prototype instance similarity residual is invalid"
                 )
+            if placement_v1:
+                validate_persisted_residual_gate(
+                    transform,
+                    expected_threshold=MAX_ASSEMBLY_RESIDUAL_RELATIVE_RMS,
+                )
+                placement_source = str(
+                    transform.get("placement_source") or ""
+                )
+                authored_node = transform.get("authored_node")
+                if authored_nodes_available:
+                    authored_binding = (
+                        placement_source.startswith(
+                            "authored_spm_node_translation_and_state__"
+                        )
+                        and isinstance(authored_node, dict)
+                        and bool(authored_node.get("node_guid"))
+                        and authored_node.get("valid_position") is True
+                        and authored_node.get("hidden") is False
+                        and authored_node.get("deleted") is False
+                        and authored_node.get("culled") is False
+                    )
+                    degraded_binding = (
+                        placement_source
+                        == "render_attachment_translation__"
+                        "authored_node_assignment_degraded"
+                        and authored_node is None
+                        and isinstance(
+                            transform.get("authored_node_match_warning"),
+                            dict,
+                        )
+                    )
+                    if not authored_binding and not degraded_binding:
+                        raise ClusterAssemblyBuildError(
+                            "normalized prototype instance has neither an "
+                            "authored Node nor explicit degraded attachment evidence"
+                        )
+                elif (
+                    placement_source
+                    != "legacy_post_cull_similarity_fallback__"
+                    "authored_node_data_absent"
+                    or authored_node is not None
+                ):
+                    raise ClusterAssemblyBuildError(
+                        "legacy Assembly placement fallback was used despite "
+                        "authored Node evidence"
+                    )
         prototype_rows[key] = part
         prototype_ids.add(prototype_id)
         asset_names.add(asset_name.casefold())
         role_ordinals[role].append(ordinal)
+        provider_role_ordinals[(provider_key, role)].append(ordinal)
 
     variant_rows = {}
     instanced_variant_rows = {}
     for variant in variants:
         role = str(variant.get("role") or "").casefold()
+        provider_key = str(
+            variant.get("provider_key") or role
+        ).casefold()
         try:
             ordinal = int(variant.get("ordinal") or 0)
         except (TypeError, ValueError):
             ordinal = 0
-        key = (role, ordinal)
-        if role not in ROLE_ORDER or ordinal <= 0 or key in variant_rows:
+        key = (provider_key, role, ordinal)
+        if (
+            role not in ROLE_ORDER
+            or not provider_key
+            or ordinal <= 0
+            or key in variant_rows
+        ):
             raise ClusterAssemblyBuildError(
                 "registered normalized variant is invalid or duplicated"
             )
@@ -1415,38 +1658,59 @@ def validate_normalized_prototype_unit_contract(manifest):
     for role, receipt in receipts["normalized"]:
         if role in role_ordinals:
             normalized_by_role[role].append(receipt)
-    capture_by_role = defaultdict(list)
-    for role, receipt in receipts["capture"]:
-        if role in role_ordinals:
-            capture_by_role[role].append(receipt)
     if set(normalized_by_role) != set(role_ordinals):
         raise ClusterAssemblyBuildError(
             "every normalized prototype role requires a production normalization receipt"
         )
-    if set(capture_by_role) != set(role_ordinals):
-        raise ClusterAssemblyBuildError(
-            "every normalized prototype role requires a direct-capture receipt"
-        )
 
     capture_reports = {}
     receipt_variant_rows = {}
-    for role in role_ordinals:
-        normalized_receipts = {
+    available_receipts_by_role = {
+        role: {
             _canonical_json(value): value
             for value in normalized_by_role[role]
         }
-        capture_receipts = {
-            _canonical_json(value): value
-            for value in capture_by_role[role]
-        }
-        if len(normalized_receipts) != 1 or len(capture_receipts) != 1:
-            raise ClusterAssemblyBuildError(
-                f"{role} has ambiguous production normalization/capture receipts"
+        for role in role_ordinals
+    }
+    used_receipts_by_role = defaultdict(set)
+    for provider_role, ordinals in sorted(provider_role_ordinals.items()):
+        provider_key, role = provider_role
+        expected_assets = {
+            str(variant.get("skeletal_asset_name") or "")
+            for (
+                variant_provider,
+                variant_role,
+                _ordinal,
+            ), variant in variant_rows.items()
+            if (
+                variant_provider == provider_key
+                and variant_role == role
             )
-        normalized = next(iter(normalized_receipts.values()))
-        capture = next(iter(capture_receipts.values()))
+        }
+        normalized_matches = []
+        for receipt_hash, candidate in (
+            available_receipts_by_role[role].items()
+        ):
+            candidate_assets = {
+                str(row.get("skeletal_asset") or "")
+                for row in candidate.get("prototypes") or []
+                if isinstance(row, dict)
+            }
+            if candidate_assets == expected_assets:
+                normalized_matches.append((receipt_hash, candidate))
+        if len(normalized_matches) != 1:
+            raise ClusterAssemblyBuildError(
+                f"{provider_key} has ambiguous production normalization receipts"
+            )
+        receipt_hash, normalized = normalized_matches[0]
+        if receipt_hash in used_receipts_by_role[role]:
+            raise ClusterAssemblyBuildError(
+                f"{provider_key} reuses another provider's normalization receipt"
+            )
+        used_receipts_by_role[role].add(receipt_hash)
+        capture = normalized.get("physical_capture_contract") or {}
         capture_report = _validate_capture_receipt(capture, role)
-        capture_reports[role] = capture_report
+        capture_reports[provider_role] = capture_report
         if (
             normalized.get("direct_uv_source") != _DIRECT_CAPTURE_UV_SOURCE
             or normalized.get("size_policy")
@@ -1462,11 +1726,6 @@ def validate_normalized_prototype_unit_contract(manifest):
                 f"{role} normalization receipt is not the physical direct-capture contract"
             )
 
-        expected_assets = {
-            str(variant.get("skeletal_asset_name") or "")
-            for (variant_role, _ordinal), variant in variant_rows.items()
-            if variant_role == role
-        }
         receipt_prototypes = normalized.get("prototypes") or []
         receipt_assets = {
             str(row.get("skeletal_asset") or "")
@@ -1484,10 +1743,11 @@ def validate_normalized_prototype_unit_contract(manifest):
             or receipt_assets != expected_assets
             or len(pivot_rows) != len(expected_assets)
             or pivot_assets != expected_assets
-        ):
-            raise ClusterAssemblyBuildError(
-                f"{role} normalized prototype receipts do not match native prototype specs"
-            )
+            ):
+                raise ClusterAssemblyBuildError(
+                    f"{provider_key} normalized prototype receipts do not "
+                    "match native prototype specs"
+                )
         for pivot in pivot_rows:
             local = pivot.get("normalized_local")
             if (
@@ -1496,7 +1756,7 @@ def validate_normalized_prototype_unit_contract(manifest):
                 or max(abs(float(value)) for value in local) > 1.0e-8
             ):
                 raise ClusterAssemblyBuildError(
-                    f"{role} attachment pivot is not baked to (0,0,0)"
+                    f"{provider_key} attachment pivot is not baked to (0,0,0)"
                 )
         target_units = capture_report["target_blender_units"]
         bounds_tolerance = max(max(target_units) * 1.0e-6, 1.0e-9)
@@ -1513,7 +1773,8 @@ def validate_normalized_prototype_unit_contract(manifest):
                 or float(size[1]) > target_units[1] + bounds_tolerance
             ):
                 raise ClusterAssemblyBuildError(
-                    f"{role} prototype physical bounds exceed the declared 0.1m capture contract"
+                    f"{provider_key} prototype physical bounds exceed the "
+                    "declared 0.1m capture contract"
                 )
 
         for receipt_variant in normalized.get("variants") or []:
@@ -1525,7 +1786,7 @@ def validate_normalized_prototype_unit_contract(manifest):
                 )
             except (TypeError, ValueError):
                 ordinal = 0
-            key = (role, ordinal)
+            key = (provider_key, role, ordinal)
             transfer = receipt_variant.get("plan_uv_transfer") or {}
             try:
                 attachment_index = int(
@@ -1551,13 +1812,19 @@ def validate_normalized_prototype_unit_contract(manifest):
                 or any(not math.isfinite(value) for value in attachment_uv)
             ):
                 raise ClusterAssemblyBuildError(
-                    f"{role} normalized variant direct-capture evidence is invalid"
+                    f"{provider_key} normalized variant direct-capture "
+                    "evidence is invalid"
                 )
             receipt_variant_rows[key] = receipt_variant
+    for role, available in available_receipts_by_role.items():
+        if used_receipts_by_role[role] != set(available):
+            raise ClusterAssemblyBuildError(
+                f"{role} normalization receipts do not map one-to-one to providers"
+            )
     relevant_variant_rows = {
         key: variant
         for key, variant in variant_rows.items()
-        if key[0] in role_ordinals
+        if (key[0], key[1]) in provider_role_ordinals
     }
     if set(receipt_variant_rows) != set(relevant_variant_rows):
         raise ClusterAssemblyBuildError(
@@ -1614,6 +1881,12 @@ def validate_normalized_prototype_unit_contract(manifest):
             role: sorted(ordinals)
             for role, ordinals in sorted(role_ordinals.items())
         },
+        "provider_ordinals": {
+            provider_key: sorted(ordinals)
+            for (provider_key, _role), ordinals in sorted(
+                provider_role_ordinals.items()
+            )
+        },
         "physical_target_meters": unit_probe["physical_target_meters"],
         "downstream_unit_scale": unit_probe["effective_scale"],
         "scale_location": unit_probe["scale_location"],
@@ -1647,6 +1920,12 @@ def validate_manifest_artifacts(manifest):
         ),
         "parts": {},
     }
+    placement_contract = manifest.get("placement_contract")
+    if placement_contract is not None:
+        checked["authored_placement_spm"] = validate_file_fingerprint(
+            placement_contract.get("source_spm"),
+            "Assembly authored placement SPM",
+        )
     source_blend = manifest.get("assembly_source_blend")
     if source_blend is not None:
         checked["assembly_source_blend"] = validate_file_fingerprint(
@@ -1683,6 +1962,8 @@ def normalize_role_identity(value):
     name = name.strip().replace("\\", "/").rsplit("/", 1)[-1]
     if "::" in name:
         name = name.rsplit("::", 1)[-1]
+    while re.search(r"\.\d{3}$", name):
+        name = re.sub(r"\.\d{3}$", "", name)
     if name.casefold().endswith("_mat"):
         name = name[:-4]
     if name.casefold().startswith("m_"):
@@ -1721,10 +2002,17 @@ def content_build_decision(handoff):
     seen = set()
     for row in inputs:
         role = str(row.get("role") or "").casefold()
-        if role not in ROLE_ORDER or role in seen:
-            raise ClusterAssemblyBuildError(f"invalid or duplicate Assembly role: {role}")
-        seen.add(role)
-        if not row.get("assignments"):
+        provider_key = str(row.get("provider_key") or role).casefold()
+        if role not in ROLE_ORDER or not provider_key or provider_key in seen:
+            raise ClusterAssemblyBuildError(
+                "invalid or duplicate Assembly provider: "
+                f"role={role}, provider={provider_key}"
+            )
+        seen.add(provider_key)
+        if not (
+            row.get("assignments")
+            or row.get("rendered_provider_expansion_covered") is True
+        ):
             raise ClusterAssemblyBuildError(
                 f"{role} has no actual FBX polygon assignment evidence"
             )
@@ -2358,6 +2646,391 @@ def fit_uniform_similarity_transform(
     return result
 
 
+def derive_endpoint_uniform_similarity_transform(
+    source_points,
+    target_points,
+    source_attachment,
+    target_attachment,
+):
+    """Place a plan from its authored pivot and surviving root-to-tip frame.
+
+    Translation is exactly the authored target attachment.  Rotation is the
+    minimum rotation that aligns the plan's pivot-to-tip vector, preserving
+    the remaining plan roll/twist, and scale is the positive endpoint-length
+    ratio.  All-point residuals are diagnostics/gates only; they do not fit or
+    move the placement.
+    """
+    try:
+        import numpy as np
+    except ImportError as exc:  # pragma: no cover - Blender bundles NumPy.
+        raise ClusterAssemblyBuildError(
+            "NumPy is required for Assembly endpoint placement"
+        ) from exc
+    source = np.asarray(source_points, dtype=np.float64)
+    target = np.asarray(target_points, dtype=np.float64)
+    source_origin = np.asarray(source_attachment, dtype=np.float64)
+    target_origin = np.asarray(target_attachment, dtype=np.float64)
+    if (
+        source.shape != target.shape
+        or source.ndim != 2
+        or source.shape[1] != 3
+        or source.shape[0] < 3
+        or source_origin.shape != (3,)
+        or target_origin.shape != (3,)
+        or not np.all(np.isfinite(source))
+        or not np.all(np.isfinite(target))
+        or not np.all(np.isfinite(source_origin))
+        or not np.all(np.isfinite(target_origin))
+    ):
+        raise ClusterAssemblyBuildError(
+            "endpoint Assembly placement requires finite matching Nx3 points"
+        )
+    source_lengths = np.linalg.norm(source - source_origin, axis=1)
+    maximum_source_length = float(np.max(source_lengths))
+    if maximum_source_length <= 1.0e-12:
+        raise ClusterAssemblyBuildError(
+            "endpoint Assembly placement source has no root-to-tip extent"
+        )
+    endpoint_band = max(maximum_source_length * 1.0e-6, 1.0e-9)
+    endpoint_indices = np.flatnonzero(
+        source_lengths >= maximum_source_length - endpoint_band
+    )
+    source_endpoint = np.mean(source[endpoint_indices], axis=0)
+    target_endpoint = np.mean(target[endpoint_indices], axis=0)
+    source_vector = source_endpoint - source_origin
+    target_vector = target_endpoint - target_origin
+    source_length = float(np.linalg.norm(source_vector))
+    target_length = float(np.linalg.norm(target_vector))
+    if source_length <= 1.0e-12 or target_length <= 1.0e-12:
+        raise ClusterAssemblyBuildError(
+            "endpoint Assembly placement has a degenerate root-to-tip vector"
+        )
+    source_direction = source_vector / source_length
+    target_direction = target_vector / target_length
+    cross = np.cross(source_direction, target_direction)
+    sine = float(np.linalg.norm(cross))
+    cosine = float(np.clip(
+        np.dot(source_direction, target_direction), -1.0, 1.0
+    ))
+    if sine > 1.0e-12:
+        axis = cross / sine
+        x, y, z = [float(value) for value in axis]
+        skew = np.asarray([
+            [0.0, -z, y],
+            [z, 0.0, -x],
+            [-y, x, 0.0],
+        ], dtype=np.float64)
+        rotation_columns = (
+            np.eye(3)
+            + skew * sine
+            + (skew @ skew) * (1.0 - cosine)
+        )
+    elif cosine >= 0.0:
+        rotation_columns = np.eye(3, dtype=np.float64)
+    else:
+        # A 180-degree alignment has no unique axis.  Pick the canonical axis
+        # least aligned with the source direction, then project it onto the
+        # perpendicular plane.  This is deterministic and preserves no hidden
+        # iteration-order state.
+        canonical = np.eye(3)[
+            int(np.argmin(np.abs(source_direction)))
+        ]
+        axis = canonical - source_direction * float(
+            np.dot(canonical, source_direction)
+        )
+        axis /= np.linalg.norm(axis)
+        rotation_columns = 2.0 * np.outer(axis, axis) - np.eye(3)
+    rotation_rows = rotation_columns.T
+    scale_value = target_length / source_length
+    linear = scale_value * rotation_rows
+    translation = target_origin - source_origin @ linear
+    prediction = source @ linear + translation
+    diagonal = max(
+        float(np.linalg.norm(np.max(target, axis=0) - np.min(target, axis=0))),
+        1.0e-9,
+    )
+    rms = float(np.sqrt(np.mean(np.sum((target - prediction) ** 2, axis=1))))
+    augmented = np.concatenate(
+        [source, np.ones((source.shape[0], 1), dtype=np.float64)], axis=1
+    )
+    coefficients, _, _, _ = np.linalg.lstsq(augmented, target, rcond=None)
+    affine_prediction = source @ coefficients[:3, :] + coefficients[3, :]
+    affine_rms = float(np.sqrt(np.mean(
+        np.sum((target - affine_prediction) ** 2, axis=1)
+    )))
+    pivot_prediction = source_origin @ linear + translation
+    endpoint_prediction = source_endpoint @ linear + translation
+    source_fit_rank = int(np.linalg.matrix_rank(source - source_origin))
+    return {
+        "translation": [float(value) for value in translation],
+        "rotation_xyzw": _rotation_matrix_to_quaternion(
+            rotation_columns.tolist()
+        ),
+        "scale": [scale_value, scale_value, scale_value],
+        "affine_relative_rms": affine_rms / diagonal,
+        "similarity_relative_rms": rms / diagonal,
+        "trs_relative_rms": rms / diagonal,
+        "shear_relative_norm": None,
+        "affine_linear_delta_relative_norm": None,
+        "affine_diagnostic_only": True,
+        "source_fit_rank": source_fit_rank,
+        "fit_mode": (
+            "uniform_similarity_3d_attachment_locked_endpoint_frame"
+        ),
+        "construction_mode": (
+            "authored_absolute_pivot_plus_surviving_root_tip_frame_v1"
+        ),
+        "attachment_pivot_error": float(
+            np.linalg.norm(target_origin - pivot_prediction)
+        ),
+        "attachment_pivot_error_scope": (
+            "authored_spm_node_absolute_translation"
+        ),
+        "endpoint_error": float(
+            np.linalg.norm(target_endpoint - endpoint_prediction)
+        ),
+        "endpoint_evidence": {
+            "policy": "mean_of_farthest_surviving_source_distance_band_v1",
+            "band_meters": endpoint_band,
+            "correspondence_indices": [
+                int(value) for value in endpoint_indices.tolist()
+            ],
+            "source_endpoint": [float(value) for value in source_endpoint],
+            "target_endpoint": [float(value) for value in target_endpoint],
+            "source_length": source_length,
+            "target_length": target_length,
+            "uniform_scale": scale_value,
+            "rotation_policy": "minimum_root_tip_vector_rotation_preserve_plan_roll",
+        },
+    }
+
+
+def attachment_locked_safe_transform(target_attachment, diagnostic):
+    """Last-resort rigid transform that keeps export attached and finite."""
+    try:
+        translation = [float(value) for value in target_attachment]
+    except (TypeError, ValueError) as exc:
+        raise ClusterAssemblyBuildError(
+            "safe Assembly fallback has no finite attachment"
+        ) from exc
+    if len(translation) != 3 or any(
+        not math.isfinite(value) for value in translation
+    ):
+        raise ClusterAssemblyBuildError(
+            "safe Assembly fallback has no finite attachment"
+        )
+    return {
+        "translation": translation,
+        "rotation_xyzw": [0.0, 0.0, 0.0, 1.0],
+        "scale": [1.0, 1.0, 1.0],
+        "affine_relative_rms": 1.0,
+        "similarity_relative_rms": 1.0,
+        "trs_relative_rms": 1.0,
+        "shear_relative_norm": None,
+        "affine_linear_delta_relative_norm": None,
+        "affine_diagnostic_only": True,
+        "source_fit_rank": 0,
+        "fit_mode": (
+            "uniform_similarity_3d_attachment_locked_safe_fallback"
+        ),
+        "construction_mode": (
+            "authored_or_render_attachment_identity_rotation_unit_scale_v1"
+        ),
+        "attachment_pivot_error": 0.0,
+        "attachment_pivot_error_scope": "attachment_translation_hard_lock",
+        "placement_quality_warning": str(diagnostic),
+    }
+
+
+def gate_assembly_transform_residuals(
+    transform,
+    evidence,
+    threshold=MAX_ASSEMBLY_RESIDUAL_RELATIVE_RMS,
+    block_geometry=True,
+):
+    """Hard-gate attachment; optionally downgrade rigid-fit error to warning."""
+    try:
+        limit = float(threshold)
+        pivot_error = float(transform.get("attachment_pivot_error"))
+        metrics = {
+            name: float(transform.get(name))
+            for name in (
+                "similarity_relative_rms",
+                "trs_relative_rms",
+                "affine_relative_rms",
+            )
+        }
+    except (TypeError, ValueError) as exc:
+        raise ClusterAssemblyBuildError(
+            "Assembly residual ready gate has missing or invalid metrics: "
+            + _canonical_json(evidence or {})
+        ) from exc
+    if (
+        not math.isfinite(limit)
+        or limit <= 0.0
+        or not math.isfinite(pivot_error)
+        or any(not math.isfinite(value) for value in metrics.values())
+    ):
+        raise ClusterAssemblyBuildError(
+            "Assembly residual ready gate has non-finite evidence: "
+            + _canonical_json({
+                "threshold": limit,
+                "metrics": metrics,
+                "attachment_pivot_error_meters": pivot_error,
+                "evidence": evidence or {},
+            })
+        )
+    failed = {
+        name: value for name, value in metrics.items()
+        if value > limit
+    }
+    pivot_failed = pivot_error > MAX_ASSEMBLY_PIVOT_ERROR_METERS
+    geometry_blocked = bool(failed and block_geometry)
+    gate = {
+        "status": (
+            "blocked"
+            if pivot_failed or geometry_blocked
+            else "warning" if failed else "pass"
+        ),
+        "policy": "all_recorded_relative_rms_at_or_below_global_threshold_v1",
+        "threshold": limit,
+        "metrics": metrics,
+        "maximum_metric": max(metrics, key=metrics.get),
+        "maximum_relative_rms": max(metrics.values()),
+        "attachment_pivot_error_meters": pivot_error,
+        "attachment_pivot_error_threshold_meters": (
+            MAX_ASSEMBLY_PIVOT_ERROR_METERS
+        ),
+        "geometry_residual_blocking": bool(block_geometry),
+        "evidence": deepcopy(evidence or {}),
+    }
+    if failed:
+        gate["failed_metrics"] = failed
+    if pivot_failed:
+        gate["attachment_pivot_failed"] = True
+    if geometry_blocked or pivot_failed:
+        raise ClusterAssemblyBuildError(
+            "Assembly residual ready gate blocked placement: "
+            + _canonical_json(gate)
+        )
+    transform["residual_gate"] = gate
+    return gate
+
+
+def validate_persisted_residual_gate(
+    transform,
+    expected_threshold=MAX_ASSEMBLY_RESIDUAL_RELATIVE_RMS,
+):
+    """Re-evaluate an additive v1 gate without trusting its saved verdict."""
+    recorded = deepcopy((transform or {}).get("residual_gate") or {})
+    if (
+        recorded.get("status") not in {"pass", "warning"}
+        or recorded.get("policy")
+        != "all_recorded_relative_rms_at_or_below_global_threshold_v1"
+    ):
+        raise ClusterAssemblyBuildError(
+            "normalized prototype instance has no passing residual ready gate"
+        )
+    try:
+        recorded_threshold = float(recorded.get("threshold"))
+    except (TypeError, ValueError) as exc:
+        raise ClusterAssemblyBuildError(
+            "normalized prototype residual ready gate threshold is invalid"
+        ) from exc
+    if abs(recorded_threshold - float(expected_threshold)) > 1.0e-15:
+        raise ClusterAssemblyBuildError(
+            "normalized prototype residual ready gate threshold changed"
+        )
+    checked = deepcopy(transform)
+    checked.pop("residual_gate", None)
+    recomputed = gate_assembly_transform_residuals(
+        checked,
+        recorded.get("evidence") or {},
+        threshold=expected_threshold,
+        block_geometry=bool(recorded.get("geometry_residual_blocking")),
+    )
+    for key in (
+        "status",
+        "policy",
+        "threshold",
+        "metrics",
+        "maximum_metric",
+        "maximum_relative_rms",
+        "attachment_pivot_error_meters",
+        "attachment_pivot_error_threshold_meters",
+        "geometry_residual_blocking",
+        "evidence",
+    ):
+        if _canonical_json(recorded.get(key)) != _canonical_json(
+            recomputed.get(key)
+        ):
+            raise ClusterAssemblyBuildError(
+                "normalized prototype residual ready gate evidence drifted"
+            )
+    return recomputed
+
+
+def _assembly_fit_summary(bindings, fit_mode):
+    rows = list(bindings or [])
+    if not rows:
+        return {"fit_mode": fit_mode}
+    transforms = [row.get("transform") or {} for row in rows]
+    similarity = [
+        float(transform.get(
+            "similarity_relative_rms",
+            transform["trs_relative_rms"],
+        ))
+        for transform in transforms
+    ]
+    trs = [float(transform["trs_relative_rms"]) for transform in transforms]
+    affine = [
+        float(transform["affine_relative_rms"])
+        for transform in transforms
+    ]
+    gates = [transform.get("residual_gate") for transform in transforms]
+    gates_present = [gate for gate in gates if gate is not None]
+    if gates_present and len(gates_present) != len(gates):
+        raise ClusterAssemblyBuildError(
+            "Assembly fit summary mixes gated and legacy bindings"
+        )
+    if any(
+        gate.get("status") not in {"pass", "warning"}
+        for gate in gates_present
+    ):
+        raise ClusterAssemblyBuildError(
+            "Assembly fit summary cannot include an ungated ready binding"
+        )
+    summary = {
+        "fit_mode": fit_mode,
+        "similarity_relative_rms_count": len(similarity),
+        "similarity_relative_rms_median": statistics.median(similarity),
+        "similarity_relative_rms_max": max(similarity),
+        "trs_relative_rms_median": statistics.median(trs),
+        "trs_relative_rms_max": max(trs),
+        "affine_relative_rms_median": statistics.median(affine),
+        "affine_relative_rms_max": max(affine),
+        "placement_sources": dict(sorted(Counter(
+            str(transform.get("placement_source") or "unspecified")
+            for transform in transforms
+        ).items())),
+    }
+    if gates_present:
+        summary["residual_ready_gate"] = {
+            "status": (
+                "warning"
+                if any(gate.get("status") == "warning" for gate in gates_present)
+                else "pass"
+            ),
+            "threshold": MAX_ASSEMBLY_RESIDUAL_RELATIVE_RMS,
+            "binding_count": len(gates_present),
+            "maximum_relative_rms": max(
+                float(gate["maximum_relative_rms"])
+                for gate in gates_present
+            ),
+        }
+    return summary
+
+
 def compose_similarity_with_relative_matrix(transform, relative_matrix):
     """Compose a fitted card transform with one normalized composite subpart.
 
@@ -2497,6 +3170,21 @@ def _rotation_matrix_to_quaternion(matrix):
     return [x / length, y / length, z / length, w / length]
 
 
+def _fbx_coordinate_tolerance(coordinates):
+    points = [tuple(float(value) for value in point) for point in coordinates]
+    if not points:
+        return MIN_FBX_COORDINATE_TOLERANCE_METERS
+    spans = [
+        max(point[axis] for point in points)
+        - min(point[axis] for point in points)
+        for axis in range(3)
+    ]
+    return max(
+        max(spans) * 2.0e-6,
+        MIN_FBX_COORDINATE_TOLERANCE_METERS,
+    )
+
+
 def _component_groups(mesh, polygon_indices):
     polygon_indices = sorted(set(int(value) for value in polygon_indices))
     if not polygon_indices:
@@ -2524,15 +3212,10 @@ def _component_groups(mesh, polygon_indices):
         index: tuple(float(mesh.vertices[index].co[axis]) for axis in range(3))
         for index in used_vertices
     }
-    spans = [
-        max(value[axis] for value in coordinates.values())
-        - min(value[axis] for value in coordinates.values())
-        for axis in range(3)
-    ]
     # Relative to the current role extent, not a species-specific world size.
     # This reconnects seam-split FBX/BWR vertices whose skinning differs only
     # by float noise while remaining far below authored card edge lengths.
-    weld_tolerance = max(max(spans) * 2.0e-6, 1.0e-9)
+    weld_tolerance = _fbx_coordinate_tolerance(coordinates.values())
     weld_tolerance_sq = weld_tolerance * weld_tolerance
     vertex_parent = {index: index for index in used_vertices}
 
@@ -2595,6 +3278,59 @@ def _component_groups(mesh, polygon_indices):
     return sorted(result, key=lambda row: row["polygons"][0])
 
 
+def _exact_index_component_groups(mesh, polygon_indices):
+    """Split polygons only when they share a real mesh edge.
+
+    The normal component pass welds seam-split FBX vertices by position.  Two
+    independent cards can nevertheless touch along the same authored pivot
+    edge and be merged by that weld.  This narrower view is used only as a
+    recovery candidate when the welded component matches no normalized plan;
+    every recovered subcomponent must independently match a plan.
+    """
+    indices = sorted(set(int(value) for value in polygon_indices))
+    if not indices:
+        return []
+    parent = {index: index for index in indices}
+
+    def find(value):
+        while parent[value] != value:
+            parent[value] = parent[parent[value]]
+            value = parent[value]
+        return value
+
+    def union(left, right):
+        left = find(left)
+        right = find(right)
+        if left != right:
+            parent[right] = left
+
+    edge_owners = {}
+    for polygon_index in indices:
+        vertices = sorted(
+            set(int(value) for value in mesh.polygons[polygon_index].vertices)
+        )
+        for edge in itertools.combinations(vertices, 2):
+            previous = edge_owners.setdefault(edge, polygon_index)
+            union(polygon_index, previous)
+    groups = defaultdict(lambda: {"vertices": set(), "polygons": []})
+    for polygon_index in indices:
+        row = groups[find(polygon_index)]
+        row["polygons"].append(polygon_index)
+        row["vertices"].update(
+            int(value) for value in mesh.polygons[polygon_index].vertices
+        )
+    return sorted(
+        (
+            {
+                "vertices": sorted(row["vertices"]),
+                "polygons": sorted(row["polygons"]),
+            }
+            for row in groups.values()
+        ),
+        key=lambda row: row["polygons"][0],
+    )
+
+
 def _component_signature(mesh, component):
     uv_layer = mesh.uv_layers.active
     uv_faces = []
@@ -2646,24 +3382,188 @@ def _component_uv_face_counter(mesh, component):
     return Counter(faces)
 
 
-def _uv_vertex_representatives(obj, component):
+def _uv_vertex_candidates(obj, component):
     uv_layer = obj.data.uv_layers.active
     if uv_layer is None:
         return None
-    values = {}
+    values = defaultdict(lambda: defaultdict(lambda: {
+        "faces": Counter(),
+        "neighbors": Counter(),
+    }))
     for polygon_index in component["polygons"]:
         polygon = obj.data.polygons[polygon_index]
-        for loop_index in polygon.loop_indices:
+        loops = list(polygon.loop_indices)
+        face_uv = tuple(sorted(
+            (
+                round(float(uv_layer.data[loop].uv.x), 6),
+                round(float(uv_layer.data[loop].uv.y), 6),
+            )
+            for loop in loops
+        ))
+        for offset, loop_index in enumerate(loops):
             uv = uv_layer.data[loop_index].uv
             key = (
                 round(float(uv.x), 6),
                 round(float(uv.y), 6),
             )
-            values.setdefault(
-                key,
-                int(obj.data.loops[loop_index].vertex_index),
+            vertex_index = int(obj.data.loops[loop_index].vertex_index)
+            record = values[key][vertex_index]
+            record["faces"][face_uv] += 1
+            for neighbor_offset in (-1, 1):
+                neighbor_loop = loops[(offset + neighbor_offset) % len(loops)]
+                neighbor_uv = uv_layer.data[neighbor_loop].uv
+                record["neighbors"][
+                    (
+                        round(float(neighbor_uv.x), 6),
+                        round(float(neighbor_uv.y), 6),
+                    )
+                ] += 1
+    return {
+        key: {
+            index: {
+                "faces": Counter(record["faces"]),
+                "neighbors": Counter(record["neighbors"]),
+            }
+            for index, record in by_index.items()
+        }
+        for key, by_index in values.items()
+    }
+
+
+def _coincident_candidate_groups(obj, component, candidates):
+    coordinates = {
+        int(index): tuple(
+            float(value) for value in obj.data.vertices[int(index)].co
+        )
+        for index in candidates
+    }
+    component_coordinates = [
+        tuple(float(value) for value in obj.data.vertices[index].co)
+        for index in component["vertices"]
+    ]
+    tolerance = _fbx_coordinate_tolerance(component_coordinates)
+    groups = []
+    for index in sorted(candidates):
+        group = next((
+            row for row in groups
+            if math.dist(coordinates[index], row["coordinate"]) <= tolerance
+        ), None)
+        if group is None:
+            group = {
+                "indices": [],
+                "coordinate": coordinates[index],
+                "faces": Counter(),
+                "neighbors": Counter(),
+            }
+            groups.append(group)
+        group["indices"].append(index)
+        group["faces"].update(candidates[index]["faces"])
+        group["neighbors"].update(candidates[index]["neighbors"])
+    for group in groups:
+        group["representative"] = min(group["indices"])
+    return groups
+
+
+def _counter_subset(left, right):
+    """Match rendered topology after bounded SpeedTree face duplication.
+
+    SpeedTree can emit a two-sided rendered card by duplicating every
+    surviving source UV face.  UV identity remains authoritative, while raw
+    Counter multiplicity does not.  Keep the conversion bounded so accidental
+    stacked geometry cannot silently collapse into one Assembly instance.
+    """
+    return bool(left) and all(
+        int(right.get(key, 0)) > 0
+        and int(count)
+        <= int(right[key]) * MAX_SPEEDTREE_RENDER_FACE_MULTIPLICITY
+        for key, count in left.items()
+    )
+
+
+def _counter_missing_identity_count(source, rendered):
+    return sum(
+        int(count)
+        for key, count in source.items()
+        if key not in rendered
+    )
+
+
+def _match_uv_candidate_groups(
+    source_obj,
+    source_component,
+    target_obj,
+    target_component,
+    key,
+    source_candidates,
+    target_candidates,
+):
+    source_groups = _coincident_candidate_groups(
+        source_obj, source_component, source_candidates
+    )
+    target_groups = _coincident_candidate_groups(
+        target_obj, target_component, target_candidates
+    )
+    if len(target_groups) > len(source_groups):
+        raise ClusterAssemblyBuildError(
+            "normalized plan duplicate UV has fewer source positions than "
+            f"the target: uv={key} source={len(source_groups)} "
+            f"target={len(target_groups)}"
+        )
+    if len(source_groups) > 8:
+        raise ClusterAssemblyBuildError(
+            "normalized plan duplicate UV has too many geometric candidates "
+            f"for bounded disambiguation: uv={key} count={len(source_groups)}"
+        )
+    possibilities = []
+    for source_order in itertools.permutations(
+        range(len(source_groups)), len(target_groups)
+    ):
+        score = 0
+        valid = True
+        for target_index, source_index in enumerate(source_order):
+            source = source_groups[source_index]
+            target = target_groups[target_index]
+            if not (
+                _counter_subset(target["faces"], source["faces"])
+                and _counter_subset(target["neighbors"], source["neighbors"])
+            ):
+                valid = False
+                break
+            score += _counter_missing_identity_count(
+                source["faces"], target["faces"]
             )
-    return values
+            score += _counter_missing_identity_count(
+                source["neighbors"], target["neighbors"]
+            )
+        if valid:
+            possibilities.append((score, source_order))
+    if not possibilities:
+        raise ClusterAssemblyBuildError(
+            "normalized plan duplicate UV has no topology-compatible "
+            f"surviving correspondence: uv={key}"
+        )
+    possibilities.sort(key=lambda row: (row[0], row[1]))
+    best_score = possibilities[0][0]
+    best = [row for row in possibilities if row[0] == best_score]
+    if len(best) != 1:
+        raise ClusterAssemblyBuildError(
+            "normalized plan duplicate UV correspondence is ambiguous: "
+            f"uv={key} equal_best_assignments={len(best)} score={best_score}"
+        )
+    assignment = best[0][1]
+    return [
+        (
+            source_groups[source_index]["representative"],
+            target_groups[target_index]["representative"],
+        )
+        for target_index, source_index in enumerate(assignment)
+    ], {
+        "uv": list(key),
+        "source_geometric_candidates": len(source_groups),
+        "target_geometric_candidates": len(target_groups),
+        "discarded_source_candidates": len(source_groups) - len(target_groups),
+        "topology_score": best_score,
+    }
 
 
 def _coincident_uv_vertex_index(obj, component, key):
@@ -2687,12 +3587,7 @@ def _coincident_uv_vertex_index(obj, component, key):
         tuple(float(value) for value in obj.data.vertices[index].co)
         for index in component["vertices"]
     ]
-    spans = [
-        max(point[axis] for point in component_coordinates)
-        - min(point[axis] for point in component_coordinates)
-        for axis in range(3)
-    ]
-    tolerance = max(max(spans) * 2.0e-6, 1.0e-9)
+    tolerance = _fbx_coordinate_tolerance(component_coordinates)
     ordered = sorted(indices)
     reference = tuple(
         float(value) for value in obj.data.vertices[ordered[0]].co
@@ -2761,6 +3656,217 @@ def _attachment_vertex_correspondence(
     return source_index, target_index
 
 
+def _attachment_uv_edge_point(obj, component, attachment_uv):
+    """Resolve one UV point on a unique geometric edge of a component."""
+    uv_layer = obj.data.uv_layers.active
+    candidates = []
+    uv_tolerance = 2.0e-6
+    for polygon_index in component["polygons"]:
+        polygon = obj.data.polygons[polygon_index]
+        loops = list(polygon.loop_indices)
+        for offset, first_loop in enumerate(loops):
+            second_loop = loops[(offset + 1) % len(loops)]
+            first_uv = uv_layer.data[first_loop].uv
+            second_uv = uv_layer.data[second_loop].uv
+            delta = (
+                float(second_uv.x) - float(first_uv.x),
+                float(second_uv.y) - float(first_uv.y),
+            )
+            length_squared = delta[0] * delta[0] + delta[1] * delta[1]
+            if length_squared <= 1.0e-20:
+                continue
+            relative = (
+                float(attachment_uv[0]) - float(first_uv.x),
+                float(attachment_uv[1]) - float(first_uv.y),
+            )
+            parameter = (
+                relative[0] * delta[0] + relative[1] * delta[1]
+            ) / length_squared
+            if parameter < -uv_tolerance or parameter > 1.0 + uv_tolerance:
+                continue
+            parameter = max(0.0, min(1.0, parameter))
+            projected = (
+                float(first_uv.x) + delta[0] * parameter,
+                float(first_uv.y) + delta[1] * parameter,
+            )
+            residual = math.dist(projected, attachment_uv)
+            if residual > uv_tolerance:
+                continue
+            first_index = int(obj.data.loops[first_loop].vertex_index)
+            second_index = int(obj.data.loops[second_loop].vertex_index)
+            first_coordinate = obj.data.vertices[first_index].co
+            second_coordinate = obj.data.vertices[second_index].co
+            coordinate = tuple(
+                float(first_coordinate[axis]) * (1.0 - parameter)
+                + float(second_coordinate[axis]) * parameter
+                for axis in range(3)
+            )
+            candidates.append({
+                "coordinate": coordinate,
+                "edge_vertices": [first_index, second_index],
+                "parameter": float(parameter),
+                "uv_residual": float(residual),
+            })
+    if not candidates:
+        return None
+
+    coordinates = [
+        tuple(float(value) for value in obj.data.vertices[index].co)
+        for index in component["vertices"]
+    ]
+    coordinate_tolerance = _fbx_coordinate_tolerance(coordinates)
+    groups = []
+    for candidate in sorted(
+        candidates,
+        key=lambda row: (
+            row["uv_residual"],
+            row["edge_vertices"],
+            row["parameter"],
+        ),
+    ):
+        group = next((
+            row for row in groups
+            if math.dist(row["coordinate"], candidate["coordinate"])
+            <= coordinate_tolerance
+        ), None)
+        if group is None:
+            groups.append({
+                "coordinate": candidate["coordinate"],
+                "candidates": [candidate],
+            })
+        else:
+            group["candidates"].append(candidate)
+    if len(groups) != 1:
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment UV crosses multiple geometric edges"
+        )
+    best = groups[0]["candidates"][0]
+    return {
+        "coordinate": groups[0]["coordinate"],
+        "edge_vertices": best["edge_vertices"],
+        "parameter": best["parameter"],
+        "uv_residual": best["uv_residual"],
+        "candidate_edge_count": len(candidates),
+    }
+
+
+def _attachment_point_correspondence(
+    source_obj,
+    source_component,
+    target_obj,
+    target_component,
+    attachment_uv,
+):
+    """Resolve an attachment as an exact vertex or a strict UV-edge point.
+
+    Older normalized plans can contain an authored origin vertex that is not
+    referenced by a face.  FBX removes that loose vertex, while preserving the
+    boundary edge on which the authored UV lies.  The compatibility path below
+    is limited to exact source/target topology matches and requires the source
+    edge interpolation to reconstruct local origin.
+    """
+    if (
+        not isinstance(attachment_uv, (list, tuple))
+        or len(attachment_uv) != 2
+    ):
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment vertex UV is missing or invalid"
+        )
+    try:
+        resolved_uv = tuple(float(value) for value in attachment_uv)
+    except (TypeError, ValueError) as exc:
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment vertex UV is missing or invalid"
+        ) from exc
+    if any(not math.isfinite(value) for value in resolved_uv):
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment vertex UV is missing or invalid"
+        )
+    if (
+        source_obj.data.uv_layers.active is None
+        or target_obj.data.uv_layers.active is None
+    ):
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment correspondence requires UV layers"
+        )
+
+    key = tuple(round(value, 6) for value in resolved_uv)
+    source_index = _coincident_uv_vertex_index(
+        source_obj, source_component, key
+    )
+    target_index = _coincident_uv_vertex_index(
+        target_obj, target_component, key
+    )
+    if source_index is not None and target_index is not None:
+        return {
+            "source_index": source_index,
+            "target_index": target_index,
+            "source_coordinate": tuple(
+                float(value) for value in source_obj.data.vertices[source_index].co
+            ),
+            "target_coordinate": tuple(
+                float(value) for value in target_obj.data.vertices[target_index].co
+            ),
+            "evidence": {
+                "policy": "exact_attachment_uv_vertex_v1",
+                "attachment_uv": list(resolved_uv),
+            },
+        }
+
+    if _component_signature(
+        source_obj.data, source_component
+    ) != _component_signature(target_obj.data, target_component):
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment pivot UV is absent from the "
+            "source/target render component"
+        )
+
+    source_edge = _attachment_uv_edge_point(
+        source_obj, source_component, resolved_uv
+    )
+    target_edge = _attachment_uv_edge_point(
+        target_obj, target_component, resolved_uv
+    )
+    if source_edge is None or target_edge is None:
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment pivot UV is absent from the "
+            "source/target render component"
+        )
+
+    source_coordinates = [
+        tuple(float(value) for value in source_obj.data.vertices[index].co)
+        for index in source_component["vertices"]
+    ]
+    spans = [
+        max(point[axis] for point in source_coordinates)
+        - min(point[axis] for point in source_coordinates)
+        for axis in range(3)
+    ]
+    origin_tolerance = max(max(spans) * 2.0e-6, 1.0e-8)
+    source_origin_error = math.dist(
+        source_edge["coordinate"], (0.0, 0.0, 0.0)
+    )
+    if source_origin_error > origin_tolerance:
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment UV edge does not resolve to the "
+            "normalized source origin"
+        )
+    return {
+        "source_index": source_index,
+        "target_index": target_index,
+        "source_coordinate": source_edge["coordinate"],
+        "target_coordinate": target_edge["coordinate"],
+        "evidence": {
+            "policy": "normalized_origin_uv_edge_interpolation_v1",
+            "attachment_uv": list(resolved_uv),
+            "source_origin_error": float(source_origin_error),
+            "source_origin_tolerance": float(origin_tolerance),
+            "source_edge": source_edge,
+            "target_edge": target_edge,
+        },
+    }
+
+
 def _normalized_prototype_for_component(prototypes, target_mesh, target_component):
     signature = _component_signature(target_mesh, target_component)
     exact = prototypes.get(signature)
@@ -2775,10 +3881,27 @@ def _normalized_prototype_for_component(prototypes, target_mesh, target_componen
             prototype["object"].data,
             prototype["component"],
         )
-        if source_faces is None or target_faces - source_faces:
+        if source_faces is None or not _counter_subset(
+            target_faces, source_faces
+        ):
             continue
-        missing_faces = sum((source_faces - target_faces).values())
-        allowed_missing = max(1, int(math.ceil(sum(source_faces.values()) * 0.1)))
+        missing_faces = _counter_missing_identity_count(
+            source_faces, target_faces
+        )
+        # SpeedTree 10.1 removes fully clipped boundary triangles when it
+        # expands an external cutout mesh into the rendered tree FBX. Reed's
+        # current cards lose 7.9-15.6% while retaining an exact UV-face
+        # subset. Keep subset and unique-candidate checks strict, but accept
+        # that measured exporter loss envelope.
+        allowed_missing = max(
+            1,
+            int(
+                math.ceil(
+                    sum(source_faces.values())
+                    * MAX_NORMALIZED_PLAN_FACE_LOSS_RATIO
+                )
+            ),
+        )
         if missing_faces <= allowed_missing:
             candidates.append((missing_faces, prototype))
     if not candidates:
@@ -2792,6 +3915,69 @@ def _normalized_prototype_for_component(prototypes, target_mesh, target_componen
             + signature
         )
     return best[0]
+
+
+def _normalized_prototype_match_diagnostics(
+    prototypes,
+    target_mesh,
+    target_component,
+):
+    target_faces = _component_uv_face_counter(target_mesh, target_component)
+    if target_faces is None:
+        return [{"reason": "target_has_no_active_uv"}]
+    rows = []
+    for signature, prototype in prototypes.items():
+        source_faces = _component_uv_face_counter(
+            prototype["object"].data,
+            prototype["component"],
+        )
+        if source_faces is None:
+            rows.append({
+                "prototype_signature": signature,
+                "reason": "prototype_has_no_active_uv",
+            })
+            continue
+        source_count = sum(source_faces.values())
+        target_only = sum(
+            int(count)
+            for key, count in target_faces.items()
+            if key not in source_faces
+        )
+        source_only = _counter_missing_identity_count(
+            source_faces, target_faces
+        )
+        rendered_face_multiplicity = max(
+            (
+                int(count) / float(source_faces[key])
+                for key, count in target_faces.items()
+                if int(source_faces.get(key, 0)) > 0
+            ),
+            default=0.0,
+        )
+        rows.append({
+            "prototype_signature": signature,
+            "plan_name": str(
+                (prototype.get("variant") or {}).get("plan_name") or ""
+            ),
+            "source_face_count": source_count,
+            "target_face_count": sum(target_faces.values()),
+            "target_only_face_count": target_only,
+            "source_only_face_count": source_only,
+            "maximum_rendered_face_multiplicity": (
+                rendered_face_multiplicity
+            ),
+            "source_face_loss_ratio": (
+                float(source_only) / float(source_count)
+                if source_count
+                else None
+            ),
+        })
+    rows.sort(key=lambda row: (
+        int(row.get("target_only_face_count") or 0),
+        int(row.get("source_only_face_count") or 0),
+        str(row.get("prototype_signature") or ""),
+    ))
+    return rows[:8]
 
 
 def _partition_normalized_render_components(
@@ -2813,18 +3999,95 @@ def _partition_normalized_render_components(
     matched = {}
     preserved = []
     for signature, instances in sorted(by_signature.items()):
-        prototype = _normalized_prototype_for_component(
-            prototypes,
-            target_mesh,
-            instances[0],
-        )
+        prototype = prototypes.get(signature)
+        exact_components = []
+        if prototype is None and len(instances) == 1:
+            exact_components = _exact_index_component_groups(
+                target_mesh,
+                instances[0]["polygons"],
+            )
+            strict_matches = []
+            if len(exact_components) > 1:
+                for component in exact_components:
+                    exact_prototype = prototypes.get(
+                        _component_signature(target_mesh, component)
+                    )
+                    if exact_prototype is None:
+                        strict_matches = []
+                        break
+                    strict_matches.append((component, exact_prototype))
+            if strict_matches:
+                for component, exact_prototype in strict_matches:
+                    recovered_signature = _component_signature(
+                        target_mesh,
+                        component,
+                    )
+                    recovered = matched.setdefault(
+                        recovered_signature,
+                        {
+                            "prototype": exact_prototype,
+                            "instances": [],
+                        },
+                    )
+                    if recovered["prototype"] is not exact_prototype:
+                        raise ClusterAssemblyBuildError(
+                            "exact-index component recovery resolved one "
+                            "render signature to multiple normalized plans"
+                        )
+                    recovered["instances"].append(component)
+                continue
         if prototype is None:
+            prototype = _normalized_prototype_for_component(
+                prototypes,
+                target_mesh,
+                instances[0],
+            )
+        if prototype is None:
+            exact_matches = []
+            if len(instances) == 1 and len(exact_components) > 1:
+                for component in exact_components:
+                    exact_prototype = _normalized_prototype_for_component(
+                        prototypes,
+                        target_mesh,
+                        component,
+                    )
+                    if exact_prototype is None:
+                        exact_matches = []
+                        break
+                    exact_matches.append((component, exact_prototype))
+            if exact_matches:
+                for component, exact_prototype in exact_matches:
+                    recovered_signature = _component_signature(
+                        target_mesh,
+                        component,
+                    )
+                    recovered = matched.setdefault(
+                        recovered_signature,
+                        {
+                            "prototype": exact_prototype,
+                            "instances": [],
+                        },
+                    )
+                    if recovered["prototype"] is not exact_prototype:
+                        raise ClusterAssemblyBuildError(
+                            "exact-index component recovery resolved one "
+                            "render signature to multiple normalized plans"
+                        )
+                    recovered["instances"].append(component)
+                continue
             preserved.append({
                 "topology_signature": signature,
                 "instance_count": len(instances),
                 "polygon_count": sum(
                     len(component["polygons"])
                     for component in instances
+                ),
+                "prototype_match_diagnostics": (
+                    _normalized_prototype_match_diagnostics(
+                        prototypes,
+                        target_mesh,
+                        instances[0],
+                    )
                 ),
             })
             continue
@@ -2840,7 +4103,7 @@ def _vertex_descriptors(obj, component):
     uv_layer = mesh.uv_layers.active
     degree = Counter()
     component_edges = set()
-    representative = {}
+    representative = defaultdict(set)
     for polygon_index in component["polygons"]:
         polygon = mesh.polygons[polygon_index]
         if uv_layer is not None:
@@ -2883,18 +4146,41 @@ def _vertex_descriptors(obj, component):
                 )
             else:
                 logical_vertex = int(loop.vertex_index)
-            representative.setdefault(logical_vertex, int(loop.vertex_index))
+            representative[logical_vertex].add(int(loop.vertex_index))
             uv = (0.0, 0.0)
             if uv_layer is not None:
                 value = uv_layer.data[loop_index].uv
                 uv = (round(float(value.x), 6), round(float(value.y), 6))
             records[logical_vertex].append((uv, face_uv))
+    component_coordinates = [
+        tuple(float(value) for value in mesh.vertices[index].co)
+        for index in component["vertices"]
+    ]
+    tolerance = _fbx_coordinate_tolerance(component_coordinates)
+    resolved_representatives = {}
+    for logical_vertex, indices in representative.items():
+        ordered = sorted(indices)
+        reference = tuple(
+            float(value) for value in mesh.vertices[ordered[0]].co
+        )
+        if any(
+            math.dist(
+                reference,
+                tuple(float(value) for value in mesh.vertices[index].co),
+            ) > tolerance
+            for index in ordered[1:]
+        ):
+            raise ClusterAssemblyBuildError(
+                "UV/topology descriptor has ambiguous geometric positions: "
+                f"logical_vertex={logical_vertex!r} indices={ordered}"
+            )
+        resolved_representatives[logical_vertex] = ordered[0]
     return sorted(
         (
             (degree[logical_vertex], tuple(sorted(records[logical_vertex]))),
-            representative[logical_vertex],
+            resolved_representatives[logical_vertex],
         )
-        for logical_vertex in representative
+        for logical_vertex in resolved_representatives
     )
 
 
@@ -2913,34 +4199,80 @@ def _ordered_cross_object_correspondence(
     source_component,
     target_obj,
     target_component,
+    include_evidence=False,
 ):
     source_uv = source_obj.data.uv_layers.active
     target_uv = target_obj.data.uv_layers.active
     if source_uv is not None and target_uv is not None:
-        source_by_uv = _uv_vertex_representatives(
+        source_by_uv = _uv_vertex_candidates(
             source_obj,
             source_component,
         )
-        target_by_uv = _uv_vertex_representatives(
+        target_by_uv = _uv_vertex_candidates(
             target_obj,
             target_component,
         )
-        common = sorted(set(source_by_uv) & set(target_by_uv))
-        if len(common) < 3 or len(common) != len(target_by_uv):
+        missing = sorted(set(target_by_uv) - set(source_by_uv))
+        if missing:
             raise ClusterAssemblyBuildError(
-                "normalized plan UV correspondence does not cover the target instance"
+                "normalized plan UV correspondence does not cover the target "
+                f"instance: missing_uv_count={len(missing)} sample={missing[:5]}"
             )
-        return (
-            [source_by_uv[key] for key in common],
-            [target_by_uv[key] for key in common],
-        )
+        source_indices = []
+        target_indices = []
+        duplicate_rows = []
+        for key in sorted(target_by_uv):
+            pairs, evidence = _match_uv_candidate_groups(
+                source_obj,
+                source_component,
+                target_obj,
+                target_component,
+                key,
+                source_by_uv[key],
+                target_by_uv[key],
+            )
+            source_indices.extend(pair[0] for pair in pairs)
+            target_indices.extend(pair[1] for pair in pairs)
+            if (
+                evidence["source_geometric_candidates"] > 1
+                or evidence["target_geometric_candidates"] > 1
+                or evidence["discarded_source_candidates"] > 0
+            ):
+                duplicate_rows.append(evidence)
+        if len(source_indices) < 3:
+            raise ClusterAssemblyBuildError(
+                "normalized plan surviving UV correspondence has fewer than "
+                f"three geometric points: count={len(source_indices)}"
+            )
+        evidence = {
+            "policy": "all_candidates_topology_disambiguated_fail_closed_v1",
+            "matched_point_count": len(source_indices),
+            "target_uv_key_count": len(target_by_uv),
+            "source_only_uv_key_count": len(
+                set(source_by_uv) - set(target_by_uv)
+            ),
+            "duplicate_uv_rows": duplicate_rows,
+        }
+        if include_evidence:
+            return source_indices, target_indices, evidence
+        return source_indices, target_indices
     source = _vertex_descriptors(source_obj, source_component)
     destination = _vertex_descriptors(target_obj, target_component)
     if [row[0] for row in source] != [row[0] for row in destination]:
         raise ClusterAssemblyBuildError(
             "normalized plan UV/topology descriptors do not match an instance"
         )
-    return [row[1] for row in source], [row[1] for row in destination]
+    source_indices = [row[1] for row in source]
+    target_indices = [row[1] for row in destination]
+    if include_evidence:
+        return source_indices, target_indices, {
+            "policy": "topology_descriptor_no_uv_v1",
+            "matched_point_count": len(source_indices),
+            "target_uv_key_count": 0,
+            "source_only_uv_key_count": 0,
+            "duplicate_uv_rows": [],
+        }
+    return source_indices, target_indices
 
 
 def _import_normalized_plan_prototypes(bpy, contract):
@@ -3013,6 +4345,20 @@ def _world_points(obj, vertex_indices):
     ]
 
 
+def _world_coordinate(obj, coordinate):
+    matrix = obj.matrix_world
+    return tuple(
+        float(
+            sum(
+                float(matrix[row][axis]) * float(coordinate[axis])
+                for axis in range(3)
+            )
+            + float(matrix[row][3])
+        )
+        for row in range(3)
+    )
+
+
 def _component_influences(obj, component):
     totals = Counter()
     for vertex_index in component["vertices"]:
@@ -3027,6 +4373,88 @@ def _component_influences(obj, component):
         for name, value in totals.most_common()
         if value > 0.0
     ]
+
+
+def _weighted_vertex_locator(obj):
+    try:
+        from mathutils.kdtree import KDTree
+    except ImportError as exc:  # pragma: no cover - Blender-only dependency.
+        raise ClusterAssemblyBuildError(
+            "Blender KDTree is required for source-role skeleton binding"
+        ) from exc
+    weighted = [
+        vertex for vertex in obj.data.vertices
+        if list(vertex.groups)
+    ]
+    if not weighted:
+        raise ClusterAssemblyBuildError(
+            "final merged mesh has no weighted vertices for Assembly binding"
+        )
+    tree = KDTree(len(weighted))
+    for vertex in weighted:
+        tree.insert(obj.matrix_world @ vertex.co, int(vertex.index))
+    tree.balance()
+    world_points = [
+        tuple(float(value) for value in (obj.matrix_world @ vertex.co))
+        for vertex in weighted
+    ]
+    spans = [
+        max(point[axis] for point in world_points)
+        - min(point[axis] for point in world_points)
+        for axis in range(3)
+    ]
+    return {
+        "tree": tree,
+        "tolerance_meters": _weighted_vertex_attachment_tolerance(spans),
+    }
+
+
+def _weighted_vertex_attachment_tolerance(spans):
+    """Bound nearest-weight inheritance by one percent of the Full-SK span.
+
+    Authored attachment pivots can sit just outside the rendered branch skin.
+    A half-percent gate rejected valid large-tree pivots by only a few
+    millimeters; one percent still keeps the lookup local to the attachment
+    while covering the branch radius and SpeedTree export clipping margin.
+    """
+    values = [abs(float(value)) for value in spans]
+    if not values:
+        return MIN_WEIGHT_BINDING_DISTANCE_METERS
+    return max(
+        max(values) * MAX_WEIGHT_BINDING_DISTANCE_SPAN_RATIO,
+        MIN_WEIGHT_BINDING_DISTANCE_METERS,
+    )
+
+
+def _nearest_weighted_vertex_influences(obj, locator, world_point):
+    _coordinate, vertex_index, distance = locator["tree"].find(world_point)
+    tolerance = float(locator["tolerance_meters"])
+    if vertex_index is None or float(distance) > tolerance:
+        raise ClusterAssemblyBuildError(
+            "Assembly source-role attachment has no nearby weighted Full-SK "
+            f"vertex: distance={float(distance):.9g} tolerance={tolerance:.9g}"
+        )
+    vertex = obj.data.vertices[int(vertex_index)]
+    totals = Counter()
+    for item in vertex.groups:
+        group = obj.vertex_groups[item.group]
+        totals[str(group.name)] += float(item.weight)
+    total = sum(totals.values())
+    if total <= 0.0:
+        raise ClusterAssemblyBuildError(
+            "nearest Full-SK attachment vertex has no skeleton weights"
+        )
+    influences = [
+        {"bone": name, "weight": value / total}
+        for name, value in totals.most_common()
+        if value > 0.0
+    ]
+    return influences, {
+        "policy": "nearest_weighted_full_sk_vertex_v1",
+        "vertex_index": int(vertex_index),
+        "distance_meters": float(distance),
+        "tolerance_meters": tolerance,
+    }
 
 
 def _copy_component_as_rigid_part(bpy, source_obj, component, name):
@@ -3233,6 +4661,29 @@ def _replicate_full_export_parent_chain(
     return created
 
 
+def _validate_base_export_parent_chain(
+    base_armature,
+    export_parents,
+    base_obj,
+):
+    """Prove the copied Base hierarchy matches the Full-SK source chain."""
+    expected_parent = base_armature
+    ordered_parents = list(export_parents or [])
+    for parent in ordered_parents:
+        if parent.parent is not expected_parent:
+            raise ClusterAssemblyBuildError(
+                "Assembly base export parent chain is not contiguous: "
+                f"object={parent.name}, expected_parent={expected_parent.name}"
+            )
+        expected_parent = parent
+    if base_obj.parent is not expected_parent:
+        raise ClusterAssemblyBuildError(
+            "Assembly base mesh is detached from its replicated Full export "
+            f"chain: mesh={base_obj.name}, expected_parent={expected_parent.name}"
+        )
+    return None
+
+
 def _strip_fbx_scene_textures(scene_data, get_fbx_uuid_from_key):
     """Keep material slots but remove FBX Texture/Video records and links.
 
@@ -3303,8 +4754,14 @@ def _textureless_fbx_scene_data(bpy):
         export_fbx_bin.fbx_data_from_scene = original
 
 
-def _validate_textureless_fbx(bpy, path, *, full_skeleton_root=False):
-    """Fail closed on texture records or a second raw-FBX object scale."""
+def _validate_textureless_fbx(
+    bpy,
+    path,
+    *,
+    full_skeleton_root=False,
+    expected_geometry_bounds=None,
+):
+    """Fail closed on textures, unit drift, axis drift, or geometry baking."""
     if not hasattr(bpy, "app"):
         return {
             "status": "not_available_in_mock",
@@ -3323,10 +4780,34 @@ def _validate_textureless_fbx(bpy, path, *, full_skeleton_root=False):
     texture_records = 0
     video_records = 0
     model_scales = []
+    geometry_bounds = {}
     if objects is not None:
         texture_records = sum(item.id == b"Texture" for item in objects.elems)
         video_records = sum(item.id == b"Video" for item in objects.elems)
         for item in objects.elems:
+            if item.id == b"Geometry" and len(item.props) >= 2:
+                vertices = next(
+                    (child for child in item.elems if child.id == b"Vertices"),
+                    None,
+                )
+                values = (
+                    list(vertices.props[0])
+                    if vertices is not None and vertices.props
+                    else []
+                )
+                axes = [values[index::3] for index in range(3)]
+                raw_name = item.props[1]
+                geometry_name = (
+                    raw_name.decode("utf-8", errors="replace")
+                    if isinstance(raw_name, bytes)
+                    else str(raw_name)
+                ).split("\x00", 1)[0]
+                geometry_bounds[geometry_name] = {
+                    "vertex_count": len(values) // 3,
+                    "minimum": [min(axis) if axis else 0.0 for axis in axes],
+                    "maximum": [max(axis) if axis else 0.0 for axis in axes],
+                }
+                continue
             if item.id != b"Model" or len(item.props) < 3:
                 continue
             if item.props[2] not in {b"Mesh", b"Null"}:
@@ -3336,6 +4817,7 @@ def _validate_textureless_fbx(bpy, path, *, full_skeleton_root=False):
                 None,
             )
             scale = [1.0, 1.0, 1.0]
+            rotation = [0.0, 0.0, 0.0]
             if properties is not None:
                 scaling = next(
                     (
@@ -3349,6 +4831,20 @@ def _validate_textureless_fbx(bpy, path, *, full_skeleton_root=False):
                 )
                 if scaling is not None and len(scaling.props) >= 3:
                     scale = [float(value) for value in scaling.props[-3:]]
+                local_rotation = next(
+                    (
+                        child
+                        for child in properties.elems
+                        if child.id == b"P"
+                        and child.props
+                        and child.props[0] == b"Lcl Rotation"
+                    ),
+                    None,
+                )
+                if local_rotation is not None and len(local_rotation.props) >= 3:
+                    rotation = [
+                        float(value) for value in local_rotation.props[-3:]
+                    ]
             raw_name = item.props[1]
             name = (
                 raw_name.decode("utf-8", errors="replace")
@@ -3360,6 +4856,7 @@ def _validate_textureless_fbx(bpy, path, *, full_skeleton_root=False):
                 "type": str(item.props[2]),
                 "is_null": item.props[2] == b"Null",
                 "scale": scale,
+                "rotation": rotation,
             })
     if texture_records or video_records:
         raise ClusterAssemblyBuildError(
@@ -3387,6 +4884,45 @@ def _validate_textureless_fbx(bpy, path, *, full_skeleton_root=False):
             "Assembly FBX model scale does not match its Full SK/part root "
             f"contract: {unexpected_model_scales}, path={path}"
         )
+    expected_model_rotation = [90.0, 0.0, 0.0]
+    unexpected_model_rotations = []
+    for row in model_scales:
+        row["expected_rotation"] = expected_model_rotation
+        if any(
+            abs((value - expected + 180.0) % 360.0 - 180.0) > 1.0e-3
+            for value, expected in zip(
+                row["rotation"], expected_model_rotation
+            )
+        ):
+            unexpected_model_rotations.append(row)
+    if unexpected_model_rotations:
+        raise ClusterAssemblyBuildError(
+            "Assembly FBX model rotation does not match the Unreal Z-up axis "
+            f"contract: {unexpected_model_rotations}, path={path}"
+        )
+    geometry_mismatches = []
+    for name, expected in (expected_geometry_bounds or {}).items():
+        actual = geometry_bounds.get(name)
+        if actual is None:
+            geometry_mismatches.append({"name": name, "reason": "missing"})
+            continue
+        mismatched = actual["vertex_count"] != expected["vertex_count"]
+        for key in ("minimum", "maximum"):
+            mismatched = mismatched or any(
+                abs(float(actual_value) - float(expected_value)) > 1.0e-5
+                for actual_value, expected_value in zip(
+                    actual[key], expected[key]
+                )
+            )
+        if mismatched:
+            geometry_mismatches.append(
+                {"name": name, "expected": expected, "actual": actual}
+            )
+    if geometry_mismatches:
+        raise ClusterAssemblyBuildError(
+            "Assembly FBX changed local geometry bounds during export: "
+            f"{geometry_mismatches}, path={path}"
+        )
     return {
         "status": "textureless",
         "fbx_version": version,
@@ -3394,8 +4930,12 @@ def _validate_textureless_fbx(bpy, path, *, full_skeleton_root=False):
         "video_records": video_records,
         "model_scales": model_scales,
         "expected_model_scale": expected_model_scale,
+        "expected_model_rotation": expected_model_rotation,
         "full_skeleton_root": bool(full_skeleton_root),
         "all_model_scales_match_contract": True,
+        "all_model_rotations_match_contract": True,
+        "geometry_bounds": geometry_bounds,
+        "all_geometry_bounds_match_contract": True,
         "material_source": "material_pipeline_json_sidecar",
     }
 
@@ -3453,6 +4993,26 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
         raise ClusterAssemblyBuildError(
             "generated Assembly FBX requires one armature and at least one mesh"
         )
+    expected_geometry_bounds = None
+    if hasattr(bpy, "app"):
+        expected_geometry_bounds = {}
+        for obj in meshes:
+            coordinates = [vertex.co for vertex in obj.data.vertices]
+            expected_geometry_bounds[obj.data.name] = {
+                "vertex_count": len(coordinates),
+                "minimum": [
+                    min(float(co[index]) for co in coordinates)
+                    if coordinates
+                    else 0.0
+                    for index in range(3)
+                ],
+                "maximum": [
+                    max(float(co[index]) for co in coordinates)
+                    if coordinates
+                    else 0.0
+                    for index in range(3)
+                ],
+            }
     for obj in armatures + meshes:
         scale = [float(value) for value in obj.matrix_world.to_scale()]
         if any(abs(value - 1.0) > 1.0e-5 for value in scale):
@@ -3469,19 +5029,15 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
             "generated Assembly coordinates must preserve the Full SK meter "
             "scene-unit contract"
         )
+    addon_runtime = None
     try:
         if not hasattr(bpy, "app"):
-            # Lightweight unit-test mocks exercise the stock operator call
-            # contract without importing Blender add-ons.
+            # Lightweight unit-test mocks exercise the operator settings
+            # without importing Blender add-ons.
             result = bpy.ops.export_scene.fbx(
                 filepath=str(path),
                 use_selection=True,
                 object_types={"ARMATURE", "MESH"},
-                # Keep BASE/PART reference poses on the exact stock-FBX contract
-                # used by speedtree_bone_weight_repair.core for the Full SK.  A
-                # separate unit-scale or modifier policy changes the imported
-                # armature-object root (bone 0), even when every authored Blender
-                # bone has the same name/order/parent/bind matrix.
                 use_mesh_modifiers=False,
                 mesh_smooth_type="FACE",
                 use_custom_props=False,
@@ -3491,9 +5047,9 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
                 armature_nodetype="NULL",
                 bake_anim=False,
                 path_mode="AUTO",
+                global_scale=1.0,
                 apply_unit_scale=True,
                 apply_scale_options="FBX_SCALE_NONE",
-                global_scale=1.0,
                 axis_forward="Y",
                 axis_up="Z",
                 bake_space_transform=False,
@@ -3501,21 +5057,19 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
             if "FINISHED" not in result:
                 raise ClusterAssemblyBuildError(f"FBX export failed: {result}")
         else:
-            # Use the same scale/bind-pose exporter as the real Send to Unreal
-            # Full mesh.  Its armature correction is part of PARK's existing
-            # handoff contract; the stock Blender exporter writes a 100x
-            # armature-object root even when all visible world transforms are
-            # identical.
-            import addon_utils
+            # The Full SK is exported through Send2UE's armature-aware FBX
+            # patch. Use that same bind/root-scale contract for generated
+            # BASE/part assets, then independently prove that it did not bake
+            # or shrink their local geometry.
+            from blender_addon_gateway import prepare_runtime
 
-            _default, loaded = addon_utils.check("send2ue")
-            if not loaded:
-                addon_utils.enable(
-                    "send2ue",
-                    default_set=False,
-                    persistent=False,
-                )
-            from send2ue.core.io import fbx_b4 as send2ue_fbx
+            addon_runtime = prepare_runtime(
+                "sk_batch.cluster_assembly_builder.fbx_export",
+                {"send2ue": ("fbx_export_v1",)},
+            )
+            send2ue_fbx_export = addon_runtime.operation(
+                "send2ue", "fbx_export"
+            )
 
             bpy.context.scene.send2ue.export_object_name_as_root = True
             bpy.context.scene.send2ue.export_custom_root_name = ""
@@ -3526,7 +5080,7 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
             previous_flag = bpy.app.driver_namespace.get(textureless_flag)
             bpy.app.driver_namespace[textureless_flag] = True
             try:
-                send2ue_fbx.export(
+                send2ue_fbx_export(
                     filepath=str(path),
                     use_selection=True,
                     object_types={"ARMATURE", "MESH", "EMPTY"},
@@ -3535,15 +5089,6 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
                     mesh_smooth_type="FACE",
                     use_mesh_edges=False,
                     use_subsurf=False,
-                    use_tspace=False,
-                    use_custom_props=False,
-                    add_leaf_bones=False,
-                    primary_bone_axis="Y",
-                    secondary_bone_axis="X",
-                    use_armature_deform_only=False,
-                    armature_nodetype="NULL",
-                    bake_anim=False,
-                    bake_anim_use_all_bones=True,
                     bake_anim_use_nla_strips=True,
                     bake_anim_use_all_actions=False,
                     bake_anim_force_startend_keying=True,
@@ -3569,11 +5114,15 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
             obj.hide_set(hidden)
     if not path.is_file():
         raise ClusterAssemblyBuildError(f"FBX export produced no file: {path}")
-    return _validate_textureless_fbx(
+    validation = _validate_textureless_fbx(
         bpy,
         path,
         full_skeleton_root=full_skeleton_root,
+        expected_geometry_bounds=expected_geometry_bounds,
     )
+    if addon_runtime is not None:
+        validation["blender_addon_runtime"] = addon_runtime.receipt
+    return validation
 
 
 def _write_assembly_source_blend(bpy, path, objects, contract):
@@ -3616,7 +5165,7 @@ def _write_assembly_source_blend(bpy, path, objects, contract):
                 "bpy.ops.wm.save_as_mainfile(filepath=target, check_existing=False)",
             ]
         )
-        completed = subprocess.run(
+        completed = owned_run(
             [
                 bpy.app.binary_path,
                 "--factory-startup",
@@ -3629,6 +5178,8 @@ def _write_assembly_source_blend(bpy, path, objects, contract):
                 collection.name,
                 text.name,
             ],
+            source="sk_batch.cluster_assembly_builder.standalone_blender",
+            run_factory=subprocess.run,
             check=False,
             capture_output=True,
             text=True,
@@ -3648,7 +5199,16 @@ def _write_assembly_source_blend(bpy, path, objects, contract):
     return file_fingerprint(target)
 
 
-def _role_material_polygons(merged_mesh, role_inputs):
+def _role_builder_key(row):
+    return str(row.get("provider_key") or row.get("role") or "").casefold()
+
+
+def _role_material_polygons(
+    merged_mesh,
+    role_inputs,
+    *,
+    allow_topology_fallback=True,
+):
     materials = list(merged_mesh.data.materials)
     slots_by_identity = defaultdict(set)
     for index, material in enumerate(materials):
@@ -3660,6 +5220,7 @@ def _role_material_polygons(merged_mesh, role_inputs):
     missing_slot_rows = []
     for row in role_inputs:
         role = str(row["role"]).casefold()
+        provider_key = _role_builder_key(row)
         identity_values = [
             row.get("role_identity"),
             *(row.get("role_identity_aliases") or []),
@@ -3681,25 +5242,26 @@ def _role_material_polygons(merged_mesh, role_inputs):
         }
         for slot in sorted(slots):
             owner = claimed_slots.get(slot)
-            if owner is not None and owner != role:
+            if owner is not None and owner != provider_key:
                 raise ClusterAssemblyBuildError(
                     "Assembly material slot is claimed by multiple roles: "
-                    f"slot={slot}, roles={owner},{role}"
+                    f"slot={slot}, roles={owner},{provider_key}"
                 )
-            claimed_slots[slot] = role
+            claimed_slots[slot] = provider_key
         polygons = [
             int(polygon.index)
             for polygon in merged_mesh.data.polygons
             if int(polygon.material_index) in slots
         ]
         if not slots:
-            missing_slot_rows.append((role, row, identities))
+            missing_slot_rows.append((provider_key, role, row, identities))
             continue
         if not polygons:
             normalized = deepcopy(row.get("normalized_variants"))
             variants = list((normalized or {}).get("variants") or [])
-            prepared_unused[role] = {
+            prepared_unused[provider_key] = {
                 "role": role,
+                "provider_key": provider_key,
                 "role_identity": row.get("role_identity"),
                 "role_identity_aliases": deepcopy(
                     row.get("role_identity_aliases") or []
@@ -3717,8 +5279,9 @@ def _role_material_polygons(merged_mesh, role_inputs):
                 ],
             }
             continue
-        result[role] = {
+        result[provider_key] = {
             "role": role,
+            "provider_key": provider_key,
             "role_identity": row.get("role_identity"),
             "role_identity_aliases": deepcopy(
                 row.get("role_identity_aliases") or []
@@ -3748,7 +5311,7 @@ def _role_material_polygons(merged_mesh, role_inputs):
         for polygon in merged_mesh.data.polygons
         if int(polygon.index) not in claimed_polygons
     ]
-    for role, row, identities in missing_slot_rows:
+    for provider_key, role, row, identities in missing_slot_rows:
         normalized = deepcopy(row.get("normalized_variants"))
         variants = list((normalized or {}).get("variants") or [])
         assignments = [
@@ -3759,9 +5322,18 @@ def _role_material_polygons(merged_mesh, role_inputs):
                 and int(assignment.get("used_polygon_count") or 0) > 0
             )
         ]
-        if topology_candidates and variants and assignments:
-            result[role] = {
+        if (
+            allow_topology_fallback
+            and topology_candidates
+            and variants
+            and (
+                assignments
+                or row.get("rendered_provider_expansion_covered") is True
+            )
+        ):
+            result[provider_key] = {
                 "role": role,
+                "provider_key": provider_key,
                 "role_identity": row.get("role_identity"),
                 "role_identity_aliases": deepcopy(
                     row.get("role_identity_aliases") or []
@@ -3773,8 +5345,9 @@ def _role_material_polygons(merged_mesh, role_inputs):
                 "selection_basis": "normalized_topology_fallback",
             }
             continue
-        prepared_unused[role] = {
+        prepared_unused[provider_key] = {
             "role": role,
+            "provider_key": provider_key,
             "role_identity": row.get("role_identity"),
             "role_identity_aliases": deepcopy(
                 row.get("role_identity_aliases") or []
@@ -3794,10 +5367,104 @@ def _role_material_polygons(merged_mesh, role_inputs):
     return result, prepared_unused
 
 
+def _role_geometry_sources(bpy_module, final_merged_mesh, role_inputs):
+    """Resolve rendered role geometry before BWR's intentional base split.
+
+    Cluster/leaf placement meshes can remain in ``SpeedTree_Source`` without
+    an armature and therefore do not belong to the repaired Full-SK base. Their
+    exact material identity is nevertheless the authoritative Assembly
+    placement geometry. Prefer those exact source objects before falling back
+    to topology search on the final merged base.
+    """
+    exact_final, _unused = _role_material_polygons(
+        final_merged_mesh,
+        role_inputs,
+        allow_topology_fallback=False,
+    )
+    roles = dict(exact_final)
+    targets = {
+        provider_key: final_merged_mesh
+        for provider_key in exact_final
+    }
+    unresolved = [
+        row for row in role_inputs
+        if _role_builder_key(row) not in roles
+    ]
+    final_property_getter = getattr(final_merged_mesh, "get", None)
+    source_fbx = _normalized_contract_path(
+        final_property_getter("codex_source_fbx", "")
+        if callable(final_property_getter)
+        else ""
+    )
+    source_objects = []
+    for obj in bpy_module.data.objects:
+        if obj is final_merged_mesh or getattr(obj, "type", "") != "MESH":
+            continue
+        collections = {
+            str(getattr(collection, "name", ""))
+            for collection in getattr(obj, "users_collection", ()) or ()
+        }
+        if "SpeedTree_Source" not in collections:
+            continue
+        property_getter = getattr(obj, "get", None)
+        tagged_fbx = _normalized_contract_path(
+            property_getter("codex_source_fbx", "")
+            if callable(property_getter)
+            else ""
+        )
+        if source_fbx and tagged_fbx != source_fbx:
+            continue
+        source_objects.append(obj)
+
+    still_unresolved = []
+    for row in unresolved:
+        provider_key = _role_builder_key(row)
+        matches = []
+        for obj in source_objects:
+            rendered, _prepared = _role_material_polygons(
+                obj,
+                [row],
+                allow_topology_fallback=False,
+            )
+            if provider_key in rendered:
+                matches.append((obj, rendered[provider_key]))
+        if len(matches) > 1:
+            raise ClusterAssemblyBuildError(
+                "Assembly provider material resolves to multiple current "
+                f"SpeedTree source meshes: provider={provider_key}, "
+                f"objects={sorted(obj.name for obj, _row in matches)}"
+            )
+        if len(matches) == 1:
+            target, role_row = matches[0]
+            role_row["selection_basis"] = (
+                "speedtree_source_material_identity"
+            )
+            roles[provider_key] = role_row
+            targets[provider_key] = target
+        else:
+            still_unresolved.append(row)
+
+    prepared_unused = {}
+    if still_unresolved:
+        fallback, prepared_unused = _role_material_polygons(
+            final_merged_mesh,
+            still_unresolved,
+            allow_topology_fallback=True,
+        )
+        roles.update(fallback)
+        targets.update({
+            provider_key: final_merged_mesh
+            for provider_key in fallback
+        })
+    return roles, prepared_unused, targets
+
+
 def _validate_role_component_claims(role_build_plans):
     claimed_polygons = {}
     unmatched_roles = []
-    for role, plan in role_build_plans.items():
+    for provider_key, plan in role_build_plans.items():
+        role = str(plan.get("role") or provider_key)
+        target_identity = id(plan.get("target_object"))
         matched_component_count = 0
         for matched in (plan.get("matched") or {}).values():
             instances = list(matched.get("instances") or [])
@@ -3805,21 +5472,35 @@ def _validate_role_component_claims(role_build_plans):
             for component in instances:
                 for polygon in component.get("polygons") or []:
                     polygon = int(polygon)
-                    owner = claimed_polygons.get(polygon)
-                    if owner is not None and owner != role:
+                    claim_key = (target_identity, polygon)
+                    owner = claimed_polygons.get(claim_key)
+                    if owner is not None and owner != provider_key:
                         raise ClusterAssemblyBuildError(
                             "one rendered mesh component matched multiple "
                             "normalized Assembly roles: "
-                            f"polygon={polygon}, roles={owner},{role}"
+                            f"polygon={polygon}, roles={owner},{provider_key}"
                         )
-                    claimed_polygons[polygon] = role
-        if matched_component_count == 0:
-            unmatched_roles.append(str(role))
+                    claimed_polygons[claim_key] = provider_key
+        # A normalized provider can legitimately cover only a subset of the
+        # rendered variants.  `_partition_normalized_render_components`
+        # deliberately leaves unknown topologies in the Full-SK Base so no
+        # geometry is invented or discarded.  Do not turn that preservation
+        # result back into a provider-wide failure here.  A role with neither
+        # a matched nor a preserved component is still invalid, and the final
+        # builder also rejects a handoff where no provider produced any part.
+        if matched_component_count == 0 and not plan.get("preserved"):
+            unmatched_roles.append({
+                "provider_key": str(provider_key),
+                "preserved": deepcopy(plan.get("preserved") or []),
+            })
     if unmatched_roles:
+        unmatched_roles.sort(key=lambda row: row["provider_key"])
         raise ClusterAssemblyBuildError(
             "requested rendered Assembly roles matched zero normalized "
             "prototype components: "
-            + ", ".join(sorted(unmatched_roles))
+            + ", ".join(row["provider_key"] for row in unmatched_roles)
+            + "; diagnostics="
+            + _canonical_json(unmatched_roles)
         )
     return claimed_polygons
 
@@ -3861,7 +5542,8 @@ def build_blender_assembly_inputs(
     checked_snapshot, skeleton_by_name = _skeleton_maps(snapshot)
     snapshot = checked_snapshot
     role_inputs = list((handoff.get("assembly") or {}).get("part_builder_inputs") or [])
-    roles, prepared_unused_roles = _role_material_polygons(
+    roles, prepared_unused_roles, role_targets = _role_geometry_sources(
+        bpy,
         final_merged_mesh,
         role_inputs,
     )
@@ -3876,7 +5558,7 @@ def build_blender_assembly_inputs(
                 ),
                 "reason": row.get("reason"),
             }
-            for role, row in sorted(prepared_unused_roles.items())
+            for _provider_key, row in sorted(prepared_unused_roles.items())
         ]
         raise ClusterAssemblyBuildError(
             "Assembly handoff requested rendered roles that disappeared before "
@@ -3895,6 +5577,15 @@ def build_blender_assembly_inputs(
     all_bindings = []
     role_build_plans = {}
     preserved_render_components = []
+    authored_node_table = None
+    authored_spm_fingerprint = None
+    claimed_authored_node_guids = set()
+    authored_binding_count = 0
+    degraded_authored_binding_count = 0
+    legacy_fallback_binding_count = 0
+    authored_component_cache = {}
+    weighted_vertex_locator = None
+    authored_assignment_report = None
     base_obj = None
     base_armature = None
     scene_units = bpy.context.scene.unit_settings
@@ -3909,10 +5600,17 @@ def build_blender_assembly_inputs(
             f"contract, got system={source_unit_system} scale={source_scale_length}"
         )
     try:
-        for role in ROLE_ORDER:
-            role_row = roles.get(role)
-            if role_row is None:
-                continue
+        provider_order = sorted(
+            roles,
+            key=lambda provider_key: (
+                ROLE_ORDER.index(roles[provider_key]["role"]),
+                provider_key,
+            ),
+        )
+        for provider_key in provider_order:
+            role_row = roles[provider_key]
+            role = role_row["role"]
+            target_object = role_targets[provider_key]
             normalized_contract = role_row.get("normalized_variants")
             if not normalized_contract:
                 raise ClusterAssemblyBuildError(
@@ -3933,31 +5631,146 @@ def build_blender_assembly_inputs(
             )
             created_objects.extend(imported_objects)
             components = _component_groups(
-                final_merged_mesh.data,
+                target_object.data,
                 role_row["polygon_indices"],
             )
             matched, preserved = _partition_normalized_render_components(
                 prototypes,
-                final_merged_mesh.data,
+                target_object.data,
                 components,
             )
-            role_build_plans[role] = {
+            if preserved and target_object is not final_merged_mesh:
+                raise ClusterAssemblyBuildError(
+                    "current SpeedTree source role contains geometry absent "
+                    "from its normalized provider plans: "
+                    f"provider={provider_key}, preserved={preserved}"
+                )
+            role_build_plans[provider_key] = {
+                "role": role,
+                "provider_key": provider_key,
+                "target_object": target_object,
                 "matched": matched,
                 "preserved": preserved,
             }
             for row in preserved:
                 preserved_render_components.append({
                     "role": role,
+                    "provider_key": provider_key,
                     "role_identity": role_row["role_identity"],
                     **row,
                 })
         _validate_role_component_claims(role_build_plans)
+        authored_spm_fingerprint = validate_file_fingerprint(
+            handoff.get("spm"),
+            "target SPM authored Node placement",
+        )
+        try:
+            authored_node_table = parse_spm_authored_placement(
+                authored_spm_fingerprint["path"]
+            )
+        except (KeyError, SpmAuthoredPlacementError) as exc:
+            raise ClusterAssemblyBuildError(
+                "target SPM authored Node placement is invalid: " + str(exc)
+            ) from exc
+        if authored_node_table.get("available"):
+            component_rows = []
+            for provider_key, role_plan in sorted(
+                role_build_plans.items()
+            ):
+                role = role_plan["role"]
+                target_object = role_plan["target_object"]
+                for signature, match in sorted(
+                    role_plan["matched"].items()
+                ):
+                    prototype = match["prototype"]
+                    variant = prototype["variant"]
+                    source_obj = prototype["object"]
+                    source_component = prototype["component"]
+                    try:
+                        target_mesh_id = int(variant.get("target_mesh_id"))
+                    except (TypeError, ValueError) as exc:
+                        raise ClusterAssemblyBuildError(
+                            "normalized variant has no target mesh id for "
+                            "authored Node matching"
+                        ) from exc
+                    for instance_index, component in enumerate(
+                        match["instances"]
+                    ):
+                        component_id = (
+                            f"{provider_key}:{signature}:{instance_index}:"
+                            f"{component['polygons'][0]}"
+                        )
+                        attachment = _attachment_point_correspondence(
+                            source_obj,
+                            source_component,
+                            target_object,
+                            component,
+                            variant.get("attachment_vertex_uv"),
+                        )
+                        source_attachment_index = attachment["source_index"]
+                        target_attachment_index = attachment["target_index"]
+                        source_attachment = _world_coordinate(
+                            source_obj,
+                            attachment["source_coordinate"],
+                        )
+                        target_attachment = _world_coordinate(
+                            target_object,
+                            attachment["target_coordinate"],
+                        )
+                        authored_component_cache[component_id] = {
+                            "source_attachment_index": (
+                                source_attachment_index
+                            ),
+                            "target_attachment_index": (
+                                target_attachment_index
+                            ),
+                            "source_attachment": source_attachment,
+                            "target_attachment": target_attachment,
+                            "attachment_correspondence": attachment["evidence"],
+                        }
+                        component_rows.append({
+                            "component_id": component_id,
+                            "target_mesh_id": target_mesh_id,
+                            "position_meters": target_attachment,
+                        })
+            authored_assignment_report = (
+                assign_authored_nodes_to_components(
+                    authored_node_table,
+                    component_rows,
+                    AUTHORED_NODE_GLOBAL_ASSIGNMENT_TOLERANCE_METERS,
+                )
+            )
+            for component_id, authored_node in (
+                authored_assignment_report["assignments"].items()
+            ):
+                authored_component_cache[component_id]["authored_node"] = (
+                    authored_node
+                )
+            unmatched_by_id = {
+                row["component_id"]: row
+                for row in authored_assignment_report["unmatched"]
+            }
+            for component_id, warning in unmatched_by_id.items():
+                authored_component_cache[component_id][
+                    "authored_node_match_warning"
+                ] = warning
+        else:
+            authored_assignment_report = {
+                "policy": "legacy_authored_node_data_absent",
+                "threshold_meters": None,
+                "component_count": 0,
+                "candidate_count": 0,
+                "assigned_count": 0,
+                "unmatched_count": 0,
+                "unmatched": [],
+            }
         # No public Assembly artifact may exist until every requested rendered
         # role has proven at least one normalized prototype/component match.
         output.mkdir(parents=True, exist_ok=True)
         excluded_polygons = sorted({
             polygon_index
             for plan in role_build_plans.values()
+            if plan["target_object"] is final_merged_mesh
             for row in plan["matched"].values()
             for component in row["instances"]
             for polygon_index in component["polygons"]
@@ -3995,6 +5808,11 @@ def build_blender_assembly_inputs(
         final_armature.name = source_armature_name + "__FullSource"
         base_armature.name = source_armature_name
         try:
+            _validate_base_export_parent_chain(
+                base_armature,
+                base_export_parents,
+                base_obj,
+            )
             base_fbx_texture_contract = _export_selected_fbx(
                 bpy,
                 base_fbx,
@@ -4004,15 +5822,22 @@ def build_blender_assembly_inputs(
         finally:
             base_armature.name = normalized_armature_name
             final_armature.name = source_armature_name
-        for role in ROLE_ORDER:
-            role_row = roles.get(role)
-            if role_row is None:
-                continue
+        if any(
+            target is not final_merged_mesh
+            for target in role_targets.values()
+        ):
+            weighted_vertex_locator = _weighted_vertex_locator(
+                final_merged_mesh
+            )
+        for provider_key in provider_order:
+            role_row = roles[provider_key]
+            role = role_row["role"]
+            target_object = role_targets[provider_key]
             normalized_contract = role_row.get("normalized_variants")
             if normalized_contract:
                 composite_accumulators = {}
                 for signature, match in sorted(
-                    role_build_plans[role]["matched"].items()
+                    role_build_plans[provider_key]["matched"].items()
                 ):
                     prototype = match["prototype"]
                     instances = match["instances"]
@@ -4045,42 +5870,133 @@ def build_blender_assembly_inputs(
                     prototype_id = (
                         f"{role}_normalized_{ordinal:02d}_{signature}"
                     )
+                    try:
+                        target_mesh_id = int(variant.get("target_mesh_id"))
+                    except (TypeError, ValueError) as exc:
+                        raise ClusterAssemblyBuildError(
+                            "normalized variant has no target mesh id for "
+                            "authored Node matching"
+                        ) from exc
                     bindings = []
                     for instance_index, component in enumerate(instances):
-                        source_indices, target_indices = (
-                            _ordered_cross_object_correspondence(
+                        component_id = (
+                            f"{provider_key}:{signature}:{instance_index}:"
+                            f"{component['polygons'][0]}"
+                        )
+                        cached_placement = authored_component_cache.get(
+                            component_id
+                        )
+                        if cached_placement is not None:
+                            source_attachment_index = cached_placement[
+                                "source_attachment_index"
+                            ]
+                            target_attachment_index = cached_placement[
+                                "target_attachment_index"
+                            ]
+                            source_attachment = cached_placement[
+                                "source_attachment"
+                            ]
+                            target_attachment = cached_placement[
+                                "target_attachment"
+                            ]
+                            attachment_correspondence = cached_placement[
+                                "attachment_correspondence"
+                            ]
+                        else:
+                            attachment = _attachment_point_correspondence(
                                 source_obj,
                                 source_component,
-                                final_merged_mesh,
+                                target_object,
                                 component,
+                                attachment_vertex_uv,
+                            )
+                            source_attachment_index = attachment[
+                                "source_index"
+                            ]
+                            target_attachment_index = attachment[
+                                "target_index"
+                            ]
+                            source_attachment = _world_coordinate(
+                                source_obj,
+                                attachment["source_coordinate"],
+                            )
+                            target_attachment = _world_coordinate(
+                                target_object,
+                                attachment["target_coordinate"],
+                            )
+                            attachment_correspondence = attachment["evidence"]
+                        authored_node = (
+                            (cached_placement or {}).get("authored_node")
+                        )
+                        authored_match_warning = (
+                            (cached_placement or {}).get(
+                                "authored_node_match_warning"
                             )
                         )
-                        source_world = _world_points(
-                            source_obj,
-                            source_indices,
-                        )
-                        target_world = _world_points(
-                            final_merged_mesh,
-                            target_indices,
-                        )
-                        (
-                            source_attachment_index,
-                            target_attachment_index,
-                        ) = _attachment_vertex_correspondence(
-                            source_obj,
-                            source_component,
-                            final_merged_mesh,
-                            component,
-                            attachment_vertex_uv,
-                        )
-                        source_attachment = _world_points(
-                            source_obj,
-                            [source_attachment_index],
-                        )[0]
-                        target_attachment = _world_points(
-                            final_merged_mesh,
-                            [target_attachment_index],
-                        )[0]
+                        if authored_node_table.get("available"):
+                            if authored_node is not None:
+                                claimed_authored_node_guids.add(
+                                    authored_node["node_guid"]
+                                )
+                                fit_target_attachment = list(
+                                    authored_node["position_meters"]
+                                )
+                                placement_source = (
+                                    "authored_spm_node_translation_and_state__"
+                                    "surviving_root_tip_rotation_uniform_scale"
+                                )
+                                authored_binding_count += 1
+                            else:
+                                fit_target_attachment = target_attachment
+                                placement_source = (
+                                    "render_attachment_translation__"
+                                    "authored_node_assignment_degraded"
+                                )
+                                degraded_authored_binding_count += 1
+                            fit_source_attachment = [0.0, 0.0, 0.0]
+                        else:
+                            fit_target_attachment = target_attachment
+                            fit_source_attachment = source_attachment
+                            placement_source = (
+                                "legacy_post_cull_similarity_fallback__"
+                                "authored_node_data_absent"
+                            )
+                            legacy_fallback_binding_count += 1
+                        correspondence_error = None
+                        try:
+                            (
+                                source_indices,
+                                target_indices,
+                                correspondence_evidence,
+                            ) = _ordered_cross_object_correspondence(
+                                source_obj,
+                                source_component,
+                                target_object,
+                                component,
+                                include_evidence=True,
+                            )
+                            source_world = _world_points(
+                                source_obj,
+                                source_indices,
+                            )
+                            target_world = _world_points(
+                                target_object,
+                                target_indices,
+                            )
+                        except ClusterAssemblyBuildError as exc:
+                            if not authored_node_table.get("available"):
+                                raise
+                            correspondence_error = str(exc)
+                            correspondence_evidence = {
+                                "policy": (
+                                    "attachment_locked_export_safe_degraded_v1"
+                                ),
+                                "error": correspondence_error,
+                            }
+                            source_world = _world_points(
+                                source_obj, source_component["vertices"]
+                            )
+                            target_world = []
                         source_diagonal = max(
                             math.dist(
                                 [
@@ -4102,12 +6018,98 @@ def build_blender_assembly_inputs(
                                 "normalized plan attachment pivot is not at "
                                 "the authored local origin"
                             )
-                        transform = fit_uniform_similarity_transform(
-                            source_world,
-                            target_world,
-                            source_attachment=source_attachment,
-                            target_attachment=target_attachment,
+                        if authored_node_table.get("available"):
+                            if correspondence_error is not None:
+                                transform = attachment_locked_safe_transform(
+                                    fit_target_attachment,
+                                    correspondence_error,
+                                )
+                            else:
+                                try:
+                                    transform = (
+                                        derive_endpoint_uniform_similarity_transform(
+                                            source_world,
+                                            target_world,
+                                            source_attachment=(
+                                                fit_source_attachment
+                                            ),
+                                            target_attachment=(
+                                                fit_target_attachment
+                                            ),
+                                        )
+                                    )
+                                except ClusterAssemblyBuildError as exc:
+                                    try:
+                                        transform = (
+                                            fit_uniform_similarity_transform(
+                                                source_world,
+                                                target_world,
+                                                source_attachment=(
+                                                    fit_source_attachment
+                                                ),
+                                                target_attachment=(
+                                                    fit_target_attachment
+                                                ),
+                                            )
+                                        )
+                                        transform["construction_mode"] = (
+                                            "bounded_similarity_after_endpoint_"
+                                            "frame_failure_v1"
+                                        )
+                                        transform[
+                                            "placement_quality_warning"
+                                        ] = str(exc)
+                                    except ClusterAssemblyBuildError as fit_exc:
+                                        transform = (
+                                            attachment_locked_safe_transform(
+                                                fit_target_attachment,
+                                                f"endpoint={exc}; fit={fit_exc}",
+                                            )
+                                        )
+                        else:
+                            transform = fit_uniform_similarity_transform(
+                                source_world,
+                                target_world,
+                                source_attachment=fit_source_attachment,
+                                target_attachment=fit_target_attachment,
+                            )
+                        transform["placement_source"] = placement_source
+                        transform["correspondence_evidence"] = (
+                            correspondence_evidence
                         )
+                        transform["attachment_correspondence"] = deepcopy(
+                            attachment_correspondence
+                        )
+                        if authored_node is not None:
+                            transform["attachment_pivot_error_scope"] = (
+                                "authored_spm_node_absolute_translation"
+                            )
+                            transform["authored_node"] = {
+                                key: deepcopy(authored_node[key])
+                                for key in (
+                                    "node_guid",
+                                    "generator_guid",
+                                    "parent_guid",
+                                    "anchor_index",
+                                    "position_speedtree_units",
+                                    "position_meters",
+                                    "hidden",
+                                    "valid_position",
+                                    "deleted",
+                                    "culled",
+                                    "match_evidence",
+                                )
+                            }
+                            transform[
+                                "authored_to_render_attachment_error_meters"
+                            ] = math.dist(
+                                fit_target_attachment,
+                                target_attachment,
+                            )
+                        elif authored_match_warning is not None:
+                            transform["authored_node_match_warning"] = (
+                                deepcopy(authored_match_warning)
+                            )
                         transform["attachment_vertex_index"] = (
                             attachment_vertex_index
                         )
@@ -4115,16 +6117,56 @@ def build_blender_assembly_inputs(
                             float(value)
                             for value in attachment_vertex_uv
                         ]
-                        influences = _component_influences(
-                            final_merged_mesh,
-                            component,
+                        gate_assembly_transform_residuals(
+                            transform,
+                            {
+                                "full_asset": stem,
+                                "part_asset": part_asset_name,
+                                "prototype_id": prototype_id,
+                                "role": role,
+                                "card_ordinal": ordinal,
+                                "instance": instance_index,
+                                "target_mesh_id": target_mesh_id,
+                                "placement_source": placement_source,
+                                "authored_node_guid": (
+                                    authored_node.get("node_guid")
+                                    if authored_node is not None
+                                    else None
+                                ),
+                                "component_polygon_indices": (
+                                    component["polygons"]
+                                ),
+                                "correspondence_policy": (
+                                    correspondence_evidence["policy"]
+                                ),
+                            },
+                            block_geometry=(
+                                not authored_node_table.get("available")
+                            ),
                         )
+                        if target_object is final_merged_mesh:
+                            influences = _component_influences(
+                                target_object,
+                                component,
+                            )
+                            influence_source = {
+                                "policy": "render_component_weights_v1",
+                            }
+                        else:
+                            influences, influence_source = (
+                                _nearest_weighted_vertex_influences(
+                                    final_merged_mesh,
+                                    weighted_vertex_locator,
+                                    target_attachment,
+                                )
+                            )
                         binding = {
                             "instance": instance_index,
                             "card_ordinal": ordinal,
                             "component_polygon_indices": component["polygons"],
                             "transform": transform,
                             "bone_influences": influences,
+                            "bone_influence_source": influence_source,
                         }
                         hierarchy = validate_binding_hierarchy(
                             binding,
@@ -4199,6 +6241,7 @@ def build_blender_assembly_inputs(
                                     "asset_name": subpart_asset,
                                     "export_stem": subpart_asset,
                                     "role": role,
+                                    "provider_key": provider_key,
                                     "role_identity": role_row["role_identity"],
                                     "topology_signature": "composite_subpart",
                                     "logical_group_index": ROLE_ORDER.index(role),
@@ -4248,6 +6291,34 @@ def build_blender_assembly_inputs(
                                         subpart.get("subpart_to_card_matrix"),
                                     )
                                 )
+                                base_gate_evidence = deepcopy(
+                                    (
+                                        base_binding["transform"].get(
+                                            "residual_gate"
+                                        )
+                                        or {}
+                                    ).get("evidence")
+                                    or {}
+                                )
+                                base_gate_evidence.update({
+                                    "part_asset": subpart_asset,
+                                    "composite_subpart_index": subpart_index,
+                                    "residual_scope": (
+                                        "parent_card_fit_before_composite"
+                                    ),
+                                })
+                                gate_assembly_transform_residuals(
+                                    composite_binding["transform"],
+                                    base_gate_evidence,
+                                    block_geometry=bool(
+                                        (
+                                            base_binding["transform"].get(
+                                                "residual_gate"
+                                            )
+                                            or {}
+                                        ).get("geometry_residual_blocking")
+                                    ),
+                                )
                                 accumulator["bindings"].append(composite_binding)
                                 all_bindings.append(composite_binding)
                         continue
@@ -4295,6 +6366,7 @@ def build_blender_assembly_inputs(
                         "asset_name": part_asset_name,
                         "export_stem": part_asset_name,
                         "role": role,
+                        "provider_key": provider_key,
                         "role_identity": role_row["role_identity"],
                         "topology_signature": signature,
                         "external_source": external_source,
@@ -4304,43 +6376,18 @@ def build_blender_assembly_inputs(
                             "center": [0.0, 0.0, 0.0],
                         },
                         "bindings": bindings,
-                        "fit_summary": {
-                            "fit_mode": "uniform_similarity_3d",
-                            "trs_relative_rms_median": statistics.median(
-                                row["transform"]["trs_relative_rms"]
-                                for row in bindings
-                            ),
-                            "trs_relative_rms_max": max(
-                                row["transform"]["trs_relative_rms"]
-                                for row in bindings
-                            ),
-                            "affine_relative_rms_median": statistics.median(
-                                row["transform"]["affine_relative_rms"]
-                                for row in bindings
-                            ),
-                            "affine_relative_rms_max": max(
-                                row["transform"]["affine_relative_rms"]
-                                for row in bindings
-                            ),
-                        },
+                        "fit_summary": _assembly_fit_summary(
+                            bindings,
+                            "uniform_similarity_3d",
+                        ),
                     })
                 for key in sorted(composite_accumulators):
                     accumulator = composite_accumulators[key]
                     fit_rows = accumulator["bindings"]
-                    accumulator["fit_summary"].update({
-                        "trs_relative_rms_median": statistics.median(
-                            row["transform"]["trs_relative_rms"] for row in fit_rows
-                        ),
-                        "trs_relative_rms_max": max(
-                            row["transform"]["trs_relative_rms"] for row in fit_rows
-                        ),
-                        "affine_relative_rms_median": statistics.median(
-                            row["transform"]["affine_relative_rms"] for row in fit_rows
-                        ),
-                        "affine_relative_rms_max": max(
-                            row["transform"]["affine_relative_rms"] for row in fit_rows
-                        ),
-                    })
+                    accumulator["fit_summary"] = _assembly_fit_summary(
+                        fit_rows,
+                        "uniform_similarity_3d_composite_subpart",
+                    )
                     parts.append(accumulator)
                 continue
             raise ClusterAssemblyBuildError(
@@ -4380,18 +6427,29 @@ def build_blender_assembly_inputs(
             if not ordinals:
                 ordinals = [int(external.get("ordinal") or 0)]
             used_variant_keys.update(
-                (str(part.get("role") or "").casefold(), int(ordinal))
+                (
+                    str(
+                        part.get("provider_key")
+                        or part.get("role")
+                        or ""
+                    ).casefold(),
+                    int(ordinal),
+                )
                 for ordinal in ordinals
                 if int(ordinal) > 0
             )
         registered_role_rows = dict(prepared_unused_roles)
         registered_role_rows.update(roles)
-        for role, role_row in sorted(registered_role_rows.items()):
+        for provider_key, role_row in sorted(
+            registered_role_rows.items()
+        ):
+            role = str(role_row.get("role") or "").casefold()
             normalized = role_row.get("normalized_variants") or {}
             for variant in normalized.get("variants") or []:
                 ordinal = int(variant.get("ordinal") or 0)
                 registered_variants.append({
                     "role": role,
+                    "provider_key": provider_key,
                     "ordinal": ordinal,
                     "card_name": str(variant.get("plan_name") or ""),
                     "skeletal_asset_name": str(
@@ -4419,8 +6477,116 @@ def build_blender_assembly_inputs(
                         float(value)
                         for value in variant.get("attachment_vertex_uv")
                     ],
-                    "instanced": (role.casefold(), ordinal) in used_variant_keys,
+                    "instanced": (
+                        provider_key.casefold(), ordinal
+                    ) in used_variant_keys,
                 })
+        authored_spm_after = validate_file_fingerprint(
+            handoff.get("spm"),
+            "target SPM authored Node placement",
+        )
+        if authored_spm_after != authored_spm_fingerprint:
+            raise ClusterAssemblyBuildError(
+                "target SPM changed while authored placement was built"
+            )
+        persisted_residual_gates = [
+            (binding.get("transform") or {}).get("residual_gate") or {}
+            for part in parts
+            for binding in part.get("bindings") or []
+        ]
+        residual_warning_count = sum(
+            gate.get("status") == "warning"
+            for gate in persisted_residual_gates
+        )
+        placement_contract = {
+            "version": PLACEMENT_CONTRACT_VERSION,
+            "status": "ready",
+            "source_spm": authored_spm_fingerprint,
+            "authored_node_table": {
+                key: deepcopy(authored_node_table.get(key))
+                for key in (
+                    "status",
+                    "available",
+                    "unit_contract",
+                    "meters_per_speedtree_unit",
+                    "node_count",
+                    "active_node_count",
+                    "excluded_node_count",
+                    "excluded_reason_counts",
+                )
+                if key in authored_node_table
+            },
+            "candidate_policy": (
+                "deterministic_maximum_cardinality_state_mesh_filtered_"
+                "one_to_one_v1"
+                if authored_node_table.get("available")
+                else "legacy_only_when_authored_node_data_absent_v1"
+            ),
+            "translation_source": (
+                "authored_spm_node_absolute_position_or_render_attachment_"
+                "when_bounded_assignment_is_unavailable"
+                if authored_node_table.get("available")
+                else "legacy_post_cull_geometry_attachment"
+            ),
+            "rotation_uniform_scale_source": (
+                "surviving_root_tip_frame_then_bounded_similarity_then_"
+                "identity_unit_scale_safe_fallback"
+            ),
+            "node_fields_do_not_serialize_rotation_or_uniform_scale": True,
+            "authored_card_binding_count": authored_binding_count,
+            "degraded_authored_card_binding_count": (
+                degraded_authored_binding_count
+            ),
+            "legacy_fallback_card_binding_count": (
+                legacy_fallback_binding_count
+            ),
+            "claimed_authored_node_count": len(
+                claimed_authored_node_guids
+            ),
+            "authored_node_match_threshold_meters": (
+                AUTHORED_NODE_GLOBAL_ASSIGNMENT_TOLERANCE_METERS
+            ),
+            "authored_node_assignment": {
+                key: deepcopy(authored_assignment_report.get(key))
+                for key in (
+                    "policy",
+                    "threshold_meters",
+                    "component_count",
+                    "candidate_count",
+                    "assigned_count",
+                    "unmatched_count",
+                    "unmatched",
+                )
+            },
+            "residual_ready_gate": {
+                "status": (
+                    "pass_with_quality_warnings"
+                    if residual_warning_count
+                    else "pass"
+                ),
+                "policy": (
+                    "hard_authored_pivot_gate_with_recorded_geometry_quality_"
+                    "warning_v1"
+                ),
+                "threshold": MAX_ASSEMBLY_RESIDUAL_RELATIVE_RMS,
+                "authored_pivot_error_threshold_meters": (
+                    MAX_ASSEMBLY_PIVOT_ERROR_METERS
+                ),
+                "asset_special_cases": False,
+                "tolerance_widening": False,
+                "authored_geometry_residual_blocks_export": False,
+                "legacy_geometry_residual_blocks_export": True,
+                "binding_count": len(persisted_residual_gates),
+                "quality_warning_binding_count": residual_warning_count,
+                "maximum_relative_rms": max(
+                    (
+                        float(gate.get("maximum_relative_rms") or 0.0)
+                        for gate in persisted_residual_gates
+                    ),
+                    default=0.0,
+                ),
+            },
+        }
         manifest = {
             "schema_version": SCHEMA_VERSION,
             "kind": MANIFEST_KIND,
@@ -4448,6 +6614,7 @@ def build_blender_assembly_inputs(
                 if role in prepared_unused_roles
             ],
             "preserved_render_components": preserved_render_components,
+            "placement_contract": placement_contract,
             "final_skeleton": snapshot,
             "wind_contract": wind_validation,
             "coordinate_contract": {
@@ -5061,9 +7228,9 @@ def _apply_generated_fbx_import_contract(manifest_asset):
         )
 
     overrides = {
-        # Generated FBX geometry and bones are already baked to centimeters
-        # with object transforms normalized to 1, so consume them with the
-        # same no-extra-conversion policy as the Full SK.
+        # Generated FBX geometry stays in the Full SK local coordinate space,
+        # while its object transforms already carry the same Unreal Z-up axis
+        # conversion as Send2UE. Consume it without a second conversion.
         "convert_scene": False,
         "convert_scene_unit": False,
         "force_front_x_axis": False,
@@ -5418,8 +7585,14 @@ def validate_unreal_bounds_contract(
         + abs(full_normalized[1] - base_normalized[2])
         + abs(full_normalized[2] - base_normalized[1])
     )
+    base_axis_shape_validation = (
+        "deferred_to_final_assembly"
+        if allow_normalized_prototype_dominance
+        else "full_base_shape"
+    )
     if (
-        not base_scale_outside_limit
+        not allow_normalized_prototype_dominance
+        and not base_scale_outside_limit
         and yz_swapped_error + 0.05 < direct_error
     ):
         raise ClusterAssemblyBuildError(
@@ -5433,6 +7606,7 @@ def validate_unreal_bounds_contract(
         "base": base_bounds,
         "base_direct_shape_error": direct_error,
         "base_yz_swapped_shape_error": yz_swapped_error,
+        "base_axis_shape_validation": base_axis_shape_validation,
         "base_axis_scale_ratios": axis_scale_ratios,
         "base_absolute_scale_ratio": absolute_scale_ratio,
         "base_absolute_scale_ratio_limit": ratio_limit,
@@ -6226,8 +8400,8 @@ __all__ = [
     "build_unreal_nanite_assembly",
     "content_build_decision",
     "file_fingerprint",
-    "fit_trs_transform",
     "fit_uniform_similarity_transform",
+    "gate_assembly_transform_residuals",
     "lowest_common_ancestor",
     "make_skeleton_snapshot",
     "normalize_role_identity",

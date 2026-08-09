@@ -22,8 +22,18 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-import addon_utils
 import bpy
+
+TOOL_DIR = Path(__file__).resolve().parents[1]
+REPO_DIR = TOOL_DIR.parent
+sys.path.insert(0, str(REPO_DIR))
+sys.path.insert(0, str(TOOL_DIR))
+
+from mutation_plan_authority import (
+    require_child_payload,
+    validate_child_authority,
+)
+from blender_addon_gateway import prepare_runtime
 
 
 def parse_args():
@@ -41,6 +51,8 @@ def parse_args():
     parser.add_argument("--target-map-json", default="")
     parser.add_argument("--reuse-existing-blend", action="store_true")
     parser.add_argument("--work-dir", default="")
+    parser.add_argument("--authority-json", required=True)
+    parser.add_argument("--authority-sha256", required=True)
     return parser.parse_args(argv)
 
 
@@ -157,13 +169,11 @@ def validate_target_paths(cli_paths, mapped_targets):
         raise RuntimeError("--spm 목록과 --target-map-json의 최종 SK 목록이 다름")
 
 
-def apply_mapped_targets(props, targets, material_name):
-    try:
-        from atlas_leaf_mesh_builder.speedtree import (
-            export_or_update_speedtree_spm_path,
-        )
-    except Exception as exc:
-        raise RuntimeError(f"아틀라스 애드온 SpeedTree 연결 모듈 로드 실패: {exc}") from exc
+def apply_mapped_targets(props, targets, material_name, addon_runtime):
+    export_or_update_speedtree_spm_path = addon_runtime.operation(
+        "atlas_leaf_mesh_builder",
+        "export_or_update_speedtree_spm_path",
+    )
 
     parameters = inspect.signature(export_or_update_speedtree_spm_path).parameters
     required_parameters = {
@@ -206,7 +216,24 @@ def main():
     report = {"status": "error"}
     spm_backups = []
     blend_backup = None
+    addon_runtime = None
     try:
+        authority = validate_child_authority(
+            args.authority_json,
+            args.authority_sha256,
+        )
+        require_child_payload(authority, {
+            "albedo": str(args.albedo),
+            "alpha": str(args.alpha),
+            "material_name": str(args.material_name),
+            "blend_out": str(args.blend_out),
+            "spms": [str(path) for path in args.spm],
+            "target_map_json": str(args.target_map_json),
+            "build_spm": bool(args.build_spm),
+            "reuse_existing_blend": bool(args.reuse_existing_blend),
+            "quality": str(args.quality),
+            "plate_mode": str(args.plate_mode),
+        })
         mapped_targets = load_target_map(args.target_map_json)
         validate_target_paths(args.spm, mapped_targets)
         if mapped_targets and (not args.build_spm or not args.spm):
@@ -222,18 +249,33 @@ def main():
             raise RuntimeError(
                 f"기존 blend 덮어쓰기 차단: {blend_out} (재사용 모드를 사용하세요)")
 
-        enabled = addon_utils.enable("atlas_leaf_mesh_builder", default_set=False, persistent=False)
-        if enabled is None:
-            raise RuntimeError("애드온 atlas_leaf_mesh_builder 활성화 실패 (Blender addons 설치 확인)")
+        addon_runtime = prepare_runtime(
+            "pcg_st9_texture_batch.jobs.atlas_blend_job",
+            {
+                "atlas_leaf_mesh_builder": (
+                    "scene_generation_v1",
+                    "target_registry_v1",
+                    "source_index_v1",
+                    "speedtree_publish_v1",
+                ),
+            },
+        )
 
         props = bpy.context.scene.atlas_leaf_builder
-        from atlas_leaf_mesh_builder.props import (
-            add_spm_target_item,
-            save_spm_target_registry,
-            sync_spm_target_registry,
+        add_spm_target_item = addon_runtime.operation(
+            "atlas_leaf_mesh_builder", "add_spm_target_item"
         )
-        from atlas_leaf_mesh_builder.source_index import (
-            current_blend_source_index,
+        save_spm_target_registry = addon_runtime.operation(
+            "atlas_leaf_mesh_builder", "save_spm_target_registry_from_props"
+        )
+        sync_spm_target_registry = addon_runtime.operation(
+            "atlas_leaf_mesh_builder", "sync_spm_target_registry"
+        )
+        current_blend_source_index = addon_runtime.operation(
+            "atlas_leaf_mesh_builder", "current_blend_source_index"
+        )
+        load_target_registry = addon_runtime.operation(
+            "atlas_leaf_mesh_builder", "load_target_registry"
         )
         work_dir = args.work_dir or str(Path(args.blend_out).parent / "_atlas_job_work")
         Path(work_dir).mkdir(parents=True, exist_ok=True)
@@ -261,7 +303,6 @@ def main():
             raise RuntimeError("사용할 잎 메시가 없음 (알파 아일랜드/기존 Collection 확인)")
 
         if args.reuse_existing_blend:
-            from atlas_leaf_mesh_builder.target_registry import load_target_registry
             if load_target_registry(blend_out) is not None:
                 sync_spm_target_registry(props, initialize_missing=False)
         else:
@@ -281,7 +322,11 @@ def main():
             spm_backups = backup_spms(args.spm)
             if mapped_targets:
                 target_results = apply_mapped_targets(
-                    props, mapped_targets, args.material_name)
+                    props,
+                    mapped_targets,
+                    args.material_name,
+                    addon_runtime,
+                )
                 generator_connections_complete = bool(target_results) and all(
                     row["generator_connection"].get("complete") is True
                     for row in target_results
@@ -319,6 +364,11 @@ def main():
             "reused_existing_blend": bool(args.reuse_existing_blend),
             "blend_backup": str(blend_backup) if blend_backup else None,
             "spm_backups": [str(backup) for _target, backup in spm_backups],
+            "blender_addon_runtime": addon_runtime.receipt,
+            "authority_sha256": authority.get(
+                "parent_authority_sha256"
+            ),
+            "authority_unit": authority.get("unit_id"),
         }
     except Exception as exc:
         restored = []
@@ -336,6 +386,7 @@ def main():
                 blend_restored = f"복원 실패: {restore_exc}"
         report = {
             "status": "error", "error": str(exc), "traceback": traceback.format_exc(),
+            "authority_document_sha256": args.authority_sha256,
             "spm_backups": [str(backup) for _target, backup in spm_backups],
             "spm_restored": restored,
             "blend_backup": str(blend_backup) if blend_backup else None,

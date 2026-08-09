@@ -400,7 +400,7 @@ class SpeedTreeTextureContractTests(unittest.TestCase):
                 material_name["missing_roles"], list(REQUIRED_TEXTURE_ROLES)
             )
 
-    def test_missing_roles_are_reported_deterministically(self):
+    def test_partial_roles_are_retained_without_becoming_an_admission_gate(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             textures = root / "texture"
@@ -423,12 +423,64 @@ class SpeedTreeTextureContractTests(unittest.TestCase):
             second = resolve_texture_bindings(stmat)
 
             expected = ["extra", "height", "opacity", "subsurface"]
-            self.assertEqual(first["status"], "incomplete")
+            self.assertEqual(first["status"], "partial")
+            self.assertFalse(first["affects_pipeline_outcome"])
+            self.assertEqual(first["bindings"][0]["status"], "partial")
+            self.assertEqual(
+                set(first["bindings"][0]["files"]), {"color", "normal"}
+            )
+            self.assertEqual(
+                first["bindings"][0]["binding_disposition"],
+                "bind_available",
+            )
             self.assertEqual(first["missing"][0]["missing_roles"], expected)
             self.assertEqual(first, second)
             self.assertEqual(
                 json.dumps(first, sort_keys=True), json.dumps(second, sort_keys=True)
             )
+
+    def test_multiple_complete_sets_are_left_unassigned_without_blocking(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            textures = root / "texture"
+            self._write_set(textures, "T_First_01")
+            self._write_set(textures, "T_Second_01")
+            stmat = root / "plant.stmat"
+            self._write_stmat(
+                stmat,
+                [
+                    (
+                        "Stem",
+                        [
+                            ("Color", "texture/T_First_01_Color.png"),
+                            ("Normal", "texture/T_Second_01_Normal.png"),
+                        ],
+                    )
+                ],
+            )
+
+            result = resolve_texture_bindings(stmat)
+
+            self.assertEqual(result["status"], "partial")
+            self.assertFalse(result["affects_pipeline_outcome"])
+            binding = result["bindings"][0]
+            self.assertEqual(binding["status"], "ambiguous_complete_sets")
+            self.assertEqual(binding["binding_disposition"], "leave_unassigned")
+            self.assertEqual(binding["files"], {})
+
+    def test_textureless_material_is_explicitly_unassigned(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stmat = root / "plant.stmat"
+            self._write_stmat(stmat, [("Stem", [])])
+
+            result = resolve_texture_bindings(stmat)
+
+            self.assertEqual(result["status"], "partial")
+            binding = result["bindings"][0]
+            self.assertEqual(binding["status"], "unassigned")
+            self.assertEqual(binding["binding_disposition"], "leave_unassigned")
+            self.assertEqual(binding["files"], {})
 
     def test_read_stmat_preserves_duplicate_named_material_slots(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -575,6 +627,94 @@ class SpeedTreeTextureContractTests(unittest.TestCase):
                 texture_root / "T_leaf_test_normal.tga",
             )
             self.assertIn("PCG ST9 Texture", missing["remediation"])
+
+    def test_runtime_rebase_keeps_safe_subset_and_clears_unavailable_roles(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "Tree_test"
+            source = root / "Cluster" / "SK_leaf_test.spm"
+            self._write_spm(
+                source,
+                "M_leaf_test",
+                [("Color", "old_color.tif"), ("Normal", "old_normal.tif")],
+            )
+            texture_root = root / "texture"
+            texture_root.mkdir(parents=True)
+            color = texture_root / "T_leaf_test_color.tga"
+            color.write_bytes(b"color")
+            missing_normal = texture_root / "T_leaf_test_normal.tga"
+            override = {
+                "7": {
+                    "origin_kind": "pcg_sbs",
+                    "texture_base": "T_leaf_test",
+                    "required_roles": ["color", "normal"],
+                    "files": {
+                        "color": str(color),
+                        "normal": str(missing_normal),
+                    },
+                }
+            }
+            plan = build_spm_canonical_texture_plan(
+                source, material_output_overrides=override
+            )
+            self.assertEqual(plan["status"], "blocked")
+
+            isolated = root / ".isolated" / source.name
+            isolated.parent.mkdir()
+            isolated.write_bytes(source.read_bytes())
+            result = rebase_spm_copy_to_canonical_outputs(
+                isolated,
+                source,
+                plan,
+                texture_policy="runtime_tolerant",
+            )
+
+            slots = inspect_spm_texture_slots(isolated)["materials"][0]["slots"]
+            self.assertEqual(result["texture_availability"], "partial")
+            self.assertEqual(result["rewritten_reference_count"], 1)
+            self.assertEqual(result["omitted_reference_count"], 1)
+            self.assertEqual([row["role"] for row in slots], ["color"])
+            self.assertEqual(
+                Path(slots[0]["resolved_ref"]).resolve(), color.resolve()
+            )
+            self.assertNotIn("old_normal.tif", isolated.read_text(encoding="utf-8"))
+
+    def test_runtime_rebase_allows_textureless_material(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "Tree_test"
+            source = root / "Cluster" / "SK_leaf_test.spm"
+            self._write_spm(
+                source,
+                "M_leaf_test",
+                [("Color", "old_color.tif"), ("Normal", "old_normal.tif")],
+            )
+            plan = build_spm_canonical_texture_plan(
+                source,
+                material_output_overrides={
+                    "7": {
+                        "origin_kind": "pcg_sbs",
+                        "texture_base": "",
+                        "required_roles": [],
+                        "files": {},
+                    }
+                },
+            )
+            isolated = root / ".isolated" / source.name
+            isolated.parent.mkdir()
+            isolated.write_bytes(source.read_bytes())
+
+            result = rebase_spm_copy_to_canonical_outputs(
+                isolated,
+                source,
+                plan,
+                texture_policy="runtime_tolerant",
+            )
+
+            self.assertEqual(result["texture_availability"], "textureless")
+            self.assertEqual(result["rewritten_reference_count"], 0)
+            self.assertEqual(result["omitted_reference_count"], 2)
+            self.assertEqual(
+                inspect_spm_texture_slots(isolated)["materials"][0]["slots"], []
+            )
 
     def test_canonical_manifest_requires_the_exact_six_role_contract(self):
         with tempfile.TemporaryDirectory() as temporary:

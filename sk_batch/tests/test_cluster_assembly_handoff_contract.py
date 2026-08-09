@@ -15,6 +15,7 @@ if str(BATCH_TOOLS_DIR) not in sys.path:
 
 from cluster_assembly_handoff_contract import (  # noqa: E402
     _compare_artifact,
+    _reconcile_role,
     assembly_source_fbx_from_contract,
     assembly_source_fbx_resolution,
     build_assembly_handoff,
@@ -25,6 +26,20 @@ from cluster_assembly_handoff_contract import (  # noqa: E402
     resolve_cluster_receipt_path,
     role_identity_aliases_from_contract,
 )
+
+
+class CurrentFbxRoleAuthorityTests(unittest.TestCase):
+    def test_rendered_expansion_does_not_invent_absent_fbx_geometry(self):
+        decision, evidence = _reconcile_role(
+            {
+                "decision": "normalize_part",
+                "rendered_provider_expansion_covered": True,
+            },
+            {"decision": "pass_through"},
+        )
+
+        self.assertEqual(decision, "pass_through")
+        self.assertEqual(evidence, "current_fbx_overrides_receipt_decision")
 from pcg_st9_texture_batch.pcg_cluster_assembly_contract import (  # noqa: E402
     ClusterAssemblyReceiptAmbiguityError,
 )
@@ -372,6 +387,12 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
     def test_export_name_normalization_keeps_role_identity(self):
         self.assertEqual(
             normalize_export_name("Material::M_branch_elm_01_Mat"),
+            "branch_elm_01",
+        )
+        self.assertEqual(
+            normalize_export_name(
+                "Material::M_branch_elm_01_Mat.001.001"
+            ),
             "branch_elm_01",
         )
 
@@ -741,7 +762,7 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                 ["M_leaf_provider_legacy_01"],
             )
 
-    def test_actionable_role_without_normalized_variants_is_blocked(self):
+    def test_actionable_role_without_normalized_variants_uses_live_pair(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             spm = root / "SK_Tree_elm_01.spm"
@@ -759,13 +780,19 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                 [role_object(fbx)], fbx, {"branch": "branch_elm_01"}
             )
             handoff = build_assembly_handoff(receipt, spm, inventory)
-            self.assertEqual(handoff["status"], "blocked")
-            self.assertIn(
-                "normalized_variants_required",
-                [row.get("reason") for row in handoff["issues"]],
+            self.assertEqual(handoff["status"], "pass_through")
+            branch = next(
+                row for row in handoff["roles"]
+                if row["role"] == "branch"
             )
+            self.assertEqual(branch["decision"], "pass_through")
+            self.assertEqual(
+                branch["reconciliation"],
+                "normalized_variants_metadata_missing_nonblocking",
+            )
+            self.assertEqual(handoff["issues"], [])
 
-    def test_asset_registration_only_is_pass_through_before_bwr(self):
+    def test_actual_pair_overrides_asset_registration_only_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             spm = root / "SK_Tree_elm_01.spm"
@@ -803,13 +830,65 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                 row for row in handoff["roles"]
                 if row["role"] == "branch"
             )
-            self.assertEqual(branch["decision"], "pass_through")
+            self.assertEqual(handoff["status"], "ready")
+            self.assertEqual(branch["decision"], "normalize_part")
             self.assertEqual(
                 branch["reconciliation"],
-                "asset_registration_only",
+                "current_fbx_pair_overrides_asset_registration_only",
             )
 
-    def test_incomplete_generator_connection_is_blocked_before_bwr(self):
+    def test_target_alias_does_not_override_unconnected_provider_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_Tree_elm_01.spm"
+            fbx = root / "tree.fbx"
+            receipt = root / "receipt.json"
+            spm.write_bytes(b"spm")
+            fbx.write_bytes(b"fbx")
+            write_receipt(
+                receipt,
+                spm,
+                fbx,
+                [("cluster", "cluster_provider_03", "pending_export")],
+                normalized_by_role={
+                    "cluster": {
+                        "status": "ready",
+                        "material": "M_cluster_provider_03",
+                        "variants": [{"ordinal": 1}],
+                        "delivery_mode": "asset_registration_only",
+                        "target_deliveries": [{
+                            "schema_version": 1,
+                            "spm": str(spm),
+                            "delivery_mode": "asset_registration_only",
+                            "generator_bindings": [],
+                        }],
+                    },
+                },
+                target_material_by_role={
+                    "cluster": "M_cluster_target_01",
+                },
+            )
+            inventory = build_blender_fbx_inventory(
+                [role_object(fbx, material="M_cluster_target_01")],
+                fbx,
+                {"cluster": "M_cluster_target_01"},
+            )
+
+            handoff = build_assembly_handoff(receipt, spm, inventory)
+
+            cluster = next(
+                row for row in handoff["roles"]
+                if row["role"] == "cluster"
+            )
+            self.assertEqual(handoff["status"], "pass_through")
+            self.assertEqual(cluster["decision"], "pass_through")
+            self.assertFalse(cluster["provider_identity_matches_actual"])
+            self.assertEqual(
+                cluster["reconciliation"],
+                "asset_registration_only_provider_name_mismatch",
+            )
+
+    def test_actual_pair_overrides_incomplete_connection_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             spm = root / "SK_Tree_elm_01.spm"
@@ -842,18 +921,67 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
 
             handoff = build_assembly_handoff(receipt, spm, inventory)
 
-            self.assertEqual(handoff["status"], "blocked")
+            self.assertEqual(handoff["status"], "ready")
             branch = next(
                 row for row in handoff["roles"]
                 if row["role"] == "branch"
             )
-            self.assertEqual(branch["decision"], "blocked")
+            self.assertEqual(branch["decision"], "normalize_part")
             self.assertEqual(
                 branch["reconciliation"],
-                "generator_connection_incomplete",
+                "current_fbx_pair_overrides_connection_incomplete",
+            )
+            self.assertEqual(handoff["issues"], [])
+
+    def test_target_alias_does_not_override_incomplete_provider_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_Tree_elm_01.spm"
+            fbx = root / "tree.fbx"
+            receipt = root / "receipt.json"
+            spm.write_bytes(b"spm")
+            fbx.write_bytes(b"fbx")
+            write_receipt(
+                receipt,
+                spm,
+                fbx,
+                [("leaf", "cluster_provider_07", "pending_export")],
+                normalized_by_role={
+                    "leaf": {
+                        "status": "ready",
+                        "material": "M_cluster_provider_07",
+                        "variants": [{"ordinal": 1}],
+                        "delivery_mode": "connection_incomplete",
+                        "target_deliveries": [{
+                            "schema_version": 1,
+                            "spm": str(spm),
+                            "delivery_mode": "connection_incomplete",
+                            "generator_bindings": [],
+                        }],
+                    },
+                },
+                target_material_by_role={"leaf": "M_leaf_target_05"},
+            )
+            inventory = build_blender_fbx_inventory(
+                [role_object(fbx, material="M_leaf_target_05")],
+                fbx,
+                {"leaf": "M_leaf_target_05"},
             )
 
-    def test_bark_block_identifies_exact_provider_and_material(self):
+            handoff = build_assembly_handoff(receipt, spm, inventory)
+
+            leaf = next(
+                row for row in handoff["roles"] if row["role"] == "leaf"
+            )
+            self.assertEqual(handoff["status"], "pass_through")
+            self.assertEqual(leaf["decision"], "pass_through")
+            self.assertFalse(leaf["provider_identity_matches_actual"])
+            self.assertEqual(
+                leaf["reconciliation"],
+                "connection_incomplete_provider_name_mismatch",
+            )
+
+    def test_bark_normalization_metadata_does_not_block_live_pair(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             spm = root / "SK_Tree_elm_01.spm"
@@ -888,6 +1016,7 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
             }]
             handoff_contract["canonical_bark"] = {
                 "status": "replacement_required",
+                "mutation_requested": True,
                 "canonical_material": "M_bark_elm_01",
                 "cluster_bark_sources": [{
                     "cluster_spm": str(provider),
@@ -913,25 +1042,14 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
 
             handoff = build_assembly_handoff(receipt, spm, inventory)
 
-            self.assertEqual(handoff["status"], "blocked")
-            issue = next(
-                row
-                for row in handoff["issues"]
-                if row["code"]
-                == "CANONICAL_BARK_NORMALIZATION_REQUIRED"
-            )
-            self.assertEqual(issue["role"], "leaf")
-            self.assertEqual(issue["spm"], str(provider))
+            self.assertEqual(handoff["status"], "ready")
+            self.assertEqual(handoff["issues"], [])
             self.assertEqual(
-                issue["material"],
-                "M_bark_common_end_01",
-            )
-            self.assertEqual(
-                issue["canonical_material"],
-                "M_bark_elm_01",
+                handoff["canonical_bark_captures"][0]["status"],
+                "missing_pipeline_report",
             )
 
-    def test_ambiguous_canonical_bark_preserves_provider_texture_conflicts(self):
+    def test_legacy_ambiguous_bark_audit_does_not_block_live_variants(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             spm = root / "SK_tree_black_locast_01.spm"
@@ -992,20 +1110,19 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
 
             handoff = build_assembly_handoff(receipt, spm, inventory)
 
-            issue = next(
-                row
+            self.assertNotEqual(handoff["status"], "blocked", handoff)
+            self.assertFalse(any(
+                row.get("code") == "CANONICAL_BARK_AMBIGUOUS"
                 for row in handoff["issues"]
-                if row["code"] == "CANONICAL_BARK_AMBIGUOUS"
-            )
+            ))
             self.assertEqual(
-                issue["reason"],
-                "blocked_canonical_ambiguous",
+                handoff["canonical_bark_delivery"],
+                {
+                    "status": "blocked_canonical_ambiguous",
+                    "mutation_requested": False,
+                    "normalization_gate_applied": False,
+                },
             )
-            self.assertEqual(
-                issue["canonical_material"],
-                "M_bark_black_locast_01",
-            )
-            self.assertEqual(issue["canonical_conflicts"], conflicts)
 
     def test_exact_isolated_bark_capture_satisfies_stale_receipt_request(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1048,6 +1165,7 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
             }]
             handoff_contract["canonical_bark"] = {
                 "status": "replacement_required",
+                "mutation_requested": True,
                 "canonical_material": "M_bark_elm_01",
                 "cluster_bark_sources": [{
                     "cluster_spm": str(provider),
@@ -1106,7 +1224,7 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                 for row in handoff["issues"]
             ))
 
-    def test_receipt_pass_through_disagreeing_with_real_pair_is_blocked(self):
+    def test_current_pair_overrides_disagreeing_receipt(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             spm = root / "SK_Tree_elm_01.spm"
@@ -1124,13 +1242,18 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                 [role_object(fbx)], fbx, {"branch": "branch_elm_01"}
             )
             handoff = build_assembly_handoff(receipt, spm, inventory)
-            self.assertEqual(handoff["status"], "blocked")
-            self.assertIn(
-                "pcg_receipt_fbx_decision_mismatch",
-                [row.get("reason") for row in handoff["issues"]],
+            self.assertEqual(handoff["status"], "pass_through")
+            branch = next(
+                row for row in handoff["roles"]
+                if row["role"] == "branch"
             )
+            self.assertEqual(
+                branch["reconciliation"],
+                "normalized_variants_metadata_missing_nonblocking",
+            )
+            self.assertEqual(handoff["issues"], [])
 
-    def test_stale_fbx_receipt_fingerprint_is_blocked(self):
+    def test_stale_fbx_receipt_fingerprint_is_diagnostic(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             spm = root / "SK_Tree_elm_01.spm"
@@ -1152,13 +1275,17 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                 [role_object(fbx)], fbx, {"branch": "branch_elm_01"}
             )
             handoff = build_assembly_handoff(receipt, spm, inventory)
-            self.assertEqual(handoff["status"], "blocked")
-            self.assertIn(
+            self.assertEqual(handoff["status"], "pass_through")
+            self.assertNotIn(
                 "CLUSTER_EXPORT_ARTIFACT_MISMATCH",
                 [row["code"] for row in handoff["issues"]],
             )
+            self.assertIn(
+                "sha256_mismatch",
+                [row["status"] for row in handoff["artifact_validation"]],
+            )
 
-    def test_post_export_handoff_rejects_replaced_xml_and_stmat(self):
+    def test_post_export_handoff_keeps_replaced_sidecars_diagnostic(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             spm = root / "SK_Tree_elm_01.spm"
@@ -1202,11 +1329,52 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                 for row in handoff["artifact_validation"]
             }
 
-            self.assertEqual(handoff["status"], "blocked")
+            self.assertEqual(handoff["status"], "pass_through")
             self.assertEqual(validations["xml"]["status"], "sha256_mismatch")
             self.assertEqual(
                 validations["stmat"]["status"],
                 "sha256_mismatch",
+            )
+            self.assertNotIn(
+                "CLUSTER_EXPORT_ARTIFACT_MISMATCH",
+                [row["code"] for row in handoff["issues"]],
+            )
+
+    def test_expected_current_artifact_missing_is_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_Tree_elm_01.spm"
+            fbx = root / "fbx" / "SK_Tree_elm_01.fbx"
+            xml = root / "xml" / "SK_Tree_elm_01.xml"
+            receipt = root / "pcg_receipt.json"
+            spm.write_bytes(b"spm")
+            fbx.parent.mkdir(parents=True)
+            fbx.write_bytes(b"fbx")
+            xml.parent.mkdir(parents=True)
+            xml.write_bytes(b"<current />")
+            write_receipt(
+                receipt,
+                spm,
+                fbx,
+                [("branch", "branch_elm_01", "pending_export")],
+            )
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+            bundle = payload["items"][0]["cluster_assembly"]["handoff"][
+                "roles"
+            ][0]["targets"][0]["export_bundle"]
+            bundle["xml"] = file_fingerprint(xml)
+            receipt.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            xml.unlink()
+            inventory = build_blender_fbx_inventory(
+                [role_object(fbx)], fbx, {"branch": "branch_elm_01"}
+            )
+
+            handoff = build_assembly_handoff(receipt, spm, inventory)
+
+            self.assertEqual(handoff["status"], "blocked")
+            self.assertIn(
+                "CLUSTER_EXPORT_ARTIFACT_MISMATCH",
+                [row["code"] for row in handoff["issues"]],
             )
 
     def test_inventory_excludes_objects_from_another_fbx(self):

@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "kind": "pcg_startup_spm_analysis_guard_calibration",
+  "issue": 134,
+  "measured_at": "2026-08-02T22:54:50+09:00",
+  "source": {
+    "git_head": "70ee38b788b253501f580d834cfda6677abf81fc",
+    "production_source_content_hash": "21bb93fbdffae6b2b410aba75b9d2b928dab872fc9bbf11e1320e69208e1a587"
+  },
+  "measurements": {
+    "production_shaped_fixture": {
+      "description": "55-folder, 597-SPM minimal fixture; cold and warm runs are identical",
+      "inventory_file_count": 597,
+      "spm_analysis_calls": 18837,
+      "spm_analysis_calls_per_inventory_file": 31.552763819095478,
+      "old_per_item_limit": 32,
+      "old_total_limit": 19104,
+      "old_headroom_calls": 267,
+      "old_headroom_fraction": 0.014174231565535914,
+      "resolve_atlas_manifests": 0
+    },
+    "production_folder": {
+      "target_identity": "tree_nothofagusAlpina",
+      "selection_basis": "11 live root-plus-Cluster SPMs match the fixture's 10-11 SPM-per-folder shape; no blend files were present",
+      "official_entrypoint": "pcg_texture_audit.py --target <folder> --no-receipt --json <isolated-receipt>",
+      "isolated_cache": true,
+      "inventory_file_count": 11,
+      "spm_analysis_calls": 253,
+      "spm_analysis_calls_per_inventory_file": 23.0,
+      "spm_analysis_calls_unique_files": 9,
+      "resolve_atlas_manifests": 3,
+      "blend_index_request_count": 0,
+      "spm_rule": {
+        "actual": 253,
+        "limit": 528,
+        "within_limit": true
+      },
+      "whole_guard_status": "failed",
+      "whole_guard_failure_explanation": "The independent atlas_manifest_resolution_calls rule observed 3 > 1; the live report remained available under existing fail-open report semantics.",
+      "receipt_persistence": "not_requested",
+      "production_spms_unchanged": true,
+      "integrity_check": "All 11 live production SPM SHA-256 values, byte lengths, and mtimes matched before and after the audit.",
+      "external_applications_started": 0
+    }
+  },
+  "calibration_policy": {
+    "baseline": "max(fixture ratio, production-folder ratio)",
+    "baseline_calls_per_inventory_file": 31.552763819095478,
+    "headroom_fraction": 0.5,
+    "formula": "ceil(baseline_calls_per_inventory_file * (1 + headroom_fraction))",
+    "unrounded_limit": 47.32914572864322,
+    "per_item_limit": 48,
+    "fixture_total_limit": 28656,
+    "fixture_headroom_calls": 9819,
+    "fixture_headroom_fraction": 0.5212613473483039,
+    "production_total_limit": 528,
+    "production_headroom_calls": 275,
+    "production_headroom_fraction": 1.0869565217391304
+  },
+  "negative_control": {
+    "description": "In-memory 597 calls per each of 597 SPMs; unique-file counters remain exactly 597",
+    "spm_count": 597,
+    "calls_per_spm": 597,
+    "spm_analysis_calls": 356409,
+    "spm_analysis_calls_unique_files": 597,
+    "limit": 28656,
+    "expected_status": "failed"
+  }
+}

@@ -12,6 +12,23 @@ weed_black_locast
 
 `SPM_Generator_Sync.bat`을 더블클릭해 실행합니다.
 
+## 공식 exact-target repair 명령
+
+인자 없이 실행하면 기존 GUI가 그대로 열린다. 인자가 있으면 GUI 없이 current board의
+exact selector만 공용 durable FIFO에서 실행한다. `--target-spm`은 반복할 수 있지만,
+각 경로와 일치하는 follower/Cluster ON target만 계획에 남고 형제 SPM이나 전체 폴더로
+확대하지 않는다.
+
+```bat
+SPM_Generator_Sync.bat --repair-action generator-sync --target-spm "D:\...\SK_asset.spm" --parent-retry-id retry-118 --request-id repair-001 --receipt "D:\...\repair-001.json"
+SPM_Generator_Sync.bat --repair-action cluster-refresh --target-spm "D:\...\cluster\SK_cluster.spm" --parent-retry-id retry-118 --request-id repair-002 --receipt "D:\...\repair-002.json"
+SPM_Generator_Sync.bat --repair-action generator-sync-and-cluster --target-spm "D:\...\SK_asset.spm" --target-spm "D:\...\cluster\SK_cluster.spm" --parent-retry-id retry-118 --request-id repair-003 --receipt "D:\...\repair-003.json"
+```
+
+master 하나만 지정해 모든 follower로 fan-out하는 요청은 fail closed한다. queue lease,
+취소, liveness, bounded publish retry와 terminal receipt는 GUI connected-run과 같은
+내부 계약을 사용한다.
+
 적용·동기화·Cluster 관계 변경/갱신은 PCG와 SK Batch가 공유하는 프로세스 간
 FIFO에 클릭 즉시 등록된다. 같은 창의 로컬 대기열뿐 아니라 다른 BAT 창의 작업도
 같은 순서를 사용하며 실제 변경은 한 번에 하나만 실행한다. Cluster 갱신은 자기
@@ -105,6 +122,29 @@ Base에서 자식에만 있는 구조는 적용 시 삭제합니다. 자식 구�
    - 다른 작업이 진행 중이면 기존 FIFO 대기열에 들어갑니다. 실제 차례가 시작될 때 계보
      manifest와 Cluster registry를 다시 읽으므로, 앞 작업에서 OFF가 된 관계를 오래된
      화면 스냅샷으로 다시 ON 처리하지 않습니다.
+   - v2 보고서는 mutation 전에 생성되고 각 시도 시작/실패 및 단위 완료 때마다 fsync 뒤
+     원자적으로 checkpoint됩니다. `run_id`, queue 소유권, 순서가 고정된 `unit_id`,
+     성공/실패/실행 중 상태, SHA-256 dependency identity, 실패 분류와 bounded retry 시도를
+     보존합니다. checkpoint가 실패하면 다음 mutation은 시작하지 않습니다.
+   - 일부만 실패하면 UI와 공용 FIFO receipt 모두 `partial`을 `failed`와 구분해 표시합니다.
+     receipt에는 Generator/Cluster 성공·실패 수와 정확한 보고서 path/SHA-256/size가 남습니다.
+   - `연결 실패 단위만 재시도`는 임의의 reports 폴더 파일이 아니라 terminal 공용 FIFO
+     receipt가 정확한 path/SHA-256/size로 봉인한 v2 partial 보고서만 읽고 현재 보드를 다시
+     스캔합니다. 전체 단위 순서, 설정/도구/코드, SPM/blend/registry, Atlas
+     target/scope/global receipt, normalization receipt, isolated-source cache 및 생성물 디렉터리
+     inventory와 Blender가 실제 로드한 `atlas_leaf_mesh_builder`/
+     `speedtree_cluster_normalizer` add-on code manifest가 모두 같을 때만 실패 단위를 선택합니다.
+     inventory는 파일 hash 전후 두 번 열거해 중간 add/remove 경쟁도 불안정으로 처리합니다.
+     매 시도 뒤 기존 성공 단위를 다시
+     검증합니다. 보수적 read/write set과 overlap graph에서 기존 성공 단위와 생성물을 공유하는
+     실패 단위는 mutation 전에 failed-only retry 부적격으로 처리하고, 예상 밖 드리프트가
+     생겨도 다음 단위를 실행하지 않은 채 새 전체 계획을 요구합니다.
+   - JSON atomic publish가 구조화된 pre-commit/rollback 성공 증명을 제공한 permission/lock
+     오류만 현재 공용 queue lease와 동일 dependency identity 아래에서 0.2초/0.5초 backoff로
+     최대 3회 시도합니다. 각 attempt 시작 직전에 전체 identity를 다시 캡처하며 Cluster는 설치된
+     add-on producer probe도 다시 실행하므로 plan 이후나 backoff 중 변경은 mutation 전에
+     중단됩니다. 일반 JSON 읽기 오류, rollback 실패, content drift, persistent denial은 재시도해
+     숨기지 않고 보고서에 남깁니다.
 
 파일명의 `_01`은 화면에서 `MASTER 후보`로만 제안합니다. 이름만으로 관계를 확정하거나 파일을
 수정하지 않습니다. 확정한 관계는 나무 폴더의 `spm_generator_sync.json`에 상대 파일명으로 저장됩니다.

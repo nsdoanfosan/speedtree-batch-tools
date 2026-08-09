@@ -12,6 +12,14 @@ from unittest import mock
 
 import cluster_blend_sync as cluster_sync
 from atlas_target_registry import save_target_registry
+from cluster_atlas_source_index import (
+    COLLECTION_CONTENT_KEY_ALGORITHM,
+    COLLECTION_PROJECTION_VERSION,
+    MESH_CONTENT_KEY_ALGORITHM,
+    SOURCE_INDEX_KIND,
+    SOURCE_INDEX_VERSION,
+    canonical_sha256,
+)
 from cluster_blend_sync import (
     ClusterBlendSyncError,
     discover_cluster_blend_relations,
@@ -19,6 +27,7 @@ from cluster_blend_sync import (
     run_cluster_relation_transaction,
     set_cluster_relation_registry,
 )
+from cluster_normalization_sync import normalization_receipt_path
 from speedtree_pipeline_contract import (
     SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
     spm_file_structural_semantic_fingerprint,
@@ -27,6 +36,79 @@ from speedtree_pipeline_contract import (
 
 def file_sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def persisted_source_index(
+    blend,
+    *,
+    collection="Atlas_Cluster_Cards",
+    export_scope_id="test-cluster-scope",
+    state="populated",
+):
+    rows = [] if state == "empty" else [{
+        "object_name": f"{blend.stem}_Card",
+        "mesh_data_name": f"{blend.stem}_Card_Mesh",
+        "group_collection": collection,
+        "group_material": f"M_{blend.stem}",
+        "user_collections": [collection],
+        "stable_source_identity": {
+            "kind": "fixture",
+            "digest": hashlib.sha256(b"fixture-object").hexdigest(),
+        },
+        "mesh_content_key": {
+            "algorithm": MESH_CONTENT_KEY_ALGORITHM,
+            "digest": hashlib.sha256(b"fixture-mesh").hexdigest(),
+        },
+        "vertices": 4,
+        "edges": 4,
+        "loops": 4,
+        "polygons": 1,
+    }]
+    projection = {
+        "projection_version": COLLECTION_PROJECTION_VERSION,
+        "collection_name": collection,
+        "export_scope_id": export_scope_id,
+        "state": state,
+        "mesh_object_count": len(rows),
+        "mesh_objects": rows,
+    }
+    blend_hash = file_sha256(blend)
+    return {
+        "kind": SOURCE_INDEX_KIND,
+        "version": SOURCE_INDEX_VERSION,
+        "status": "ok",
+        "indexed_by_blender": True,
+        "blend": str(Path(blend).absolute()),
+        "blend_sha256": blend_hash,
+        "atlas_source_index": {
+            "schema_version": 1,
+            "status": "ok",
+            "indexed_by_blender": True,
+            "blend": str(Path(blend).absolute()),
+            "blend_sha256": blend_hash,
+            "image_count": 0,
+            "images": [],
+        },
+        "authoritative_collection": {
+            **projection,
+            "content_key": {
+                "algorithm": COLLECTION_CONTENT_KEY_ALGORITHM,
+                "digest": canonical_sha256(projection),
+            },
+        },
+        "refresh_reasons": [],
+        "publication": {
+            "status": "bound",
+            "target_count": 1,
+            "targets": [{
+                "target_spm": str(blend.with_suffix(".spm")),
+                "export_scope_id": export_scope_id,
+                "mesh_count": len(rows),
+                "state": state,
+                "manifest": None,
+            }],
+        },
+    }
 
 
 def write_capture_manifest(blend, contract_sha256):
@@ -52,6 +134,8 @@ def write_scope_manifest(
     source_fbx=None,
     connection_requested=None,
     semantic_source=True,
+    source_collection="Atlas_Cluster_Cards",
+    export_scope_id="test-cluster-scope",
 ):
     scope = target.parent / ".atlas_leaf_speedtree_scopes"
     scope.mkdir(exist_ok=True)
@@ -61,6 +145,8 @@ def write_scope_manifest(
         "spm": str(target),
         "material": material,
         "mesh_ids": [10, 11, 12],
+        "export_scope_id": export_scope_id,
+        "source_collection": source_collection,
         "generator_connection": {"complete": complete},
         "source_material_adoption": {"material_name": material, "material_id": 8},
     }
@@ -94,6 +180,23 @@ def write_scope_manifest(
                 },
             }],
         }
+        normalization_receipt = {
+            "kind": "speedtree_cluster_sync_normalization",
+            "status": "ready",
+            "blend": str(blend.absolute()),
+            "output_blend_sha256": file_sha256(blend),
+            "source_blender_index": persisted_source_index(
+                blend,
+                collection=source_collection,
+                export_scope_id=export_scope_id,
+            ),
+        }
+        receipt_path = normalization_receipt_path(blend)
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text(
+            json.dumps(normalization_receipt),
+            encoding="utf-8",
+        )
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path
 
@@ -478,6 +581,14 @@ class ClusterBlendSyncTests(unittest.TestCase):
                 "physical_capture_changed",
                 changed["refresh_reasons"],
             )
+            self.assertIn(
+                "physical_capture_changed",
+                changed["capture_texture_refresh_reasons"],
+            )
+            self.assertNotIn(
+                "physical_capture_changed",
+                changed["geometry_ownership_refresh_reasons"],
+            )
 
     def test_registry_toggle_preserves_other_targets_and_never_mutates_source_spm(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -617,6 +728,65 @@ class ClusterBlendSyncTests(unittest.TestCase):
                     )
 
             self.assertEqual(registry_path.read_bytes(), registry_before)
+
+    def test_current_normalization_sync_rolls_back_capture_side_effects(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            owner = root / "Tree_elm"
+            cluster = owner / "Cluster"
+            reports = cluster / "reports"
+            cluster.mkdir(parents=True)
+            reports.mkdir()
+            blend = cluster / "SK_branch_elm_01.blend"
+            target = owner / "SK_Tree_elm_01.spm"
+            receipt = reports / (
+                "SK_branch_elm_01_cluster_normalization_sync_receipt.json"
+            )
+            color = cluster / "branch_elm_01.tga"
+            capture_manifest = (
+                cluster / "branch_elm_01_auto_capture_manifest.json"
+            )
+            blend.write_bytes(b"blend")
+            target.write_bytes(b"target")
+            color.write_bytes(b"old-color")
+            capture_manifest.write_bytes(b"old-manifest")
+            receipt.write_bytes(b"old-receipt")
+            original_stats = {
+                path: path.stat().st_mtime_ns
+                for path in (color, capture_manifest, receipt)
+            }
+            recipe = {
+                "blend": str(blend),
+                "normalization_required": False,
+                "first_target_spm": str(target),
+                "target_spms": [str(target)],
+                "capture_output_dir": str(cluster),
+                "capture_prefix": "branch_elm_01",
+                "receipt_path": str(receipt),
+                "material_name": "M_branch_elm_01",
+            }
+
+            snapshots = cluster_sync._snapshot_normalization_artifacts(
+                recipe,
+                root / "snapshots",
+            )
+            color.write_bytes(b"new-color")
+            capture_manifest.write_bytes(b"new-manifest")
+            receipt.write_bytes(b"new-receipt")
+
+            restored, failed = cluster_sync._restore_normalization_artifacts(
+                snapshots
+            )
+
+            self.assertFalse(failed)
+            self.assertEqual(color.read_bytes(), b"old-color")
+            self.assertEqual(
+                capture_manifest.read_bytes(), b"old-manifest"
+            )
+            self.assertEqual(receipt.read_bytes(), b"old-receipt")
+            for path, expected_mtime in original_stats.items():
+                self.assertEqual(path.stat().st_mtime_ns, expected_mtime)
+                self.assertIn(str(path), restored)
 
     def test_failed_apply_persists_pre_rollback_diagnostic_report(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1061,6 +1231,11 @@ class ClusterBlendSyncTests(unittest.TestCase):
                 result["skip_reason"],
                 "already_on_up_to_date",
             )
+            self.assertEqual(result["refresh_reasons"], [])
+            self.assertEqual(
+                result["refresh_reason_categories"], []
+            )
+            self.assertTrue(result["source_content_identity"]["current"])
 
             with mock.patch(
                 "cluster_blend_sync._write_shared_repair_runtime_receipt",
@@ -1092,6 +1267,214 @@ class ClusterBlendSyncTests(unittest.TestCase):
             self.assertIn(
                 "Failure diagnostic log:",
                 str(caught.exception),
+            )
+
+    def test_saved_blend_object_mutations_cannot_take_already_on_noop(self):
+        mutations = {
+            "mesh_added": b"blend:mesh-added",
+            "mesh_deleted": b"blend:mesh-deleted",
+            "mesh_renamed": b"blend:mesh-renamed",
+            "mesh_regrouped": b"blend:mesh-regrouped",
+            "final_mesh_deleted": b"blend:final-mesh-deleted",
+        }
+        for label, changed_blend in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                owner = Path(temporary) / "Tree_elm"
+                cluster = owner / "Cluster"
+                cluster.mkdir(parents=True)
+                canonical = cluster / "SK_branch_elm_01.spm"
+                write_material_spm(
+                    canonical, "M_branch_elm_01", 8, [10, 11, 12]
+                )
+                blend = canonical.with_suffix(".blend")
+                blend.write_bytes(b"blend:current")
+                target = owner / "SK_Tree_elm_01.spm"
+                write_material_spm(
+                    target, "M_branch_elm_01", 8, [10, 11, 12]
+                )
+                blender = Path(temporary) / "blender.exe"
+                blender.touch()
+                set_cluster_relation_registry(blend, target, True)
+                write_capture_manifest(blend, "capture")
+                write_scope_manifest(
+                    blend,
+                    target,
+                    canonical_spm=canonical,
+                    capture_contract_sha256="capture",
+                    material_groups=[{
+                        "material": "M_branch_elm_01",
+                        "material_id": 8,
+                        "mesh_ids": [10, 11, 12],
+                    }],
+                )
+                blend.write_bytes(changed_blend)
+
+                row = discover_cluster_blend_relations(owner)[0]
+                self.assertEqual(
+                    row["targets"][0]["status"],
+                    "refresh_required",
+                )
+                self.assertIn(
+                    "blender_source_content_changed",
+                    row["geometry_ownership_refresh_reasons"],
+                )
+                self.assertNotIn(
+                    "blender_source_content_changed",
+                    row["capture_texture_refresh_reasons"],
+                )
+
+                def complete(command, **_kwargs):
+                    report_path = Path(
+                        command[command.index("--report") + 1]
+                    )
+                    report_path.write_text(
+                        json.dumps({"status": "ok"}),
+                        encoding="utf-8",
+                    )
+                    return SimpleNamespace(
+                        returncode=0, stdout="", stderr=""
+                    )
+
+                with mock.patch(
+                    "cluster_blend_sync.subprocess.run",
+                    side_effect=complete,
+                ) as worker:
+                    result = run_cluster_relation_transaction(
+                        blend,
+                        [target],
+                        enabled=True,
+                        blender_exe=blender,
+                        auto_normalize=False,
+                    )
+
+                worker.assert_called_once()
+                self.assertNotIn("no_change", result)
+                self.assertTrue(result["preflight_refresh_required"])
+                self.assertIn(
+                    "blender_source_content_changed",
+                    result["preflight_refresh_reasons"],
+                )
+                self.assertIn(
+                    "geometry_ownership",
+                    result["preflight_refresh_reason_categories"],
+                )
+                self.assertIn(
+                    "blender_source_content_changed",
+                    result["refresh_reasons"],
+                )
+                self.assertIn(
+                    "geometry_ownership",
+                    result["refresh_reason_categories"],
+                )
+
+    def test_missing_source_identity_forces_one_refresh(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_elm"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            canonical = cluster / "SK_branch_elm_01.spm"
+            write_material_spm(
+                canonical, "M_branch_elm_01", 8, [10, 11, 12]
+            )
+            blend = canonical.with_suffix(".blend")
+            blend.write_bytes(b"blend")
+            target = owner / "SK_Tree_elm_01.spm"
+            write_material_spm(
+                target, "M_branch_elm_01", 8, [10, 11, 12]
+            )
+            set_cluster_relation_registry(blend, target, True)
+            write_capture_manifest(blend, "capture")
+            write_scope_manifest(
+                blend,
+                target,
+                canonical_spm=canonical,
+                capture_contract_sha256="capture",
+                material_groups=[{
+                    "material": "M_branch_elm_01",
+                    "material_id": 8,
+                    "mesh_ids": [10, 11, 12],
+                }],
+            )
+            receipt_path = normalization_receipt_path(blend)
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt.pop("source_blender_index")
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+            row = discover_cluster_blend_relations(owner)[0]
+
+            self.assertEqual(
+                row["targets"][0]["status"], "refresh_required"
+            )
+            self.assertIn(
+                "blender_source_identity_missing",
+                row["refresh_reasons"],
+            )
+
+    def test_copied_blend_cannot_reuse_source_identity_or_scope(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original_owner = root / "Tree_original"
+            original_cluster = original_owner / "Cluster"
+            original_cluster.mkdir(parents=True)
+            original_canonical = (
+                original_cluster / "SK_branch_elm_01.spm"
+            )
+            write_material_spm(
+                original_canonical,
+                "M_branch_elm_01",
+                8,
+                [10, 11, 12],
+            )
+            original_blend = original_canonical.with_suffix(".blend")
+            original_blend.write_bytes(b"byte-identical-blend")
+            original_target = original_owner / "SK_Tree_elm_01.spm"
+            write_material_spm(
+                original_target, "M_branch_elm_01", 8, [10, 11, 12]
+            )
+            set_cluster_relation_registry(
+                original_blend, original_target, True
+            )
+            write_capture_manifest(original_blend, "capture")
+            write_scope_manifest(
+                original_blend,
+                original_target,
+                canonical_spm=original_canonical,
+                capture_contract_sha256="capture",
+            )
+            original_receipt = normalization_receipt_path(
+                original_blend
+            ).read_bytes()
+
+            copied_owner = root / "Tree_copied"
+            copied_cluster = copied_owner / "Cluster"
+            copied_cluster.mkdir(parents=True)
+            copied_canonical = copied_cluster / original_canonical.name
+            copied_canonical.write_bytes(original_canonical.read_bytes())
+            copied_blend = copied_canonical.with_suffix(".blend")
+            copied_blend.write_bytes(original_blend.read_bytes())
+            copied_target = copied_owner / original_target.name
+            copied_target.write_bytes(original_target.read_bytes())
+            set_cluster_relation_registry(copied_blend, copied_target, True)
+            write_capture_manifest(copied_blend, "capture")
+            write_scope_manifest(
+                copied_blend,
+                copied_target,
+                canonical_spm=copied_canonical,
+                capture_contract_sha256="capture",
+                export_scope_id="test-cluster-scope",
+            )
+            normalization_receipt_path(copied_blend).write_bytes(
+                original_receipt
+            )
+
+            row = discover_cluster_blend_relations(copied_owner)[0]
+
+            self.assertEqual(
+                row["targets"][0]["status"], "refresh_required"
+            )
+            self.assertIn(
+                "blender_source_path_changed",
+                row["geometry_ownership_refresh_reasons"],
             )
 
     def test_already_on_but_changed_source_runs_blender_worker(self):
@@ -1765,6 +2148,88 @@ class ClusterBlendSyncTests(unittest.TestCase):
                 "source_fbx_changed",
                 changed["targets"][0]["refresh_reasons"],
             )
+
+    def test_provider_disagreement_cannot_block_cluster_relation_inspection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            blend = root / "SK_cluster.blend"
+            blend.write_bytes(b"blend")
+            target = root / "SK_tree_01.spm"
+            target.write_bytes(b"spm")
+            authority = {
+                "atlas_manifest_schema_version": 1,
+                "spm": str(target),
+                "blend_file": str(blend),
+                "source_collection": "Provider A",
+                "export_scope_id": "provider-a",
+                "material_groups": [{
+                    "material": "M_shared",
+                    "material_id": 7,
+                    "mesh_ids": [20],
+                }],
+                "generator_connection": {
+                    "complete": True,
+                    "bindings": [],
+                },
+            }
+            target_dir = root / ".atlas_leaf_speedtree_targets"
+            target_dir.mkdir()
+            (target_dir / f"{target.stem}.json").write_text(
+                json.dumps(authority), encoding="utf-8"
+            )
+            competing = json.loads(json.dumps(authority))
+            competing["source_collection"] = "Provider B"
+            competing["export_scope_id"] = "provider-b"
+            competing["material_groups"][0]["mesh_ids"] = [99]
+            (root / "speedtree_import_manifest.json").write_text(
+                json.dumps(competing), encoding="utf-8"
+            )
+
+            match = cluster_sync._matching_scope_manifest(blend, target)
+
+            self.assertIsNotNone(match)
+            self.assertFalse(
+                match["resolution"]["mutation_authorized"]
+            )
+            self.assertTrue(match["resolution"]["conflicting"])
+
+
+class AtlasWorkerConflictContractTests(unittest.TestCase):
+    def test_hash_bound_precommit_conflict_preserves_external_spm(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "tree.spm"
+            snapshot = root / "snapshot.spm"
+            snapshot.write_bytes(b"before")
+            target.write_bytes(b"external-edit")
+            report = {
+                "failure_contract": {
+                    "kind": "atlas_speedtree_transaction_failure",
+                    "version": 1,
+                    "reason": "production_changed_while_staging",
+                    "commit_started": False,
+                    "preserve_external_changes": True,
+                    "conflicts": [{
+                        "path": str(target),
+                        "expected_sha256": file_sha256(snapshot),
+                        "actual_sha256": file_sha256(target),
+                    }],
+                }
+            }
+
+            preserve = cluster_sync._worker_transaction_conflict_preserve_paths(
+                report,
+                [(target, snapshot)],
+            )
+            restored, failed = cluster_sync._restore_spm_files(
+                [(target, snapshot)],
+                preserve_paths=preserve,
+            )
+
+            self.assertEqual(preserve, [target])
+            self.assertEqual(target.read_bytes(), b"external-edit")
+            self.assertEqual(restored, [])
+            self.assertEqual(failed, [])
 
 
 if __name__ == "__main__":

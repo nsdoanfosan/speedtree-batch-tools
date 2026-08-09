@@ -1,0 +1,10 @@
+{
+  "kind": "issue138_sanitized_dependency_artifact_verdicts",
+  "source": "GitHub PR 148 comment 5163221145; aggregate counts only",
+  "shared_dependency_failed_targets": 19,
+  "current_consumer_evidence": 12,
+  "consumer_own_evidence_blocking": 7,
+  "expected_dependency_blocked_after_artifact_check": 0,
+  "expected_current_consumers_released": 12,
+  "expected_consumer_own_blocks_preserved": 7
+}

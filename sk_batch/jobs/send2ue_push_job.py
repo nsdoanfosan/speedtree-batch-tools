@@ -44,6 +44,8 @@ REPO_DIR = str(Path(SK_BATCH_DIR).parent)
 if REPO_DIR not in sys.path:
     sys.path.insert(0, REPO_DIR)
 
+from process_lifecycle import owned_run
+
 from vertex_color_contract import (
     inspect_object_vertex_colors,
     pack_speedtree_vertex_payload,
@@ -88,6 +90,7 @@ from child_progress_contract import (
     SEND2UE_RPC_OWNED_START_MARKER,
     emit_progress_marker as emit_child_progress_marker,
 )
+from blender_addon_gateway import prepare_runtime
 
 
 def load_cluster_assembly_manifest(blend_dir, spm_path):
@@ -422,8 +425,10 @@ def unreal_editor_running():
     if os.name != "nt":
         return None
     try:
-        result = subprocess.run(
+        result = owned_run(
             ["tasklist", "/FI", "IMAGENAME eq UnrealEditor.exe", "/NH"],
+            source="sk_batch.jobs.send2ue_push_job.tasklist_observation",
+            run_factory=subprocess.run,
             capture_output=True,
             text=True,
             encoding="mbcs",
@@ -436,13 +441,6 @@ def unreal_editor_running():
         return result.returncode == 0 and "UnrealEditor.exe" in (result.stdout or "")
     except Exception:
         return None
-
-
-def enable_required_addon(addon_utils, module):
-    """Enable only the add-ons that the isolated Push pipeline requires."""
-    _loaded, enabled = addon_utils.check(module)
-    if not enabled:
-        bpy.ops.preferences.addon_enable(module=module)
 
 
 def export_complexity():
@@ -513,20 +511,56 @@ def main():
         SEND2UE_JOB_START_MARKER, transport=args.transport
     )
     try:
-        import addon_utils
-
         # --factory-startup keeps unrelated UI/GPU add-ons out of background
         # Blender, so required handoff registrations must be explicit.
         report["stage"] = "addon_setup"
-        enable_required_addon(addon_utils, "speedtree_bone_weight_repair")
-        enable_required_addon(addon_utils, "ue_unique_export_names_addon")
-        enable_required_addon(addon_utils, "send2ue")
+        addon_runtime = prepare_runtime(
+            "sk_batch.jobs.send2ue_push_job",
+            {
+                "speedtree_bone_weight_repair": ("material_handoff_v1",),
+                "send2ue": (
+                    "headless_export_v1",
+                    "unreal_rpc_v1",
+                ),
+                "ue_unique_export_names_addon": (
+                    "unreal_handoff_json_v1",
+                ),
+            },
+        )
+        report["blender_addon_runtime"] = addon_runtime.receipt
         report["rpc_configuration"] = configure_send2ue_rpc_preferences(args)
-
-        from speedtree_bone_weight_repair.core import (
-            consolidate_speedtree_group_materials,
-            load_speedtree_texture_readiness_contract,
-            normalize_speedtree_material_textures,
+        consolidate_speedtree_group_materials = addon_runtime.operation(
+            "speedtree_bone_weight_repair",
+            "consolidate_speedtree_group_materials",
+        )
+        load_speedtree_texture_readiness_contract = addon_runtime.operation(
+            "speedtree_bone_weight_repair",
+            "load_speedtree_texture_readiness_contract",
+        )
+        normalize_speedtree_material_textures = addon_runtime.operation(
+            "speedtree_bone_weight_repair",
+            "normalize_speedtree_material_textures",
+        )
+        send_to_disk_path_mode = addon_runtime.operation(
+            "send2ue", "send_to_disk_path_mode"
+        )
+        sync_unreal_mesh_folder_path = addon_runtime.operation(
+            "send2ue", "sync_unreal_mesh_folder_path"
+        )
+        build_manifest_items = addon_runtime.operation(
+            "send2ue", "build_manifest_items"
+        )
+        is_unreal_connected = addon_runtime.operation(
+            "send2ue", "is_unreal_connected"
+        )
+        send2ue_unreal_dependency = addon_runtime.operation(
+            "send2ue", "unreal_dependency_module"
+        )
+        run_commands = addon_runtime.operation(
+            "send2ue", "run_commands"
+        )
+        set_rpc_env = addon_runtime.operation(
+            "send2ue", "set_rpc_env"
         )
 
         report["stage"] = "texture_validation"
@@ -702,8 +736,7 @@ def main():
         report["export_collection_issues"] = export_collection_issues
         report["handoff_preflight"] = {
             "status": "blocked" if (
-                texture_normalization.get("missing")
-                or export_collection_issues
+                export_collection_issues
                 or empty_material_slots
                 or blocked_vertex_payloads
                 or blocked_vertex_colors
@@ -727,19 +760,6 @@ def main():
             or any(item.get("changed") for item in vertex_payload_contracts)
         )
         report["blend_resaved"] = False
-        missing_textures = texture_normalization.get("missing", [])
-        if missing_textures:
-            details = []
-            for item in missing_textures:
-                roles = ", ".join(item.get("missing_roles", [])) or "대응 세트"
-                details.append(
-                    f"{item.get('material', '?')} -> "
-                    f"{item.get('expected_texture_base', 'T_?')} ({roles})"
-                )
-            raise RuntimeError(
-                "PCG ST9 Texture Batch 산출물 누락; Unreal Push 중단: "
-                + " | ".join(details)
-            )
         if export_collection_issues:
             raise RuntimeError(
                 "Send2UE Export collection contract failed: "
@@ -791,17 +811,12 @@ def main():
                 + ", ".join(over_reference)
             )
 
-        from send2ue.constants import PathModes
-        from send2ue.core import ingest, utilities
-        from send2ue.dependencies import unreal as send2ue_unreal_dependency
-        from send2ue.dependencies.unreal import run_commands, set_rpc_env
-
         if not args.send2ue_unreal_py:
             args.send2ue_unreal_py = str(Path(send2ue_unreal_dependency.__file__).resolve())
 
         if args.transport == "rpc":
             report["stage"] = "unreal_preflight"
-            if not utilities.is_unreal_connected():
+            if not is_unreal_connected():
                 raise RuntimeError(
                     "Unreal editor is not running / RPC not reachable. Open the project first."
                 )
@@ -844,7 +859,7 @@ def main():
         # A saved template or an earlier output layout can leave this value on
         # the FBX staging folder.  Re-derive it from the actual .blend location
         # immediately before Send2UE builds the manifest.
-        utilities.sync_unreal_mesh_folder_path()
+        sync_unreal_mesh_folder_path()
         if hasattr(scene_props, "skip_animation_export"):
             scene_props.skip_animation_export = True
 
@@ -860,7 +875,7 @@ def main():
 
         export_root = Path(args.export_root).resolve()
         export_root.mkdir(parents=True, exist_ok=True)
-        scene_props.path_mode = PathModes.SEND_TO_DISK.value
+        scene_props.path_mode = send_to_disk_path_mode
         scene_props.disk_mesh_folder_path = str(export_root)
         scene_props.disk_animation_folder_path = str(export_root / "animations")
         scene_props.disk_groom_folder_path = str(export_root / "groom")
@@ -889,7 +904,7 @@ def main():
         )
 
         report["stage"] = "manifest"
-        manifest_assets = ingest.build_manifest_items(scene_props)
+        manifest_assets = build_manifest_items(scene_props)
         if not manifest_assets:
             raise RuntimeError("Send2UE produced no manifest assets")
         report["manifest_handoff_normalization"] = (
@@ -898,6 +913,9 @@ def main():
                 export_root,
                 sidecar_descriptor_builder=(
                     shared_contract_api().build_sidecar_descriptor
+                ),
+                authoritative_pipeline_contract=material_payload.get(
+                    "speedtree_pipeline_contract"
                 ),
             )
         )

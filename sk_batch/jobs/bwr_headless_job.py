@@ -2,7 +2,8 @@
 
 Run:
   blender.exe -b --python bwr_headless_job.py -- --spm X.spm --blend X.blend
-      --wind TREE|BUSH|GRASS|NONE --report result.json
+      --wind TREE|BUSH|WEED|NONE --material-contract preflight.json
+      --report result.json
 
 Runs with --factory-startup and enables only the junction-installed
 speedtree_bone_weight_repair add-on for this process.  This avoids loading every
@@ -39,7 +40,12 @@ from spm_leaf_handoff_contract import (
     inspect_spm_leaf_contract,
     leaf_contract_user_message,
 )
-from speedtree_pipeline_contract import source_identity, validate_preflight_report
+from speedtree_pipeline_contract import (
+    refresh_preflight_report_after_exact_export,
+    source_identity,
+    validate_preflight_report,
+)
+from bwr_atlas_manifest_bridge import install_bwr_atlas_manifest_resolver
 from cluster_assembly_handoff_contract import (
     assembly_source_fbx_resolution,
     build_assembly_handoff,
@@ -53,6 +59,11 @@ from cluster_assembly_builder import build_blender_assembly_inputs
 from spm_audit import is_cluster_normalization_spm
 from speedtree_legacy_cluster_contract import inspect_legacy_cluster_state
 from job_report_contract import mark_job_failed
+from repair_runtime_contract import (
+    REPAIR_OUTPUT_CONTRACT_VERSION,
+    RepairPipelineEvidenceError,
+    validate_unassigned_geometry_cleanup_evidence,
+)
 from cluster_export_handoff_contract import (
     capture_cluster_export_snapshot,
     cluster_export_contract_issues as inspect_cluster_export_contract,
@@ -66,6 +77,7 @@ from cluster_bark_source_resolution import (
     ClusterBarkSourceResolutionError,
     load_current_isolated_bark_manifest,
 )
+from blender_addon_gateway import prepare_runtime
 
 
 VERTEX_COLOR_ISSUE_TEXT = {
@@ -89,8 +101,13 @@ def parse_args():
     parser.add_argument("--spm", required=True)
     parser.add_argument("--speedtree-spm", default="")
     parser.add_argument("--blend", required=True)
-    parser.add_argument("--wind", default="GRASS", choices=["TREE", "BUSH", "GRASS", "NONE"])
-    parser.add_argument("--material-contract", default="")
+    parser.add_argument(
+        "--wind",
+        default="WEED",
+        choices=["TREE", "BUSH", "WEED", "NONE", "GRASS"],
+        help="Immutable response preset ID (legacy GRASS is accepted as WEED)",
+    )
+    parser.add_argument("--material-contract", required=True)
     parser.add_argument("--bark-normalization-manifest", default="")
     parser.add_argument("--cluster-source-build-only", action="store_true")
     parser.add_argument("--manual-bones-locked", action="store_true")
@@ -339,6 +356,30 @@ def require_cluster_assembly_handoff_ready(handoff):
     )
 
 
+def select_cluster_assembly_build_handoff(receipt_contract, inspected_handoff):
+    """Prefer current FBX evidence over a stale pass-through receipt.
+
+    The PCG receipt describes what was known before the final BWR FBX existed.
+    Once that FBX has been inspected, a ready handoff is the authoritative
+    content signal and must create Assembly inputs even when the older receipt
+    recorded ``pass_through``.
+    """
+    if (
+        isinstance(inspected_handoff, dict)
+        and inspected_handoff.get("status") == "ready"
+    ):
+        return "build", inspected_handoff
+
+    receipt_handoff = {}
+    if isinstance(receipt_contract, dict):
+        receipt_handoff = receipt_contract.get("handoff") or {}
+    if receipt_handoff.get("status") == "pass_through":
+        return "pass_through", receipt_handoff
+    if isinstance(inspected_handoff, dict):
+        return "build", inspected_handoff
+    return None, None
+
+
 def cluster_assembly_contract_from_material_contract(receipt_path, spm_path):
     """Find the additive PCG receipt inside the existing required contract."""
     try:
@@ -434,25 +475,35 @@ def main():
                 "speedtree_pipeline_contract"
             ]
             report["speedtree_pipeline_contract_required"] = True
-        import addon_utils
-
-        _default_enabled, loaded = addon_utils.check("speedtree_bone_weight_repair")
-        if not loaded:
-            addon_utils.enable(
-                "speedtree_bone_weight_repair",
-                default_set=False,
-                persistent=False,
-            )
-        _default_enabled, loaded = addon_utils.check("speedtree_bone_weight_repair")
-        if not loaded:
-            raise RuntimeError("speedtree_bone_weight_repair add-on enable failed")
+        addon_runtime = prepare_runtime(
+            "sk_batch.jobs.bwr_headless_job",
+            {
+                "speedtree_bone_weight_repair": (
+                    "spm_sk_preflight_v1",
+                    "speedtree_export_v1",
+                    "repair_pipeline_v1",
+                    "atlas_manifest_consumer_v1",
+                ),
+            },
+        )
+        report["blender_addon_runtime"] = addon_runtime.receipt
+        require_spm_sk_ready = addon_runtime.operation(
+            "speedtree_bone_weight_repair",
+            "require_spm_sk_ready",
+        )
+        run_speedtree_cli_export = addon_runtime.operation(
+            "speedtree_bone_weight_repair",
+            "run_speedtree_cli_export",
+        )
+        run_import_and_repair = addon_runtime.operation(
+            "speedtree_bone_weight_repair",
+            "run_import_and_repair",
+        )
 
         # Reject authored-but-disabled Branch skeletons before creating an
         # empty .blend. BranchMesh-only assets remain valid and use the rigid
         # one-bone fallback inside the add-on.
         if not args.manual_bones_locked:
-            from speedtree_bone_weight_repair.core import require_spm_sk_ready
-
             require_spm_sk_ready(str(speedtree_spm))
 
         blend_path = os.path.abspath(args.blend)
@@ -498,17 +549,9 @@ def main():
             if args.material_contract
             else ""
         )
-        if args.wind == "NONE":
-            # Dead vegetation: keep the JSON contract but zero all sway.
-            # flexibility=0.0 makes the add-on emit all-zero non-trunk groups
-            # and bIsEnabled=false (trunk groups would still rock in Unreal's
-            # shader regardless of influence, so the add-on avoids them).
-            settings.wind_preset = "CUSTOM"
-            settings.dynamic_wind_flexibility = 0.0
-            settings.dynamic_wind_gust_attenuation = 0.0
-            settings.dynamic_wind_ground_cover = False
-        else:
-            settings.wind_preset = args.wind
+        # The batch owns only the immutable category assignment. Numeric
+        # response values are shared per preset and edited centrally in Unreal.
+        settings.wind_preset = "WEED" if args.wind == "GRASS" else args.wind
         settings.write_unreal_json = True
         settings.write_dynamic_wind_json = True
         is_cluster_source = is_cluster_normalization_spm(canonical_spm)
@@ -542,10 +585,15 @@ def main():
         # export and the repaired Blender output.  Cluster pairs deliberately
         # have two identities, so perform those two existing core stages with
         # explicit stems instead of deriving one by removing ``SK_``.
-        from speedtree_bone_weight_repair import core as bwr_core
+        report["atlas_manifest_resolution"] = (
+            install_bwr_atlas_manifest_resolver(
+                addon_runtime,
+                speedtree_spm,
+            )
+        )
 
         export_settings = settings.as_dict()
-        speedtree_export = bwr_core.run_speedtree_cli_export(
+        speedtree_export = run_speedtree_cli_export(
             str(speedtree_spm),
             speedtree_exe_path=export_settings["speedtree_exe_path"],
             export_options_path=export_settings["speedtree_export_options_path"],
@@ -625,7 +673,7 @@ def main():
             if source_spm_path == speedtree_spm:
                 assembly_source_export = speedtree_export
             else:
-                assembly_source_export = bwr_core.run_speedtree_cli_export(
+                assembly_source_export = run_speedtree_cli_export(
                     str(source_spm_path),
                     speedtree_exe_path=export_settings[
                         "speedtree_exe_path"
@@ -682,21 +730,37 @@ def main():
                     "the authoritative SpeedTree export"
                 )
 
-        # SpeedTree FBX export also promotes its generated STMAT sidecar, while
-        # the paired XML export replaces the XML in the same bundle.  Recheck
-        # every source contract only after all CLI exports have completed.
-        # Deferring the actual FBX import to this point also prevents a ready
-        # pre-export inventory (and its cached hashes) from being reused after
-        # the exporter replaces those files.
+        # SpeedTree FBX export promotes a newly generated STMAT sidecar.  The
+        # initial validation above proved the exact SPM/report pair before any
+        # mutation; now bind a derived runtime contract to the exact producer
+        # output instead of treating that expected replacement as an asset
+        # failure.  The original preflight receipt remains immutable.
         if args.material_contract:
-            material_preflight = validate_preflight_report(
-                args.material_contract,
+            live_stmat_path = Path(fbx_export["path"]).with_suffix(".stmat")
+            material_preflight = refresh_preflight_report_after_exact_export(
+                material_preflight,
+                speedtree_spm,
+                live_stmat_path,
+            )
+            live_material_contract_path = Path(args.report).with_name(
+                Path(args.report).stem + "_live_material_contract.json"
+            )
+            write_report(live_material_contract_path, material_preflight)
+            validate_preflight_report(
+                live_material_contract_path,
                 speedtree_spm,
                 require_ok=True,
             )
+            settings.texture_contract_path = str(live_material_contract_path)
             report["speedtree_pipeline_contract"] = material_preflight[
                 "speedtree_pipeline_contract"
             ]
+            report["exact_target_export_contract_refresh"] = (
+                material_preflight["exact_target_export_contract_refresh"]
+            )
+            report["live_material_contract"] = source_identity(
+                live_material_contract_path
+            )
             report["speedtree_pipeline_contract_revalidated_after_export"] = True
 
         if (
@@ -750,7 +814,28 @@ def main():
                 bpy.data,
                 canonical_spm.stem,
             )
-        result = bwr_core.run_import_and_repair(repair_settings)
+        result = run_import_and_repair(repair_settings)
+        try:
+            unassigned_geometry_cleanup = (
+                validate_unassigned_geometry_cleanup_evidence(
+                    result,
+                    expected_spm=canonical_spm,
+                    expected_fbx=fbx_export["path"],
+                    require_recheck=True,
+                )
+            )
+        except RepairPipelineEvidenceError as exc:
+            raise RuntimeError(
+                "Blender Repair output contract requires pre-repair "
+                "Default/empty-material geometry cleanup evidence: "
+                f"{exc}"
+            ) from exc
+        report["repair_output_contract_version"] = (
+            REPAIR_OUTPUT_CONTRACT_VERSION
+        )
+        report["unassigned_geometry_cleanup"] = (
+            unassigned_geometry_cleanup
+        )
         report["speedtree_export"] = speedtree_export
         transient_export_reconciliation = None
         if cluster_export_snapshot is not None:
@@ -877,12 +962,6 @@ def main():
                 "status": texture_normalization.get("texture_contract_status", ""),
                 "path": texture_normalization.get("texture_contract_path", ""),
             }
-            for missing in texture_normalization.get("missing", []):
-                roles = ", ".join(missing.get("missing_roles", [])) or "대응 세트"
-                report.setdefault("warnings", []).append(
-                    f"{missing.get('material', '?')}: "
-                    f"{missing.get('expected_texture_base', 'T_?')} ({roles}) 누락"
-                )
             merged_name = str((pipeline_data.get("paths") or {}).get("merged_name") or "")
             merged_object = bpy.data.objects.get(merged_name)
             removed_empty_slots = remove_unused_empty_material_slots(merged_object)
@@ -952,8 +1031,7 @@ def main():
             report.setdefault("warnings", []).append(f"expected output missing: {path}")
 
         reviewable_source_issues = bool(
-            texture_normalization.get("missing")
-            or empty_material_slots
+            empty_material_slots
             or material_export_blocked
         )
         structural_handoff_blocked = bool(
@@ -1037,20 +1115,19 @@ def main():
         report["source_review_required"] = handoff_status == "source_review"
         report["unreal_push_ready"] = handoff_status == "ok"
         assembly_manifest = None
-        pass_through_handoff = None
-        if isinstance(cluster_assembly_contract, dict):
-            candidate_handoff = (
-                cluster_assembly_contract.get("handoff") or {}
+        assembly_mode, selected_assembly_handoff = (
+            select_cluster_assembly_build_handoff(
+                cluster_assembly_contract,
+                cluster_assembly_handoff,
             )
-            if candidate_handoff.get("status") == "pass_through":
-                pass_through_handoff = candidate_handoff
-        if preflight["status"] == "ok" and pass_through_handoff is not None:
+        )
+        if preflight["status"] == "ok" and assembly_mode == "pass_through":
             # Persist "no content-driven Assembly" as a positive current
             # contract. Without this manifest, Push falls back to historical
             # target registries and can falsely dependency-orchestrate an
             # otherwise ordinary Full-SK asset.
             assembly_manifest = build_blender_assembly_inputs(
-                pass_through_handoff,
+                selected_assembly_handoff,
                 None,
                 None,
                 Path(blend_dir) / "assembly",
@@ -1063,7 +1140,7 @@ def main():
             report["cluster_assembly_manifest"] = assembly_manifest
         elif (
             preflight["status"] == "ok"
-            and cluster_assembly_handoff is not None
+            and assembly_mode == "build"
         ):
             if pipeline_data is None or merged_object is None:
                 raise RuntimeError(
@@ -1080,7 +1157,7 @@ def main():
                     "Cluster Assembly builder found no final Full SK FBX path"
                 )
             assembly_manifest = build_blender_assembly_inputs(
-                cluster_assembly_handoff,
+                selected_assembly_handoff,
                 final_armature,
                 merged_object,
                 Path(blend_dir) / "assembly",
@@ -1140,8 +1217,6 @@ def main():
                     "Send2UE Export 구조 오류: "
                     + ", ".join(blocking_export_collection_issues)
                 )
-            if texture_normalization.get("missing"):
-                reasons.append(f"텍스처 세트 {len(texture_normalization['missing'])}개 미준비")
             if empty_material_slots:
                 details = ", ".join(
                     f"{item['object']} slot {item['slot']}"

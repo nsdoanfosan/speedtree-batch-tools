@@ -18,6 +18,7 @@ from stale_node_table_recovery import (  # noqa: E402
     AUTHORING_GRAPH_CORE_PROJECTION_VERSION,
     _authoring_graph_core_projection,
     _legacy_authoring_graph_core_v3_projection,
+    _legacy_authoring_graph_core_v4_projection,
 )
 
 
@@ -37,6 +38,10 @@ RAW_GUID_RE = re.compile(
 
 def project(text):
     return _authoring_graph_core_projection(text)["fingerprint"]
+
+
+def project_v4(text):
+    return _legacy_authoring_graph_core_v4_projection(text)["fingerprint"]
 
 
 def default_material_map(map_name, seed):
@@ -104,8 +109,8 @@ class AuthoredTreeProjectionV4Tests(unittest.TestCase):
         cls.before_fingerprint = project(cls.before)
         cls.after_fingerprint = project(cls.after)
 
-    def test_literal_no_edit_pair_has_one_core_v4_fingerprint(self):
-        self.assertEqual(AUTHORING_GRAPH_CORE_PROJECTION_VERSION, 4)
+    def test_literal_no_edit_pair_has_one_current_core_fingerprint(self):
+        self.assertEqual(AUTHORING_GRAPH_CORE_PROJECTION_VERSION, 6)
         self.assertEqual(
             self.before_fingerprint,
             "8d5dc57396cfbd31e918f8f89a2c601fe60c46ffb65fc81ad50ea5656b7419bb",
@@ -177,10 +182,17 @@ class AuthoredTreeProjectionV4Tests(unittest.TestCase):
                     before_text + after_text,
                     r"(?i)(PARK|OneDrive|Forestportfolio|[A-Z]:[\\/])",
                 )
+                # Projecting one of these documents costs about 15 s -- they
+                # are 78-93 MB of real authored XML -- so the repeated
+                # project_v4(before_text) is worth hoisting rather than
+                # recomputing. Same three assertions, one fewer projection per
+                # pair.
+                before_core_v4 = project_v4(before_text)
                 self.assertEqual(
-                    project(before_text),
+                    before_core_v4,
                     pair["expected_core_fingerprint"],
                 )
+                self.assertEqual(before_core_v4, project_v4(after_text))
                 self.assertEqual(project(before_text), project(after_text))
 
     def test_authored_attack_matrix_changes_the_fingerprint(self):

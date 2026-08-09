@@ -320,11 +320,7 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
             issues = preflight.preflight_contract_issues({
                 "texture_readiness_contract": result,
             })
-            self.assertEqual(
-                issues[0]["code"],
-                "TEXTURE_SOURCE_FALLBACK_NEEDS_PCG_GENERATION",
-            )
-            self.assertEqual(issues[0]["severity"], "warning")
+            self.assertEqual(issues, [])
 
     def test_fbx_copy_is_blocked_instead_of_becoming_provisional(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -408,15 +404,9 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
             binding["texture_contract_status"],
             "inactive_provisional_source_diagnostic",
         )
-        self.assertEqual(issues[0]["severity"], "warning")
-        self.assertEqual(issues[0]["entity"], "Material")
-        self.assertTrue(issues[0]["details"]["source_rejections"])
-        self.assertNotIn(
-            fixture["expected"]["blocking_issue_absent"],
-            {issue["code"] for issue in issues},
-        )
+        self.assertEqual(issues, [])
 
-    def test_issue64_live_exporting_material_remains_blocked(self):
+    def test_issue64_live_exporting_texture_candidate_is_omitted_not_blocked(self):
         def make_live(snapshot):
             row = snapshot["leaf_generator_bindings"][0]
             row["visible"] = True
@@ -435,12 +425,9 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
             result["missing"][0]["export_scope"]["reason"],
             "material_live_binding_visible_or_exporting",
         )
-        self.assertIn(
-            "TEXTURE_SET_INCOMPLETE",
-            {issue["code"] for issue in issues},
-        )
+        self.assertEqual(issues, [])
 
-    def test_issue64_stale_node_table_remains_fail_closed(self):
+    def test_issue64_stale_texture_evidence_stays_telemetry_only(self):
         def make_stale(snapshot):
             snapshot["node_table"]["stale"] = True
             snapshot["node_table"]["orphan_node_count"] = 9
@@ -457,12 +444,9 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
             "live_export_evidence_stale_node_table",
         )
         self.assertTrue(scope["node_table"]["stale"])
-        self.assertIn(
-            "TEXTURE_SET_INCOMPLETE",
-            {issue["code"] for issue in issues},
-        )
+        self.assertEqual(issues, [])
 
-    def test_issue64_ambiguous_binding_state_remains_fail_closed(self):
+    def test_issue64_ambiguous_texture_binding_is_left_unassigned(self):
         def make_ambiguous(snapshot):
             del snapshot["leaf_generator_bindings"][1]["graph_visible"]
 
@@ -475,10 +459,7 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
             result["missing"][0]["export_scope"]["reason"],
             "material_live_binding_state_ambiguous",
         )
-        self.assertIn(
-            "TEXTURE_SET_INCOMPLETE",
-            {issue["code"] for issue in issues},
-        )
+        self.assertEqual(issues, [])
 
     def test_issue64_nonblocking_diagnostic_allows_main_to_finish(self):
         fixture_path = (
@@ -548,14 +529,7 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                 "nonblocking_diagnostics",
             )
             issues = report["speedtree_pipeline_contract"]["issues"]
-            self.assertIn(
-                "INACTIVE_MATERIAL_PROVISIONAL_SOURCE",
-                {issue["code"] for issue in issues},
-            )
-            self.assertNotIn(
-                "TEXTURE_SET_INCOMPLETE",
-                {issue["code"] for issue in issues},
-            )
+            self.assertEqual(issues, [])
 
     def test_invalid_cluster_bake_preserves_exact_origin_issue(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -650,6 +624,142 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                     Path(temporary) / "Texture" / "leaf_source.tif"
                 ])
             )
+
+    def test_selected_manifest_proves_exact_duplicate_name_cluster_material(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            asset = Path(temporary) / "tree_birch_sample"
+            cluster = asset / "cluster"
+            cluster.mkdir(parents=True)
+            spm = asset / "SK_tree_birch_sample_03.spm"
+            spm.write_bytes(b"sanitized-spm")
+            color = cluster / "leaf_main.tga"
+            opacity = cluster / "leaf_main_Opacity.tga"
+            color.write_bytes(b"color")
+            opacity.write_bytes(b"opacity")
+            stmat = asset / "fbx" / f"{spm.stem}.stmat"
+            stmat.parent.mkdir()
+            self._write_raw_stmat(
+                stmat,
+                "M_leaf_main_Mat",
+                {"Color": color, "Opacity": opacity},
+            )
+            scope_dir = asset / ".atlas_leaf_speedtree_scopes"
+            scope_dir.mkdir()
+            manifest = {
+                "atlas_manifest_schema_version": 1,
+                "spm": str(spm),
+                "blend_file": str(cluster / "SK_leaf_main.blend"),
+                "source_collection": "Atlas_Cluster_Cards",
+                "export_scope_id": "scope-leaf-main",
+                "material_groups": [{
+                    "material": "M_leaf_main",
+                    "material_id": 17,
+                    "mesh_ids": [35],
+                    "blender_cluster_bake_texture": {
+                        "files": {
+                            "albedo": str(color),
+                            "alpha": str(opacity),
+                        },
+                        "origin_receipt": {"proof": "selected-exact-target"},
+                    },
+                }],
+                "generator_connection": {
+                    "requested": True,
+                    "complete": True,
+                    "bindings": [],
+                },
+            }
+            (scope_dir / f"scope-leaf-main__{spm.stem}.json").write_text(
+                json.dumps(manifest),
+                encoding="utf-8",
+            )
+            slots = [
+                {
+                    "map_index": index,
+                    "map": map_name,
+                    "role": map_name.casefold(),
+                    "authored_ref": str(source),
+                    "resolved_ref": str(source.resolve()),
+                }
+                for index, (map_name, source) in enumerate(
+                    (("Color", color), ("Opacity", opacity))
+                )
+            ]
+            inspection = {
+                "materials": [
+                    {
+                        "material_id": "4",
+                        "material_name": "leaf_main",
+                        "slots": slots,
+                    },
+                    {
+                        "material_id": "17",
+                        "material_name": "M_leaf_main",
+                        "slots": slots,
+                    },
+                ],
+            }
+            live_rows = [{
+                "material_id": "17",
+                "material_name": "M_leaf_main",
+                "cutout_mesh_ids": ["35"],
+                "refs": [str(color), str(opacity)],
+                "managed_leaf_output": True,
+            }]
+
+            def prove_origin(
+                _spm,
+                material,
+                output,
+                _asset_root,
+                *,
+                consumption_context,
+            ):
+                self.assertEqual(material["material_id"], "17")
+                self.assertEqual(
+                    output["origin_receipt"]["proof"],
+                    "selected-exact-target",
+                )
+                self.assertEqual(
+                    consumption_context,
+                    preflight.BLENDER_BAKE_CONSUMPTION_SPEEDTREE_PREVIEW,
+                )
+                return ({"slot_files": output["slot_files"]}, "")
+
+            with mock.patch.object(
+                preflight,
+                "inspect_spm_texture_slots",
+                return_value=inspection,
+            ), mock.patch.object(
+                preflight,
+                "extract_material_image_refs",
+                return_value=live_rows,
+            ), mock.patch.object(
+                preflight,
+                "resolve_blender_cluster_bake_origin",
+                side_effect=prove_origin,
+            ), mock.patch.object(
+                preflight,
+                "validate_blender_cluster_bake_receipt_for_consumption",
+                return_value="",
+            ):
+                result = preflight.augment_texture_readiness_contract(
+                    preflight.resolve_texture_bindings(stmat),
+                    stmat,
+                    spm,
+                    source_texture_roots=[],
+                )
+
+            binding = result["bindings"][0]
+            self.assertEqual(
+                binding["texture_contract_status"],
+                "blender_cluster_bake",
+            )
+            self.assertEqual(
+                binding["atlas_manifest_ownership"]["material_id"],
+                "17",
+            )
+            self.assertNotIn("source_rejections", binding)
 
     def test_cluster_bake_receipt_records_proven_stmat_index_space(self):
         root = Path("C:/asset")
@@ -804,7 +914,7 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
             xml_declaration=True,
         )
 
-    def test_marker_only_atlas_ownership_emits_the_shadow_issue(self):
+    def test_marker_only_atlas_ownership_is_silent_mutation_diagnostic(self):
         issues = preflight.preflight_contract_issues({
             "spm": "SK_atlas.spm",
             "leaf_reference_contract": {
@@ -817,16 +927,72 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
             },
         })
 
-        self.assertIn(
-            {
-                "code": "ATLAS_OWNERSHIP_PROVENANCE_MISMATCH",
-                "severity": "warning",
-            },
-            [
-                {"code": issue["code"], "severity": issue["severity"]}
-                for issue in issues
-            ],
-        )
+        self.assertEqual(issues, [])
+
+    def test_provider_claim_disagreement_does_not_abort_texture_preflight(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_overlapping_providers.spm"
+            spm.write_bytes(b"fixture-spm")
+            authority = {
+                "atlas_manifest_schema_version": 1,
+                "spm": str(spm),
+                "blend_file": str(root / "provider_a.blend"),
+                "source_collection": "Provider A",
+                "export_scope_id": "provider-a",
+                "material_groups": [{
+                    "material": "M_leaf_shared",
+                    "material_id": 7,
+                    "mesh_ids": [20],
+                }],
+                "generator_connection": {
+                    "complete": True,
+                    "bindings": [],
+                },
+            }
+            target_dir = root / ".atlas_leaf_speedtree_targets"
+            target_dir.mkdir()
+            (target_dir / f"{spm.stem}.json").write_text(
+                json.dumps(authority),
+                encoding="utf-8",
+            )
+            competing = json.loads(json.dumps(authority))
+            competing["blend_file"] = str(root / "provider_b.blend")
+            competing["source_collection"] = "Provider B"
+            competing["export_scope_id"] = "provider-b"
+            competing["material_groups"][0]["mesh_ids"] = [99]
+            (root / "speedtree_import_manifest.json").write_text(
+                json.dumps(competing),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                preflight,
+                "read_stmat_material_sources",
+                return_value={"materials": []},
+            ), mock.patch.object(
+                preflight,
+                "inspect_spm_texture_slots",
+                return_value={"materials": []},
+            ), mock.patch.object(
+                preflight,
+                "extract_material_image_refs",
+                return_value=[],
+            ):
+                readiness = preflight.augment_texture_readiness_contract(
+                    {"bindings": [], "warnings": [], "missing": []},
+                    root / "SK_overlapping_providers.stmat",
+                    spm,
+                )
+
+            diagnostic = readiness["atlas_manifest_diagnostic"]
+            self.assertEqual(
+                diagnostic["status"],
+                "provider_claim_disagreement",
+            )
+            self.assertFalse(diagnostic["mutation_authorized"])
+            self.assertTrue(diagnostic["resolution"]["conflicting"])
+            self.assertEqual(readiness["warnings"], [])
+            self.assertEqual(readiness["missing"], [])
 
     def run_preflight(self, spm, report_path):
         args = argparse.Namespace(
@@ -955,7 +1121,7 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                     issue["code"] for issue in issues
                     if issue["severity"] == "warning"
                 },
-                {"TEXTURE_SOURCE_FALLBACK_NEEDS_PCG_GENERATION"},
+                set(),
             )
             self.assertTrue(all(
                 set(warning["expected_t_paths"])
@@ -1070,7 +1236,7 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                 },
             )
 
-    def test_unbound_managed_mesh_is_nonblocking_when_material_keeps_others(
+    def test_unbound_marker_only_missing_mesh_is_not_export_authority(
         self,
     ):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1109,6 +1275,12 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
             self.assertEqual(
                 contract["orphan_missing"][0]["usage"],
                 "managed_orphan",
+            )
+            self.assertFalse(
+                contract["atlas_consumer_integrity"]["blocking"]
+            )
+            self.assertTrue(
+                contract["atlas_consumer_integrity"]["mutation_blocking"]
             )
 
     def test_final_managed_material_mesh_stays_a_blocking_reference(self):
@@ -1217,7 +1389,7 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                 report["problem_node_marker"]["status"], "reported_only"
             )
 
-    def test_textureless_stmat_remains_blocked_after_material_name_match(self):
+    def test_textureless_stmat_continues_after_material_name_match(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             spm = root / "SK_reed_textureless.spm"
@@ -1241,30 +1413,25 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
 
             exited, export_mock = self.run_preflight(spm, report_path)
 
-            self.assertTrue(exited)
+            self.assertFalse(exited)
             export_mock.assert_called_once()
             report = json.loads(report_path.read_text(encoding="utf-8"))
-            self.assertEqual(report["status"], "blocked")
+            self.assertEqual(report["status"], "ok")
             self.assertEqual(
-                report["speedtree_pipeline_contract"]["outcome"], "blocked"
+                report["speedtree_pipeline_contract"]["outcome"], "ok"
             )
             self.assertEqual(
                 report["texture_source_contract"]["status"],
-                "missing_sources",
+                "ok",
             )
             self.assertEqual(
-                report["classification"],
-                "asset_texture_source_undeclared",
+                report["texture_source_contract"]["availability_status"],
+                "textureless",
             )
-            self.assertIn("M_leaf_grass_dead_Mat", report["error"])
-            self.assertIn("<Source 미지정>", report["error"])
-            self.assertIn(
-                "TEXTURE_SOURCE_MISSING",
-                {
-                    issue["code"]
-                    for issue in report["speedtree_pipeline_contract"]["issues"]
-                },
+            self.assertFalse(
+                report["texture_source_contract"]["affects_pipeline_outcome"]
             )
+            self.assertEqual(report["speedtree_pipeline_contract"]["issues"], [])
 
 if __name__ == "__main__":
     unittest.main()

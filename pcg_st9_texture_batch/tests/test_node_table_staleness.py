@@ -50,10 +50,20 @@ def node(generator_guid, index):
     )
 
 
-def document(generators, nodes):
+def link(source_guid, target_guid):
+    return (
+        "<Link>"
+        f"<SourceGUID>{source_guid}</SourceGUID>"
+        f"<TargetGUID>{target_guid}</TargetGUID>"
+        "</Link>"
+    )
+
+
+def document(generators, nodes, links=()):
     return (
         '<?xml version="1.0"?><SpeedTree>'
         f"<Generators>{''.join(generators)}</Generators>"
+        f"<Links>{''.join(links)}</Links>"
         f"<Nodes>{''.join(nodes)}</Nodes>"
         "</SpeedTree>"
     )
@@ -178,19 +188,38 @@ class LeafBindingEvidenceTests(unittest.TestCase):
         self.assertFalse(rows["leaf"]["node_table_stale"])
         self.assertTrue(rows["other"]["export_participates"])
 
-    def test_zero_nodes_in_a_stale_table_is_unavailable_evidence(self):
+    def test_disconnected_orphan_does_not_taint_unconnected_generator(self):
         text = document(
             [generator("leaf", mesh_id="130")],
             [node("removed", 0), node("removed", 1)],
         )
         row = bindings_for(text)[0]
-        # Still fails closed ...
         self.assertFalse(row["export_participates"])
         self.assertFalse(row["visible"])
-        # ... but is no longer reported as a disconnected Generator.
+        self.assertEqual(row["export_evidence"], "node_table")
+        self.assertFalse(row["node_table_stale"])
+        self.assertTrue(row["node_table_document_stale"])
+        self.assertEqual(
+            row["causal_path_reason"],
+            "generator_causal_path_unconnected",
+        )
+        self.assertTrue(row["graph_visible"])
+        self.assertFalse(_stale_node_table_evidence(row))
+
+    def test_orphan_ancestor_keeps_descendant_evidence_unavailable(self):
+        text = document(
+            [generator("leaf", mesh_id="130")],
+            [node("removed", 0), node("removed", 1)],
+            [link("removed", "leaf")],
+        )
+        row = bindings_for(text)[0]
         self.assertEqual(row["export_evidence"], "node_table_stale")
         self.assertTrue(row["node_table_stale"])
-        self.assertTrue(row["graph_visible"])
+        self.assertEqual(row["orphan_ancestor_guids"], ["removed"])
+        self.assertEqual(
+            row["causal_path_reason"],
+            "generator_causal_path_evidence_unavailable",
+        )
         self.assertTrue(_stale_node_table_evidence(row))
 
     def test_generators_that_own_nodes_keep_positive_evidence(self):
@@ -201,7 +230,8 @@ class LeafBindingEvidenceTests(unittest.TestCase):
         row = bindings_for(text)[0]
         self.assertTrue(row["export_participates"])
         self.assertEqual(row["export_evidence"], "node_table")
-        self.assertTrue(row["node_table_stale"])
+        self.assertFalse(row["node_table_stale"])
+        self.assertTrue(row["node_table_document_stale"])
         self.assertFalse(_stale_node_table_evidence(row))
 
     def test_hidden_generator_is_not_excused_by_a_stale_table(self):
@@ -258,10 +288,17 @@ class DeliveryClassificationTests(unittest.TestCase):
             evidence["stale_node_table_target_mesh_ids"], [130, 131]
         )
         recovery = evidence["stale_node_table_recovery"]
-        self.assertEqual(recovery["mode"], "interactive_modeler_save_watch")
-        self.assertFalse(recovery["modeler_auto_save"])
+        self.assertEqual(
+            recovery["mode"],
+            "owned_semantic_uia_modeler_save_watch",
+        )
+        self.assertTrue(recovery["modeler_auto_save"])
         self.assertFalse(recovery["direct_spm_xml_edit"])
-        self.assertTrue(recovery["requires_user_save"])
+        self.assertFalse(recovery["requires_user_save"])
+        self.assertTrue(recovery["requires_node_table_stale"])
+        self.assertTrue(recovery["requires_nonzero_orphan_owners"])
+        self.assertTrue(recovery["requires_nonzero_orphan_nodes"])
+        self.assertTrue(recovery["requires_complete_sealed_scope"])
         self.assertTrue(recovery["automatic_reaudit"])
 
     def test_an_independent_fault_keeps_the_original_reason(self):
@@ -282,7 +319,7 @@ class DeliveryClassificationTests(unittest.TestCase):
         self.assertIsNone(evidence.get("delivery_remedy"))
         self.assertEqual(
             evidence["stale_node_table_recovery"]["mode"],
-            "interactive_modeler_save_watch",
+            "owned_semantic_uia_modeler_save_watch",
         )
 
     def test_unexplained_missing_mesh_id_keeps_the_original_reason(self):

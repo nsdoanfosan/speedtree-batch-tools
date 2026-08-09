@@ -71,6 +71,8 @@ class FullPipelineScopeTests(unittest.TestCase):
             gui, "calibration_settings_signature", return_value="current"
         ), mock.patch.object(
             gui, "legacy_calibration_settings_signature", return_value="legacy"
+        ), mock.patch.object(
+            app, "_production_source_revision_precheck", return_value=None
         ), mock.patch.object(gui, "save_config"), mock.patch.object(
             gui.threading, "Thread", return_value=worker
         ) as thread, mock.patch.object(gui.messagebox, "showinfo") as showinfo:
@@ -213,6 +215,66 @@ class FullPipelineScopeTests(unittest.TestCase):
         app.root_entry.configure.assert_called_with(state="normal")
         app.btn_stop.configure.assert_called_with(state="disabled")
 
+    def test_new_active_job_replaces_only_selected_previous_stops_with_pending(self):
+        gui = load_gui_module()
+        app, checked, unchecked = self.make_start_app(gui)
+        checked_iid = str(checked["spm"])
+        unchecked_iid = str(unchecked["spm"])
+        cancelled_receipt = {
+            "kind": "cancelled",
+            "message": "사용자 중지",
+            "outcome": "cancelled",
+        }
+        app.state = {
+            checked_iid: {
+                "blend_status": "중지: 사용자 중지",
+                "blend_status_kind": "cancelled",
+                "blend_status_result": cancelled_receipt,
+                "push_status": "준비됨 ✓",
+                "push_status_kind": "ready",
+            },
+            unchecked_iid: {
+                "blend_status": "중지: 사용자 중지",
+                "blend_status_kind": "cancelled",
+            },
+        }
+        app.state_lock = threading.RLock()
+        app.ui_queue = queue.Queue()
+        job = {
+            "mode": "pipeline",
+            "terminal_phase": "push",
+            "targets": [checked],
+        }
+
+        with mock.patch.object(gui, "save_state") as save:
+            app._mark_previous_cancellations_pending(job)
+
+        self.assertEqual(
+            app.state[checked_iid]["blend_status"], "재실행 대기"
+        )
+        self.assertEqual(
+            app.state[checked_iid]["blend_status_kind"], "rerun_pending"
+        )
+        self.assertIs(
+            app.state[checked_iid]["blend_status_result"],
+            cancelled_receipt,
+        )
+        self.assertEqual(app.state[checked_iid]["push_status_kind"], "ready")
+        self.assertEqual(
+            app.state[unchecked_iid]["blend_status_kind"], "cancelled"
+        )
+        self.assertEqual(
+            app.ui_queue.get_nowait(),
+            ("cell", (checked_iid, "blend_status", "재실행 대기")),
+        )
+        self.assertTrue(app.ui_queue.empty())
+        save.assert_called_once_with(app.state)
+        self.assertIsNone(
+            app._target_outcome_for_kind(
+                "rerun_pending", "사용자 중지"
+            )
+        )
+
     def test_batch_request_snapshot_recursively_freezes_nested_item_data(self):
         gui = load_gui_module()
         app, _checked, _unchecked = self.make_start_app(gui)
@@ -253,6 +315,23 @@ class FullPipelineScopeTests(unittest.TestCase):
         self.assertTrue(app.stop_flag.is_set())
         self.assertFalse(app.pending_batch_jobs)
         self.assertIn("대기 작업 2개 취소", app.log.call_args.args[0])
+
+    def test_window_shutdown_records_operator_close_before_stopping(self):
+        gui = load_gui_module()
+        app, _checked, _unchecked = self.make_start_app(gui)
+        app.pending_batch_jobs = gui.deque()
+        app.active_batch_job = {"id": 1, "label": "running retry"}
+        app.shared_queue_runtime = mock.Mock()
+        app._app_open = True
+        app._ensure_batch_queue_state()
+
+        app.shutdown_shared_queue()
+
+        app.shared_queue_runtime.shutdown.assert_called_once_with(
+            operator_close=True
+        )
+        self.assertFalse(app._app_open)
+        self.assertTrue(app.stop_flag.is_set())
 
     def test_queued_worker_reports_item_failures_instead_of_success(self):
         gui = load_gui_module()

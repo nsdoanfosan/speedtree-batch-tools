@@ -13,9 +13,15 @@ import os
 import tempfile
 import threading
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from artifact_content_key import sampled_file_content_snapshot
+from artifact_content_key import (
+    SHA256_ALGORITHM,
+    SAMPLED_FINGERPRINT_ALGORITHM,
+    file_content_key_snapshot,
+    sampled_file_content_snapshot,
+)
 
 
 CONTENT_CACHE_SCHEMA_VERSION = 1
@@ -61,17 +67,33 @@ def canonical_json_sha256(value) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _stable_content_row(path, memo=None):
+def _stable_content_row(path, memo=None, *, exact=False):
     candidate = Path(path).expanduser().absolute()
     key = path_key(candidate)
+    expected_algorithm = (
+        SHA256_ALGORITHM if exact else SAMPLED_FINGERPRINT_ALGORITHM
+    )
     if memo is not None and key in memo:
-        return dict(memo[key])
+        cached = memo[key]
+        if cached.get("fingerprint_algorithm") == expected_algorithm:
+            return dict(cached)
     if not candidate.is_file():
         raise ContentIdentityError(
             f"Content-identity input is unavailable: {candidate}"
         )
     try:
-        snapshot = sampled_file_content_snapshot(candidate)
+        if exact:
+            exact_snapshot = file_content_key_snapshot(
+                candidate, SHA256_ALGORITHM
+            )
+            snapshot = {
+                "size": exact_snapshot["size"],
+                "mtime_ns": exact_snapshot["mtime_ns"],
+                "fingerprint": exact_snapshot["digest"],
+                "fingerprint_algorithm": exact_snapshot["algorithm"],
+            }
+        else:
+            snapshot = sampled_file_content_snapshot(candidate)
     except OSError as exc:
         raise ContentIdentityError(
             f"Content-identity input could not be read: {candidate}: {exc}"
@@ -88,7 +110,9 @@ def _stable_content_row(path, memo=None):
     return row
 
 
-def content_identity(paths, *, membership=None, memo=None, max_files=None):
+def content_identity(
+        paths, *, membership=None, memo=None, max_files=None, exact=False,
+        workers=1):
     """Capture stable bounded content keys plus caller-owned membership data."""
     unique = {
         path_key(path): Path(path).expanduser().absolute()
@@ -99,7 +123,24 @@ def content_identity(paths, *, membership=None, memo=None, max_files=None):
         raise BoundedDiscoveryError(
             f"Content identity needs {len(unique)} files; bound is {limit}"
         )
-    rows = [_stable_content_row(unique[key], memo=memo) for key in sorted(unique)]
+    ordered_keys = sorted(unique)
+    worker_count = min(max(1, int(workers)), len(ordered_keys) or 1)
+    if worker_count > 1:
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="pcg-content-key",
+        ) as executor:
+            rows = list(executor.map(
+                lambda key: _stable_content_row(
+                    unique[key], memo=memo, exact=exact
+                ),
+                ordered_keys,
+            ))
+    else:
+        rows = [
+            _stable_content_row(unique[key], memo=memo, exact=exact)
+            for key in ordered_keys
+        ]
     stable_rows = [
         {
             "path": row["path"],
@@ -111,7 +152,10 @@ def content_identity(paths, *, membership=None, memo=None, max_files=None):
     ]
     stable_membership = sorted(str(value) for value in membership or ())
     return {
-        "algorithm": "sha256-of-bounded-content-keys-v1",
+        "algorithm": (
+            "sha256-of-full-content-keys-v1" if exact
+            else "sha256-of-bounded-content-keys-v1"
+        ),
         "sha256": canonical_json_sha256({
             "files": stable_rows,
             "membership": stable_membership,
@@ -241,18 +285,31 @@ class ContentAddressedJsonCache:
         return payload
 
     def get(self, namespace, identity_sha256):
+        return self.get_many(((namespace, identity_sha256),)).get(
+            str(namespace)
+        )
+
+    def get_many(self, rows):
+        """Read and validate several namespaces from one cache snapshot."""
+        requested = [
+            (str(namespace), str(identity_sha256))
+            for namespace, identity_sha256 in rows
+        ]
         with _CACHE_LOCK:
             payload = self._load()
-            row = payload["entries"].get(str(namespace))
-            if (
-                not isinstance(row, dict)
-                or row.get("identity_sha256") != str(identity_sha256)
-                or "value" not in row
-                or row.get("value_sha256")
-                != canonical_json_sha256(row.get("value"))
-            ):
-                return None
-            return row["value"]
+            result = {}
+            for namespace, identity_sha256 in requested:
+                row = payload["entries"].get(namespace)
+                if (
+                    not isinstance(row, dict)
+                    or row.get("identity_sha256") != identity_sha256
+                    or "value" not in row
+                    or row.get("value_sha256")
+                    != canonical_json_sha256(row.get("value"))
+                ):
+                    continue
+                result[namespace] = row["value"]
+            return result
 
     def put(self, namespace, identity_sha256, value):
         self.put_many([(namespace, identity_sha256, value)])

@@ -116,6 +116,163 @@ class BoardDisplaySnapshotTests(unittest.TestCase):
         self.assertNotIn("ready", loaded)
         self.assertNotIn("authority", loaded)
 
+    def test_display_payload_tamper_is_marked_untrusted_and_not_painted(self):
+        self._write(report={
+            "items": [{
+                "folder": str(self.root / "Tree" / "tree_elm"),
+                "name": "tree_elm",
+                "status": "ready",
+            }],
+        })
+        payload = json.loads(self.snapshot.read_text(encoding="utf-8"))
+        payload["display_report"]["items"][0]["status"] = "spoofed"
+        self.snapshot.write_text(json.dumps(payload), encoding="utf-8")
+
+        loaded = self._read()
+
+        self.assertEqual(loaded["cache_state"], "untrusted_payload")
+        self.assertEqual(loaded["context_state"], "unknown")
+        self.assertFalse(loaded["can_display"])
+
+    def test_projection_omits_actual_fleet_heavy_fields_but_keeps_ui_state(self):
+        target = {
+            "spm": str(self.root / "Tree" / "SK_tree.spm"),
+            "generator_connection_complete": False,
+            "generator_connection_update_needed": True,
+            "source_material_names": ["M_leaf"],
+            "source_material_ids": ["17"],
+            "source_material_statuses": [
+                {"name": "M_leaf", "diagnostic": "x" * 4096}
+            ],
+            "expected_generator_bindings": [{"rows": list(range(1000))}],
+            "source_generator_bindings": [{"rows": list(range(1000))}],
+            "generator_bindings": [{"rows": list(range(1000))}],
+        }
+        report = {
+            "items": [{
+                "folder": str(self.root / "Tree" / "tree_elm"),
+                "name": "tree_elm",
+                "status": "needs_atlas",
+                "actions": ["② 아틀라스 생성"],
+                "leaf_atlas_lineage": {"rows": list(range(1000))},
+                "assembly_handoff": {"rows": list(range(1000))},
+                "preserved_cluster_materials": [
+                    {"payload": "x" * 4096}
+                ],
+                "cluster_assembly": {
+                    "hierarchy": {
+                        "name": "Cluster",
+                        "path": str(self.root / "Tree" / "Cluster"),
+                    },
+                    "canonical_bark": {
+                        "status": "ready",
+                        "canonical_material": "M_bark_tree_01",
+                    },
+                    "handoff": {
+                        "status": "pending_export",
+                        "skeleton_wind_contract": {
+                            "status": "ready",
+                            "lod_count": 4,
+                        },
+                    },
+                    "dependencies": [{
+                        "spm": str(self.root / "Tree" / "Cluster" / "a.spm"),
+                        "role": "leaf",
+                        "decision": "pending_export",
+                        "source_mesh_ids": [1, 2],
+                        "source_materials": [{
+                            "material_name": "M_leaf",
+                            "normalized_variants": "x" * 8192,
+                        }],
+                        "normalized_variants": "x" * 32768,
+                    }],
+                    "normalized_delivery": "x" * 65536,
+                },
+                "leaf_mesh_sources": [{
+                    "atlas_base": "M_leaf",
+                    "atlas_blends": [],
+                    "generator_connection_complete": False,
+                    "targets": [target],
+                }],
+            }],
+        }
+        metrics = {}
+        written = write_board_display_snapshot(
+            report,
+            self.cfg,
+            pcg_targets=self.pcg_targets,
+            path=self.snapshot,
+            pcg_targets_path=self.targets_path,
+            metrics=metrics,
+        )
+
+        self.assertEqual(written, self.snapshot)
+        payload = json.loads(self.snapshot.read_text(encoding="utf-8"))
+        item = payload["display_report"]["items"][0]
+        projected_target = item["leaf_mesh_sources"][0]["targets"][0]
+        self.assertNotIn("leaf_atlas_lineage", item)
+        self.assertNotIn("assembly_handoff", item)
+        self.assertNotIn("preserved_cluster_materials", item)
+        projected_assembly = item["cluster_assembly"]
+        self.assertEqual(
+            projected_assembly["canonical_bark"]["status"], "ready"
+        )
+        self.assertEqual(
+            projected_assembly["canonical_bark"]["canonical_material"],
+            "M_bark_tree_01",
+        )
+        self.assertEqual(
+            projected_assembly["handoff"]["skeleton_wind_contract"],
+            {"status": "ready", "lod_count": 4},
+        )
+        self.assertEqual(
+            projected_assembly["dependencies"][0]["role"], "leaf"
+        )
+        self.assertEqual(
+            projected_assembly["dependencies"][0]["source_materials"],
+            [{"material_name": "M_leaf"}],
+        )
+        self.assertNotIn("normalized_delivery", projected_assembly)
+        self.assertNotIn(
+            "normalized_variants",
+            projected_assembly["dependencies"][0],
+        )
+        self.assertNotIn("source_material_statuses", projected_target)
+        self.assertNotIn("expected_generator_bindings", projected_target)
+        self.assertNotIn("source_generator_bindings", projected_target)
+        self.assertNotIn("generator_bindings", projected_target)
+        self.assertEqual(projected_target["spm"], target["spm"])
+        self.assertIs(
+            projected_target["generator_connection_complete"], False
+        )
+        self.assertEqual(projected_target["source_material_names"], ["M_leaf"])
+        self.assertEqual(item["status"], "needs_atlas")
+        self.assertEqual(item["actions"], ["② 아틀라스 생성"])
+        self.assertTrue(metrics["written"])
+        self.assertGreaterEqual(metrics["omitted_field_count"], 6)
+        self.assertLessEqual(
+            metrics["candidate_bytes"], BOARD_SNAPSHOT_MAX_BYTES
+        )
+
+    def test_canceled_generation_does_not_replace_last_good_snapshot(self):
+        self._write(report={"items": [{"name": "last-good"}]})
+        previous = self.snapshot.read_bytes()
+        metrics = {}
+
+        written = write_board_display_snapshot(
+            {"items": [{"name": "superseded"}]},
+            self.cfg,
+            pcg_targets=self.pcg_targets,
+            path=self.snapshot,
+            pcg_targets_path=self.targets_path,
+            metrics=metrics,
+            publish_check=lambda: False,
+        )
+
+        self.assertIsNone(written)
+        self.assertEqual(self.snapshot.read_bytes(), previous)
+        self.assertEqual(metrics["reason"], "publication_canceled")
+
     def test_context_changes_are_returned_as_stale_display_metadata(self):
         self._write()
 

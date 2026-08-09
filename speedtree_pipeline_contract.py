@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sys
+import threading
 import xml.etree.ElementTree as ET
 from functools import lru_cache
 from pathlib import Path
@@ -48,6 +49,10 @@ BACKUP_FILENAME_RE = re.compile(
     r"|^__spm_sync_(?:preflight|verify)_.+\.spm$"
     r"|^\.__spm_pass_repair_.+\.spm$"
     r")",
+    re.IGNORECASE,
+)
+MANUAL_COPY_FILENAME_RE = re.compile(
+    r"\s+-\s+(?:\uBCF5\uC0AC\uBCF8|copy)(?:\s*\(\d+\))?\.spm$",
     re.IGNORECASE,
 )
 # A SpeedTree 16-byte Generator GUID appears in two observed serialization
@@ -88,6 +93,15 @@ def _canonical_path(value):
     try:
         return path.resolve(strict=False)
     except (OSError, RuntimeError):
+        return path.absolute()
+
+
+def _lexical_path(value):
+    """Return an absolute spelling without following aliases or junctions."""
+    path = Path(str(value or "")).expanduser()
+    try:
+        return Path(os.path.abspath(os.path.normpath(os.fspath(path))))
+    except (OSError, TypeError, ValueError):
         return path.absolute()
 
 
@@ -135,17 +149,28 @@ def is_live_spm(path, require_file=True):
     Tool-owned backup, rollback, recovery, preflight, and verification files
     remain directly addressable by their recovery code, but they must never be
     rediscovered as board rows, queue targets, registry owners, Push
-    dependencies, or Cluster consumers.  Patterns stay deliberately explicit:
-    an ordinary authored asset is not excluded merely because its name contains
-    a word such as ``backup``.
+    dependencies, or Cluster consumers.  Explorer-style `` - Copy`` and its
+    Korean-localized duplicate suffix are also inventory artifacts: their
+    provenance is ambiguous, so they remain reportable and directly
+    addressable but cannot silently become a second production target.
+    Patterns stay deliberately explicit: an ordinary authored asset is not
+    excluded merely because its name contains a word such as ``backup`` or
+    ``copy``.
     """
+    lexical = _lexical_path(path)
     candidate = _canonical_path(path)
-    if candidate.suffix.casefold() != ".spm":
-        return False
-    if BACKUP_FILENAME_RE.search(candidate.name):
-        return False
-    if any(part.casefold() in BACKUP_DIRECTORY_NAMES for part in candidate.parts):
-        return False
+    for inspected in (lexical, candidate):
+        if inspected.suffix.casefold() != ".spm":
+            return False
+        if BACKUP_FILENAME_RE.search(inspected.name):
+            return False
+        if MANUAL_COPY_FILENAME_RE.search(inspected.name):
+            return False
+        if any(
+            part.casefold() in BACKUP_DIRECTORY_NAMES
+            for part in inspected.parts
+        ):
+            return False
     return candidate.is_file() if require_file else True
 
 
@@ -231,8 +256,7 @@ def pipeline_contract_path():
     return None
 
 
-@lru_cache(maxsize=1)
-def shared_contract_api():
+def _load_shared_contract_api():
     """Dynamically load the central stdlib-only SpeedTree policy module."""
     contract_path = pipeline_contract_path()
     if contract_path is None:
@@ -284,6 +308,23 @@ def shared_contract_api():
             "central SpeedTree handoff API is incomplete: " + ", ".join(missing)
         )
     return module
+
+
+_SHARED_CONTRACT_API_LOCK = threading.RLock()
+
+
+@lru_cache(maxsize=1)
+def shared_contract_api():
+    """Return one fully initialized policy module across worker threads.
+
+    ``functools.lru_cache`` may execute a cold miss more than once when
+    callers arrive concurrently.  The loader publishes its module name before
+    executing the file, so an unguarded second caller could observe a matching
+    ``__file__`` and return the half-initialized module.  Serialize that one
+    cold initialization; later calls remain ordinary cached reads.
+    """
+    with _SHARED_CONTRACT_API_LOCK:
+        return _load_shared_contract_api()
 
 
 def clear_contract_caches():
@@ -893,11 +934,11 @@ def _binding_summary(binding):
 
 def _texture_source_mode(binding):
     status = str((binding or {}).get("status") or "")
-    if status == "ok":
+    if status in {"ok", "partial"}:
         return "managed_texture_set"
     if status == "not_managed":
         return "preserve_declared_sources"
-    return "unresolved"
+    return "leave_unassigned"
 
 
 def build_stmat_material_intents(
@@ -1015,6 +1056,11 @@ def build_preflight_envelope(
         "instance_profile": normalized_profile,
         "tree_user_data": profile,
         "material_intents": material_intents,
+        "texture_admission": {
+            "mode": "runtime_tolerant",
+            "affects_outcome": False,
+            "state": str((texture_readiness or {}).get("status") or "unassigned"),
+        },
         "dynamic_wind": {
             "path": canonical_path(dynamic_wind_path(spm)),
             "rules": api.dynamic_wind_rules(),
@@ -1121,6 +1167,148 @@ def validate_preflight_envelope(envelope, spm_path, require_ok=True):
     return copy.deepcopy(envelope)
 
 
+def refresh_preflight_report_after_exact_export(
+    report,
+    spm_path,
+    stmat_path=None,
+):
+    """Rebind an already-validated report to its exact producer output.
+
+    SpeedTree's FBX export promotes a newly generated STMAT at the canonical
+    target path.  That tool-owned replacement is expected after the caller has
+    validated the report and then exported the *same* SPM.  Revalidating the
+    pre-export byte hash at that point would make a successful exact-target
+    export invalidate itself.
+
+    The SPM identity remains immutable here.  Texture bindings are reused only
+    when the live STMAT has the same duplicate-safe material order, names, IDs,
+    and declared map sources as the validated report.  Otherwise bindings are
+    resolved again from the live STMAT; a resolver exception degrades only the
+    optional texture metadata to runtime-unassigned rather than failing the
+    asset.
+    """
+    if not isinstance(report, dict):
+        raise ValueError("SpeedTree preflight report is not an object")
+    if report.get("status") != "ok":
+        raise ValueError(
+            "SpeedTree material preflight status is not ok: "
+            f"{report.get('status')!r}"
+        )
+    previous = report.get("speedtree_pipeline_contract")
+    if not isinstance(previous, dict):
+        raise ValueError("SpeedTree pipeline contract is not an object")
+
+    spm = _canonical_path(spm_path)
+    recorded_spm = (previous.get("source") or {}).get("spm") or {}
+    current_spm = source_identity(spm)
+    if not _same_source_identity(recorded_spm, current_spm):
+        raise ValueError(
+            "SpeedTree preflight SPM source changed during exact-target export"
+        )
+
+    stmat = _canonical_path(stmat_path or speedtree_stmat_path(spm))
+    unbound = build_preflight_envelope(
+        spm,
+        stmat,
+        outcome=previous.get("outcome") or "ok",
+        texture_readiness=None,
+        issues=previous.get("issues") or [],
+    )
+
+    def material_keys(envelope):
+        return [
+            (
+                int(item.get("stmat_material_index", -1)),
+                str(item.get("stmat_material_id") or ""),
+                str(item.get("material_name") or "").casefold(),
+            )
+            for item in (envelope.get("material_intents") or [])
+        ]
+
+    previous_readiness = report.get("texture_readiness_contract") or {}
+    live_resolution_error = ""
+    try:
+        from speedtree_texture_contract import resolve_texture_bindings
+
+        live_readiness = resolve_texture_bindings(stmat)
+    except Exception as exc:  # texture metadata is runtime-tolerant by contract
+        live_resolution_error = f"{type(exc).__name__}: {exc}"
+        live_readiness = {
+            "status": "unassigned",
+            "stmat": canonical_path(stmat),
+            "bindings": [],
+            "missing": [],
+            "texture_admission_mode": "runtime_tolerant",
+            "affects_pipeline_outcome": False,
+            "diagnostic": live_resolution_error,
+        }
+
+    def binding_source_keys(readiness):
+        return [
+            (
+                int(item.get("material_index", -1)),
+                str(item.get("material") or "").casefold(),
+                str(item.get("texture_base") or "").casefold(),
+                json.dumps(
+                    item.get("stmat_roles") or {},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                ),
+                tuple(
+                    sorted(
+                        (
+                            str(role).casefold(),
+                            canonical_path_key(path),
+                        )
+                        for role, path in (item.get("files") or {}).items()
+                    )
+                ),
+            )
+            for item in (readiness.get("bindings") or [])
+        ]
+
+    preserve_bindings = (
+        material_keys(previous) == material_keys(unbound)
+        and binding_source_keys(previous_readiness)
+        == binding_source_keys(live_readiness)
+    )
+    texture_readiness = previous_readiness if preserve_bindings else live_readiness
+    refreshed = build_preflight_envelope(
+        spm,
+        stmat,
+        outcome=previous.get("outcome") or "ok",
+        texture_readiness=texture_readiness,
+        issues=previous.get("issues") or [],
+    )
+    validate_preflight_envelope(refreshed, spm, require_ok=True)
+
+    payload = copy.deepcopy(report)
+    payload["speedtree_pipeline_contract"] = refreshed
+    if not preserve_bindings:
+        payload["texture_readiness_contract"] = copy.deepcopy(live_readiness)
+    payload["exact_target_export_contract_refresh"] = {
+        "status": "refreshed",
+        "refresh_cause": "exact_target_export_regenerated_stmat",
+        "previous_stmat": copy.deepcopy(
+            (previous.get("source") or {}).get("stmat") or []
+        ),
+        "live_stmat": copy.deepcopy(
+            (refreshed.get("source") or {}).get("stmat") or []
+        ),
+        "texture_binding_disposition": (
+            "preserved_same_live_material_sources"
+            if preserve_bindings
+            else "runtime_unassigned_live_resolution_error"
+            if live_resolution_error
+            else "refreshed_from_live_stmat"
+        ),
+        "texture_resolution_diagnostic": live_resolution_error,
+        "asset_failure": False,
+    }
+    return payload
+
+
 def validate_preflight_report(report_path, spm_path, require_ok=True):
     path = _canonical_path(report_path)
     try:
@@ -1143,6 +1331,7 @@ def validate_preflight_report(report_path, spm_path, require_ok=True):
 
 __all__ = [
     "BACKUP_DIRECTORY_NAMES",
+    "MANUAL_COPY_FILENAME_RE",
     "PREFLIGHT_CONTRACT_KIND",
     "PREFLIGHT_SCHEMA_VERSION",
     "SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION",
@@ -1174,6 +1363,7 @@ __all__ = [
     "spm_file_structural_semantic_fingerprint",
     "spm_authoring_graph_fingerprint",
     "spm_structural_semantic_fingerprint",
+    "refresh_preflight_report_after_exact_export",
     "validate_preflight_envelope",
     "validate_preflight_report",
 ]

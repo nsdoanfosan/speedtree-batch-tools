@@ -31,12 +31,18 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
+TOOL_DIR = Path(__file__).resolve().parent
+REPO_DIR = TOOL_DIR.parent
+if str(REPO_DIR) not in sys.path:
+    sys.path.insert(0, str(REPO_DIR))
+
+from process_lifecycle import owned_run
+
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from pcg_texture_common import load_config
 
-TOOL_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = TOOL_DIR / "assets"
 TEMPLATE_PATH = ASSETS_DIR / "m_graph_template.xml"
 TEMPLATE_GRAPH_NAME = "M_Leaf_elm_atlas_01"
@@ -259,8 +265,10 @@ def ensure_hbao_sbsar(cfg=None, timeout=1800):
     target = cache_dir / "hbao_2.sbsar"
     if target.exists() and target.stat().st_mtime >= source.stat().st_mtime:
         return target
-    result = subprocess.run(
+    result = owned_run(
         [str(cooker), "--inputs", str(source), "--output-path", str(cache_dir)],
+        source="pcg_st9_texture_batch.sbs_auto.ensure_hbao_sbsar",
+        run_factory=subprocess.run,
         capture_output=True, text=True, timeout=timeout,
         creationflags=_hidden_creationflags(),
     )
@@ -303,8 +311,10 @@ def render_hbao_from_height(atlas_base, height_path, out_dir, cfg=None,
             "--output-format", "png",
             "--output-path", temp_dir,
         ]
-        result = subprocess.run(
+        result = owned_run(
             cmd, capture_output=True, text=True, timeout=timeout,
+            source="pcg_st9_texture_batch.sbs_auto.render_hbao",
+            run_factory=subprocess.run,
             creationflags=_hidden_creationflags(),
         )
         rendered = Path(temp_dir) / f"{atlas_base}_ao_from_height_output.png"
@@ -1668,8 +1678,10 @@ def render_maps(atlas_base, inputs, params, out_dir, cfg=None,
     ]
     normal_corrected = False
     try:
-        result = subprocess.run(
+        result = owned_run(
             cmd, capture_output=True, text=True, timeout=timeout,
+            source="pcg_st9_texture_batch.sbs_auto.render_atlas",
+            run_factory=subprocess.run,
             creationflags=_hidden_creationflags(),
         )
         missing = [p.name for p in staged if not p.exists() or p.stat().st_size == 0]
@@ -1718,9 +1730,11 @@ def cook_sbs_package(sbs_path, cache_root, cfg=None, timeout=1800):
     if sbsar.is_file() and sbsar.stat().st_size > 0:
         return sbsar
     cache_dir.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(
+    result = owned_run(
         [str(sbscooker_exe(cfg)), "--inputs", str(sbs_path),
          "--output-path", str(cache_dir)],
+        source="pcg_st9_texture_batch.sbs_auto.cook_existing_sbs",
+        run_factory=subprocess.run,
         capture_output=True, text=True, timeout=timeout,
         creationflags=_hidden_creationflags(),
     )
@@ -1809,6 +1823,11 @@ def cook_sbs_graph_package(sbs_path, graph_names, cache_root, cfg=None,
     stat = sbs_path.stat()
     tree = ET.parse(sbs_path)
     root = tree.getroot()
+    # SBSCooker may reinterpret a relative package dependency after unrelated
+    # graphs are removed. Pin the existing Cluster_System dependency to the
+    # configured package in this temporary document only; the authored SBS is
+    # never modified.
+    _rebind_cluster_dependency_for_isolated_cook(root, cfg)
     graphs = {
         graph.find("identifier").get("v", "").lower(): graph
         for graph in root.iter("graph")
@@ -1878,9 +1897,11 @@ def cook_sbs_graph_package(sbs_path, graph_names, cache_root, cfg=None,
         f"{sbs_path.stem}_pcgtex_isolated_{key}.sbs")
     try:
         tree.write(temp_sbs, encoding="utf-8", xml_declaration=True)
-        result = subprocess.run(
+        result = owned_run(
             [str(sbscooker_exe(cfg)), "--inputs", str(temp_sbs),
              "--output-path", str(cache_dir)],
+            source="pcg_st9_texture_batch.sbs_auto.cook_isolated_sbs",
+            run_factory=subprocess.run,
             capture_output=True, text=True, timeout=timeout,
             creationflags=_hidden_creationflags(),
         )
@@ -1940,8 +1961,10 @@ def render_sbs_graph_maps(sbs_path, graph_name, texture_base, out_dir,
     ]
     normal_corrected = False
     try:
-        result = subprocess.run(
+        result = owned_run(
             cmd, capture_output=True, text=True, timeout=timeout,
+            source="pcg_st9_texture_batch.sbs_auto.render_graph",
+            run_factory=subprocess.run,
             creationflags=_hidden_creationflags(),
         )
         missing = [path.name for path in staged if not path.is_file() or path.stat().st_size == 0]
@@ -2281,6 +2304,17 @@ def _find_dependency_uid(root, predicate):
         if fn is not None and uid is not None and predicate(fn.get("v", "")):
             return uid.get("v")
     return None
+
+
+def _rebind_cluster_dependency_for_isolated_cook(root, cfg):
+    configured = str(cluster_sbsar(cfg)).replace("\\", "/")
+    for dep in root.iter("dependency"):
+        filename = dep.find("filename")
+        if filename is None:
+            continue
+        basename = filename.get("v", "").replace("\\", "/").split("/")[-1]
+        if basename.lower() == "cluster_system_01.sbsar":
+            filename.set("v", configured)
 
 
 def _ensure_cluster_dependency(root, sbs_path, cfg, used_uids):

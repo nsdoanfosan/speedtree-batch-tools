@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import unittest
@@ -225,6 +226,265 @@ class Send2ueManifestContractTests(unittest.TestCase):
             )
             self.assertFalse(result[0]["identity_changed"])
             self.assertTrue(result[0]["asset_path_changed"])
+
+    def test_missing_descriptor_uses_source_bound_wrapper_cache_copy(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            export_root = root / "export"
+            mesh_name = "SK_weed_deadbranches_a_01"
+            source = root / f"{mesh_name}.json"
+            source.write_text(
+                json.dumps({
+                    "schema_version": 3,
+                    "mesh_name": mesh_name,
+                    "materials": [{"master_preset": "tree"}],
+                }),
+                encoding="utf-8",
+            )
+            source_before = source.read_bytes()
+            source_identity = {
+                "spm": {
+                    "canonical_path": rf"D:\tree\{mesh_name}.spm",
+                    "sha256": "strict-spm",
+                },
+                "stmat": [{
+                    "canonical_path": rf"D:\tree\fbx\{mesh_name}.stmat",
+                    "sha256": "strict-stmat",
+                }],
+            }
+            authoritative_pipeline = {
+                "source": source_identity,
+                "speedtree_handoff_contract": descriptor(
+                    mesh_name,
+                    source=source_identity,
+                ),
+            }
+            manifest_asset = self._asset(
+                f"/Game/Tree/{mesh_name}_Mesh",
+                source,
+            )
+            source_sha256 = hashlib.sha256(source_before).hexdigest()
+            manifest_asset["asset_data"][
+                "_material_pipeline_json_sha256"
+            ] = source_sha256
+            for groups_key in ("pre_import_commands", "post_import_commands"):
+                for commands in manifest_asset[groups_key]:
+                    for index, command in enumerate(commands):
+                        if "json_path=" in command:
+                            commands[index] = command[:-1] + (
+                                f", sidecar_sha256={source_sha256!r})"
+                            )
+
+            result = normalize_manifest_handoff_sidecars(
+                [manifest_asset],
+                export_root,
+                sidecar_descriptor_builder=descriptor,
+                authoritative_pipeline_contract=authoritative_pipeline,
+            )
+
+            normalized_path = Path(
+                manifest_asset["asset_data"][
+                    "_material_pipeline_json_path"
+                ]
+            )
+            normalized = json.loads(
+                normalized_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(source.read_bytes(), source_before)
+            self.assertNotEqual(normalized_path, source)
+            self.assertEqual(
+                normalized_path.parent,
+                (export_root / "handoff").resolve(),
+            )
+            self.assertEqual(normalized["mesh_name"], mesh_name)
+            self.assertEqual(
+                normalized["speedtree_handoff_contract"]["mesh_name"],
+                mesh_name,
+            )
+            self.assertEqual(
+                normalized["speedtree_handoff_contract"]["source"],
+                source_identity,
+            )
+            normalized_sha256 = hashlib.sha256(
+                normalized_path.read_bytes()
+            ).hexdigest()
+            self.assertEqual(
+                manifest_asset["asset_data"][
+                    "_material_pipeline_json_sha256"
+                ],
+                normalized_sha256,
+            )
+            commands = sum(
+                manifest_asset["pre_import_commands"]
+                + manifest_asset["post_import_commands"],
+                [],
+            )
+            json_commands = [line for line in commands if "json_path=" in line]
+            self.assertTrue(json_commands)
+            self.assertTrue(
+                all(normalized_path.as_posix() in line for line in json_commands)
+            )
+            self.assertTrue(
+                all(source.as_posix() not in line for line in json_commands)
+            )
+            self.assertTrue(
+                all(normalized_sha256 in line for line in json_commands)
+            )
+            self.assertTrue(
+                all(source_sha256 not in line for line in json_commands)
+            )
+            self.assertTrue(result[0]["identity_changed"])
+
+    def test_stale_or_foreign_complete_descriptor_is_reissued_in_cache(self):
+        for mismatch in ("version", "source"):
+            with self.subTest(mismatch=mismatch), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                export_root = root / "export"
+                mesh_name = "SK_weed_deadbranches_a_01"
+                source_identity = {
+                    "spm": {
+                        "canonical_path": rf"D:\tree\{mesh_name}.spm",
+                        "sha256": "strict-spm",
+                    },
+                    "stmat": [{
+                        "canonical_path": rf"D:\tree\fbx\{mesh_name}.stmat",
+                        "sha256": "strict-stmat",
+                    }],
+                }
+                source = self._sidecar(root, mesh_name)
+                source_data = json.loads(source.read_text(encoding="utf-8"))
+                source_data["speedtree_handoff_contract"] = descriptor(
+                    mesh_name,
+                    source=source_identity,
+                )
+                if mismatch == "version":
+                    source_data["speedtree_handoff_contract"]["version"] = 98
+                else:
+                    source_data["speedtree_handoff_contract"]["source"] = {
+                        "spm": {"sha256": "foreign-source"}
+                    }
+                source.write_text(
+                    json.dumps(source_data),
+                    encoding="utf-8",
+                )
+                source_before = source.read_bytes()
+                authoritative_pipeline = {
+                    "source": source_identity,
+                    "speedtree_handoff_contract": descriptor(
+                        mesh_name,
+                        source=source_identity,
+                    ),
+                }
+                manifest_asset = self._asset(
+                    f"/Game/Tree/{mesh_name}_Mesh",
+                    source,
+                )
+
+                result = normalize_manifest_handoff_sidecars(
+                    [manifest_asset],
+                    export_root,
+                    sidecar_descriptor_builder=descriptor,
+                    authoritative_pipeline_contract=authoritative_pipeline,
+                )
+
+                normalized_path = Path(
+                    manifest_asset["asset_data"][
+                        "_material_pipeline_json_path"
+                    ]
+                )
+                normalized = json.loads(
+                    normalized_path.read_text(encoding="utf-8")
+                )
+                self.assertEqual(source.read_bytes(), source_before)
+                self.assertNotEqual(normalized_path, source)
+                self.assertEqual(
+                    normalized["speedtree_handoff_contract"],
+                    descriptor(mesh_name, source=source_identity),
+                )
+                self.assertTrue(result[0]["identity_changed"])
+
+    def test_missing_descriptor_reissues_each_live_wrapper_unit(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            wrapper_name = "SK_cluster_blackgum_01"
+            wrapper_source = {"spm": {"sha256": "strict-source"}}
+            authoritative_pipeline = {
+                "source": wrapper_source,
+                "speedtree_handoff_contract": descriptor(
+                    wrapper_name,
+                    source=wrapper_source,
+                ),
+            }
+            assets = []
+            source_bytes = {}
+            for ordinal in range(1, 4):
+                mesh_name = f"{wrapper_name}_{ordinal:02d}"
+                source = root / f"{mesh_name}.json"
+                source.write_text(
+                    json.dumps({
+                        "mesh_name": mesh_name,
+                        "materials": [],
+                    }),
+                    encoding="utf-8",
+                )
+                source_bytes[source] = source.read_bytes()
+                assets.append(
+                    self._asset(f"/Game/Tree/{mesh_name}_Mesh", source)
+                )
+
+            result = normalize_manifest_handoff_sidecars(
+                assets,
+                root / "export",
+                sidecar_descriptor_builder=descriptor,
+                authoritative_pipeline_contract=authoritative_pipeline,
+            )
+
+            self.assertEqual(len(result), 3)
+            for ordinal, asset in enumerate(assets, start=1):
+                mesh_name = f"{wrapper_name}_{ordinal:02d}"
+                source = root / f"{mesh_name}.json"
+                self.assertEqual(source.read_bytes(), source_bytes[source])
+                normalized_path = Path(
+                    asset["asset_data"]["_material_pipeline_json_path"]
+                )
+                normalized = json.loads(
+                    normalized_path.read_text(encoding="utf-8")
+                )
+                self.assertNotEqual(normalized_path, source)
+                self.assertEqual(normalized["mesh_name"], mesh_name)
+                self.assertEqual(
+                    normalized["speedtree_handoff_contract"],
+                    descriptor(mesh_name, source=wrapper_source),
+                )
+                self.assertEqual(
+                    asset["asset_data"]["asset_path"],
+                    f"/Game/Tree/{mesh_name}",
+                )
+
+    def test_missing_descriptor_rejects_wrapper_source_mismatch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            mesh_name = "SK_weed_deadbranches_a_01"
+            source = root / f"{mesh_name}.json"
+            source.write_text(
+                json.dumps({"mesh_name": mesh_name, "materials": []}),
+                encoding="utf-8",
+            )
+            authoritative_pipeline = {
+                "source": {"spm": {"sha256": "current-source"}},
+                "speedtree_handoff_contract": descriptor(
+                    mesh_name,
+                    source={"spm": {"sha256": "unrelated-source"}},
+                ),
+            }
+
+            with self.assertRaisesRegex(RuntimeError, "not bound"):
+                normalize_manifest_handoff_sidecars(
+                    [self._asset(f"/Game/Tree/{mesh_name}_Mesh", source)],
+                    root / "export",
+                    sidecar_descriptor_builder=descriptor,
+                    authoritative_pipeline_contract=authoritative_pipeline,
+                )
 
     def test_distinct_empty_sidecars_preserve_public_asset_ordinals(self):
         with tempfile.TemporaryDirectory() as temp_dir:

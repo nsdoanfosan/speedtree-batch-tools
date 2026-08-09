@@ -13,14 +13,21 @@ import hashlib
 import io
 import json
 import os
+import subprocess
 import sys
 import time
 import tokenize
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from process_lifecycle import ProcessLifecycleError, owned_run  # noqa: E402
+
+
 GUI_PATH = Path(__file__).resolve().with_name("sk_batch_gui.pyw")
 PUSH_JOB_PATH = (
     Path(__file__).resolve().parent / "jobs" / "send2ue_push_job.py"
@@ -37,7 +44,12 @@ IGNORED_DIRECTORY_NAMES = {
     "node_modules",
     "work",
 }
+IGNORED_REPO_RELATIVE_DIRECTORY_PREFIXES = {
+    (".claude", "worktrees"),
+}
+VCS_ROOT_MARKER_NAMES = {".git", ".hg", ".svn"}
 PRODUCTION_SOURCE_MANIFEST_VERSION = 1
+CODE_REVISION_RESTART_ROUTE = "code_revision_restart_required"
 RUNTIME_COMPILE_NAMES = {
     "_batch_compile_enabled",
     "_compile_blender_wave",
@@ -48,6 +60,10 @@ RUNTIME_COMPILE_NAMES = {
 
 class CompileGateError(RuntimeError):
     """Raised when syntax or an SK Batch orchestration contract is invalid."""
+
+    def __init__(self, message, *, details=None):
+        super().__init__(message)
+        self.details = copy.deepcopy(details or {})
 
 
 @dataclass(frozen=True)
@@ -93,17 +109,107 @@ def _read_python_source(path: Path) -> str:
         return handle.read()
 
 
-def _production_sources(repo_root: Path):
-    for current_root, directories, filenames in os.walk(repo_root):
-        directories[:] = sorted(
-            name
-            for name in directories
-            if name.casefold() not in IGNORED_DIRECTORY_NAMES
+def _normalized_relative_parts(path):
+    return tuple(part.casefold() for part in path.parts)
+
+
+def _has_prefix(parts, prefixes):
+    return any(
+        len(parts) >= len(prefix) and parts[: len(prefix)] == prefix
+        for prefix in prefixes
+    )
+
+
+def _git_stdout(repo_root, *arguments):
+    try:
+        result = owned_run(
+            ["git", "-C", str(repo_root), *arguments],
+            source="sk_batch.code_compile_gate.git_scope_observation",
+            check=False,
+            capture_output=True,
+            timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+    except (OSError, subprocess.SubprocessError, ProcessLifecycleError):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _git_ignored_paths(repo_root):
+    """Return ignored untracked directories/files relative to a Git root."""
+    output = _git_stdout(
+        repo_root,
+        "ls-files",
+        "--full-name",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "--directory",
+        "-z",
+    )
+    if output is None:
+        return frozenset(), frozenset()
+
+    directories = set()
+    files = set()
+    for raw_path in output.split(b"\0"):
+        if not raw_path:
+            continue
+        value = os.fsdecode(raw_path).replace("\\", "/")
+        relative = PurePosixPath(value.rstrip("/"))
+        if (
+            relative.is_absolute()
+            or not relative.parts
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            continue
+        parts = _normalized_relative_parts(relative)
+        if value.endswith("/"):
+            directories.add(parts)
+        else:
+            files.add(parts)
+    return frozenset(directories), frozenset(files)
+
+
+def _is_nested_vcs_root(path):
+    return any((path / marker).exists() for marker in VCS_ROOT_MARKER_NAMES)
+
+
+def _production_sources(repo_root: Path):
+    repo_root = Path(repo_root).resolve()
+    ignored_directories, ignored_files = _git_ignored_paths(repo_root)
+    structural_prefixes = frozenset(
+        tuple(part.casefold() for part in prefix)
+        for prefix in IGNORED_REPO_RELATIVE_DIRECTORY_PREFIXES
+    )
+    for current_root, directories, filenames in os.walk(repo_root):
         current = Path(current_root)
+        current_parts = _normalized_relative_parts(
+            current.relative_to(repo_root)
+        )
+        retained_directories = []
+        for name in sorted(directories):
+            relative_parts = current_parts + (name.casefold(),)
+            child = current / name
+            if (
+                name.casefold() in IGNORED_DIRECTORY_NAMES
+                or name.casefold() in VCS_ROOT_MARKER_NAMES
+                or _has_prefix(relative_parts, structural_prefixes)
+                or _has_prefix(relative_parts, ignored_directories)
+                or _is_nested_vcs_root(child)
+            ):
+                continue
+            retained_directories.append(name)
+        directories[:] = retained_directories
         for filename in sorted(filenames):
             path = current / filename
-            if path.suffix.casefold() in SOURCE_SUFFIXES:
+            relative_parts = current_parts + (filename.casefold(),)
+            if (
+                path.suffix.casefold() in SOURCE_SUFFIXES
+                and not _has_prefix(relative_parts, structural_prefixes)
+                and not _has_prefix(relative_parts, ignored_directories)
+                and relative_parts not in ignored_files
+            ):
                 yield path
 
 
@@ -240,6 +346,107 @@ def _manifest_from_payload(payload, label):
     )
 
 
+def _source_file_identity(record):
+    if record is None:
+        return None
+    return {
+        "path": record.path,
+        "size": record.size,
+        "sha256": record.sha256,
+    }
+
+
+def production_source_revision_difference(
+    expected,
+    actual,
+    *,
+    label="Production source",
+):
+    """Describe every exact path changed between two production revisions."""
+
+    expected = _manifest_from_payload(
+        expected,
+        "Expected production manifest",
+    )
+    actual = _manifest_from_payload(actual, label)
+    expected_files = {record.path: record for record in expected.files}
+    actual_files = {record.path: record for record in actual.files}
+    changed_paths = []
+    for path in sorted(set(expected_files) | set(actual_files)):
+        expected_record = expected_files.get(path)
+        actual_record = actual_files.get(path)
+        if expected_record == actual_record:
+            continue
+        if expected_record is None:
+            status = "added"
+        elif actual_record is None:
+            status = "removed"
+        else:
+            status = "modified"
+        changed_paths.append({
+            "path": path,
+            "status": status,
+            "expected": _source_file_identity(expected_record),
+            "actual": _source_file_identity(actual_record),
+        })
+    return {
+        "route": CODE_REVISION_RESTART_ROUTE,
+        "status": "revision_mismatch",
+        "label": str(label),
+        "expected_revision": expected.content_hash,
+        "actual_revision": actual.content_hash,
+        "expected": {
+            "schema_version": expected.schema_version,
+            "source_count": expected.source_count,
+            "content_hash": expected.content_hash,
+        },
+        "actual": {
+            "schema_version": actual.schema_version,
+            "source_count": actual.source_count,
+            "content_hash": actual.content_hash,
+        },
+        "changed_paths": changed_paths,
+    }
+
+
+def format_production_source_revision_difference(details):
+    """Render a complete, non-truncated restart diagnostic."""
+
+    details = details if isinstance(details, dict) else {}
+    lines = [
+        f"{details.get('label') or 'Production source'} revision mismatch: "
+        f"expected {details.get('expected_revision') or '<unknown>'}, "
+        f"actual {details.get('actual_revision') or '<unknown>'}",
+        "exact changed paths:",
+    ]
+    changed_paths = details.get("changed_paths") or []
+    if not changed_paths:
+        lines.append(
+            "- <manifest metadata> [metadata_changed] "
+            f"expected={json.dumps(details.get('expected'), sort_keys=True)} "
+            f"actual={json.dumps(details.get('actual'), sort_keys=True)}"
+        )
+    for row in changed_paths:
+        lines.append(
+            f"- {row.get('path')} [{row.get('status')}] "
+            "expected="
+            + json.dumps(
+                row.get("expected"),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + " actual="
+            + json.dumps(
+                row.get("actual"),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    return "\n".join(lines)
+
+
 def validate_production_source_manifest(
     expected,
     actual,
@@ -248,19 +455,14 @@ def validate_production_source_manifest(
     expected = _manifest_from_payload(expected, "Expected production manifest")
     actual = _manifest_from_payload(actual, label)
     if expected != actual:
-        expected_files = {record.path: record for record in expected.files}
-        actual_files = {record.path: record for record in actual.files}
-        changed = [
-            path
-            for path in sorted(set(expected_files) | set(actual_files))
-            if expected_files.get(path) != actual_files.get(path)
-        ]
-        detail = ", ".join(changed[:5]) or "manifest metadata"
-        if len(changed) > 5:
-            detail += f" and {len(changed) - 5} more"
+        details = production_source_revision_difference(
+            expected,
+            actual,
+            label=label,
+        )
         raise CompileGateError(
-            f"{label} revision mismatch: expected {expected.content_hash}, "
-            f"actual {actual.content_hash}; changed: {detail}"
+            format_production_source_revision_difference(details),
+            details=details,
         )
     return actual
 
@@ -313,8 +515,51 @@ def validate_production_source_revision_report(report, expected_manifest):
         or str(state.get("expected_content_hash") or "").casefold()
         != expected.content_hash
     ):
+        reported_expected_revision = str(
+            state.get("expected_content_hash") or ""
+        ).casefold()
+        details = {
+            "route": CODE_REVISION_RESTART_ROUTE,
+            "status": "revision_metadata_mismatch",
+            "label": "Child production source metadata",
+            "expected_revision": expected.content_hash,
+            "actual_revision": reported_expected_revision,
+            "expected": {
+                "schema_version": expected.schema_version,
+                "source_count": expected.source_count,
+                "content_hash": expected.content_hash,
+            },
+            "actual": {
+                "schema_version": state.get("manifest_schema_version"),
+                "content_hash": reported_expected_revision,
+            },
+            "changed_paths": [],
+        }
+        try:
+            reported_started = _manifest_from_payload(
+                state.get("started"),
+                "Child-start production source",
+            )
+        except CompileGateError:
+            reported_started = None
+        if reported_started is not None:
+            details = production_source_revision_difference(
+                expected,
+                reported_started,
+                label="Child-start production source",
+            )
+            details["status"] = "revision_metadata_mismatch"
+            details["reported_started_revision"] = details[
+                "actual_revision"
+            ]
+            details["reported_expected_revision"] = (
+                reported_expected_revision
+            )
+            if reported_expected_revision != expected.content_hash:
+                details["actual_revision"] = reported_expected_revision
         raise CompileGateError(
-            "Child production source revision metadata differs from batch"
+            format_production_source_revision_difference(details),
+            details=details,
         )
     started = validate_production_source_manifest(
         expected,
@@ -331,8 +576,35 @@ def validate_production_source_revision_report(report, expected_manifest):
         or state.get("stable") is not True
         or started != finished
     ):
+        details = production_source_revision_difference(
+            expected,
+            finished,
+            label="Child production source assertion",
+        )
+        details["status"] = "revision_assertion_mismatch"
+        expected_assertions = {
+            "matches_expected": True,
+            "stable": True,
+            "started_equals_finished": True,
+        }
+        actual_assertions = {
+            "matches_expected": state.get("matches_expected"),
+            "stable": state.get("stable"),
+            "started_equals_finished": started == finished,
+        }
+        details["expected"]["assertions"] = expected_assertions
+        details["actual"]["assertions"] = actual_assertions
+        details["assertion_deltas"] = {
+            key: {
+                "expected": expected_assertions[key],
+                "actual": actual_assertions[key],
+            }
+            for key in expected_assertions
+            if expected_assertions[key] != actual_assertions[key]
+        }
         raise CompileGateError(
-            "Child production source revision assertion is not stable"
+            format_production_source_revision_difference(details),
+            details=details,
         )
     return state
 

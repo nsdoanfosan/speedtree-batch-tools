@@ -2,8 +2,11 @@
 
 import json
 import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+
+from artifact_content_key import SHA256_ALGORITHM, file_content_key_snapshot
 
 
 REGISTRY_KIND = "atlas_leaf_spm_targets"
@@ -13,6 +16,10 @@ REGISTRY_SUFFIX = ".atlas_leaf_targets.json"
 
 class TargetRegistryError(RuntimeError):
     pass
+
+
+class TargetRegistryPublishError(TargetRegistryError):
+    """A structured pre-commit atomic registry publication failure."""
 
 
 def registry_path_for_blend(blend_path):
@@ -67,7 +74,51 @@ def load_target_registry(blend_path):
     return payload
 
 
-def save_target_registry(blend_path, target_spms):
+def _registry_path_state(path):
+    path = Path(path)
+    if path.is_file():
+        snapshot = file_content_key_snapshot(path, SHA256_ALGORITHM)
+        return {
+            "path": os.path.normcase(str(path.absolute())),
+            "state": "file",
+            "size": snapshot["size"],
+            "sha256": snapshot["digest"],
+            "algorithm": snapshot["algorithm"],
+        }
+    if path.is_dir():
+        state = "directory"
+    elif path.exists():
+        state = "other"
+    else:
+        state = "missing"
+    return {
+        "path": os.path.normcase(str(path.absolute())),
+        "state": state,
+    }
+
+
+def _require_registry_precondition(path, expected_state):
+    if expected_state is None:
+        return
+    current = _registry_path_state(path)
+    if current != expected_state:
+        error = TargetRegistryPublishError(
+            "Atlas target registry changed after authority seal; atomic "
+            "publish was not committed"
+        )
+        error.connected_retry_contract = {
+            "operation_phase": "registry_compare_and_swap",
+            "committed": False,
+            "rollback_succeeded": False,
+            "temporary_output_isolated": True,
+            "expected_state": expected_state,
+            "current_state": current,
+        }
+        raise error
+
+
+def save_target_registry(
+        blend_path, target_spms, *, expected_registry_state=None):
     blend = Path(blend_path).expanduser().absolute()
     registry_path = registry_path_for_blend(blend)
     targets = _normalized_spm_paths(target_spms)
@@ -78,12 +129,48 @@ def save_target_registry(blend_path, target_spms):
         "target_spms": [str(path) for path in targets],
         "updated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
+    _require_registry_precondition(registry_path, expected_registry_state)
     registry_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = registry_path.with_name(registry_path.name + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
+    temporary = registry_path.with_name(
+        f".{registry_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     )
-    os.replace(temporary, registry_path)
+    try:
+        with temporary.open(
+            "x",
+            encoding="utf-8",
+            newline="\n",
+        ) as handle:
+            handle.write(
+                json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            # The second comparison is intentionally adjacent to atomic
+            # replacement. It prevents a stale read/plan from overwriting a
+            # registry changed while the new payload was being prepared.
+            _require_registry_precondition(
+                registry_path, expected_registry_state
+            )
+            os.replace(temporary, registry_path)
+        except PermissionError as exc:
+            error = TargetRegistryPublishError(
+                "Atlas target registry atomic publish failed before commit: "
+                f"{temporary} -> {registry_path}: {exc}"
+            )
+            error.connected_retry_contract = {
+                "operation_phase": "registry_publish",
+                "committed": False,
+                "rollback_succeeded": False,
+                "temporary_output_isolated": True,
+                "error_code": int(
+                    getattr(exc, "winerror", None)
+                    or getattr(exc, "errno", None)
+                    or 0
+                ),
+            }
+            raise error from exc
+    finally:
+        temporary.unlink(missing_ok=True)
     payload["registry_path"] = str(registry_path)
     return payload

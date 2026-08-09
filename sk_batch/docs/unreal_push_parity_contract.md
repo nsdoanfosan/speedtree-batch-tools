@@ -53,6 +53,16 @@ not allowed to remap, regenerate, or discard R/G.
 12. Assets/directories are saved, assigned slots are verified, and relevant
     materials are compiled/checked.
 
+## Optional texture availability
+
+Texture completeness is not a transaction precondition. Material identity,
+slot identity, mesh payload, and a valid Unreal material interface remain
+structural requirements, but an empty or partial texture list is valid input.
+Only proven live candidates are serialized or imported. Missing candidates are
+left unassigned; ambiguous, stale, or unsafe candidates are omitted. The
+material instance is still reused or created and assigned to its mesh slot, and
+texture availability never changes the target outcome.
+
 RPC invokes this transaction through the open editor's existing Send2UE RPC
 bridge. Headless invokes the identical transaction in one
 `UnrealEditor-Cmd.exe -run=pythonscript` session for the pending batch.

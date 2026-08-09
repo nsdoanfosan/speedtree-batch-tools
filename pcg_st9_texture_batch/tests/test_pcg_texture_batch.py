@@ -92,6 +92,115 @@ def write_physical_capture_manifest(manifest, role_paths):
 
 
 class TargetCollectionTests(unittest.TestCase):
+    def test_generic_cluster_folder_does_not_claim_other_species_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            birch = root / "tree_birch_paper" / "cluster"
+            locast = root / "weed_black_locast" / "cluster"
+            birch.mkdir(parents=True)
+            locast.mkdir(parents=True)
+            (birch / "SK_branch_birch_paper_01.spm").write_bytes(b"spm")
+            (locast / "SK_cluster_black_locast_side_01.spm").write_bytes(
+                b"spm"
+            )
+            targets = [
+                "branch_birch_paper_01",
+                "cluster_black_locast_side_01",
+            ]
+
+            self.assertEqual(
+                pcg_texture_audit.folder_target_mesh_names(birch, targets),
+                ["branch_birch_paper_01"],
+            )
+            self.assertEqual(
+                pcg_texture_audit.folder_target_mesh_names(locast, targets),
+                ["cluster_black_locast_side_01"],
+            )
+
+    def test_asset_token_does_not_prefix_match_unrelated_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "tree_elm"
+            folder.mkdir()
+
+            self.assertEqual(
+                pcg_texture_audit.folder_target_mesh_names(
+                    folder,
+                    ["tree_elm_01", "tree_elmtree_01"],
+                ),
+                ["tree_elm_01"],
+            )
+
+    def test_complete_live_handoff_suppresses_maintenance_actions(self):
+        item = {
+            "sk_spms": ["SK_tree_elm_01.spm"],
+            "material_renames_needed": [],
+            "materials_missing_m_prefix": [],
+            "cluster_items": [{
+                "shared_from": None,
+                "missing_export_maps": ["color"],
+                "connection_update_needed": True,
+            }],
+            "leaf_mesh_sources": [{
+                "atlas_blends": [],
+                "generator_connection_update_needed": True,
+            }],
+            "sbs_files": [],
+            "cluster_assembly": {
+                "canonical_bark": {"status": "replacement_required"},
+                "handoff": {"status": "pass_through"},
+            },
+        }
+
+        pcg_texture_audit.derive_status_actions(item)
+
+        self.assertEqual(item["status"], "ready")
+        self.assertEqual(item["actions"], [])
+
+    def test_empty_leaf_inventory_skips_atlas_registry_scan(self):
+        spm = Path("manifest-free-tree") / "SK_tree_test.spm"
+        with mock.patch.object(
+            pcg_texture_audit,
+            "extract_material_image_refs",
+            return_value=[],
+        ), mock.patch.object(
+            pcg_texture_audit,
+            "mesh_asset_ids",
+            return_value=set(),
+        ), mock.patch.object(
+            pcg_texture_audit,
+            "leaf_generator_bindings",
+            return_value=[],
+        ), mock.patch.object(
+            pcg_texture_audit,
+            "_existing_atlas_registry",
+        ) as registry:
+            actual = pcg_texture_audit.current_leaf_atlas_inventory(
+                spm.parent,
+                {"atlas_root": "atlas"},
+                [spm],
+            )
+
+        self.assertEqual(actual, [])
+        registry.assert_not_called()
+
+    def test_empty_cluster_items_skip_atlas_declaration_scan(self):
+        items = [{
+            "folder": "manifest-free-tree",
+            "cluster_items": [],
+        }]
+
+        with mock.patch.object(
+            pcg_texture_audit,
+            "atlas_provisional_source_declarations",
+        ) as declarations:
+            actual = pcg_texture_audit.refresh_texture_output_contract_states(
+                items,
+                {"source_texture_roots": []},
+            )
+
+        self.assertIs(actual, items)
+        declarations.assert_not_called()
+
     def test_unchanged_receipt_is_not_reported_as_written(self):
         report = {"items": []}
 
@@ -290,6 +399,32 @@ class TargetCollectionTests(unittest.TestCase):
                 [folder],
             )
 
+    def test_explicit_mesh_target_narrows_pcg_candidate_folders(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            elm = root / "tree_elm"
+            pine = root / "tree_pine"
+            elm.mkdir()
+            pine.mkdir()
+            (elm / "SK_tree_elm_01.spm").write_bytes(b"SPM")
+            (pine / "SK_tree_pine_01.spm").write_bytes(b"SPM")
+            cfg = {"tree_root": str(root)}
+            pcg_targets = {
+                "meshes": [
+                    {"static_mesh": "/Game/st9/tree_elm_01.tree_elm_01"},
+                    {"static_mesh": "/Game/st9/tree_pine_01.tree_pine_01"},
+                ],
+                "data_assets": [],
+            }
+
+            actual = pcg_texture_audit.candidate_folders(
+                cfg,
+                pcg_targets=pcg_targets,
+                target_mesh_names=["tree_elm_01"],
+            )
+
+        self.assertEqual(actual, [elm])
+
     def test_unknown_target_is_reported_instead_of_auditing_nothing(self):
         with tempfile.TemporaryDirectory() as temporary:
             cfg = {"tree_root": temporary}
@@ -339,6 +474,91 @@ class TargetCollectionTests(unittest.TestCase):
         self.assertEqual(
             [row["mesh_name"] for row in report["items"][0]["target_spm_statuses"]],
             local_names,
+        )
+
+    def test_explicit_mesh_targets_override_broader_pcg_inventory(self):
+        folder = Path(r"D:\Trees\tree_nothofagussolandri")
+        requested_names = [
+            "tree_nothofagussolandri_22",
+            "tree_nothofagussolandri_31",
+        ]
+        pcg_targets = {
+            "meshes": [
+                {
+                    "static_mesh": (
+                        "/Game/st9/tree_nothofagussolandri_01."
+                        "tree_nothofagussolandri_01"
+                    ),
+                    "data_assets": [],
+                    "level_instances": [],
+                },
+                {
+                    "static_mesh": (
+                        "/Game/st9/tree_nothofagussolandri_22."
+                        "tree_nothofagussolandri_22"
+                    ),
+                    "data_assets": [],
+                    "level_instances": [],
+                },
+                {
+                    "static_mesh": (
+                        "/Game/st9/tree_nothofagussolandri_31."
+                        "tree_nothofagussolandri_31"
+                    ),
+                    "data_assets": [],
+                    "level_instances": [],
+                },
+            ],
+            "data_assets": [],
+        }
+        audit_item = {
+            "folder": str(folder),
+            "name": folder.name,
+            "status": "ready",
+            "actions": [],
+        }
+
+        with mock.patch.object(
+                pcg_texture_audit, "ensure_blend_source_index"), \
+                mock.patch.object(
+                    pcg_texture_audit, "candidate_folders",
+                    return_value=[folder]), \
+                mock.patch.object(
+                    pcg_texture_audit, "folder_match_tokens",
+                    return_value=["tree_nothofagussolandri"]), \
+                mock.patch.object(
+                    pcg_texture_audit, "audit_folder",
+                    return_value=audit_item) as audit, \
+                mock.patch.object(
+                    pcg_texture_audit, "attach_global_m_graphs"), \
+                mock.patch.object(
+                    pcg_texture_audit, "resolve_shared_atlas_entries"), \
+                mock.patch.object(
+                    pcg_texture_audit, "target_spm_status",
+                    side_effect=lambda _folder, name: {
+                        "mesh_name": name,
+                        "status": "ready",
+                        "actions": [],
+                    }):
+            report = pcg_texture_audit.make_report(
+                {
+                    "pcg_focus_data_assets": [],
+                    "pcg_positive_weight_only": True,
+                },
+                pcg_targets=pcg_targets,
+                target_mesh_names=requested_names,
+            )
+
+        self.assertEqual(
+            audit.call_args.kwargs["target_mesh_names"],
+            requested_names,
+        )
+        self.assertEqual(
+            [
+                row["mesh_name"]
+                for row in report["items"][0]["target_spm_statuses"]
+            ],
+            requested_names,
         )
 
     def test_pcg_and_level_provenance_stay_separate(self):
@@ -550,6 +770,62 @@ class SourceSelectionTests(unittest.TestCase):
         self.assertEqual(item["status"], "ready")
         self.assertEqual(item["actions"], [])
 
+    def test_current_pass_through_handoff_ignores_connection_metadata_cleanup(self):
+        item = {
+            "sk_spms": [r"D:\Trees\dogwood\SK_bush_dogwood_01.spm"],
+            "chosen_spm": r"D:\Trees\dogwood\SK_bush_dogwood_01.spm",
+            "materials_missing_m_prefix": [],
+            "material_renames_needed": [],
+            "cluster_items": [{
+                "connection_update_needed": True,
+                "missing_export_maps": [],
+            }],
+            "cluster_assembly": {"handoff": {"status": "pass_through"}},
+            "leaf_mesh_sources": [],
+            "sbs_files": [r"D:\Trees\dogwood\dogwood.sbs"],
+        }
+
+        pcg_texture_audit.derive_status_actions(item)
+
+        self.assertEqual(item["status"], "ready")
+        self.assertEqual(item["actions"], [])
+
+    def test_issue_178_live_delivery_suppresses_advisory_texture_actions(self):
+        item = {
+            "sk_spms": [r"D:\Trees\nothofagus\SK_tree_01.spm"],
+            "chosen_spm": r"D:\Trees\nothofagus\SK_tree_01.spm",
+            "materials_missing_m_prefix": [],
+            "material_renames_needed": [],
+            "cluster_items": [{
+                "connection_update_needed": False,
+                "missing_export_maps": ["BaseColor"],
+            }],
+            "cluster_assembly": {"handoff": {"status": "pass_through"}},
+            "leaf_mesh_sources": [],
+            "sbs_files": [],
+        }
+
+        pcg_texture_audit.derive_status_actions(item)
+
+        self.assertEqual(item["status"], "ready")
+        self.assertEqual(item["actions"], [])
+
+    def test_issue_178_concrete_fbx_partial_remains_blocking(self):
+        item = {
+            "sk_spms": [r"D:\Trees\birch\SK_tree_01.spm"],
+            "chosen_spm": r"D:\Trees\birch\SK_tree_01.spm",
+            "materials_missing_m_prefix": [],
+            "material_renames_needed": [],
+            "cluster_items": [],
+            "cluster_assembly": {"handoff": {"status": "blocked"}},
+            "leaf_mesh_sources": [],
+            "sbs_files": [],
+        }
+
+        pcg_texture_audit.derive_status_actions(item)
+
+        self.assertEqual(item["status"], "needs_texture_work")
+
     def test_relative_image_resolve_cache_is_shared_by_spms_in_one_folder(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -750,12 +1026,12 @@ class SourceSelectionTests(unittest.TestCase):
                         pcg_texture_audit.extract_material_image_refs(spm)[0]["refs"],
                         ["leaf_color.tga", "leaf_opacity.tga"],
                     )
-                    self.assertEqual(reader.call_count, 1)
+                    self.assertEqual(reader.call_count, 0)
 
                     write_spm(spm, "88", "leaf_changed_name")
                     self.assertEqual(
                         pcg_texture_audit.active_material_ids(spm), {"88"})
-                    self.assertEqual(reader.call_count, 2)
+                    self.assertEqual(reader.call_count, 0)
             finally:
                 pcg_texture_audit._SPM_ANALYSIS_CACHE = old_memory
                 pcg_texture_audit._PERSISTENT_SPM_ANALYSIS = old_persistent
@@ -3123,6 +3399,8 @@ class GuiLabelTests(unittest.TestCase):
                 pcg_targets={"meshes": []},
                 progress_callback=mock.ANY,
                 item_callback=mock.ANY,
+                cancel_check=mock.ANY,
+                session_evidence={},
             )
             save_config.assert_called_once_with({"tree_root": "new"})
             self.assertIsNone(app.report)
@@ -3151,9 +3429,13 @@ class GuiLabelTests(unittest.TestCase):
                 report,
                 {"tree_root": "new"},
                 pcg_targets={"meshes": []},
+                metrics=mock.ANY,
+                publish_check=mock.ANY,
             )
-            save_analysis.assert_called_once_with()
-            load_sync.assert_called_once_with(migrate=False)
+            save_analysis.assert_called_once_with(
+                publish_check=mock.ANY
+            )
+            load_sync.assert_not_called()
             self.assertEqual(len(app.root.callbacks), 1)
             delay, callback = app.root.callbacks.pop()
             self.assertEqual(delay, 0)
@@ -3261,7 +3543,7 @@ class GuiLabelTests(unittest.TestCase):
         self.assertIs(app.report, report)
         app.populate.assert_called_once_with()
         app._update_summary.assert_called_once_with()
-        app._start_sync_state_migration.assert_called_once_with()
+        app._start_sync_state_migration.assert_not_called()
         self.assertIn("live audit는 완료", app.log.call_args.args[0])
 
     def test_initial_refresh_failure_logs_traceback_and_unlocks_parent_ui(self):
@@ -3369,11 +3651,14 @@ class GuiLabelTests(unittest.TestCase):
                 {"tree_root": "new"},
                 pcg_targets={"meshes": []},
                 progress_callback=mock.ANY,
+                cancel_check=mock.ANY,
+                session_evidence={},
             )
             write_snapshot.assert_called_once_with(
                 report,
                 {"tree_root": "new"},
                 pcg_targets={"meshes": []},
+                publish_check=mock.ANY,
             )
             delay, callback = app.root.callbacks.pop()
             self.assertEqual(delay, 0)
@@ -3546,10 +3831,18 @@ class GuiLabelTests(unittest.TestCase):
                 self.gui, "cleanup_preserved_cluster_outputs",
                 return_value={"cleaned": [], "conflicts": []},
         ) as cleanup:
-            app._run_step3([], [selected], sync_files=[])
+            baseline = self.gui.seal_exact_mutation_baseline(
+                [], action="unit_test_step3_cleanup"
+            )
+            app._run_step3(
+                [], [selected], sync_files=[],
+                exact_mutation_baseline=baseline,
+            )
 
         make_report.assert_called_once_with(
-            app.cfg, targets=[r"D:\Trees\ladyfern"]
+            app.cfg,
+            targets=[r"D:\Trees\ladyfern"],
+            mutation_authority=True,
         )
         exact_plan = build_jobs.call_args.args[0]
         self.assertEqual(
@@ -3653,11 +3946,18 @@ class GuiLabelTests(unittest.TestCase):
                 "cleanup_preserved_cluster_outputs",
                 return_value={"cleaned": [], "conflicts": []},
         ):
-            app._run_step3(jobs, [target], sync_files=[])
+            baseline = self.gui.seal_exact_mutation_baseline(
+                [], action="unit_test_step3_normalize"
+            )
+            app._run_step3(
+                jobs, [target], sync_files=[],
+                exact_mutation_baseline=baseline,
+            )
 
         make_report.assert_called_once_with(
             app.cfg,
             targets=[folder],
+            mutation_authority=True,
         )
         exact_plan = build_jobs.call_args.args[0]
         self.assertEqual(
@@ -4351,6 +4651,12 @@ class GuiLabelTests(unittest.TestCase):
             "patch": {"changed": False, "renames": []},
         }]}
 
+        baseline = self.gui.seal_exact_mutation_baseline(
+            [], action="unit_test_prepare"
+        )
+        app._reaudit_and_seal_mutation_items = mock.Mock(
+            return_value=baseline
+        )
         with mock.patch.object(self.gui, "prepare_sk", return_value=result):
             app._run_prepare([row])
 
@@ -4360,7 +4666,7 @@ class GuiLabelTests(unittest.TestCase):
         app.log.assert_called_once_with(
             "[① 변경 없음] tree_test: 이미 최신입니다.")
         app._prepare_finished.assert_called_once_with(1, 0)
-        app._validate_live_mutation_items.assert_called_once()
+        app._reaudit_and_seal_mutation_items.assert_called_once()
 
     def test_prepare_rows_drop_stale_audit_when_preview_is_up_to_date(self):
         app = self.gui.App.__new__(self.gui.App)
@@ -4587,6 +4893,7 @@ class GuiLabelTests(unittest.TestCase):
             }
             (asset / "speedtree_import_manifest.json").write_text(
                 json.dumps({
+                    "spm": str(asset / "SK_tree_declared.spm"),
                     "texture_contract_status":
                         "source_fallback_needs_pcg_generation",
                     "source_texture_fallbacks": [fallback],
