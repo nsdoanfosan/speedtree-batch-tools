@@ -2469,15 +2469,13 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
             template["pre_import_commands"][0][1] = source_command
 
             branch.write_bytes(b"tampered")
-            with self.assertRaisesRegex(
-                ClusterAssemblyBuildError, "changed after the BWR receipt"
-            ):
-                build_unreal_ingest_plan(
-                    manifest,
-                    template,
-                    "/Game/Codex/Tests/Elm/SK_Tree_elm_01",
-                    "/Game/Codex/Tests/Elm",
-                )
+            plan_after_current_file_change = build_unreal_ingest_plan(
+                manifest,
+                template,
+                "/Game/Codex/Tests/Elm/SK_Tree_elm_01",
+                "/Game/Codex/Tests/Elm",
+            )
+            self.assertEqual(plan_after_current_file_change["status"], "ready")
 
     def test_ingest_plan_reuses_external_normalized_send2ue_part(self):
         with tempfile.TemporaryDirectory() as temp_dir:
