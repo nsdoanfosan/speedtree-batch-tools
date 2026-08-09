@@ -102,6 +102,73 @@ class AtlasBlendJobTests(unittest.TestCase):
                     "export_or_update_speedtree_spm_path",
                 )
 
+    def test_assets_only_refresh_stages_one_exact_path_without_props_registry(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            target = (root / "SK_cluster_leaf.spm").absolute()
+            target.write_bytes(b"spm")
+            calls = []
+
+            def target_manifest_path(path):
+                path = Path(path)
+                return path.parent / ".atlas_leaf_speedtree_targets" / f"{path.stem}.json"
+
+            def export_target(_props, staged, **kwargs):
+                calls.append((Path(staged), kwargs))
+                manifest = target_manifest_path(staged)
+                manifest.parent.mkdir(parents=True, exist_ok=True)
+                manifest.write_text("{}", encoding="utf-8")
+                return (staged, manifest, [], "updated", 5, [3], [], {})
+
+            validate_targets = mock.Mock(return_value={})
+            cleanup_transactions = mock.Mock()
+
+            def execute(targets, build, validate, *, allow_create=False):
+                self.assertEqual(targets, [target])
+                self.assertFalse(allow_create)
+                staged = root / "private-stage" / target.name
+                staged.parent.mkdir()
+                staged.write_bytes(target.read_bytes())
+                result = build(staged, target)
+                validate([staged], [{"production_root": target.parent}])
+                return [result]
+
+            execute_transaction = mock.Mock(side_effect=execute)
+            producer_contract = types.ModuleType("atlas_producer_rebind")
+            producer_contract.validate_atlas_producer_refresh_manifest = (
+                mock.Mock(return_value={"status": "validated"})
+            )
+            proof = {"proof_sha256": "sealed"}
+            operations = {
+                "export_or_update_speedtree_spm_path_impl": export_target,
+                "validate_staged_speedtree_targets": validate_targets,
+                "target_manifest_path": target_manifest_path,
+                "cleanup_pending_transaction_roots": cleanup_transactions,
+                "execute_atomic_target_update": execute_transaction,
+            }
+            runtime = mock.Mock()
+            runtime.operation.side_effect = (
+                lambda addon_id, name: operations[name]
+                if addon_id == "atlas_leaf_mesh_builder"
+                else None
+            )
+
+            with mock.patch.dict(sys.modules, {
+                "atlas_producer_rebind": producer_contract,
+            }):
+                result = self.job.apply_exact_assets_only_target(
+                    object(), target, "M_leaf", proof, runtime
+                )
+
+        self.assertEqual(result[0], calls[0][0])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1]["production_target_spm"], target)
+        self.assertIsNone(calls[0][1]["source_material_names"])
+        self.assertIsNone(calls[0][1]["source_material_ids"])
+        producer_contract.validate_atlas_producer_refresh_manifest.assert_called_once()
+        cleanup_transactions.assert_called_once()
+        self.assertEqual(runtime.operation.call_count, 5)
+
 
 if __name__ == "__main__":
     unittest.main()

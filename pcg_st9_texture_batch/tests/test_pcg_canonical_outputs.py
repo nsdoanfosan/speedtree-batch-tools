@@ -11,6 +11,8 @@ from unittest import mock
 TOOL_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TOOL_DIR))
 
+import pcg_canonical_outputs as canonical_outputs
+from atlas_manifest_resolver import AtlasManifestResolutionError
 from pcg_canonical_outputs import (
     MANIFEST_KIND,
     MANIFEST_NAME,
@@ -61,6 +63,59 @@ class CanonicalOutputManifestTests(unittest.TestCase):
             },
         }), encoding="utf-8")
         return receipt
+
+    def test_ownership_conflict_seals_fresh_live_spm_plan_in_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "SK_cluster_test.spm"
+            target.write_bytes(b"spm")
+            canonical = Path(temporary) / MANIFEST_NAME
+            resolution = {
+                "target_spm": str(target),
+                "selected": [],
+                "conflicting": [],
+            }
+            mirror_plan = {
+                "schema_version": 1,
+                "status": "unrepairable",
+                "reason_code": "atlas_manifest_ownership_conflict",
+                "target_spm": str(target.resolve()),
+            }
+            ownership_plan = {
+                "contract": "atlas_slot_ownership_reconciliation_plan",
+                "status": "repairable",
+                "plan_sha256": "sealed-live-plan",
+            }
+
+            with mock.patch(
+                "speedtree_texture_contract.load_canonical_output_manifest",
+                return_value={},
+            ), mock.patch.object(
+                canonical_outputs,
+                "resolve_atlas_manifests",
+                side_effect=AtlasManifestResolutionError(
+                    "ownership conflict", resolution
+                ),
+            ), mock.patch.object(
+                canonical_outputs,
+                "atlas_manifest_mirror_repair_plan",
+                return_value=mirror_plan,
+            ), mock.patch(
+                "atlas_slot_ownership.plan_atlas_slot_ownership_reconciliation",
+                return_value=ownership_plan,
+            ) as live_plan:
+                with self.assertRaises(CanonicalOutputManifestError) as caught:
+                    refresh_atlas_manifests_for_spm(target, canonical)
+
+            live_plan.assert_called_once_with(target.resolve())
+            report = caught.exception.report
+            self.assertEqual(
+                report["reason_token"],
+                "atlas_manifest_ownership_conflict",
+            )
+            self.assertEqual(
+                report["evidence"]["ownership_plan"],
+                ownership_plan,
+            )
 
     def test_exact_bat_dispatches_atlas_mirror_repair_then_canonical_refresh(self):
         class Lease:

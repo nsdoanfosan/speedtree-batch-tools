@@ -15,13 +15,25 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from atlas_producer_rebind import (
+    PROOF_KIND as ATLAS_PRODUCER_RELATION_KIND,
+    AtlasProducerRebindProofError,
+    validate_atlas_producer_rebind_proof,
+)
+from atlas_slot_ownership import (
+    PLAN_CONTRACT as ATLAS_SLOT_OWNERSHIP_PLAN_CONTRACT,
+    AtlasSlotOwnershipError,
+    validate_atlas_slot_ownership_plan,
+)
 from repair_reason_registry import (
     ATLAS_MIRROR_REPAIR_PLAN,
     BLOCKING_DISPOSITIONS,
     BLOCKING_REASON_CODES,
     CURRENT_MATERIAL_BINDING_RECIPE,
     DURABLE_FAILURE_REASON_CODES,
+    EXACT_ATLAS_PRODUCER_RELATION,
     EXACT_CLUSTER_PROVIDER,
+    EXACT_LIVE_SPM_OWNERSHIP_PLAN,
     FATAL,
     REPAIRABLE,
     SEALED_MODELER_RECOVERY_SCOPE,
@@ -42,6 +54,8 @@ MODELER_RECOVERY_TOOL = "speedtree_modeler"
 
 STEP3_STANDARD = "step3-standard"
 ATLAS_MANIFEST_MIRROR_REPAIR = "atlas-manifest-mirror-repair"
+ATLAS_PRODUCER_REFRESH = "atlas-producer-refresh"
+ATLAS_SLOT_OWNERSHIP_RECONCILE = "atlas-slot-ownership-reconcile"
 GENERATOR_SYNC = "generator-sync"
 CLUSTER_REFRESH = "cluster-refresh"
 GENERATOR_SYNC_AND_CLUSTER = "generator-sync-and-cluster"
@@ -425,11 +439,13 @@ def _validated_modeler_recovery_scope(
 _DISPOSITION_PRIORITY = {FATAL: 0, UNSUPPORTED: 1, REPAIRABLE: 2}
 _ACTION_PRIORITY = {
     ATLAS_MANIFEST_MIRROR_REPAIR: 0,
-    STEP3_STANDARD: 1,
-    MODELER_NODE_TABLE_RECOVERY: 2,
-    GENERATOR_SYNC: 3,
-    GENERATOR_SYNC_AND_CLUSTER: 4,
-    CLUSTER_REFRESH: 5,
+    ATLAS_PRODUCER_REFRESH: 1,
+    ATLAS_SLOT_OWNERSHIP_RECONCILE: 2,
+    STEP3_STANDARD: 3,
+    MODELER_NODE_TABLE_RECOVERY: 4,
+    GENERATOR_SYNC: 5,
+    GENERATOR_SYNC_AND_CLUSTER: 6,
+    CLUSTER_REFRESH: 7,
 }
 
 
@@ -467,6 +483,57 @@ def _primary_policy_row(rows):
     )
 
 
+def _validated_atlas_producer_relation(
+    evidence: Mapping[str, Any],
+    canonical: Path | None = None,
+) -> dict[str, Any] | None:
+    for trail, value in _walk(evidence):
+        if not isinstance(value, Mapping):
+            continue
+        if (
+            value.get("kind") != ATLAS_PRODUCER_RELATION_KIND
+            and (not trail or trail[-1].casefold() != "atlas_producer_relation")
+        ):
+            continue
+        try:
+            return validate_atlas_producer_rebind_proof(
+                value,
+                canonical_spm=canonical,
+            )
+        except (AtlasProducerRebindProofError, OSError, ValueError):
+            continue
+    return None
+
+
+def _validated_live_spm_ownership_plan(
+    evidence: Mapping[str, Any],
+    canonical: Path | None = None,
+) -> dict[str, Any] | None:
+    for trail, value in _walk(evidence):
+        if not isinstance(value, Mapping):
+            continue
+        if (
+            value.get("contract") != ATLAS_SLOT_OWNERSHIP_PLAN_CONTRACT
+            and (
+                not trail
+                or trail[-1].casefold() not in {
+                    "atlas_slot_ownership_plan",
+                    "live_spm_ownership_plan",
+                }
+            )
+        ):
+            continue
+        try:
+            return validate_atlas_slot_ownership_plan(
+                value,
+                target_spm=canonical,
+                require_repairable=True,
+            )
+        except (AtlasSlotOwnershipError, OSError, ValueError):
+            continue
+    return None
+
+
 def _requirement_failure(rows, evidence, canonical=None, *, check_atlas=False):
     repairable = [row for _code, row in rows if row.disposition == REPAIRABLE]
     requirements = {
@@ -475,7 +542,19 @@ def _requirement_failure(rows, evidence, canonical=None, *, check_atlas=False):
         for requirement in row.evidence_requirements
     }
     failing = None
-    if CURRENT_MATERIAL_BINDING_RECIPE in requirements:
+    if EXACT_ATLAS_PRODUCER_RELATION in requirements:
+        if _validated_atlas_producer_relation(evidence, canonical) is None:
+            failing = next(
+                row for row in repairable
+                if EXACT_ATLAS_PRODUCER_RELATION in row.evidence_requirements
+            )
+    if failing is None and EXACT_LIVE_SPM_OWNERSHIP_PLAN in requirements:
+        if _validated_live_spm_ownership_plan(evidence, canonical) is None:
+            failing = next(
+                row for row in repairable
+                if EXACT_LIVE_SPM_OWNERSHIP_PLAN in row.evidence_requirements
+            )
+    if failing is None and CURRENT_MATERIAL_BINDING_RECIPE in requirements:
         if _validated_recipe(evidence) is None:
             failing = next(
                 row for row in repairable
@@ -631,6 +710,10 @@ def build_exact_target_repair_plan(
 
     texture = STEP3_STANDARD in repair_actions
     atlas_manifest = ATLAS_MANIFEST_MIRROR_REPAIR in repair_actions
+    atlas_producer = ATLAS_PRODUCER_REFRESH in repair_actions
+    atlas_slot_ownership = (
+        ATLAS_SLOT_OWNERSHIP_RECONCILE in repair_actions
+    )
     generator = GENERATOR_SYNC in repair_actions
     generator_cluster = GENERATOR_SYNC_AND_CLUSTER in repair_actions
     cluster_stale = CLUSTER_REFRESH in repair_actions
@@ -681,6 +764,26 @@ def build_exact_target_repair_plan(
             PCG_TEXTURE_TOOL,
             ATLAS_MANIFEST_MIRROR_REPAIR,
             [canonical],
+        )
+    if atlas_producer:
+        add(
+            "atlas_producer_refresh",
+            PCG_TEXTURE_TOOL,
+            ATLAS_PRODUCER_REFRESH,
+            [canonical],
+            producer_relation=_validated_atlas_producer_relation(
+                evidence, Path(canonical)
+            ),
+        )
+    if atlas_slot_ownership:
+        add(
+            "atlas_slot_ownership_reconcile",
+            GENERATOR_SYNC_TOOL,
+            ATLAS_SLOT_OWNERSHIP_RECONCILE,
+            [canonical],
+            ownership_plan=_validated_live_spm_ownership_plan(
+                evidence, Path(canonical)
+            ),
         )
     if texture:
         add(
@@ -844,6 +947,8 @@ def has_repair_contract_evidence(evidence: Mapping[str, Any]) -> bool:
 def stage_running_status(stage: Mapping[str, Any]) -> str:
     return {
         "atlas_manifest_repair": STATUS_ATLAS,
+        "atlas_producer_refresh": STATUS_ATLAS,
+        "atlas_slot_ownership_reconcile": STATUS_ATLAS,
         "pcg_texture": STATUS_TEXTURE,
         "generator_sync": STATUS_GENERATOR,
         "generator_sync_and_cluster": STATUS_GENERATOR,
