@@ -15,6 +15,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from sk_common import unreal_remote_execution_settings
+
 
 SK_BATCH_DIR = Path(__file__).resolve().parent
 LOG_DIR = SK_BATCH_DIR / "logs"
@@ -22,6 +24,9 @@ PUSH_JOB = SK_BATCH_DIR / "jobs" / "send2ue_push_job.py"
 GUI_ENTRY = SK_BATCH_DIR / "sk_batch_gui.pyw"
 DEFAULT_BLENDER = Path(
     r"C:\Program Files\Blender Foundation\Blender 5.1\blender.exe"
+)
+DEFAULT_UNREAL_PROJECT = Path(
+    r"C:\UnrealProjects\MyProject2\MyProject2.uproject"
 )
 
 
@@ -55,6 +60,7 @@ def build_exact_push_command(
     run_id: str | None = None,
     repair_evidence: Path | None = None,
     material_contract: Path | None = None,
+    unreal_project: Path | None = DEFAULT_UNREAL_PROJECT,
 ) -> tuple[list[str], dict]:
     spm = spm.expanduser().resolve()
     blender = blender.expanduser().resolve()
@@ -122,6 +128,20 @@ def build_exact_push_command(
     if repair_evidence is not None:
         command.extend(["--repair-evidence", str(repair_evidence)])
         outputs["repair_evidence"] = repair_evidence
+    rpc_settings = unreal_remote_execution_settings(unreal_project)
+    bind_address = rpc_settings.get("multicast_bind_address")
+    if bind_address:
+        command.extend(["--rpc-multicast-bind-address", str(bind_address)])
+    group_endpoint = rpc_settings.get("multicast_group_endpoint")
+    if group_endpoint:
+        command.extend(["--rpc-multicast-group-endpoint", str(group_endpoint)])
+    if "multicast_ttl" in rpc_settings:
+        command.extend(["--rpc-multicast-ttl", str(rpc_settings["multicast_ttl"])])
+    outputs["unreal_project"] = (
+        Path(unreal_project).expanduser().resolve()
+        if unreal_project
+        else None
+    )
     return command, outputs
 
 
@@ -134,6 +154,7 @@ def parse_args(argv=None):
     parser.add_argument("--log-dir", type=Path, default=LOG_DIR)
     parser.add_argument("--repair-evidence", type=Path)
     parser.add_argument("--material-contract", type=Path)
+    parser.add_argument("--unreal-project", type=Path, default=DEFAULT_UNREAL_PROJECT)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 
@@ -147,6 +168,7 @@ def main(argv=None):
             log_dir=args.log_dir,
             repair_evidence=args.repair_evidence,
             material_contract=args.material_contract,
+            unreal_project=args.unreal_project,
         )
     except ExactPushError as exc:
         print(f"SK Exact Push failed: {exc}", file=sys.stderr)

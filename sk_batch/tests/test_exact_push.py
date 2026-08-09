@@ -21,7 +21,21 @@ class ExactPushCommandTests(unittest.TestCase):
             blend = spm.with_suffix(".blend")
             blender = root / "blender.exe"
             logs = root / "logs"
+            project = root / "MyProject.uproject"
+            config = root / "Config" / "DefaultEngine.ini"
             logs.mkdir()
+            config.parent.mkdir()
+            project.write_text("{}", encoding="utf-8")
+            config.write_text(
+                "\n".join([
+                    "[/Script/PythonScriptPlugin.PythonScriptPluginSettings]",
+                    "bRemoteExecution=True",
+                    "RemoteExecutionMulticastBindAddress=192.168.0.4",
+                    "RemoteExecutionMulticastGroupEndpoint=239.0.0.1:6766",
+                    "RemoteExecutionMulticastTtl=1",
+                ]),
+                encoding="utf-8",
+            )
             for path in (spm, blend, blender):
                 path.write_bytes(b"current")
             material = logs / "SK_tree_sample_01_push_material_contract_current.json"
@@ -33,11 +47,17 @@ class ExactPushCommandTests(unittest.TestCase):
                 log_dir=logs,
                 run_id="test",
                 material_contract=material,
+                unreal_project=project,
             )
 
             self.assertEqual(command[0], str(blender.resolve()))
             self.assertNotIn("--require-green-signal", command)
             self.assertIn("--dependency-orchestrated", command)
+            self.assertIn("--rpc-multicast-bind-address", command)
+            self.assertIn("192.168.0.4", command)
+            self.assertIn("--rpc-multicast-group-endpoint", command)
+            self.assertIn("239.0.0.1:6766", command)
+            self.assertIn("--rpc-multicast-ttl", command)
             self.assertEqual(
                 outputs["material_contract"],
                 material.resolve(),
