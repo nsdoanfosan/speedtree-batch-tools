@@ -159,7 +159,14 @@ def configure_send2ue_rpc_preferences(args):
     """Apply project-matched RPC settings to this factory-startup session."""
     addon = bpy.context.preferences.addons.get("send2ue")
     if addon is None:
-        raise RuntimeError("Send2UE preferences are unavailable after add-on setup")
+        # Blender 5.1 can register an add-on's RNA classes through
+        # addon_utils.enable(default_set=False) without materializing an Addon
+        # preferences collection entry. Create that session-only entry now; the
+        # registered SendToUnrealPreferences class supplies its normal defaults.
+        addon = bpy.context.preferences.addons.new()
+        addon.module = "send2ue"
+    if addon.preferences is None:
+        raise RuntimeError("Send2UE session preferences could not be initialized")
     preferences = addon.preferences
     before = {
         "command_endpoint": str(preferences.command_endpoint),
