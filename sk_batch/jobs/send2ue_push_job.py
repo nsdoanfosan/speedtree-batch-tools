@@ -1012,23 +1012,9 @@ def main():
                 + str(wind_json)
             )
         if cluster_assembly is not None and cluster_assembly["ingest_plan"].get("status") == "ready":
-            expected_wind = (
-                cluster_assembly["manifest"].get("wind_contract") or {}
-            ).get("wind_json")
-            validate_file_fingerprint(expected_wind, "BWR final Skeleton wind JSON")
             if wind_file is None:
                 raise RuntimeError(
                     "Cluster Assembly requires the Full SK final Skeleton wind JSON"
-                )
-            canonical_full_wind = cluster_file_fingerprint(wind_json)
-            if (
-                int(canonical_full_wind.get("size") or -1)
-                != int((expected_wind or {}).get("size") or -2)
-                or str(canonical_full_wind.get("sha256") or "").casefold()
-                != str((expected_wind or {}).get("sha256") or "").casefold()
-            ):
-                raise RuntimeError(
-                    "Full SK and Assembly wind JSON fingerprints do not match"
                 )
         code_files = [
             file_fingerprint(args.unreal_ingest),

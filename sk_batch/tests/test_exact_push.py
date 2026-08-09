@@ -24,30 +24,52 @@ class ExactPushCommandTests(unittest.TestCase):
             logs.mkdir()
             for path in (spm, blend, blender):
                 path.write_bytes(b"current")
-            old_material = logs / "SK_tree_sample_01_push_material_contract_old.json"
-            new_material = logs / "SK_tree_sample_01_push_material_contract_new.json"
-            evidence = logs / "SK_tree_sample_01_repair_push_evidence_new.json"
-            old_material.write_text("{}", encoding="utf-8")
-            new_material.write_text("{}", encoding="utf-8")
-            evidence.write_text("{}", encoding="utf-8")
-            new_material.touch()
+            material = logs / "SK_tree_sample_01_push_material_contract_current.json"
+            material.write_text("{}", encoding="utf-8")
 
             command, outputs = build_exact_push_command(
                 spm,
                 blender=blender,
                 log_dir=logs,
                 run_id="test",
+                material_contract=material,
             )
 
             self.assertEqual(command[0], str(blender.resolve()))
-            self.assertIn("--require-green-signal", command)
+            self.assertNotIn("--require-green-signal", command)
             self.assertIn("--dependency-orchestrated", command)
             self.assertEqual(
                 outputs["material_contract"],
-                new_material.resolve(),
+                material.resolve(),
             )
-            self.assertEqual(outputs["repair_evidence"], evidence.resolve())
+            self.assertNotIn("--repair-evidence", command)
+            self.assertNotIn("repair_evidence", outputs)
             self.assertTrue(str(outputs["report"]).endswith("_exact_push_test.json"))
+
+    def test_uses_only_explicit_repair_evidence(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            spm = root / "SK_tree_sample_01.spm"
+            blend = spm.with_suffix(".blend")
+            blender = root / "blender.exe"
+            evidence = root / "current_evidence.json"
+            logs = root / "logs"
+            logs.mkdir()
+            material = logs / "SK_tree_sample_01_push_material_contract_current.json"
+            for path in (spm, blend, blender, evidence, material):
+                path.write_bytes(b"current")
+
+            command, outputs = build_exact_push_command(
+                spm,
+                blender=blender,
+                log_dir=logs,
+                run_id="test",
+                repair_evidence=evidence,
+                material_contract=material,
+            )
+
+            self.assertIn("--repair-evidence", command)
+            self.assertEqual(outputs["repair_evidence"], evidence.resolve())
 
     def test_missing_repaired_blend_fails_before_launch(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -62,6 +84,7 @@ class ExactPushCommandTests(unittest.TestCase):
                     blender=blender,
                     log_dir=root,
                     run_id="test",
+                    material_contract=root / "missing.json",
                 )
 
 

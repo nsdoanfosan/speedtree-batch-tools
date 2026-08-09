@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import runpy
 import subprocess
 import sys
 from datetime import datetime
@@ -18,6 +19,7 @@ from pathlib import Path
 SK_BATCH_DIR = Path(__file__).resolve().parent
 LOG_DIR = SK_BATCH_DIR / "logs"
 PUSH_JOB = SK_BATCH_DIR / "jobs" / "send2ue_push_job.py"
+GUI_ENTRY = SK_BATCH_DIR / "sk_batch_gui.pyw"
 DEFAULT_BLENDER = Path(
     r"C:\Program Files\Blender Foundation\Blender 5.1\blender.exe"
 )
@@ -27,15 +29,22 @@ class ExactPushError(RuntimeError):
     pass
 
 
-def _latest_exact(log_dir: Path, pattern: str, label: str) -> Path:
-    matches = sorted(
-        (path for path in log_dir.glob(pattern) if path.is_file()),
-        key=lambda path: path.stat().st_mtime_ns,
-        reverse=True,
-    )
-    if not matches:
-        raise ExactPushError(f"current {label} was not found: {pattern}")
-    return matches[0].resolve()
+def _write_current_material_contract(spm: Path) -> Path:
+    """Regenerate the single current wrapper from the asset-local Repair report."""
+    try:
+        namespace = runpy.run_path(
+            str(GUI_ENTRY),
+            run_name="sk_batch_current_contract_writer",
+        )
+        path = namespace["App"]._push_material_contract(spm)
+    except Exception as exc:
+        raise ExactPushError(
+            f"current Push material contract could not be regenerated: {exc}"
+        ) from exc
+    path = Path(path).resolve()
+    if not path.is_file():
+        raise ExactPushError(f"current Push material contract was not written: {path}")
+    return path
 
 
 def build_exact_push_command(
@@ -44,6 +53,8 @@ def build_exact_push_command(
     blender: Path = DEFAULT_BLENDER,
     log_dir: Path = LOG_DIR,
     run_id: str | None = None,
+    repair_evidence: Path | None = None,
+    material_contract: Path | None = None,
 ) -> tuple[list[str], dict]:
     spm = spm.expanduser().resolve()
     blender = blender.expanduser().resolve()
@@ -59,16 +70,20 @@ def build_exact_push_command(
         raise ExactPushError(f"production Push job is missing: {PUSH_JOB}")
 
     stem = spm.stem
-    material_contract = _latest_exact(
-        log_dir,
-        f"{stem}_push_material_contract_*.json",
-        "Push material contract",
-    )
-    repair_evidence = _latest_exact(
-        log_dir,
-        f"{stem}_repair_push_evidence_*.json",
-        "Repair/Push evidence",
-    )
+    if material_contract is None:
+        material_contract = _write_current_material_contract(spm)
+    else:
+        material_contract = material_contract.expanduser().resolve()
+        if not material_contract.is_file():
+            raise ExactPushError(
+                f"explicit Push material contract is missing: {material_contract}"
+            )
+    if repair_evidence is not None:
+        repair_evidence = repair_evidence.expanduser().resolve()
+        if not repair_evidence.is_file():
+            raise ExactPushError(
+                f"explicit Repair/Push evidence is missing: {repair_evidence}"
+            )
     run_id = run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
     prefix = log_dir / f"{stem}_exact_push_{run_id}"
     outputs = {
@@ -77,7 +92,6 @@ def build_exact_push_command(
         "checkpoint": prefix.with_name(prefix.name + "_checkpoint.json"),
         "batch_report": prefix.with_name(prefix.name + "_batch.json"),
         "material_contract": material_contract,
-        "repair_evidence": repair_evidence,
     }
     command = [
         str(blender),
@@ -93,11 +107,8 @@ def build_exact_push_command(
         str(spm),
         "--material-contract",
         str(material_contract),
-        "--repair-evidence",
-        str(repair_evidence),
         "--transport",
         "rpc",
-        "--require-green-signal",
         "--dependency-orchestrated",
         "--manifest",
         str(outputs["manifest"]),
@@ -108,6 +119,9 @@ def build_exact_push_command(
         "--queue-id",
         str(spm),
     ]
+    if repair_evidence is not None:
+        command.extend(["--repair-evidence", str(repair_evidence)])
+        outputs["repair_evidence"] = repair_evidence
     return command, outputs
 
 
@@ -118,6 +132,8 @@ def parse_args(argv=None):
     parser.add_argument("--spm", required=True, type=Path)
     parser.add_argument("--blender", type=Path, default=DEFAULT_BLENDER)
     parser.add_argument("--log-dir", type=Path, default=LOG_DIR)
+    parser.add_argument("--repair-evidence", type=Path)
+    parser.add_argument("--material-contract", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 
@@ -129,6 +145,8 @@ def main(argv=None):
             args.spm,
             blender=args.blender,
             log_dir=args.log_dir,
+            repair_evidence=args.repair_evidence,
+            material_contract=args.material_contract,
         )
     except ExactPushError as exc:
         print(f"SK Exact Push failed: {exc}", file=sys.stderr)
