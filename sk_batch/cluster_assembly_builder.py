@@ -7470,6 +7470,26 @@ def _unreal_bone_names(unreal, mesh):
     ]
 
 
+def _current_unreal_skeleton_diagnostic(expected_bones, actual_bones):
+    """Describe manifest drift without rejecting a valid reimported Skeleton."""
+    expected = [str(value) for value in expected_bones]
+    actual = [str(value) for value in actual_bones]
+    expected_set = set(expected)
+    actual_set = set(actual)
+    exact_match = actual == expected
+    return {
+        "status": "match" if exact_match else "diagnostic_mismatch",
+        "manifest_snapshot_is_authoritative": False,
+        "current_unreal_skeleton_is_authoritative": True,
+        "exact_order_match": exact_match,
+        "expected_bone_count": len(expected),
+        "actual_bone_count": len(actual),
+        "common_bone_count": len(expected_set & actual_set),
+        "missing_from_current": [name for name in expected if name not in actual_set],
+        "added_in_current": [name for name in actual if name not in expected_set],
+    }
+
+
 def _unreal_transform(unreal, transform, coordinate_contract):
     factor = float(coordinate_contract["centimeters_per_blender_unit"])
     translation = transform["translation"]
@@ -8109,10 +8129,10 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
         row["name"] for row in manifest["final_skeleton"]["bones"]
     ]
     actual_bones = _unreal_bone_names(unreal, full)
-    if actual_bones != expected_bones:
-        raise ClusterAssemblyBuildError(
-            "Full SK final Skeleton does not match the BWR Assembly manifest"
-        )
+    skeleton_snapshot_diagnostic = _current_unreal_skeleton_diagnostic(
+        expected_bones,
+        actual_bones,
+    )
     full_skeleton = full.get_editor_property("skeleton")
     base_skeleton = base.get_editor_property("skeleton")
     if full_skeleton is None or base_skeleton is None:
@@ -8138,7 +8158,7 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
     # Binding validity is defined by the final imported Skeleton.  Wind JSON
     # generation/import is verified independently and must not be used as a
     # second, narrower authority for which Assembly bones are allowed.
-    wind_bones = set(skeleton_by_name)
+    wind_bones = set(actual_bones)
     base_contract = manifest.get("base") or {}
     base_weighted_bones = list(base_contract.get("weighted_bones") or [])
     if (
@@ -8150,7 +8170,7 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
             "Assembly base has no usable weighted-bone list"
         )
     for bone_name in base_weighted_bones:
-        if bone_name not in skeleton_by_name:
+        if bone_name not in wind_bones:
             raise ClusterAssemblyBuildError(
                 "Assembly base weighted bone is outside the imported Skeleton: "
                 + str(bone_name)
@@ -8348,6 +8368,7 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
         "assembly": assembly.get_path_name(),
         "final_skeleton": full_skeleton.get_path_name(),
         "final_skeleton_bones": len(actual_bones),
+        "manifest_skeleton_diagnostic": skeleton_snapshot_diagnostic,
         "production_skeleton_required": False,
         "parts": built_parts,
         "binding_count": sum(row["bindings"] for row in built_parts),
