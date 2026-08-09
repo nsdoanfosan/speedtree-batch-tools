@@ -49,6 +49,7 @@ from cluster_assembly_builder import (  # noqa: E402
     _partition_normalized_render_components,
     _role_material_polygons,
     _strip_fbx_scene_textures,
+    _validate_capture_receipt,
     _validate_role_component_claims,
     _vertex_descriptors,
     _weighted_vertex_attachment_tolerance,
@@ -3519,6 +3520,133 @@ class CodexTestMaterialScopeTests(unittest.TestCase):
                     "/Game/Codex/Tests/Elm",
                     root / "out",
                 )
+
+
+class CurrentPassThroughAndCaptureDiagnosticsTests(unittest.TestCase):
+    def test_missing_target_contract_persists_current_pass_through_manifest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            assembly = root / "assembly"
+            spm = root / "SK_tree_no_assembly.spm"
+            receipt = root / "receipt.json"
+            spm.write_bytes(b"current spm")
+            receipt.write_text('{"status":"ready"}', encoding="utf-8")
+            stale = assembly / (
+                "SK_tree_no_assembly_cluster_assembly_bindings.json"
+            )
+            assembly.mkdir()
+            stale.write_text(
+                json.dumps({"status": "ready", "content_decision": "build"}),
+                encoding="utf-8",
+            )
+            handoff = {
+                "status": "pass_through",
+                "assembly": {"requested": False},
+                "roles": [],
+                "pcg_receipt": {"path": str(receipt)},
+            }
+
+            manifest = build_blender_assembly_inputs(
+                handoff,
+                None,
+                None,
+                assembly,
+                "",
+                "",
+                pass_through_receipt_path=None,
+                pass_through_target_contract=None,
+                pass_through_target_spm=spm,
+            )
+
+            persisted = json.loads(stale.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["status"], "pass_through")
+            self.assertEqual(persisted["status"], "pass_through")
+            self.assertEqual(persisted["content_decision"], "pass_through")
+
+    def test_current_inspected_pass_through_supersedes_ready_receipt_contract(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            assembly = root / "assembly"
+            spm = root / "SK_tree_no_assembly.spm"
+            receipt = root / "receipt.json"
+            spm.write_bytes(b"current spm")
+            receipt.write_text('{"status":"ready"}', encoding="utf-8")
+            handoff = {
+                "status": "pass_through",
+                "assembly": {"requested": False},
+                "roles": [],
+                "pcg_receipt": {"path": str(receipt)},
+            }
+
+            manifest = build_blender_assembly_inputs(
+                handoff,
+                None,
+                None,
+                assembly,
+                "",
+                "",
+                pass_through_receipt_path=receipt,
+                pass_through_target_contract={
+                    "handoff": {
+                        "status": "ready",
+                        "assembly": {"requested": True},
+                    }
+                },
+                pass_through_target_spm=spm,
+            )
+
+            self.assertEqual(manifest["status"], "pass_through")
+            self.assertEqual(
+                manifest["target_contract_disposition"],
+                "current_inspected_pass_through_superseded_receipt_contract",
+            )
+
+    def test_stale_capture_self_hash_is_refreshed_diagnostically(self):
+        contract = {
+            "kind": "speedtree_cluster_physical_capture_fit",
+            "version": 1,
+            "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
+            "direct_uv_source": "same_blender_physical_capture_projection",
+            "frame": {
+                "policy": "physical_target_uniform_whole_source_fit",
+                "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
+                "direct_uv_source": (
+                    "same_blender_physical_capture_projection"
+                ),
+                "unit_system": "METRIC",
+                "scale_length": 1.0,
+                "fit_scale": 1.0,
+                "width": 0.1,
+                "height": 0.1,
+                "content_width": 0.1,
+                "content_height": 0.1,
+                "target_meters": [0.1, 0.1],
+                "target_blender_units": [0.1, 0.1],
+                "center": [0.0, 0.0, 0.0],
+                "plane": "XY",
+                "rotation_degrees": 0.0,
+            },
+            "contract_sha256": "stale",
+        }
+
+        result = _validate_capture_receipt(contract, "branch")
+
+        self.assertEqual(
+            result["contract_hash_status"], "refreshed_diagnostic"
+        )
+        self.assertEqual(contract["contract_sha256"], result["contract_sha256"])
+
+    def test_stale_outer_capture_hash_is_refreshed_diagnostically(self):
+        manifest = physical_production_manifest()
+        receipt = manifest["normalized_variant_receipts"][0]["receipt"]
+        receipt["physical_capture_contract_sha256"] = "stale"
+
+        result = validate_normalized_prototype_unit_contract(manifest)
+
+        self.assertEqual(result["status"], "verified")
+        self.assertNotEqual(
+            receipt["physical_capture_contract_sha256"], "stale"
+        )
 
 
 if __name__ == "__main__":

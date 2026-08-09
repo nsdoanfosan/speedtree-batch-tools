@@ -42,7 +42,7 @@ class ClusterFleetPushTests(unittest.TestCase):
                 str(contract),
             )
 
-    def test_repair_result_requires_complete_v3_binding_and_plan_free_base(self):
+    def test_repair_result_requires_complete_v4_binding_and_plan_free_base(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             report = root / "repair.json"
@@ -53,7 +53,7 @@ class ClusterFleetPushTests(unittest.TestCase):
                     "authored_node_assignment": {
                         "policy": (
                             "deterministic_state_mesh_then_global_position_"
-                            "recovery_one_to_one_v3"
+                            "recovery_shared_components_v4"
                         ),
                         "assigned_count": 2,
                         "unmatched_count": 0,
@@ -73,6 +73,27 @@ class ClusterFleetPushTests(unittest.TestCase):
 
             self.assertTrue(result["ok"])
             self.assertEqual(result["bindings"], 2)
+
+    def test_repair_result_accepts_current_pass_through_without_stale_manifest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report = root / "repair.json"
+            report.write_text(json.dumps({
+                "status": "ok",
+                "cluster_assembly_manifest": {
+                    "status": "pass_through",
+                    "content_decision": "pass_through",
+                },
+            }), encoding="utf-8")
+
+            result = validate_repair_result(
+                report,
+                {"manifest": root / "stale_ready_manifest.json"},
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["pass_through"])
+            self.assertEqual(result["parts"], 0)
 
     def _manifest(self, root, asset, stem, *, birch=False):
         asset_dir = root / asset

@@ -58,6 +58,23 @@ def build_repair_command(target, blender, material_contract, report_path):
 
 def validate_repair_result(report_path, target):
     report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+    assembly_manifest = report.get("cluster_assembly_manifest") or {}
+    if (
+        assembly_manifest.get("status") == "pass_through"
+        and assembly_manifest.get("content_decision") == "pass_through"
+    ):
+        return {
+            "ok": True,
+            "pass_through": True,
+            "problems": [],
+            "policy": "current_receipt_pass_through",
+            "parts": 0,
+            "bindings": 0,
+            "assigned": 0,
+            "unmatched": 0,
+            "preserved_role_polygons_removed": 0,
+            "report": str(Path(report_path).resolve()),
+        }
     manifest_path = Path(target["manifest"])
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     placement = (
@@ -74,7 +91,7 @@ def validate_repair_result(report_path, target):
         problems.append("repair_not_ok")
     if placement.get("policy") != (
         "deterministic_state_mesh_then_global_position_recovery_"
-        "one_to_one_v3"
+        "shared_components_v4"
     ):
         problems.append("assembly_binding_policy_not_current")
     if int(placement.get("unmatched_count") or 0) != 0:
@@ -308,6 +325,18 @@ def main(argv=None):
                     "production Repair postcondition failed: "
                     + "; ".join(repair_verification["problems"])
                 )
+            if repair_verification.get("pass_through"):
+                result["status"] = "skipped_no_current_assembly"
+                result["diagnostic"] = (
+                    "current receipt declares Assembly pass-through; stale "
+                    "ready manifest was replaced and was not exported"
+                )
+                fleet["results"].append(result)
+                fleet_report_path.write_text(
+                    json.dumps(fleet, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                continue
             target["expected_parts"] = repair_verification["parts"]
             target["expected_bindings"] = repair_verification["bindings"]
             completed = owned_run(
@@ -400,12 +429,30 @@ def main(argv=None):
             encoding="utf-8",
         )
 
-    failed = [row for row in fleet["results"] if row["status"] != "verified_in_unreal"]
+    successful_statuses = {
+        "verified_in_unreal",
+        "skipped_no_current_assembly",
+    }
+    failed = [
+        row for row in fleet["results"]
+        if row["status"] not in successful_statuses
+    ]
     fleet["status"] = "ok" if not failed else "failed"
-    fleet["verified_count"] = len(fleet["results"]) - len(failed)
+    fleet["verified_count"] = len([
+        row for row in fleet["results"]
+        if row["status"] == "verified_in_unreal"
+    ])
+    fleet["skipped_no_current_assembly_count"] = len([
+        row for row in fleet["results"]
+        if row["status"] == "skipped_no_current_assembly"
+    ])
     fleet["failed_count"] = len(failed)
     fleet_report_path.write_text(json.dumps(fleet, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"SK_CLUSTER_FLEET_VERIFIED={fleet['verified_count']}")
+    print(
+        "SK_CLUSTER_FLEET_SKIPPED_NO_CURRENT_ASSEMBLY="
+        f"{fleet['skipped_no_current_assembly_count']}"
+    )
     print(f"SK_CLUSTER_FLEET_FAILED={fleet['failed_count']}")
     return 0 if not failed else 1
 
