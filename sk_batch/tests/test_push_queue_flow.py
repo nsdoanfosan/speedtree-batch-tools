@@ -4488,6 +4488,8 @@ class PushQueueFlowTests(unittest.TestCase):
             'preferences.command_endpoint = f"{bind_address}:{int(port_text)}"',
             source,
         )
+        self.assertIn("bpy.context.preferences.addons.new()", source)
+        self.assertIn('addon.module = "send2ue"', source)
 
     def test_saved_preflight_skip_is_rechecked_against_current_handoff(self):
         gui = load_gui_module()
