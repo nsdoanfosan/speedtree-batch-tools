@@ -22,6 +22,7 @@ from pathlib import Path
 
 SCHEMA_VERSION = 1
 CONTRACT_KIND = "pcg_cluster_blender_assembly_handoff"
+CURRENT_ASSEMBLY_MANIFEST_KIND = "sk_batch_cluster_nanite_assembly_inputs"
 ROLE_ORDER = ("branch", "cluster", "leaf", "leaf_side")
 ROLE_PREFIX_RE = re.compile(
     r"^(leaf_side|leaf(?:_[^_]+)*_side|branch|cluster|leaf)(?:_|$)",
@@ -92,6 +93,108 @@ def file_fingerprint(path, *, hash_content=True):
             _sha256_cached(absolute, stat.st_size, stat.st_mtime_ns)
             if hash_content else None
         ),
+    }
+
+
+def _refresh_current_artifact_fingerprints(value):
+    """Refresh persisted artifact rows without changing logical contracts."""
+    if isinstance(value, list):
+        return [_refresh_current_artifact_fingerprints(item) for item in value]
+    if not isinstance(value, dict):
+        return deepcopy(value)
+    refreshed = {
+        key: _refresh_current_artifact_fingerprints(item)
+        for key, item in value.items()
+    }
+    path = str(value.get("path") or "").strip()
+    if path and any(
+        key in value for key in ("exists", "size", "mtime_ns", "sha256")
+    ):
+        current = file_fingerprint(path)
+        if current.get("exists"):
+            refreshed.update(current)
+    return refreshed
+
+
+def current_assembly_manifest_repair_handoff(spm_path, full_fbx_path):
+    """Recover a live Repair handoff from the current production manifest.
+
+    PCG receipts are discovery-time evidence and can become stale after a
+    legitimate source Repair.  The manifest directly under the asset's
+    ``assembly`` folder is the current production Assembly contract.  Reuse
+    only that file, refresh its concrete artifact fingerprints, and never
+    consult historical logs or backups.
+    """
+    spm = Path(spm_path).expanduser().resolve()
+    manifest_path = (
+        spm.parent
+        / "assembly"
+        / f"{spm.stem}_cluster_assembly_bindings.json"
+    )
+    if not manifest_path.is_file() or not Path(full_fbx_path).is_file():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            "current production Assembly manifest is unreadable: "
+            + str(manifest_path)
+        ) from exc
+    if (
+        manifest.get("kind") != CURRENT_ASSEMBLY_MANIFEST_KIND
+        or manifest.get("status") != "ready"
+        or manifest.get("content_decision") != "build"
+        or not list(manifest.get("parts") or [])
+    ):
+        return None
+    evidence = manifest.get("handoff_evidence") or {}
+    roles = evidence.get("roles") or {}
+    if not isinstance(roles, dict) or not roles:
+        raise ValueError(
+            "current production Assembly manifest has no persisted role inputs"
+        )
+    part_builder_inputs = []
+    for provider_key, saved_role in sorted(roles.items()):
+        if not isinstance(saved_role, dict):
+            raise ValueError(
+                "current production Assembly manifest has an invalid role: "
+                + str(provider_key)
+            )
+        role = _refresh_current_artifact_fingerprints(saved_role)
+        polygons = list(role.get("polygon_indices") or [])
+        normalized = role.get("normalized_variants") or {}
+        if not polygons or not list(normalized.get("variants") or []):
+            raise ValueError(
+                "current production Assembly role is incomplete: "
+                + str(provider_key)
+            )
+        role["provider_key"] = str(
+            role.get("provider_key") or provider_key
+        )
+        role["rendered_provider_expansion_covered"] = True
+        role["current_manifest_authority"] = {
+            "status": "current",
+            "source": "production_assembly_manifest",
+            "manifest": file_fingerprint(manifest_path),
+        }
+        part_builder_inputs.append(role)
+    return {
+        "status": "ready",
+        "issues": [],
+        "spm": file_fingerprint(spm),
+        "actual_fbx": file_fingerprint(full_fbx_path),
+        "pcg_receipt": evidence.get("pcg_receipt"),
+        "full_skeletal_mesh": {"preserved": True},
+        "assembly": {
+            "requested": True,
+            "part_builder_inputs": part_builder_inputs,
+        },
+        "current_manifest_authority": {
+            "status": "current",
+            "source": "production_assembly_manifest",
+            "manifest": file_fingerprint(manifest_path),
+            "historical_receipts_consulted": False,
+        },
     }
 
 
