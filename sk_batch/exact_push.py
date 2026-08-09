@@ -9,24 +9,26 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import runpy
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
-from sk_common import unreal_remote_execution_settings
-
-
 SK_BATCH_DIR = Path(__file__).resolve().parent
 LOG_DIR = SK_BATCH_DIR / "logs"
 PUSH_JOB = SK_BATCH_DIR / "jobs" / "send2ue_push_job.py"
+UNREAL_INGEST = SK_BATCH_DIR / "unreal_ingest.py"
 GUI_ENTRY = SK_BATCH_DIR / "sk_batch_gui.pyw"
 DEFAULT_BLENDER = Path(
     r"C:\Program Files\Blender Foundation\Blender 5.1\blender.exe"
 )
 DEFAULT_UNREAL_PROJECT = Path(
     r"C:\UnrealProjects\MyProject2\MyProject2.uproject"
+)
+DEFAULT_UNREAL_EDITOR_CMD = Path(
+    r"C:\Program Files\Epic Games\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe"
 )
 
 
@@ -97,7 +99,10 @@ def build_exact_push_command(
         "manifest": prefix.with_name(prefix.name + "_manifest.json"),
         "checkpoint": prefix.with_name(prefix.name + "_checkpoint.json"),
         "batch_report": prefix.with_name(prefix.name + "_batch.json"),
+        "item_import_report": prefix.with_name(prefix.name + "_unreal.json"),
+        "export_root": prefix.with_name(prefix.name + "_export"),
         "material_contract": material_contract,
+        "queue_id": str(spm),
     }
     command = [
         str(blender),
@@ -114,7 +119,7 @@ def build_exact_push_command(
         "--material-contract",
         str(material_contract),
         "--transport",
-        "rpc",
+        "headless_export",
         "--dependency-orchestrated",
         "--manifest",
         str(outputs["manifest"]),
@@ -122,21 +127,18 @@ def build_exact_push_command(
         str(outputs["checkpoint"]),
         "--batch-report",
         str(outputs["batch_report"]),
+        "--item-import-report",
+        str(outputs["item_import_report"]),
+        "--export-root",
+        str(outputs["export_root"]),
         "--queue-id",
-        str(spm),
+        outputs["queue_id"],
+        "--unreal-ingest",
+        str(UNREAL_INGEST),
     ]
     if repair_evidence is not None:
         command.extend(["--repair-evidence", str(repair_evidence)])
         outputs["repair_evidence"] = repair_evidence
-    rpc_settings = unreal_remote_execution_settings(unreal_project)
-    bind_address = rpc_settings.get("multicast_bind_address")
-    if bind_address:
-        command.extend(["--rpc-multicast-bind-address", str(bind_address)])
-    group_endpoint = rpc_settings.get("multicast_group_endpoint")
-    if group_endpoint:
-        command.extend(["--rpc-multicast-group-endpoint", str(group_endpoint)])
-    if "multicast_ttl" in rpc_settings:
-        command.extend(["--rpc-multicast-ttl", str(rpc_settings["multicast_ttl"])])
     outputs["unreal_project"] = (
         Path(unreal_project).expanduser().resolve()
         if unreal_project
@@ -145,9 +147,104 @@ def build_exact_push_command(
     return command, outputs
 
 
+def run_headless_manifest(
+    manifest_path: Path,
+    checkpoint_path: Path,
+    batch_report_path: Path,
+    *,
+    unreal_project: Path = DEFAULT_UNREAL_PROJECT,
+    unreal_editor_cmd: Path = DEFAULT_UNREAL_EDITOR_CMD,
+    max_restarts: int = 10,
+) -> dict:
+    """Ingest one immutable manifest in UnrealEditor-Cmd, with crash resume."""
+    unreal_project = unreal_project.expanduser().resolve()
+    unreal_editor_cmd = unreal_editor_cmd.expanduser().resolve()
+    if not unreal_project.is_file():
+        raise ExactPushError(f"Unreal project is missing: {unreal_project}")
+    if not unreal_editor_cmd.is_file():
+        raise ExactPushError(
+            f"UnrealEditor-Cmd executable is missing: {unreal_editor_cmd}"
+        )
+    if not UNREAL_INGEST.is_file():
+        raise ExactPushError(f"Unreal ingest script is missing: {UNREAL_INGEST}")
+
+    manifest_path = manifest_path.expanduser().resolve()
+    checkpoint_path = checkpoint_path.expanduser().resolve()
+    batch_report_path = batch_report_path.expanduser().resolve()
+    command = [
+        str(unreal_editor_cmd),
+        str(unreal_project),
+        "-run=pythonscript",
+        f"-script={UNREAL_INGEST}",
+        "-unattended",
+        "-NoSplash",
+        "-NoSound",
+        "-UTF8Output",
+    ]
+    environment = os.environ.copy()
+    environment.update({
+        "SK_BATCH_MANIFEST_PATH": str(manifest_path),
+        "SK_BATCH_CHECKPOINT_PATH": str(checkpoint_path),
+        "SK_BATCH_REPORT_PATH": str(batch_report_path),
+    })
+    last_returncode = None
+    for attempt in range(max(0, int(max_restarts)) + 1):
+        print(
+            f"UnrealEditor-Cmd headless ingest "
+            f"({attempt + 1}/{max(0, int(max_restarts)) + 1})",
+            flush=True,
+        )
+        completed = subprocess.run(command, check=False, env=environment)
+        last_returncode = completed.returncode
+        try:
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            checkpoint = {}
+        if checkpoint.get("complete") and batch_report_path.is_file():
+            try:
+                return json.loads(batch_report_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise ExactPushError(
+                    f"Unreal batch report is unreadable: {exc}"
+                ) from exc
+    raise ExactPushError(
+        "UnrealEditor-Cmd did not complete the manifest after "
+        f"{max(0, int(max_restarts)) + 1} launches; "
+        f"last return code={last_returncode}, checkpoint={checkpoint_path}"
+    )
+
+
+def merge_unreal_result(outputs: dict, batch_result: dict) -> dict:
+    """Promote commandlet item evidence into the exact Push report."""
+    report_path = Path(outputs["report"])
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ExactPushError(f"exact Push export report is unreadable: {exc}") from exc
+    item = (batch_result.get("items") or {}).get(outputs["queue_id"], {})
+    report["unreal_result"] = item
+    report["wind"] = item.get("wind")
+    report["materials"] = item.get("materials")
+    report["checkout"] = item.get("checkout")
+    if item.get("status") == "imported_ok":
+        report["stage"] = "completed"
+        report["status"] = "ok"
+        report["failure_kind"] = None
+    else:
+        report["stage"] = "unreal_ingest_failed"
+        report["status"] = item.get("status") or "failed"
+        report["failure_kind"] = item.get("status") or "data_error"
+        report["error"] = item.get("message") or "Unreal manifest ingest failed"
+    report_path.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return report
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Push one exact repaired SK target to the open Unreal Editor",
+        description="Push one exact repaired SK target through UnrealEditor-Cmd",
     )
     parser.add_argument("--spm", required=True, type=Path)
     parser.add_argument("--blender", type=Path, default=DEFAULT_BLENDER)
@@ -155,6 +252,11 @@ def parse_args(argv=None):
     parser.add_argument("--repair-evidence", type=Path)
     parser.add_argument("--material-contract", type=Path)
     parser.add_argument("--unreal-project", type=Path, default=DEFAULT_UNREAL_PROJECT)
+    parser.add_argument(
+        "--unreal-editor-cmd",
+        type=Path,
+        default=DEFAULT_UNREAL_EDITOR_CMD,
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 
@@ -196,9 +298,22 @@ def main(argv=None):
         )
         return completed.returncode or 1
     try:
-        report = json.loads(outputs["report"].read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        print(f"SK Exact Push wrote no readable report: {exc}", file=sys.stderr)
+        export_report = json.loads(outputs["report"].read_text(encoding="utf-8"))
+        if export_report.get("status") != "exported_pending_unreal":
+            raise ExactPushError(
+                "Blender export did not reach exported_pending_unreal: "
+                + str(export_report)
+            )
+        batch_result = run_headless_manifest(
+            outputs["manifest"],
+            outputs["checkpoint"],
+            outputs["batch_report"],
+            unreal_project=args.unreal_project,
+            unreal_editor_cmd=args.unreal_editor_cmd,
+        )
+        report = merge_unreal_result(outputs, batch_result)
+    except (OSError, ValueError, ExactPushError) as exc:
+        print(f"SK Exact Push headless ingest failed: {exc}", file=sys.stderr)
         return 1
     if report.get("status") != "ok":
         print(

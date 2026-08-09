@@ -14,7 +14,7 @@ from exact_push import ExactPushError, build_exact_push_command  # noqa: E402
 
 
 class ExactPushCommandTests(unittest.TestCase):
-    def test_builds_production_rpc_push_from_latest_exact_evidence(self):
+    def test_builds_production_headless_push_from_latest_exact_evidence(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             spm = root / "SK_tree_sample_01.spm"
@@ -53,11 +53,16 @@ class ExactPushCommandTests(unittest.TestCase):
             self.assertEqual(command[0], str(blender.resolve()))
             self.assertNotIn("--require-green-signal", command)
             self.assertIn("--dependency-orchestrated", command)
-            self.assertIn("--rpc-multicast-bind-address", command)
-            self.assertIn("192.168.0.4", command)
-            self.assertIn("--rpc-multicast-group-endpoint", command)
-            self.assertIn("239.0.0.1:6766", command)
-            self.assertIn("--rpc-multicast-ttl", command)
+            self.assertEqual(
+                command[command.index("--transport") + 1],
+                "headless_export",
+            )
+            self.assertNotIn("--rpc-multicast-bind-address", command)
+            self.assertNotIn("--rpc-multicast-group-endpoint", command)
+            self.assertNotIn("--rpc-multicast-ttl", command)
+            self.assertIn("--item-import-report", command)
+            self.assertIn("--export-root", command)
+            self.assertIn("--unreal-ingest", command)
             self.assertEqual(
                 outputs["material_contract"],
                 material.resolve(),
