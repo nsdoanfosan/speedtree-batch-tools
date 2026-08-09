@@ -28,6 +28,11 @@ from cluster_bark_source_resolution import (
     ClusterBarkSourceResolutionError,
     load_current_isolated_bark_manifest,
 )
+from cluster_physical_capture_contract import (
+    PhysicalCaptureValidationError,
+    validate_normalization_receipt,
+    validate_physical_capture_manifest,
+)
 from generator_delivery_scope import (
     GeneratorDeliveryScopeError,
     validate_delivery_scope_intent,
@@ -354,19 +359,28 @@ def inspect_normalization_source_identity(blend):
     }
 
 
+def capture_plane_for_blend(blend):
+    """Resolve capture orientation from exact filename tokens only."""
+    stem = Path(blend).stem
+    base = stem[3:] if stem.casefold().startswith("sk_") else stem
+    tokens = {token for token in base.casefold().split("_") if token}
+    return "YZ" if "side" in tokens else "XY"
+
+
 def _role_contract(blend):
     stem = Path(blend).stem
     base = stem[3:] if stem.casefold().startswith("sk_") else stem
     tokens = {token for token in base.casefold().split("_") if token}
     if "leaf" in tokens and "side" in tokens:
         role = "leaf_side"
-        plane = "YZ"
     elif "leaf" in tokens:
         role = "leaf"
-        plane = "XY"
     else:
         role = "branch"
-        plane = "XY"
+    # Asset role selects the Atlas collection, while the exact ``side`` token
+    # independently selects capture orientation.  Coupling these decisions
+    # made branch-side assets fall through to the top-facing XY capture.
+    plane = capture_plane_for_blend(blend)
     return {
         "role": role,
         "capture_plane": plane,
@@ -1096,6 +1110,32 @@ def _receipt_is_current(recipe):
         != _sha256_file(capture_manifest)
     ):
         return False
+    # Version-3 receipts are production delivery evidence.  They may only
+    # authorize reuse when the finalized manifest proves the recipe's exact
+    # plane/basis, physical extent, complete eight-map coverage, and immutable
+    # map/manifest fingerprints.  In particular, an old XY receipt for an
+    # exact ``side`` token must route to recapture instead of the already-ON
+    # no-op path.
+    if int(receipt.get("version") or 0) >= 3:
+        try:
+            manifest_evidence = validate_physical_capture_manifest(
+                capture_manifest,
+                expected_blend=recipe["blend"],
+                expected_plane=recipe["capture_plane"],
+                expected_resolution=recipe["capture_resolution"],
+                expected_target_meters=recipe["capture_target_meters"],
+                expected_padding_ratio=recipe["capture_padding_ratio"],
+            )
+            validate_normalization_receipt(
+                recipe["receipt_path"],
+                manifest_evidence=manifest_evidence,
+                expected_blend=recipe["blend"],
+                expected_normalization_contract_sha256=recipe[
+                    "normalization_contract_sha256"
+                ],
+            )
+        except PhysicalCaptureValidationError:
+            return False
     recorded_contract_hash = (
         receipt.get("normalization_contract_sha256")
         or receipt.get("recipe_sha256")
@@ -1373,6 +1413,7 @@ def resolve_normalization_recipe(
 __all__ = [
     "ClusterNormalizationSyncError",
     "ClusterSourceBuildRequiredError",
+    "capture_plane_for_blend",
     "inspect_normalization_source_identity",
     "normalization_receipt_path",
     "resolve_normalization_recipe",

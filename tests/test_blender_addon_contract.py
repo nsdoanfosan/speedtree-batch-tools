@@ -1,3 +1,4 @@
+import importlib
 import json
 import os
 import sys
@@ -233,6 +234,55 @@ class BlenderAddonGatewayTests(unittest.TestCase):
                             "speedtree_bone_weight_repair": expected
                         },
                     )
+
+    def test_expected_source_is_importable_without_installed_addon(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = root / "speedtree_bone_weight_repair"
+            package.mkdir()
+            (package / "__init__.py").write_text(
+                "bl_info = {'version': (1, 2, 3)}\n",
+                encoding="utf-8",
+            )
+            (package / "core.py").write_text(
+                "def require_spm_sk_ready(value):\n"
+                "    return ('ready', value)\n",
+                encoding="utf-8",
+            )
+            loaded = set()
+            addon_utils = types.ModuleType("addon_utils")
+            addon_utils.check = lambda name: (False, name in loaded)
+
+            def enable(name, **_kwargs):
+                importlib.import_module(name)
+                loaded.add(name)
+
+            addon_utils.enable = enable
+            addon_utils.disable = lambda name, **_kwargs: loaded.discard(name)
+            with mock.patch.dict(
+                sys.modules, {"addon_utils": addon_utils}, clear=False
+            ), mock.patch.dict(
+                os.environ,
+                {"SPEEDTREE_BWR_ADDON_DIR": str(package)},
+                clear=False,
+            ):
+                sys.modules.pop("speedtree_bone_weight_repair", None)
+                sys.modules.pop("speedtree_bone_weight_repair.core", None)
+                session = gateway.prepare_runtime(
+                    "test.gateway.source",
+                    {"speedtree_bone_weight_repair": ["spm_sk_preflight_v1"]},
+                )
+                self.assertEqual(
+                    session.operation(
+                        "speedtree_bone_weight_repair",
+                        "require_spm_sk_ready",
+                    )("tree.spm"),
+                    ("ready", "tree.spm"),
+                )
+                self.assertEqual(
+                    session.receipt["addons"][0]["expected_source"],
+                    str(package.resolve()),
+                )
 
 
 if __name__ == "__main__":

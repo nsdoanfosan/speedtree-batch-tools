@@ -255,6 +255,29 @@ Base에서 자식에만 있는 구조는 적용 시 삭제합니다. 자식 구�
 - PCG ST9 Texture 보드는 같은 JSON을 읽어 관계를 표시하지만, 실제 ON/OFF 적용은
   이 도구가 단독으로 담당한다.
 
+### Standalone physical-capture delivery
+
+GUI 없이 한 관계를 재실행하고 production 증거까지 검증하려면 저장소 루트에서 다음
+명령을 사용한다.
+
+```powershell
+python .\tools\deliver_cluster_physical_capture.py `
+  --blend "...\Cluster\SK_branch_species_side_01.blend" `
+  --target "...\SK_tree_species_01.spm" `
+  --blender "C:\Program Files\Blender Foundation\Blender 5.1\blender.exe" `
+  --bwr-addon-dir "...\addons\speedtree_bone_weight_repair" `
+  --atlas-addon-dir "...\addons\atlas_leaf_mesh_builder" `
+  --normalizer-addon-dir "...\addons\speedtree_cluster_normalizer" `
+  --unit-probe "...\speedtree_unit_probe_10cm_user_scale_0_1_verified.json"
+```
+
+정확한 `side` filename token은 항상 YZ를 요구한다. 이미 ON인 관계라도 기존 manifest가
+XY이거나 축/extent/8맵 coverage/self-hash/file fingerprint가 불완전하면 no-op을 거부하고
+재촬영으로 보낸다. 성공 후 `Cluster/reports`에는 현재 blend·대상 SPM·manifest·normalization
+receipt·8개 TGA를 묶는 content-addressed delivery receipt가 생성된다. 동일 입력으로 다시
+실행하면 관계는 no-op이 되고 같은 receipt 경로를 재사용한다. 의도적으로 다시 촬영해야 할
+때만 `--force-refresh`를 추가한다.
+
 ## SK Batch 연동 준비
 
 엔진은 패키지 진입점을 제공하므로, 안정화 후 기존 SK Batch의 `0. Generator Sync` 단계에서

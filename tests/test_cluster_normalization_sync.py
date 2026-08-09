@@ -292,6 +292,20 @@ def delivery_scope_intent(target, provider_blend, material_id=6):
 
 
 class ClusterNormalizationSyncTests(unittest.TestCase):
+    def test_capture_plane_is_independent_of_asset_role(self):
+        cases = (
+            ("SK_branch_weeping_willow_side_01.blend", "branch", "YZ"),
+            ("SK_leaf_elm_side_01.blend", "leaf_side", "YZ"),
+            ("SK_branch_weeping_willow_01.blend", "branch", "XY"),
+            ("SK_branch_sideways_01.blend", "branch", "XY"),
+            ("SK_leaf_elm_01.blend", "leaf", "XY"),
+        )
+        for filename, expected_role, expected_plane in cases:
+            with self.subTest(filename=filename):
+                contract = normalization_sync._role_contract(Path(filename))
+                self.assertEqual(contract["role"], expected_role)
+                self.assertEqual(contract["capture_plane"], expected_plane)
+
     def fixture(self, temporary):
         owner = Path(temporary) / "Tree_elm"
         cluster = owner / "Cluster"

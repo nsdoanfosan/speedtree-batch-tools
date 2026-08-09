@@ -28,6 +28,16 @@ from cluster_blend_sync import (
     set_cluster_relation_registry,
 )
 from cluster_normalization_sync import normalization_receipt_path
+from cluster_physical_capture_contract import (
+    CAPTURE_CONTRACT_KIND,
+    CAPTURE_KIND,
+    CAPTURE_WORKFLOW,
+    DIRECT_UV_SOURCE,
+    FRAME_POLICY,
+    PLANE_BASES,
+    REQUIRED_MAP_ROLES,
+    canonical_sha256,
+)
 from speedtree_pipeline_contract import (
     SPM_STRUCTURAL_SEMANTIC_PROJECTION_VERSION,
     spm_file_structural_semantic_fingerprint,
@@ -111,13 +121,135 @@ def persisted_source_index(
     }
 
 
-def write_capture_manifest(blend, contract_sha256):
+def write_capture_manifest(blend, contract_sha256, *, plane=None):
     stem = blend.stem.removeprefix("SK_")
     path = blend.with_name(f"{stem}_auto_capture_manifest.json")
+    tokens = {token for token in stem.casefold().split("_") if token}
+    plane = plane or ("YZ" if "side" in tokens else "XY")
+    basis = PLANE_BASES[plane]
+    raw_min = [0.0, 0.0, 0.0]
+    raw_max = [4.0, 8.0, 2.0]
+    right_axis, up_axis, normal_axis = basis["axis_indices"]
+    raw_width = raw_max[right_axis] - raw_min[right_axis]
+    raw_height = raw_max[up_axis] - raw_min[up_axis]
+    raw_depth = raw_max[normal_axis] - raw_min[normal_axis]
+    width = 0.1
+    padding = 0.04
+    fit_scale = width / (max(raw_width, raw_height) * (1.0 + 2.0 * padding))
+    center = [(raw_max[index] + raw_min[index]) * 0.5 for index in range(3)]
+    fitted_extents = [
+        (raw_max[index] - raw_min[index]) * fit_scale for index in range(3)
+    ]
+    fitted_min = [
+        center[index] - fitted_extents[index] * 0.5 for index in range(3)
+    ]
+    fitted_max = [
+        center[index] + fitted_extents[index] * 0.5 for index in range(3)
+    ]
+    camera_distance = raw_depth * fit_scale * 0.5 + width
+    camera = [
+        center[index] + basis["normal"][index] * camera_distance
+        for index in range(3)
+    ]
+    frame = {
+        "policy": FRAME_POLICY,
+        "workflow_mode": CAPTURE_WORKFLOW,
+        "plane": plane,
+        "right": list(basis["right"]),
+        "up": list(basis["up"]),
+        "normal": list(basis["normal"]),
+        "view_direction": list(basis["view_direction"]),
+        "center": center,
+        "camera_location": camera,
+        "width": width,
+        "height": width,
+        "content_width": raw_width * fit_scale,
+        "content_height": raw_height * fit_scale,
+        "raw_content_width": raw_width,
+        "raw_content_height": raw_height,
+        "padding_ratio": padding,
+        "fit_scale": fit_scale,
+        "unit_system": "METRIC",
+        "scale_length": 1.0,
+        "meters_per_blender_unit": 1.0,
+        "target_meters": [0.1, 0.1],
+        "target_blender_units": [0.1, 0.1],
+        "raw_world_bounds_min": raw_min,
+        "raw_world_bounds_max": raw_max,
+        "fitted_world_bounds_min": fitted_min,
+        "fitted_world_bounds_max": fitted_max,
+        "raw_depth_min": raw_min[normal_axis],
+        "raw_depth_max": raw_max[normal_axis],
+        "fitted_depth": raw_depth * fit_scale,
+        "fit_matrix_world": [],
+        "orthogonality_error": 0.0,
+        "handedness": 1.0,
+        "rotation_degrees": basis["rotation_degrees"],
+        "direct_uv_source": DIRECT_UV_SOURCE,
+    }
+    contract_maps = []
+    for index, role in enumerate(REQUIRED_MAP_ROLES):
+        map_path = blend.with_name(f"{stem}_{index}_{role}.tga")
+        map_path.write_bytes(f"{role}-map".encode("ascii"))
+        contract_maps.append({
+            "role": role,
+            "path": str(map_path.absolute()),
+            "size": map_path.stat().st_size,
+            "sha256": file_sha256(map_path),
+        })
+    contract = {
+        "kind": CAPTURE_CONTRACT_KIND,
+        "version": 1,
+        "workflow_mode": CAPTURE_WORKFLOW,
+        "direct_uv_source": DIRECT_UV_SOURCE,
+        "source_blend": str(blend.absolute()),
+        "source_collection": "SpeedTree_Source",
+        "source_objects": [{
+            "name": "Source",
+            "vertices": 8,
+            "polygons": 6,
+            "evaluated_sha256": hashlib.sha256(
+                str(contract_sha256).encode("utf-8")
+            ).hexdigest(),
+        }],
+        "attachment_pivots": [{
+            "prototype_index": 1,
+            "prototype_asset": "SK_test_01",
+            "xml_bone_id": 0,
+            "source_world": [0.0, 0.0, 0.0],
+            "fitted_capture_world": [0.0, 0.0, 0.0],
+            "normalized_local": [0.0, 0.0, 0.0],
+        }],
+        "frame": frame,
+        "capture_manifest": str(path.absolute()),
+        "capture_resolution": [1024, 1024],
+        "capture_maps": contract_maps,
+    }
+    contract["contract_sha256"] = canonical_sha256(contract)
+    manifest_maps = [
+        {
+            **row,
+            "physical_capture_contract_sha256": contract["contract_sha256"],
+        }
+        for row in contract_maps
+    ]
     path.write_text(json.dumps({
-        "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
-        "direct_uv_source": "same_blender_physical_capture_projection",
-        "physical_capture_contract_sha256": contract_sha256,
+        "kind": CAPTURE_KIND,
+        "version": 2,
+        "workflow_mode": CAPTURE_WORKFLOW,
+        "blend": str(blend.absolute()),
+        "source_objects": [{
+            "name": "Source",
+            "vertices": 8,
+            "polygons": 6,
+        }],
+        "frame": frame,
+        "physical_capture_contract": contract,
+        "direct_uv_source": DIRECT_UV_SOURCE,
+        "resolution": [1024, 1024],
+        "maps": manifest_maps,
+        "physical_capture_contract_sha256": contract["contract_sha256"],
+        "normalization_status": "finalized",
     }), encoding="utf-8")
     return path
 
@@ -137,6 +269,13 @@ def write_scope_manifest(
     source_collection="Atlas_Cluster_Cards",
     export_scope_id="test-cluster-scope",
 ):
+    capture_manifest = blend.with_name(
+        f"{blend.stem.removeprefix('SK_')}_auto_capture_manifest.json"
+    )
+    if capture_contract_sha256 is not None and capture_manifest.is_file():
+        capture_contract_sha256 = json.loads(
+            capture_manifest.read_text(encoding="utf-8")
+        )["physical_capture_contract_sha256"]
     scope = target.parent / ".atlas_leaf_speedtree_scopes"
     scope.mkdir(exist_ok=True)
     path = scope / f"scope__{target.stem}.json"
@@ -567,13 +706,7 @@ class ClusterBlendSyncTests(unittest.TestCase):
                 capture_contract_sha256="capture-v1",
             )
 
-            capture.write_text(json.dumps({
-                "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
-                "direct_uv_source": (
-                    "same_blender_physical_capture_projection"
-                ),
-                "physical_capture_contract_sha256": "capture-v2",
-            }), encoding="utf-8")
+            write_capture_manifest(blend, "capture-v2")
             changed = discover_cluster_blend_relations(owner)[0]
 
             self.assertEqual(changed["refresh_required_count"], 1)
@@ -588,6 +721,40 @@ class ClusterBlendSyncTests(unittest.TestCase):
             self.assertNotIn(
                 "physical_capture_changed",
                 changed["geometry_ownership_refresh_reasons"],
+            )
+
+    def test_side_xy_capture_routes_to_refresh_before_already_on_noop(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_willow"
+            cluster = owner / "Cluster"
+            cluster.mkdir(parents=True)
+            canonical = cluster / "SK_branch_willow_side_01.spm"
+            write_material_spm(
+                canonical, "M_branch_willow_side_01", 8, [10, 11, 12]
+            )
+            blend = canonical.with_suffix(".blend")
+            blend.write_bytes(b"blend")
+            target = owner / "SK_Tree_willow_01.spm"
+            write_material_spm(
+                target, "M_branch_willow_side_01", 8, [10, 11, 12]
+            )
+            save_target_registry(blend, [target])
+            write_capture_manifest(blend, "old-top-capture", plane="XY")
+            write_scope_manifest(
+                blend,
+                target,
+                canonical_spm=canonical,
+                capture_contract_sha256="old-top-capture",
+            )
+
+            changed = discover_cluster_blend_relations(owner)[0]
+
+            self.assertEqual(
+                changed["targets"][0]["status"], "refresh_required"
+            )
+            self.assertIn(
+                "physical_capture_orientation_mismatch",
+                changed["capture_texture_refresh_reasons"],
             )
 
     def test_registry_toggle_preserves_other_targets_and_never_mutates_source_spm(self):

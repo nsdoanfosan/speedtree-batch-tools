@@ -1,0 +1,69 @@
+{
+  "kind": "issue_215_production_yz_delivery_evidence",
+  "version": 1,
+  "source_issue": 215,
+  "asset": "SK_branch_weeping_willow_side_01.blend",
+  "recorded_at": "2026-08-09T22:56:32+09:00",
+  "capture": {
+    "plane": "YZ",
+    "right": [0.0, 1.0, 0.0],
+    "up": [0.0, 0.0, 1.0],
+    "normal": [1.0, 0.0, 0.0],
+    "view_direction": [-1.0, 0.0, 0.0],
+    "rotation_degrees": 90.0,
+    "target_meters": [0.10000000149011612, 0.10000000149011612],
+    "content_width": 0.09259259412563386,
+    "content_height": 0.07715756883572329,
+    "padding_ratio": 0.03999999910593033,
+    "coverage_ratio": 0.9259259274589672,
+    "resolution": [1024, 1024],
+    "map_roles": [
+      "Color",
+      "Opacity",
+      "Normal",
+      "Gloss",
+      "SubsurfaceColor",
+      "SubsurfaceAmount",
+      "AO",
+      "Height"
+    ],
+    "manifest_sha256": "7f24a2ca0cd3d85abfcef5ce21fb239fd0dea5b4dca14851026840c566e4c268",
+    "physical_capture_contract_sha256": "da487248aaa871ffb49dcf4007a00113334e8a752d419451f105e2f07e1938c4"
+  },
+  "normalization": {
+    "receipt_sha256": "8b34e3e9c2e7b2ed4b987385b7c211b36a54b1acda28788ac3cb48368b89ed59",
+    "normalization_contract_sha256": "4ae1c84b5180a568be782f0adfaf886b3f17e4cd772b4f511af1257889983822",
+    "output_blend_sha256": "3ab52ed3eac4e7b84e58c2bb8674ea990da9c33fdc3f78ccde38b63d410ccab4"
+  },
+  "delivery": {
+    "receipt_name": "SK_branch_weeping_willow_side_01_physical_capture_delivery_1414d2c20e68c407.json",
+    "delivery_sha256": "1414d2c20e68c4075cf083491b941a00b9ad29c1dd6b987b7dad52b0626a8e76",
+    "targets": [
+      {
+        "asset": "SK_tree_Weeping_Willow_01.spm",
+        "sha256": "34187d064f4bdfffdf8e425d912f853e9945aafe556724dff7b9ebc8cb5c7d01",
+        "size": 2227704
+      },
+      {
+        "asset": "SK_tree_Weeping_Willow_root_03.spm",
+        "sha256": "c9bce125563b390586752c85b895bcab9289d71617fad0925149495a4e50ef53",
+        "size": 401306
+      }
+    ]
+  },
+  "forced_refresh_run": {
+    "status": "ready",
+    "force_refresh": true,
+    "transaction_no_change": false,
+    "delivery_receipt_written": false,
+    "delivery_sha256": "1414d2c20e68c4075cf083491b941a00b9ad29c1dd6b987b7dad52b0626a8e76",
+    "refresh_reasons": []
+  },
+  "second_identical_run": {
+    "status": "ready",
+    "transaction_no_change": true,
+    "delivery_receipt_written": false,
+    "delivery_sha256": "1414d2c20e68c4075cf083491b941a00b9ad29c1dd6b987b7dad52b0626a8e76",
+    "refresh_reasons": []
+  }
+}

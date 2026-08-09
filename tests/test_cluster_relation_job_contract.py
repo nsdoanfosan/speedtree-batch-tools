@@ -275,6 +275,36 @@ class ClusterRelationJobContractTests(unittest.TestCase):
         )
         self.assertLess(validation, bake)
 
+    def test_physical_capture_is_strictly_validated_before_blend_save(self):
+        source = JOB_PATH.read_text(encoding="utf-8")
+        normalize_source = source[
+            source.index("def normalize_cluster_blend("):
+            source.index("\ndef configure_cluster_export_properties(")
+        ]
+        validation = normalize_source.index(
+            "validate_physical_capture_manifest("
+        )
+        save = normalize_source.index("bpy.ops.wm.save_as_mainfile(")
+        self.assertLess(validation, save)
+
+    def test_atlas_export_requires_manifest_and_normalization_receipt(self):
+        source = JOB_PATH.read_text(encoding="utf-8")
+        configure_source = source[
+            source.index("def configure_cluster_export_properties("):
+            source.index("\ndef apply_recipe_source_material_mappings(")
+        ]
+        manifest_validation = configure_source.index(
+            "validate_physical_capture_manifest("
+        )
+        receipt_validation = configure_source.index(
+            "validate_normalization_receipt("
+        )
+        atlas_configuration = configure_source.index(
+            "configure_external_plan_target("
+        )
+        self.assertLess(manifest_validation, receipt_validation)
+        self.assertLess(receipt_validation, atlas_configuration)
+
     def test_explicit_generator_delivery_scope_requires_producer_echo(self):
         source = JOB_PATH.read_text(encoding="utf-8")
         mapping_source = source[
