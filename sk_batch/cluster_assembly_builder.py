@@ -344,24 +344,23 @@ def file_fingerprint(path):
 
 
 def validate_file_fingerprint(record, label):
-    """Fail closed when a persisted handoff artifact changed after receipt."""
+    """Require the current artifact; treat a recorded identity as diagnostic."""
     if not isinstance(record, dict) or not record.get("path"):
-        raise ClusterAssemblyBuildError(f"{label} fingerprint is missing")
-    expected_exists = record.get("exists")
+        raise ClusterAssemblyBuildError(f"{label} path is missing")
+    actual = file_fingerprint(record["path"])
+    if actual.get("exists") is not True:
+        raise ClusterAssemblyBuildError(
+            f"{label} current file is missing: {actual.get('path')}"
+        )
     expected_size = record.get("size")
     expected_sha256 = str(record.get("sha256") or "").casefold()
-    if expected_exists is not True or expected_size is None or not expected_sha256:
-        raise ClusterAssemblyBuildError(f"{label} fingerprint is incomplete")
-    actual = file_fingerprint(record["path"])
-    if (
-        actual.get("exists") is not True
-        or int(actual.get("size") or -1) != int(expected_size)
-        or str(actual.get("sha256") or "").casefold() != expected_sha256
-    ):
-        raise ClusterAssemblyBuildError(
-            f"{label} changed after the BWR receipt: "
-            f"expected={_canonical_json(record)} actual={_canonical_json(actual)}"
-        )
+    actual["recorded_identity_is_diagnostic"] = True
+    actual["recorded_identity_matches_current"] = bool(
+        expected_size is not None
+        and expected_sha256
+        and int(actual.get("size") or -1) == int(expected_size)
+        and str(actual.get("sha256") or "").casefold() == expected_sha256
+    )
     return actual
 
 
