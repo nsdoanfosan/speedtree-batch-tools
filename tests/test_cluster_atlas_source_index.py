@@ -182,13 +182,30 @@ class ClusterAtlasSourceIndexTests(unittest.TestCase):
         }
 
     def build(self):
-        with mock.patch.dict(sys.modules, self.modules()):
+        modules = self.modules()
+
+        class FakeRuntime:
+            def operation(self, addon_id, operation_name):
+                if addon_id != "atlas_leaf_mesh_builder":
+                    raise AssertionError(addon_id)
+                mapping = {
+                    "current_blend_source_index": modules[
+                        "atlas_leaf_mesh_builder.source_index"
+                    ].current_blend_source_index,
+                    "grouped_source_objects": modules[
+                        "atlas_leaf_mesh_builder.speedtree"
+                    ].grouped_source_objects,
+                }
+                return mapping[operation_name]
+
+        with mock.patch.dict(sys.modules, modules):
             return build_current_atlas_source_index(
                 self.blend,
                 "Atlas_Branch_Plans",
                 atlas_asset_name="M_cluster",
                 expected_scope_id=self.scope,
                 bpy_module=self.bpy,
+                addon_runtime=FakeRuntime(),
             )
 
     def test_uses_atlas_saved_source_index_and_binds_actual_export(self):

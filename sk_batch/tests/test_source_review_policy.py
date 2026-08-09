@@ -179,8 +179,16 @@ class SourceReviewPolicyTests(unittest.TestCase):
                 node
                 for node in ast.walk(job_tree())
                 if isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "run_speedtree_cli_export"
+                and (
+                    (
+                        isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "run_speedtree_cli_export"
+                    )
+                    or (
+                        isinstance(node.func, ast.Name)
+                        and node.func.id == "run_speedtree_cli_export"
+                    )
+                )
             ),
             key=lambda node: node.lineno,
         )

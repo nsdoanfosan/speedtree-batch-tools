@@ -7,8 +7,14 @@ import sys
 import time
 from pathlib import Path
 
-import addon_utils
 import bpy
+
+
+REPO_DIR = Path(__file__).resolve().parents[2]
+if str(REPO_DIR) not in sys.path:
+    sys.path.insert(0, str(REPO_DIR))
+
+from blender_addon_gateway import prepare_runtime
 
 
 SCHEMA_VERSION = 1
@@ -50,31 +56,24 @@ def _load_requests(path):
 
 def _load_source_index_function():
     """Import the pure index function, then remove add-on side effects."""
-    enabled = addon_utils.enable(
-        "atlas_leaf_mesh_builder", default_set=False, persistent=False
+    addon_runtime = prepare_runtime(
+        "pcg_st9_texture_batch.jobs.index_leaf_blend_sources",
+        {"atlas_leaf_mesh_builder": ("source_index_v1",)},
     )
-    if enabled is None:
-        raise RuntimeError("atlas_leaf_mesh_builder add-on could not be enabled")
     try:
-        from atlas_leaf_mesh_builder.source_index import (
-            current_blend_source_index,
+        current_blend_source_index = addon_runtime.operation(
+            "atlas_leaf_mesh_builder", "current_blend_source_index"
         )
 
         # Enabling the add-on makes its package importable, but this worker
         # must not retain the UI add-on's load handlers or delayed scene
         # initialization while it opens unrelated source files.
-        addon_module = sys.modules.get("atlas_leaf_mesh_builder")
-        initialize_scene_items = getattr(
-            addon_module, "initialize_scene_items", None
+        addon_runtime.detach_timer(
+            "atlas_leaf_mesh_builder", "initialize_scene_items"
         )
-        if (
-            initialize_scene_items is not None
-            and bpy.app.timers.is_registered(initialize_scene_items)
-        ):
-            bpy.app.timers.unregister(initialize_scene_items)
-        return current_blend_source_index
+        return current_blend_source_index, addon_runtime.receipt
     finally:
-        addon_utils.disable("atlas_leaf_mesh_builder", default_set=False)
+        addon_runtime.disable("atlas_leaf_mesh_builder")
 
 
 def main():
@@ -88,7 +87,9 @@ def main():
     report = {"schema_version": SCHEMA_VERSION, "status": "error", "rows": []}
     try:
         addon_started = time.perf_counter()
-        current_blend_source_index = _load_source_index_function()
+        current_blend_source_index, addon_receipt = (
+            _load_source_index_function()
+        )
         addon_seconds = time.perf_counter() - addon_started
 
         rows = []
@@ -121,6 +122,7 @@ def main():
             "schema_version": SCHEMA_VERSION,
             "status": "ok",
             "rows": rows,
+            "blender_addon_runtime": addon_receipt,
             "timing": {
                 "addon_enable_seconds": round(addon_seconds, 6),
                 "requests": request_timings,

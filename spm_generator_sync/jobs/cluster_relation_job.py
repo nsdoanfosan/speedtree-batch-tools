@@ -8,7 +8,6 @@ import sys
 import traceback
 from pathlib import Path
 
-import addon_utils
 import bpy
 
 REPO_DIR = Path(__file__).resolve().parents[2]
@@ -35,6 +34,16 @@ from generator_delivery_scope import (
     validate_resolved_delivery_scope,
 )
 from speedtree_pipeline_contract import read_spm_text
+from blender_addon_gateway import prepare_runtime
+
+
+_ATLAS_RUNTIME = None
+
+
+def atlas_operation(name):
+    if _ATLAS_RUNTIME is None:
+        raise RuntimeError("Atlas add-on runtime was not negotiated")
+    return _ATLAS_RUNTIME.operation("atlas_leaf_mesh_builder", name)
 
 
 def parse_args():
@@ -241,14 +250,7 @@ def normalize_cluster_blend(recipe):
                 else None
             ),
         }
-    enabled = addon_utils.enable(
-        "speedtree_cluster_normalizer",
-        default_set=False,
-        persistent=False,
-    )
-    if enabled is None or not hasattr(
-        bpy.types.Scene, "speedtree_cluster_normalizer"
-    ):
+    if not hasattr(bpy.types.Scene, "speedtree_cluster_normalizer"):
         raise RuntimeError("Could not enable speedtree_cluster_normalizer")
     if not hasattr(bpy.types.Scene, "atlas_leaf_builder"):
         raise RuntimeError("atlas_leaf_mesh_builder is not registered")
@@ -427,11 +429,16 @@ def capture_normalization_source_index(recipe):
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     previous = receipt.get("source_blender_index") or {}
     previous_collection = previous.get("authoritative_collection") or {}
+    kwargs = {
+        "atlas_asset_name": recipe["material_name"],
+        "expected_scope_id": previous_collection.get("export_scope_id"),
+    }
+    if _ATLAS_RUNTIME is not None:
+        kwargs["addon_runtime"] = _ATLAS_RUNTIME
     return build_current_atlas_source_index(
         Path(recipe["blend"]).expanduser().absolute(),
         recipe["plan_collection"],
-        atlas_asset_name=recipe["material_name"],
-        expected_scope_id=previous_collection.get("export_scope_id"),
+        **kwargs,
     )
 
 
@@ -481,8 +488,8 @@ def configure_cluster_export_properties(
     """
     if not recipe:
         return None
-    from atlas_leaf_mesh_builder.integration_api import (
-        configure_external_plan_target,
+    configure_external_plan_target = atlas_operation(
+        "configure_external_plan_target"
     )
 
     manifest_path = (
@@ -689,21 +696,38 @@ def sync_targets(blend, requested, normalization_recipe=None):
         raise RuntimeError(
             f"Loaded blend differs from requested Cluster blend: {bpy.data.filepath}"
         )
-    from atlas_leaf_mesh_builder.integration_api import (
-        execute_external_target_transaction,
-        require_integration_contract,
+    execute_external_target_transaction = atlas_operation(
+        "execute_external_target_transaction"
     )
-    from atlas_leaf_mesh_builder.props import sync_spm_target_registry
-    from atlas_leaf_mesh_builder.target_registry import load_target_registry
-
-    integration_contract = require_integration_contract(
-        minimum_version=1,
-        capabilities=(
-            "atomic_exact_target_slice_v1",
-            "generator_adoption_reconciliation_v1",
-            "structured_transaction_conflict_v1",
-        ),
+    sync_spm_target_registry = atlas_operation(
+        "sync_spm_target_registry"
     )
+    load_target_registry = atlas_operation("load_target_registry")
+    integration_contract = next(
+        row.get("api_contract")
+        for row in _ATLAS_RUNTIME.receipt["addons"]
+        if row.get("id") == "atlas_leaf_mesh_builder"
+    )
+    required_native_capabilities = {
+        "atomic_exact_target_slice_v1",
+        "generator_adoption_reconciliation_v1",
+        "structured_transaction_conflict_v1",
+    }
+    actual_native_capabilities = set(
+        (integration_contract or {}).get("capabilities") or []
+    )
+    if not required_native_capabilities.issubset(
+        actual_native_capabilities
+    ):
+        raise RuntimeError(
+            "Atlas runtime receipt lost required native capabilities: "
+            + ", ".join(
+                sorted(
+                    required_native_capabilities
+                    - actual_native_capabilities
+                )
+            )
+        )
 
     normalization = normalize_cluster_blend(normalization_recipe)
     source_index = capture_normalization_source_index(
@@ -788,6 +812,7 @@ def sync_targets(blend, requested, normalization_recipe=None):
         "blend": str(blend),
         "target_spms": [str(path) for path in requested],
         "atlas_integration_contract": integration_contract,
+        "blender_addon_runtime": _ATLAS_RUNTIME.receipt,
         "atlas_transaction": transaction["transaction"],
         "normalization": normalization,
         "source_content_identity": source_content_identity,
@@ -800,11 +825,11 @@ def sync_targets(blend, requested, normalization_recipe=None):
 
 
 def remove_targets(blend, requested):
-    from atlas_leaf_mesh_builder.speedtree import remove_blend_target_from_spm
-    from atlas_leaf_mesh_builder.target_registry import (
-        load_target_registry,
-        save_target_registry,
+    remove_blend_target_from_spm = atlas_operation(
+        "remove_blend_target_from_spm"
     )
+    load_target_registry = atlas_operation("load_target_registry")
+    save_target_registry = atlas_operation("save_target_registry")
 
     registry = load_target_registry(blend)
     if registry is None:
@@ -832,19 +857,30 @@ def remove_targets(blend, requested):
         "target_spms": [str(path) for path in requested],
         "remaining_target_spms": payload["target_spms"],
         "results": cleanups,
+        "blender_addon_runtime": _ATLAS_RUNTIME.receipt,
     }
 
 
 def main():
+    global _ATLAS_RUNTIME
     args = parse_args()
     report_path = Path(args.report).expanduser().absolute()
     report = {"status": "error"}
     try:
-        enabled = addon_utils.enable(
-            "atlas_leaf_mesh_builder", default_set=False, persistent=False
+        _ATLAS_RUNTIME = prepare_runtime(
+            "spm_generator_sync.jobs.cluster_relation_job",
+            {
+                "atlas_leaf_mesh_builder": (
+                    "scene_generation_v1",
+                    "target_registry_v1",
+                    "source_index_v1",
+                    "atomic_target_transaction_v1",
+                ),
+                "speedtree_cluster_normalizer": (
+                    "cluster_normalization_v1",
+                ),
+            },
         )
-        if enabled is None:
-            raise RuntimeError("Could not enable atlas_leaf_mesh_builder")
         blend = Path(args.blend).expanduser().absolute()
         targets = [Path(value).expanduser().absolute() for value in args.target]
         normalization_recipe = load_normalization_recipe(

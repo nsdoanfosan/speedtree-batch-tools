@@ -18,6 +18,23 @@ from bwr_atlas_manifest_bridge import (  # noqa: E402
 )
 
 
+class FakeAddonRuntime:
+    def __init__(self, core):
+        self.core = core
+
+    def operation(self, addon_id, operation_name):
+        if addon_id != "speedtree_bone_weight_repair":
+            raise AssertionError(addon_id)
+        if operation_name != "speedtree_manifest_paths":
+            raise AssertionError(operation_name)
+        return self.core._speedtree_manifest_paths
+
+    def replace_operation(self, addon_id, operation_name, replacement):
+        previous = self.operation(addon_id, operation_name)
+        self.core._speedtree_manifest_paths = replacement
+        return previous
+
+
 class BwrAtlasManifestBridgeTests(unittest.TestCase):
     def test_foreign_rolling_global_is_not_exposed_to_exact_bwr_target(self):
         fixture_path = (
@@ -63,7 +80,7 @@ class BwrAtlasManifestBridgeTests(unittest.TestCase):
                 _speedtree_manifest_paths=legacy_paths
             )
             evidence = install_bwr_atlas_manifest_resolver(
-                bwr_core,
+                FakeAddonRuntime(bwr_core),
                 target,
             )
 
@@ -96,7 +113,7 @@ class BwrAtlasManifestBridgeTests(unittest.TestCase):
             SK_BATCH / "jobs" / "bwr_headless_job.py"
         ).read_text(encoding="utf-8")
         install_at = source.index("install_bwr_atlas_manifest_resolver(")
-        repair_at = source.index("bwr_core.run_import_and_repair(")
+        repair_at = source.index("run_import_and_repair(repair_settings)")
         self.assertLess(install_at, repair_at)
 
     def test_provider_disagreement_is_diagnostic_and_export_remains_reachable(self):
@@ -135,7 +152,9 @@ class BwrAtlasManifestBridgeTests(unittest.TestCase):
                 run_speedtree_cli_export=export,
             )
 
-            evidence = install_bwr_atlas_manifest_resolver(bwr_core, target)
+            evidence = install_bwr_atlas_manifest_resolver(
+                FakeAddonRuntime(bwr_core), target
+            )
             result = bwr_core.run_speedtree_cli_export(target)
 
             self.assertEqual(result, {"status": "ok"})
@@ -196,7 +215,9 @@ class BwrAtlasManifestBridgeTests(unittest.TestCase):
                 _speedtree_manifest_paths=lambda *_args: [],
             )
 
-            evidence = install_bwr_atlas_manifest_resolver(bwr_core, target)
+            evidence = install_bwr_atlas_manifest_resolver(
+                FakeAddonRuntime(bwr_core), target
+            )
 
             self.assertIn(
                 str(scope_path.resolve()),
