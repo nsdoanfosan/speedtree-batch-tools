@@ -1,0 +1,419 @@
+{
+  "contract": "speedtree_issue_13_black_locast_modeler_recovery_evidence_v2",
+  "schema_version": 2,
+  "source_issue": 13,
+  "repo_baseline": "0e85e461c2f64a5917b1e95cac08a7828f9ca87b",
+  "asset_recovery_branch": "codex/issue-13-black-locast-modeler-recovery",
+  "modeler": {
+    "product": "SpeedTree Modeler",
+    "version": "10.1.0",
+    "save_action": "verified exact document and used mouse-only File > Save"
+  },
+  "safety_boundary": {
+    "direct_spm_xml_edit": false,
+    "save_automation": false,
+    "automated_keystrokes": false,
+    "modeler_process_kill": false,
+    "automatic_rollback": false,
+    "continuation_authorized": false
+  },
+  "takeover_audit": [
+    {
+      "asset_name": "SK_tree_black_locast_02.spm",
+      "raw_sha256": "e8e753749e5675f2ff73ec0f6ca83043d254bc8e73c249e02c58347e0c473f99",
+      "mtime_local": "2026-08-02T00:03:55.052650+09:00",
+      "stale": false,
+      "generator_count": 63,
+      "node_table_owner_count": 60,
+      "orphan_owner_count": 0,
+      "orphan_node_count": 0,
+      "total_node_count": 11489,
+      "generator_membership_fingerprint": "fbc1e541ec87efe03d210b763b337a1b66299dbb5ad391eab9e1e6f5a53f4e04"
+    },
+    {
+      "asset_name": "SK_bush_black_locast_02.spm",
+      "raw_sha256": "71574efb8eee2b02016edd99369bb047df8e392e345a5f7ec5fe969ee506e0b9",
+      "mtime_local": "2026-08-02T00:07:41.716045+09:00",
+      "stale": true,
+      "generator_count": 26,
+      "node_table_owner_count": 23,
+      "orphan_owner_count": 6,
+      "orphan_node_count": 3266,
+      "total_node_count": 4487,
+      "generator_membership_fingerprint": "1d16f917ddbbdbeda5ae6976b9661ce5cc3d345fded9868245e9ee825fbfde5a"
+    },
+    {
+      "asset_name": "SK_bush_black_locast_03.spm",
+      "raw_sha256": "b2fbd6909616080a54f8e0e778d68476c3960b4f6a3dd363be0d34bffe2d3928",
+      "mtime_local": "2026-08-02T00:07:46.359659+09:00",
+      "stale": true,
+      "generator_count": 38,
+      "node_table_owner_count": 35,
+      "orphan_owner_count": 6,
+      "orphan_node_count": 2097,
+      "total_node_count": 6094,
+      "generator_membership_fingerprint": "4d61a0b2cd69528fb2944a3c1eafe6db9450ada4c351e46f5e6bdcf0b9b54a86"
+    },
+    {
+      "asset_name": "SK_tree_black_locast_04.spm",
+      "raw_sha256": "9f08f81b2e48a64238b3b9d7e3f8edfc5fb118982de6cf8d4e87a7ce617e2e7b",
+      "mtime_local": "2026-08-02T00:08:09.351142+09:00",
+      "stale": true,
+      "generator_count": 90,
+      "node_table_owner_count": 83,
+      "orphan_owner_count": 2,
+      "orphan_node_count": 970,
+      "total_node_count": 21249,
+      "generator_membership_fingerprint": "1617db3d0d86535502d791c80ad41762844fac6cf75e1db58cc431488bcad8c9"
+    }
+  ],
+  "results": {
+    "SK_tree_black_locast_02.spm": {
+      "disposition": "read_only_reaudit_no_modeler_action_this_run",
+      "raw_sha256": "e8e753749e5675f2ff73ec0f6ca83043d254bc8e73c249e02c58347e0c473f99",
+      "stale": false,
+      "orphan_owner_count": 0,
+      "orphan_node_count": 0,
+      "generator_count": 63,
+      "node_table_owner_count": 60,
+      "total_node_count": 11489,
+      "generator_membership_fingerprint": "fbc1e541ec87efe03d210b763b337a1b66299dbb5ad391eab9e1e6f5a53f4e04",
+      "regex_elementtree_parity": true,
+      "float_reserialization_fixture": "issue_13_tree02_roots_spline_float_reserialization.json",
+      "float_fixture_verdict": "accepted_by_existing_exact_property_tag_round5_contract",
+      "whole_file_sealed_claim": false,
+      "note": "Current bytes include later Generator Sync changes, so an older whole-file preimage receipt was not reused."
+    },
+    "SK_bush_black_locast_02.spm": {
+      "disposition": "accepted_sealed_resave",
+      "preimage": {
+        "file_name": "SK_bush_black_locast_02.71574efb8eee2b02016edd99369bb047df8e392e345a5f7ec5fe969ee506e0b9.preimage.spm",
+        "raw_sha256": "71574efb8eee2b02016edd99369bb047df8e392e345a5f7ec5fe969ee506e0b9",
+        "size": 428567
+      },
+      "receipt": {
+        "file_name": "SK_bush_black_locast_02.71574efb8eee2b02016edd99369bb047df8e392e345a5f7ec5fe969ee506e0b9.receipt.json",
+        "raw_sha256": "ea80e98e49d9537ce50515bce869ccae7a80a58429a0aa1037bd06899e9cf020",
+        "size": 3271
+      },
+      "after": {
+        "raw_sha256": "67d8761d752b0a3e01898aa2216f9af16404db411b159520c79c5ddbc1cb6364",
+        "size": 331804,
+        "mtime_local": "2026-08-02T07:36:39.668163+09:00",
+        "stale": false,
+        "orphan_owner_count": 0,
+        "orphan_node_count": 0,
+        "generator_count": 26,
+        "node_table_owner_count": 19,
+        "total_node_count": 2166,
+        "generator_membership_fingerprint": "1d16f917ddbbdbeda5ae6976b9661ce5cc3d345fded9868245e9ee825fbfde5a",
+        "authoring_graph_core_v4_fingerprint": "34a3c01a591fb51d6a705ec0506bbd45dad2fe924882ad0ba9454a7b6f6adfa3",
+        "regex_elementtree_parity": true,
+        "required_live_mesh_ids": [88],
+        "required_live_projection_complete": true,
+        "normalization_complete": true,
+        "live_row_node_counts": [53, 95, 95]
+      },
+      "membership_unchanged": true,
+      "authoring_graph_core_v4_unchanged": true
+    },
+    "SK_bush_black_locast_03.spm": {
+      "disposition": "rejected_unaccepted_postimage",
+      "stop_reason": "authoring_graph_changed_during_resave",
+      "preimage": {
+        "file_name": "SK_bush_black_locast_03.b2fbd6909616080a54f8e0e778d68476c3960b4f6a3dd363be0d34bffe2d3928.preimage.spm",
+        "raw_sha256": "b2fbd6909616080a54f8e0e778d68476c3960b4f6a3dd363be0d34bffe2d3928",
+        "size": 545829,
+        "authoring_graph_core_v4_fingerprint": "e5b7815ea8d3e91279ca09d6f51dda48f9ae1d8147753477997a67697df891c3"
+      },
+      "receipt": {
+        "file_name": "SK_bush_black_locast_03.b2fbd6909616080a54f8e0e778d68476c3960b4f6a3dd363be0d34bffe2d3928.receipt.json",
+        "raw_sha256": "f2ce4b5245d2bd28a3f218a4818e23111067cade484da22d4d69792cfd219155",
+        "size": 3271
+      },
+      "after": {
+        "raw_sha256": "0e6d810051a6f9abe899b4a3d479f2215d7c1328a8e8625794fec7c31a43b3e3",
+        "size": 502537,
+        "mtime_local": "2026-08-02T07:43:16.995969+09:00",
+        "stale": false,
+        "orphan_owner_count": 0,
+        "orphan_node_count": 0,
+        "generator_count": 38,
+        "node_table_owner_count": 31,
+        "total_node_count": 5490,
+        "generator_membership_fingerprint": "4d61a0b2cd69528fb2944a3c1eafe6db9450ada4c351e46f5e6bdcf0b9b54a86",
+        "authoring_graph_core_v4_fingerprint": "228b7cb5b3638faefccd7567092a803f52c6a2f8aaebd9aa83f11083bfa09eee",
+        "regex_elementtree_parity": true,
+        "required_live_mesh_ids": [88],
+        "required_live_projection_complete": true,
+        "normalization_complete": true,
+        "live_row_node_counts": [29, 182, 182]
+      },
+      "membership_unchanged": true,
+      "stale_node_table_repair_passed": true,
+      "sealed_authoring_contract_passed": false,
+      "uncovered_core_changes": [
+        {
+          "xml_node_type": "Property/Value scalar integer",
+          "property_name": "Leaves:Type:0:Material",
+          "before": -1,
+          "after": 0,
+          "paired_mesh_before": -10,
+          "paired_mesh_after": -10
+        },
+        {
+          "xml_node_type": "Property/Value scalar integer",
+          "property_name": "Leaves:Type:1:Material",
+          "before": -1,
+          "after": 0,
+          "paired_mesh_before": -10,
+          "paired_mesh_after": -10
+        },
+        {
+          "xml_node_type": "Property/Value scalar integer",
+          "property_name": "Leaves:Type:2:Material",
+          "before": -1,
+          "after": 0,
+          "paired_mesh_before": -10,
+          "paired_mesh_after": -10
+        },
+        {
+          "xml_node_type": "Property/Value scalar integer",
+          "property_name": "Leaves:Type:3:Material",
+          "before": -1,
+          "after": 0,
+          "paired_mesh_before": -10,
+          "paired_mesh_after": -10
+        }
+      ],
+      "canonicalization_accepted": false,
+      "continuation_authorized": false,
+      "rejected_postimage_evidence": {
+        "file_name": "SK_bush_black_locast_03.0e6d810051a6f9abe899b4a3d479f2215d7c1328a8e8625794fec7c31a43b3e3.rejected-postimage.spm",
+        "raw_sha256": "0e6d810051a6f9abe899b4a3d479f2215d7c1328a8e8625794fec7c31a43b3e3",
+        "size": 502537,
+        "byte_identical_to_canonical_source_at_capture": true
+      }
+    },
+    "SK_tree_black_locast_04.spm": {
+      "disposition": "not_attempted_after_bush03_stop",
+      "raw_sha256": "9f08f81b2e48a64238b3b9d7e3f8edfc5fb118982de6cf8d4e87a7ce617e2e7b",
+      "mtime_local": "2026-08-02T00:08:09.351142+09:00",
+      "stale": true,
+      "orphan_owner_count": 2,
+      "orphan_node_count": 970,
+      "generator_count": 90,
+      "node_table_owner_count": 83,
+      "total_node_count": 21249,
+      "generator_membership_fingerprint": "1617db3d0d86535502d791c80ad41762844fac6cf75e1db58cc431488bcad8c9",
+      "regex_elementtree_parity": true
+    }
+  },
+  "production_scope": {
+    "changed_by_this_run": [
+      "SK_bush_black_locast_02.spm",
+      "SK_bush_black_locast_03.spm"
+    ],
+    "untouched_by_this_run": [
+      "SK_tree_black_locast_02.spm",
+      "SK_tree_black_locast_04.spm"
+    ],
+    "successful_assets": [
+      "SK_tree_black_locast_02.spm",
+      "SK_bush_black_locast_02.spm"
+    ],
+    "rejected_assets": [
+      "SK_bush_black_locast_03.spm"
+    ],
+    "remaining_assets": [
+      "SK_bush_black_locast_03.spm",
+      "SK_tree_black_locast_04.spm"
+    ]
+  },
+  "detached_contract_investigation": {
+    "issue": 102,
+    "branch": "codex/issue-102-leaf-material-canonicalization",
+    "branch_base": "0e85e461c2f64a5917b1e95cac08a7828f9ca87b",
+    "asset_branch_contract_change": false
+  },
+  "stop_disposition": {
+    "stopped_at": "SK_bush_black_locast_03.spm",
+    "next_asset_opened": false,
+    "modeler_windows_left_open_and_untouched": true,
+    "canonical_postimage_preserved_but_not_accepted": true,
+    "stale_session_lock_removed_after_watcher_exit": true
+  },
+  "current_resolution_audit": {
+    "observed_at_local": "2026-08-09",
+    "repo_baseline": "df6eb6efce35c233c20dc4532a8069696af93e1b",
+    "causal_contract_source_issue": 174,
+    "read_only": true,
+    "prior_two_guid_970_orphan_conclusion_reused": false,
+    "source": {
+      "asset_name": "SK_tree_black_locast_04.spm",
+      "raw_sha256": "83c7c714d26ed9818874bc65fe1fb3ed73c00d5ae4a63fb9b540c9198c29bdf5",
+      "raw_sha256_before": "83c7c714d26ed9818874bc65fe1fb3ed73c00d5ae4a63fb9b540c9198c29bdf5",
+      "raw_sha256_after": "83c7c714d26ed9818874bc65fe1fb3ed73c00d5ae4a63fb9b540c9198c29bdf5",
+      "spm_text_sha256": "15bac9b1721e16aea637b41030f9d8f0fc6f3cf29397701b9ada6c1a5ea9be0b",
+      "size": 2207135,
+      "stale": true,
+      "generator_count": 85,
+      "node_table_owner_count": 88,
+      "orphan_owner_count": 5,
+      "orphan_node_count": 16842,
+      "total_node_count": 39256,
+      "eligible_node_count": 39247,
+      "generator_membership_fingerprint": "3ee94259d7131b17362e6514425000d98794c6ceb718a2a894b067ecef3d965f",
+      "eligible_owner_counts_fingerprint": "812652e8fd5467c087938f181ee54382c4939960b80dd2aac0e10f5bc715d516",
+      "regex_elementtree_parity": true,
+      "bytes_unchanged_by_audit": true
+    },
+    "scope_authority": {
+      "manifest_count": 5,
+      "requested_scope_count": 3,
+      "manifests_unchanged_by_audit": true,
+      "authoring_pairs": [
+        [2, 79],
+        [12, 82],
+        [12, 83],
+        [12, 84],
+        [12, 85],
+        [13, 86],
+        [13, 87]
+      ],
+      "required_live_pairs": [
+        [2, 79],
+        [12, 82],
+        [12, 83],
+        [12, 84],
+        [12, 85],
+        [13, 86],
+        [13, 87]
+      ]
+    },
+    "binding_local_required_live": [
+      {
+        "material_id": 2,
+        "mesh_id": 79,
+        "binding_count": 4,
+        "participating_binding_count": 4,
+        "eligible_node_counts": [69, 485, 2663, 2663],
+        "fail_closed_binding_count": 0,
+        "binding_local_orphan_ancestor_count": 0,
+        "required_live_pair_delivered": true
+      },
+      {
+        "material_id": 12,
+        "mesh_id": 82,
+        "binding_count": 2,
+        "participating_binding_count": 2,
+        "eligible_node_counts": [429, 592],
+        "fail_closed_binding_count": 0,
+        "binding_local_orphan_ancestor_count": 0,
+        "required_live_pair_delivered": true
+      },
+      {
+        "material_id": 12,
+        "mesh_id": 83,
+        "binding_count": 1,
+        "participating_binding_count": 1,
+        "eligible_node_counts": [592],
+        "fail_closed_binding_count": 0,
+        "binding_local_orphan_ancestor_count": 0,
+        "required_live_pair_delivered": true
+      },
+      {
+        "material_id": 12,
+        "mesh_id": 84,
+        "binding_count": 1,
+        "participating_binding_count": 1,
+        "eligible_node_counts": [592],
+        "fail_closed_binding_count": 0,
+        "binding_local_orphan_ancestor_count": 0,
+        "required_live_pair_delivered": true
+      },
+      {
+        "material_id": 12,
+        "mesh_id": 85,
+        "binding_count": 1,
+        "participating_binding_count": 1,
+        "eligible_node_counts": [592],
+        "fail_closed_binding_count": 0,
+        "binding_local_orphan_ancestor_count": 0,
+        "required_live_pair_delivered": true
+      },
+      {
+        "material_id": 13,
+        "mesh_id": 86,
+        "binding_count": 2,
+        "participating_binding_count": 2,
+        "eligible_node_counts": [429, 592],
+        "fail_closed_binding_count": 0,
+        "binding_local_orphan_ancestor_count": 0,
+        "required_live_pair_delivered": true
+      },
+      {
+        "material_id": 13,
+        "mesh_id": 87,
+        "binding_count": 1,
+        "participating_binding_count": 1,
+        "eligible_node_counts": [429],
+        "fail_closed_binding_count": 0,
+        "binding_local_orphan_ancestor_count": 0,
+        "required_live_pair_delivered": true
+      }
+    ],
+    "operational_verdict": {
+      "report_status": "ok",
+      "item_status": "ready",
+      "target_status": "ready",
+      "actions": [],
+      "assembly_handoff_status": "ready",
+      "assembly_issue_codes": [],
+      "assembly_error_codes": [],
+      "current_live_pair_dependency_count": 3,
+      "current_live_pairs_all_covered": true,
+      "spm_material_mesh_pairs_all_complete": true,
+      "fbx_material_mesh_pairs_all_complete": true,
+      "legacy_scope_drift_diagnostic_present": true,
+      "legacy_scope_drift_code": "live_generator_slot_not_declared_exactly_once",
+      "legacy_scope_drift_pair": [2, 79],
+      "legacy_scope_drift_blocks_handoff": false,
+      "resolution": "operational_block_resolved_under_current_live_pair_contract"
+    },
+    "maintenance_verdict": {
+      "saved_node_table_still_stale": true,
+      "orphan_cleanup_complete": false,
+      "modeler_resave_required_for_current_delivery": false,
+      "modeler_resave_required_for_zero_orphan_asset_hygiene": true,
+      "clean_resave_acceptance": {
+        "stale": false,
+        "orphan_owner_count": 0,
+        "orphan_node_count": 0,
+        "generator_membership_unchanged": true,
+        "authoring_semantics_unchanged": true,
+        "required_live_pairs_still_delivered": true
+      }
+    },
+    "production_interaction": {
+      "spm_written": false,
+      "scope_manifest_written": false,
+      "modeler_launched": false,
+      "modeler_terminated": false,
+      "backup_required": false,
+      "receipt_required": false
+    },
+    "issue_disposition": {
+      "issue_13_operational_acceptance_proven": true,
+      "legacy_resave_remedy_superseded_for_delivery_by_issue_174": true,
+      "asset_hygiene_debt_remains_nonblocking": true,
+      "close_issue_13": true
+    }
+  },
+  "sanitization": {
+    "contains_raw_spm_or_xml": false,
+    "contains_absolute_paths": false,
+    "contains_generator_guids": false,
+    "contains_user_names": false
+  }
+}

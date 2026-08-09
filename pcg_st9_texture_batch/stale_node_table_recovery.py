@@ -4,8 +4,10 @@ The Modeler is opened only after an exact byte preimage and an immutable,
 SHA-bound receipt have been created and verified.  A caller may provide the
 bounded exact-PID semantic UIA session; it is invoked only after the stale,
 nonzero-orphan, complete-scope, and unchanged-SHA gates pass.  The module never
-edits the SPM, kills Modeler, simulates input, rolls back automatically, or
-treats ``stale=false`` alone as permission to continue.
+edits the SPM, force-terminates Modeler, simulates input, rolls back
+automatically, or treats ``stale=false`` alone as permission to continue.  A
+failed semantic session may close only its exact document and request graceful
+exit from the exact process handle that it launched.
 """
 
 from __future__ import annotations
@@ -21,11 +23,13 @@ import re
 import struct
 import subprocess
 import sys
+import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
 
@@ -33,7 +37,11 @@ REPO_DIR = Path(__file__).resolve().parent.parent
 if str(REPO_DIR) not in sys.path:
     sys.path.insert(0, str(REPO_DIR))
 
-from process_lifecycle import external_handoff_popen
+from process_lifecycle import (
+    _current_process_start_identity,
+    external_handoff_popen,
+    process_identity_is_alive,
+)
 
 from speedtree_pipeline_contract import (
     SPM_AUTHORING_GRAPH_PROJECTION_VERSION,
@@ -2700,35 +2708,472 @@ def _atomic_write_new(path, payload):
             temporary.unlink()
 
 
-def _acquire_session_lock(recovery_root, source_identity):
+def _atomic_replace(path, payload):
+    """Atomically replace one owned metadata file after external serialization."""
+    path = Path(path)
+    temporary = path.with_name(path.name + ".tmp." + uuid.uuid4().hex)
+    data = payload if isinstance(payload, bytes) else _canonical_json_bytes(payload)
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _utc_now_text():
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
+        "+00:00",
+        "Z",
+    )
+
+
+def _portable_current_process_start_identity():
+    identity = _current_process_start_identity()
+    if identity is not None:
+        return str(identity)
+    if os.name == "posix":
+        try:
+            raw = Path("/proc/self/stat").read_text(encoding="ascii")
+            # Field 2 may contain spaces and parentheses.  Fields after its
+            # final ')' begin at field 3; starttime is field 22.
+            fields_after_name = raw.rsplit(")", 1)[1].strip().split()
+            return "procfs:" + str(fields_after_name[19])
+        except (OSError, IndexError, UnicodeError):
+            return None
+    return None
+
+
+def _owner_process_started_at_utc(process_start_identity):
+    if os.name != "nt" or process_start_identity is None:
+        return None
+    try:
+        filetime_ticks = int(process_start_identity)
+        unix_seconds = (filetime_ticks - 116444736000000000) / 10000000.0
+        return datetime.fromtimestamp(
+            unix_seconds,
+            tz=timezone.utc,
+        ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    except (OverflowError, TypeError, ValueError):
+        return None
+
+
+def _session_owner_identity_is_alive(pid, process_start_identity):
+    if os.name != "posix" or not str(process_start_identity).startswith(
+        "procfs:"
+    ):
+        return process_identity_is_alive(pid, process_start_identity)
+    try:
+        raw = Path(f"/proc/{int(pid)}/stat").read_text(encoding="ascii")
+        fields_after_name = raw.rsplit(")", 1)[1].strip().split()
+        observed = "procfs:" + str(fields_after_name[19])
+    except FileNotFoundError:
+        return False
+    except (OSError, IndexError, UnicodeError, ValueError):
+        # Observational uncertainty is not proof that the owner is gone.
+        return True
+    return observed == str(process_start_identity)
+
+
+def _session_lock_evidence(payload, lock):
+    heartbeat = payload.get("heartbeat_monotonic_seconds")
+    age = None
+    try:
+        age = max(0.0, time.monotonic() - float(heartbeat))
+    except (TypeError, ValueError):
+        pass
+    return {
+        "session_lock": Path(lock).name,
+        "session_lock_schema_version": payload.get("schema_version"),
+        "session_owner_pid": payload.get("owner_pid"),
+        "session_owner_process_start_identity": payload.get(
+            "owner_process_start_identity"
+        ),
+        "session_owner_process_started_at_utc": payload.get(
+            "owner_process_started_at_utc"
+        ),
+        "session_heartbeat_utc": payload.get("heartbeat_utc"),
+        "session_heartbeat_monotonic_seconds": heartbeat,
+        "session_heartbeat_sequence": payload.get("heartbeat_sequence"),
+        "session_heartbeat_age_seconds": (
+            round(age, 3) if age is not None else None
+        ),
+    }
+
+
+@contextmanager
+def _exclusive_session_lock_guard(lock, source_identity, timeout=5.0):
+    """Serialize lock replacement with an OS-released advisory byte lock."""
+    guard_path = Path(lock).with_name(Path(lock).name + ".guard")
+    deadline = time.monotonic() + float(timeout)
+    handle = guard_path.open("a+b")
+    locked = False
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name == "nt":
+            import msvcrt
+
+            while True:
+                try:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    locked = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.01)
+        else:
+            import fcntl
+
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.01)
+        if not locked:
+            raise StaleNodeTableRecoveryError(
+                "recovery_session_lock_guard_busy",
+                "the bounded session-lock ownership guard remained busy",
+                {
+                    **source_identity,
+                    "session_lock": Path(lock).name,
+                    "guard_timeout_seconds": float(timeout),
+                },
+            )
+        yield
+    finally:
+        if locked:
+            try:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
+
+
+def _read_session_lock(lock):
+    raw = Path(lock).read_bytes()
+    return raw, json.loads(raw.decode("utf-8"))
+
+
+def _verified_session_lock_owner(payload, lock, source_identity):
+    owner_pid = payload.get("owner_pid")
+    owner_start = payload.get("owner_process_start_identity")
+    valid = bool(
+        payload.get("kind")
+        == "speedtree_stale_node_table_recovery_session_lock"
+        and payload.get("schema_version") == 2
+        and payload.get("source_identity_sha256")
+        == source_identity["source_identity_sha256"]
+        and payload.get("asset_name") == source_identity["asset_name"]
+        and isinstance(payload.get("session_token"), str)
+        and len(payload["session_token"]) == 32
+        and type(owner_pid) is int
+        and owner_pid > 0
+        and isinstance(owner_start, str)
+        and bool(owner_start)
+        and isinstance(payload.get("heartbeat_sequence"), int)
+        and payload.get("heartbeat_sequence") >= 0
+        and isinstance(payload.get("heartbeat_monotonic_seconds"), (int, float))
+        and math.isfinite(float(payload["heartbeat_monotonic_seconds"]))
+    )
+    if not valid:
+        raise StaleNodeTableRecoveryError(
+            "recovery_session_lock_ownership_unverifiable",
+            "the existing session lock has no complete, matching ownership proof",
+            {
+                **source_identity,
+                **_session_lock_evidence(payload, lock),
+            },
+        )
+    return owner_pid, owner_start
+
+
+def _new_session_lock_payload(
+    source_identity,
+    *,
+    owner_pid,
+    owner_process_start_identity,
+    monotonic_fn,
+    utcnow_fn,
+):
+    monotonic_now = float(monotonic_fn())
+    utc_now = utcnow_fn()
+    return {
+        "kind": "speedtree_stale_node_table_recovery_session_lock",
+        "schema_version": 2,
+        **source_identity,
+        "session_token": uuid.uuid4().hex,
+        "owner_pid": int(owner_pid),
+        "owner_process_start_identity": str(owner_process_start_identity),
+        "owner_process_started_at_utc": _owner_process_started_at_utc(
+            owner_process_start_identity
+        ),
+        "acquired_utc": utc_now,
+        "acquired_monotonic_seconds": monotonic_now,
+        "heartbeat_utc": utc_now,
+        "heartbeat_monotonic_seconds": monotonic_now,
+        "heartbeat_sequence": 0,
+    }
+
+
+def _acquire_session_lock(
+    recovery_root,
+    source_identity,
+    *,
+    owner_pid=None,
+    owner_process_start_identity=None,
+    liveness_fn=_session_owner_identity_is_alive,
+    monotonic_fn=time.monotonic,
+    utcnow_fn=_utc_now_text,
+):
     lock = recovery_root / (
         "session." + source_identity["source_identity_sha256"][:24] + ".lock.json"
     )
-    payload = {
-        "kind": "speedtree_stale_node_table_recovery_session_lock",
-        "schema_version": 1,
-        **source_identity,
-        "session_token": uuid.uuid4().hex,
-    }
-    try:
-        _atomic_write_new(lock, payload)
-    except FileExistsError as exc:
+    owner_pid = os.getpid() if owner_pid is None else int(owner_pid)
+    owner_process_start_identity = (
+        _portable_current_process_start_identity()
+        if owner_process_start_identity is None
+        else str(owner_process_start_identity)
+    )
+    if owner_pid <= 0 or not owner_process_start_identity:
         raise StaleNodeTableRecoveryError(
-            "recovery_session_already_active",
-            "another recovery session or an interrupted session lock exists",
+            "recovery_session_owner_identity_unavailable",
+            "the recovery process PID and creation identity could not be sealed",
             source_identity,
-        ) from exc
+        )
+    payload = _new_session_lock_payload(
+        source_identity,
+        owner_pid=owner_pid,
+        owner_process_start_identity=owner_process_start_identity,
+        monotonic_fn=monotonic_fn,
+        utcnow_fn=utcnow_fn,
+    )
+    with _exclusive_session_lock_guard(lock, source_identity):
+        try:
+            _atomic_write_new(lock, payload)
+        except FileExistsError:
+            try:
+                existing_raw, existing = _read_session_lock(lock)
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise StaleNodeTableRecoveryError(
+                    "recovery_session_lock_ownership_unverifiable",
+                    "the existing session lock cannot be read as ownership proof",
+                    {**source_identity, "session_lock": lock.name},
+                ) from exc
+            existing_pid, existing_start = _verified_session_lock_owner(
+                existing,
+                lock,
+                source_identity,
+            )
+            try:
+                owner_alive = bool(liveness_fn(existing_pid, existing_start))
+            except Exception as exc:
+                raise StaleNodeTableRecoveryError(
+                    "recovery_session_lock_liveness_unverifiable",
+                    "the existing session owner identity could not be queried",
+                    {
+                        **source_identity,
+                        **_session_lock_evidence(existing, lock),
+                    },
+                ) from exc
+            if owner_alive:
+                raise StaleNodeTableRecoveryError(
+                    "recovery_session_already_active",
+                    "the exact PID and creation identity still own this recovery lock",
+                    {
+                        **source_identity,
+                        **_session_lock_evidence(existing, lock),
+                    },
+                )
+
+            reclaimed = recovery_root / (
+                "reclaimed.session."
+                + source_identity["source_identity_sha256"][:24]
+                + "."
+                + uuid.uuid4().hex
+                + ".json"
+            )
+            os.rename(lock, reclaimed)
+            try:
+                if reclaimed.read_bytes() != existing_raw:
+                    raise StaleNodeTableRecoveryError(
+                        "recovery_session_lock_changed_during_reclaim",
+                        "the stale lock changed while its exact owner was verified",
+                        {
+                            **source_identity,
+                            "session_lock": lock.name,
+                            "reclaimed_lock": reclaimed.name,
+                        },
+                    )
+                _atomic_write_new(lock, payload)
+            except Exception:
+                if not lock.exists() and reclaimed.exists():
+                    try:
+                        os.rename(reclaimed, lock)
+                    except OSError:
+                        pass
+                raise
     return lock, payload["session_token"]
 
 
-def _release_session_lock(lock, token):
+def _refresh_session_lock(
+    lock,
+    token,
+    *,
+    owner_pid=None,
+    owner_process_start_identity=None,
+    monotonic_fn=time.monotonic,
+    utcnow_fn=_utc_now_text,
+):
+    owner_pid = os.getpid() if owner_pid is None else int(owner_pid)
+    owner_process_start_identity = (
+        _portable_current_process_start_identity()
+        if owner_process_start_identity is None
+        else str(owner_process_start_identity)
+    )
+    source_identity = {"asset_name": None, "source_identity_sha256": None}
+    with _exclusive_session_lock_guard(lock, source_identity):
+        try:
+            _raw, current = _read_session_lock(lock)
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise StaleNodeTableRecoveryError(
+                "recovery_session_lock_lost",
+                "the owned session lock disappeared or became unreadable",
+                {"session_lock": Path(lock).name},
+            ) from exc
+        owned = bool(
+            current.get("schema_version") == 2
+            and current.get("session_token") == token
+            and current.get("owner_pid") == owner_pid
+            and current.get("owner_process_start_identity")
+            == owner_process_start_identity
+        )
+        if not owned:
+            raise StaleNodeTableRecoveryError(
+                "recovery_session_lock_lost",
+                "the lock no longer carries this recovery process ownership proof",
+                _session_lock_evidence(current, lock),
+            )
+        updated = dict(current)
+        updated["heartbeat_utc"] = utcnow_fn()
+        updated["heartbeat_monotonic_seconds"] = float(monotonic_fn())
+        updated["heartbeat_sequence"] = int(current["heartbeat_sequence"]) + 1
+        _atomic_replace(lock, updated)
+    return updated
+
+
+def _release_session_lock(
+    lock,
+    token,
+    *,
+    owner_pid=None,
+    owner_process_start_identity=None,
+):
+    owner_pid = os.getpid() if owner_pid is None else int(owner_pid)
+    owner_process_start_identity = (
+        _portable_current_process_start_identity()
+        if owner_process_start_identity is None
+        else str(owner_process_start_identity)
+    )
     try:
-        current = json.loads(lock.read_text(encoding="utf-8"))
-        if current.get("session_token") == token:
-            lock.unlink()
-    except (OSError, UnicodeError, json.JSONDecodeError):
+        with _exclusive_session_lock_guard(
+            lock,
+            {"asset_name": None, "source_identity_sha256": None},
+        ):
+            current = json.loads(lock.read_text(encoding="utf-8"))
+            owned = bool(
+                current.get("schema_version") == 2
+                and current.get("session_token") == token
+                and current.get("owner_pid") == owner_pid
+                and current.get("owner_process_start_identity")
+                == owner_process_start_identity
+            )
+            if owned:
+                lock.unlink()
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        StaleNodeTableRecoveryError,
+    ):
         # Never delete an unverified lock belonging to another/interrupted run.
         pass
+
+
+class _SessionLockHeartbeat:
+    """Refresh one exact lock lease and surface any ownership loss."""
+
+    def __init__(self, lock, token, source_identity, *, interval=5.0):
+        self.lock = Path(lock)
+        self.token = str(token)
+        self.source_identity = dict(source_identity)
+        self.interval = float(interval)
+        if not math.isfinite(self.interval) or self.interval <= 0:
+            raise StaleNodeTableRecoveryError(
+                "invalid_session_lock_heartbeat_interval",
+                "the session-lock heartbeat interval must be finite and positive",
+                source_identity,
+            )
+        self._stop = threading.Event()
+        self._failure = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name="stale-node-table-session-heartbeat",
+            daemon=True,
+        )
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            try:
+                _refresh_session_lock(self.lock, self.token)
+            except Exception as exc:
+                self._failure = exc
+                self._stop.set()
+                return
+
+    def check(self):
+        if self._failure is None:
+            return
+        evidence = dict(self.source_identity)
+        evidence["session_lock"] = self.lock.name
+        evidence["heartbeat_error_type"] = type(self._failure).__name__
+        if isinstance(self._failure, StaleNodeTableRecoveryError):
+            evidence["heartbeat_reason_token"] = self._failure.reason_token
+            evidence.update(self._failure.evidence)
+        raise StaleNodeTableRecoveryError(
+            "recovery_session_lock_lost",
+            "the recovery session could not renew its exact owned lock",
+            evidence,
+        ) from self._failure
+
+    def stop(self):
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=min(10.0, self.interval + 5.5))
 
 
 def _preimage_receipt(
@@ -3662,6 +4107,7 @@ def wait_for_valid_resave(
     sleep_fn=time.sleep,
     monotonic_fn=time.monotonic,
     guards=None,
+    session_lock_heartbeat=None,
 ):
     """Require repeated stat/size/SHA/parse quiescence and every safety gate."""
     target_scopes, scope_error = _resolve_target_scopes(
@@ -3687,6 +4133,8 @@ def wait_for_valid_resave(
     last_errors = ["file_content_not_changed"]
     last_snapshot = None
     while monotonic_fn() < deadline:
+        if session_lock_heartbeat is not None:
+            session_lock_heartbeat.check()
         # A valid Save may never arrive.  Poll lifecycle authority alongside
         # the file so Stop, app shutdown, stale job generations, and an
         # optional queue-lease loss do not strand the worker until timeout.
@@ -3722,6 +4170,8 @@ def wait_for_valid_resave(
         )
         last_errors = verdict["errors"]
         if candidate_reads >= stable_reads and verdict["valid"]:
+            if session_lock_heartbeat is not None:
+                session_lock_heartbeat.check()
             _check_guards(guards, snapshot["source_identity"])
             return snapshot, verdict
         sleep_fn(poll_interval)
@@ -3941,6 +4391,11 @@ def _record_blocked_event(recovery_root, identity, error):
             if isinstance(evidence.get("semantic_uia"), dict)
             else None
         ),
+        "semantic_uia_cleanup": (
+            copy.deepcopy(evidence.get("semantic_uia_cleanup"))
+            if isinstance(evidence.get("semantic_uia_cleanup"), dict)
+            else None
+        ),
     }
     path = recovery_root / ("blocked." + uuid.uuid4().hex + ".json")
     try:
@@ -4111,6 +4566,7 @@ def recover_stale_node_table(
     continuation_commit_lock=None,
     on_continuation_claimed=None,
     modeler_session=None,
+    session_lock_heartbeat_interval=5.0,
 ):
     """Seal, open, watch, audit, and resume a bound job at most once."""
     spm = Path(spm_path).expanduser().resolve(strict=False)
@@ -4193,8 +4649,17 @@ def recover_stale_node_table(
     root.mkdir(parents=True, exist_ok=True)
     lock = None
     token = None
+    lock_heartbeat = None
+    semantic_save_attempted = False
+    semantic_document_closed = False
     try:
         lock, token = _acquire_session_lock(root, identity)
+        lock_heartbeat = _SessionLockHeartbeat(
+            lock,
+            token,
+            identity,
+            interval=session_lock_heartbeat_interval,
+        ).start()
         baseline = capture_fn(spm, authoring)
         if (
             expected_preimage_sha
@@ -4286,6 +4751,7 @@ def recover_stale_node_table(
         # This is the final effectful prelaunch check.  Modeler starts
         # immediately after the exact immutable backup is recaptured.
         _verify_preimage_artifacts(artifacts, prelaunch)
+        lock_heartbeat.check()
         process = None
         semantic_save_evidence = None
         semantic_close_evidence = None
@@ -4293,6 +4759,7 @@ def recover_stale_node_table(
         if modeler_session is None:
             process = launch_fn(executable, spm)
         else:
+            semantic_save_attempted = True
             try:
                 semantic_save_evidence = modeler_session.save_document(
                     executable,
@@ -4326,6 +4793,7 @@ def recover_stale_node_table(
             sleep_fn=sleep_fn,
             monotonic_fn=monotonic_fn,
             guards=guards,
+            session_lock_heartbeat=lock_heartbeat,
         )
         if modeler_session is not None:
             try:
@@ -4348,6 +4816,7 @@ def recover_stale_node_table(
                     "owned_process_id"
                 ],
             )
+            semantic_document_closed = True
             semantic_completion = _write_semantic_completion_receipt(
                 root,
                 identity,
@@ -4361,6 +4830,7 @@ def recover_stale_node_table(
             )
         retry_result = None
         claim_name = None
+        lock_heartbeat.check()
         if retry is not None:
             retry_result, claim_name = _claim_and_resume_once(
                 spm,
@@ -4415,9 +4885,31 @@ def recover_stale_node_table(
             "closure_gate": "cluster_normalization_and_unreal_push_pending",
         }
     except StaleNodeTableRecoveryError as exc:
+        if (
+            modeler_session is not None
+            and semantic_save_attempted
+            and not semantic_document_closed
+        ):
+            cleanup = getattr(modeler_session, "cleanup_after_failure", None)
+            if callable(cleanup):
+                try:
+                    exc.evidence["semantic_uia_cleanup"] = cleanup(spm)
+                except Exception as cleanup_exc:
+                    exc.evidence["semantic_uia_cleanup"] = {
+                        "cleanup_status": "cleanup_hook_failed",
+                        "cleanup_error_type": type(cleanup_exc).__name__,
+                        "force_termination_used": False,
+                    }
+            else:
+                exc.evidence["semantic_uia_cleanup"] = {
+                    "cleanup_status": "cleanup_hook_unavailable",
+                    "force_termination_used": False,
+                }
         _record_blocked_event(root, identity, exc)
         raise
     finally:
+        if lock_heartbeat is not None:
+            lock_heartbeat.stop()
         if lock is not None and token is not None:
             _release_session_lock(lock, token)
 

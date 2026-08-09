@@ -132,6 +132,119 @@ class PowerShellBridgeReceiptTests(unittest.TestCase):
             "uia_bridge_receipt_identity_mismatch",
         )
 
+    def test_default_wait_and_subprocess_caps_are_separate_and_operation_specific(self):
+        captured = []
+
+        def runner(command, **kwargs):
+            operation = command[command.index("-Operation") + 1]
+            action = "Save" if operation == "save" else "Close"
+            captured.append((operation, list(command), dict(kwargs)))
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "ok": True,
+                        "contract": SEMANTIC_UIA_CONTRACT,
+                        "owned_process_id": 4242,
+                        "document_accessible_name": "tree.spm",
+                        "operation": operation,
+                        "menu_path": ["File", action],
+                        "semantic_pattern": "InvokePattern",
+                        "pending_phase": "complete",
+                        "elapsed_seconds": 1.25,
+                    }
+                ),
+                stderr="",
+            )
+
+        bridge = PowerShellUIABridge(runner=runner, platform_name="nt")
+        for operation in ("save", "close"):
+            bridge.invoke(
+                owned_process_id=4242,
+                executable="SpeedTree_Modeler.exe",
+                document_name="tree.spm",
+                operation=operation,
+            )
+
+        by_operation = {row[0]: row for row in captured}
+        save_command = by_operation["save"][1]
+        close_command = by_operation["close"][1]
+        self.assertEqual(
+            save_command[save_command.index("-OperationTimeoutSeconds") + 1],
+            "300",
+        )
+        self.assertEqual(
+            close_command[close_command.index("-OperationTimeoutSeconds") + 1],
+            "120",
+        )
+        self.assertEqual(by_operation["save"][2]["timeout"], 315.0)
+        self.assertEqual(by_operation["close"][2]["timeout"], 135.0)
+        self.assertNotIn("45", save_command)
+
+    def test_timeout_reports_last_pending_phase_and_elapsed_time(self):
+        ticks = iter((10.0, 18.5))
+        progress = json.dumps(
+            {
+                "kind": "uia_bridge_progress",
+                "phase": "resolving_save_menu",
+                "elapsed_seconds": 4.25,
+                "phase_elapsed_seconds": 0.0,
+            }
+        )
+
+        def runner(command, **kwargs):
+            raise subprocess.TimeoutExpired(
+                command,
+                kwargs["timeout"],
+                output=progress,
+            )
+
+        bridge = PowerShellUIABridge(
+            runner=runner,
+            platform_name="nt",
+            element_wait_timeouts={"save": 20},
+            subprocess_timeouts={"save": 25},
+            monotonic_fn=lambda: next(ticks),
+        )
+        with self.assertRaises(SemanticModelerUIAError) as caught:
+            bridge.invoke(
+                owned_process_id=4242,
+                executable="SpeedTree_Modeler.exe",
+                document_name="tree.spm",
+                operation="save",
+            )
+
+        self.assertEqual(caught.exception.reason_token, "uia_bridge_timed_out")
+        self.assertEqual(
+            caught.exception.evidence["pending_phase"],
+            "resolving_save_menu",
+        )
+        self.assertEqual(caught.exception.evidence["elapsed_seconds"], 8.5)
+        self.assertEqual(caught.exception.evidence["phase_elapsed_seconds"], 4.25)
+        self.assertEqual(caught.exception.evidence["operation_timeout_seconds"], 20.0)
+        self.assertEqual(caught.exception.evidence["subprocess_timeout_seconds"], 25.0)
+
+    def test_spawn_failure_has_distinct_token_and_phase(self):
+        def runner(_command, **_kwargs):
+            raise FileNotFoundError(2, "missing powershell")
+
+        bridge = PowerShellUIABridge(
+            runner=runner,
+            timeout=2,
+            platform_name="nt",
+            monotonic_fn=lambda: 4.0,
+        )
+        with self.assertRaises(SemanticModelerUIAError) as caught:
+            bridge.invoke(
+                owned_process_id=4242,
+                executable="SpeedTree_Modeler.exe",
+                document_name="tree.spm",
+                operation="save",
+            )
+
+        self.assertEqual(caught.exception.reason_token, "uia_bridge_spawn_failed")
+        self.assertEqual(caught.exception.evidence["pending_phase"], "bridge_spawn")
+
 
 class OwnedSessionReuseTests(unittest.TestCase):
     def test_two_documents_reuse_one_owned_pid_and_close_exactly(self):
@@ -241,6 +354,73 @@ class OwnedSessionReuseTests(unittest.TestCase):
                 "uia_previous_document_not_closed",
             )
             self.assertEqual(forwards, [])
+
+    def test_failed_save_cleanup_is_exact_and_never_forces_the_owned_process(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            executable = folder / "SpeedTree_Modeler.exe"
+            document = folder / "tree.spm"
+            executable.write_bytes(b"fixture")
+            document.write_bytes(b"fixture")
+
+            class Process(FakeProcess):
+                def wait(self, timeout=None):
+                    self.wait_timeout = timeout
+                    return self.returncode
+
+                def terminate(self):
+                    raise AssertionError("forced termination is forbidden")
+
+                def kill(self):
+                    raise AssertionError("forced kill is forbidden")
+
+            process = Process()
+            calls = []
+
+            class Bridge:
+                def invoke(inner_self, **kwargs):
+                    calls.append(dict(kwargs))
+                    if kwargs["operation"] == "save":
+                        raise SemanticModelerUIAError(
+                            "uia_bridge_timed_out",
+                            "fixture timeout",
+                            {"pending_phase": "resolving_save_menu"},
+                        )
+                    return {
+                        "contract": SEMANTIC_UIA_CONTRACT,
+                        "operation": "close",
+                    }
+
+            def graceful_close(observed, start_identity):
+                self.assertIs(observed, process)
+                self.assertEqual(start_identity, "creation-100")
+                observed.returncode = 0
+                return {
+                    "graceful_close_requested": True,
+                    "graceful_close_reason": "fixture",
+                }
+
+            session = SpeedTreeModelerRecoverySession(
+                executable,
+                bridge=Bridge(),
+                launcher=lambda *_args: process,
+                process_start_identity_fn=lambda _process: "creation-100",
+                graceful_process_closer=graceful_close,
+            )
+            with self.assertRaises(SemanticModelerUIAError):
+                session.save_document(executable, document)
+
+            cleanup = session.cleanup_after_failure(document)
+
+            self.assertEqual(
+                [(call["document_name"], call["operation"]) for call in calls],
+                [("tree.spm", "save"), ("tree.spm", "close")],
+            )
+            self.assertTrue(cleanup["exact_document_closed"])
+            self.assertTrue(cleanup["graceful_process_exit_requested"])
+            self.assertFalse(cleanup["force_termination_used"])
+            self.assertFalse(cleanup["owned_process_alive_after_cleanup"])
+            self.assertEqual(cleanup["cleanup_status"], "owned_process_exited_gracefully")
 
 
 class BoundedPathEquivalenceTests(unittest.TestCase):

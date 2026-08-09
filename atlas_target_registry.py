@@ -1,5 +1,6 @@
 """Read and write Atlas Leaf target-SPM sidecars without importing Blender."""
 
+import hashlib
 import json
 import os
 import uuid
@@ -97,6 +98,60 @@ def _registry_path_state(path):
     }
 
 
+def _registry_file_state_for_bytes(path, content):
+    return {
+        "path": os.path.normcase(str(Path(path).absolute())),
+        "state": "file",
+        "size": len(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "algorithm": SHA256_ALGORITHM,
+    }
+
+
+def target_registry_path_state(blend_path):
+    """Return the compare-and-swap state used by ``save_target_registry``."""
+
+    return _registry_path_state(registry_path_for_blend(blend_path))
+
+
+def capture_target_registry_preimage(blend_path):
+    """Seal the exact existing registry bytes for a later CAS rollback."""
+
+    path = registry_path_for_blend(blend_path)
+    before = _registry_path_state(path)
+    if before.get("state") != "file":
+        raise TargetRegistryPublishError(
+            f"Atlas target registry preimage is not a file: {path}"
+        )
+    try:
+        content = path.read_bytes()
+    except OSError as exc:
+        raise TargetRegistryPublishError(
+            f"Cannot read Atlas target registry preimage {path}: {exc}"
+        ) from exc
+    sealed = _registry_file_state_for_bytes(path, content)
+    after = _registry_path_state(path)
+    if before != sealed or after != sealed:
+        error = TargetRegistryPublishError(
+            "Atlas target registry changed while its rollback preimage was "
+            "being sealed"
+        )
+        error.connected_retry_contract = {
+            "operation_phase": "registry_preimage_capture",
+            "committed": False,
+            "rollback_succeeded": False,
+            "expected_state": before,
+            "sealed_state": sealed,
+            "current_state": after,
+        }
+        raise error
+    return {
+        "path": str(path.absolute()),
+        "state": sealed,
+        "content": content,
+    }
+
+
 def _require_registry_precondition(path, expected_state):
     if expected_state is None:
         return
@@ -134,15 +189,12 @@ def save_target_registry(
     temporary = registry_path.with_name(
         f".{registry_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     )
+    content = (
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
     try:
-        with temporary.open(
-            "x",
-            encoding="utf-8",
-            newline="\n",
-        ) as handle:
-            handle.write(
-                json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
-            )
+        with temporary.open("xb") as handle:
+            handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
         try:
@@ -173,4 +225,86 @@ def save_target_registry(
     finally:
         temporary.unlink(missing_ok=True)
     payload["registry_path"] = str(registry_path)
+    payload["registry_state"] = _registry_file_state_for_bytes(
+        registry_path,
+        content,
+    )
     return payload
+
+
+def restore_target_registry_preimage(
+    preimage,
+    *,
+    expected_registry_state,
+):
+    """CAS-restore exact registry bytes without overwriting external work."""
+
+    if not isinstance(preimage, dict):
+        raise TargetRegistryPublishError(
+            "Atlas target registry rollback preimage is missing"
+        )
+    path = Path(str(preimage.get("path") or "")).expanduser().absolute()
+    content = preimage.get("content")
+    original_state = preimage.get("state")
+    if not isinstance(content, bytes) or not isinstance(original_state, dict):
+        raise TargetRegistryPublishError(
+            "Atlas target registry rollback preimage is incomplete"
+        )
+    sealed = _registry_file_state_for_bytes(path, content)
+    if sealed != original_state:
+        raise TargetRegistryPublishError(
+            "Atlas target registry rollback preimage hash is invalid"
+        )
+    if not isinstance(expected_registry_state, dict):
+        raise TargetRegistryPublishError(
+            "Atlas target registry rollback CAS state is missing"
+        )
+
+    _require_registry_precondition(path, expected_registry_state)
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.rollback.tmp"
+    )
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _require_registry_precondition(path, expected_registry_state)
+        os.replace(temporary, path)
+    except Exception as exc:
+        if isinstance(exc, TargetRegistryPublishError):
+            raise
+        error = TargetRegistryPublishError(
+            f"Atlas target registry exact rollback failed: {path}: {exc}"
+        )
+        error.connected_retry_contract = {
+            "operation_phase": "registry_rollback",
+            "committed": False,
+            "rollback_succeeded": False,
+            "temporary_output_isolated": True,
+            "expected_state": expected_registry_state,
+            "current_state": _registry_path_state(path),
+        }
+        raise error from exc
+    finally:
+        temporary.unlink(missing_ok=True)
+
+    restored = _registry_path_state(path)
+    if restored != original_state:
+        error = TargetRegistryPublishError(
+            "Atlas target registry rollback postcondition does not match the "
+            "sealed preimage"
+        )
+        error.connected_retry_contract = {
+            "operation_phase": "registry_rollback_verify",
+            "committed": True,
+            "rollback_succeeded": False,
+            "expected_state": original_state,
+            "current_state": restored,
+        }
+        raise error
+    return {
+        "status": "restored",
+        "registry_path": str(path),
+        "registry_state": restored,
+    }
