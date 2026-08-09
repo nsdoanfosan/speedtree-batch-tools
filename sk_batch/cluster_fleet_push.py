@@ -16,10 +16,13 @@ from pathlib import Path
 
 from exact_push import (
     DEFAULT_BLENDER,
+    DEFAULT_UNREAL_EDITOR_CMD,
     DEFAULT_UNREAL_PROJECT,
     LOG_DIR,
     ExactPushError,
     build_exact_push_command,
+    merge_unreal_result,
+    run_headless_manifest,
 )
 
 
@@ -125,6 +128,11 @@ def parse_args(argv=None):
     parser.add_argument("--blender", type=Path, default=DEFAULT_BLENDER)
     parser.add_argument("--log-dir", type=Path, default=LOG_DIR)
     parser.add_argument("--unreal-project", type=Path, default=DEFAULT_UNREAL_PROJECT)
+    parser.add_argument(
+        "--unreal-editor-cmd",
+        type=Path,
+        default=DEFAULT_UNREAL_EDITOR_CMD,
+    )
     parser.add_argument("--only", action="append", default=[])
     parser.add_argument("--skip-birch", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -148,6 +156,7 @@ def main(argv=None):
     fleet = {
         "status": "running",
         "root": str(args.root.expanduser().resolve()),
+        "transport": "headless_commandlet",
         "birch_paper_order": "last",
         "targets": [str(row["spm"]) for row in targets],
         "missing_current_assembly_data": missing,
@@ -162,8 +171,9 @@ def main(argv=None):
         fleet_report_path.write_text(json.dumps(fleet, ensure_ascii=False, indent=2), encoding="utf-8")
         return 0
 
+    pending = []
     for index, target in enumerate(targets, 1):
-        print(f"[{index}/{len(targets)}] PUSH {target['stem']}", flush=True)
+        print(f"[{index}/{len(targets)}] EXPORT {target['stem']}", flush=True)
         result = {
             "stem": target["stem"],
             "spm": str(target["spm"]),
@@ -181,18 +191,86 @@ def main(argv=None):
             result["returncode"] = completed.returncode
             result["report"] = str(outputs["report"])
             if completed.returncode:
-                raise RuntimeError(f"production push exited {completed.returncode}")
-            report = json.loads(outputs["report"].read_text(encoding="utf-8"))
-            verification = validate_live_result(report, target)
-            result["verification"] = verification
-            if not verification["ok"]:
-                raise RuntimeError("; ".join(verification["problems"]))
-            result["status"] = "verified_in_unreal"
+                raise RuntimeError(f"production export exited {completed.returncode}")
+            export_report = json.loads(
+                outputs["report"].read_text(encoding="utf-8")
+            )
+            if export_report.get("status") != "exported_pending_unreal":
+                raise RuntimeError(
+                    "production export did not reach exported_pending_unreal"
+                )
+            exported_manifest = json.loads(
+                outputs["manifest"].read_text(encoding="utf-8")
+            )
+            items = list(exported_manifest.get("items") or [])
+            if len(items) != 1:
+                raise RuntimeError(
+                    f"exact export manifest item count is {len(items)}, expected 1"
+                )
+            result["status"] = "exported_pending_unreal"
+            pending.append({
+                "target": target,
+                "outputs": outputs,
+                "item": items[0],
+                "result": result,
+            })
         except (ExactPushError, OSError, ValueError, RuntimeError) as exc:
             result["status"] = "failed"
             result["error"] = str(exc)
         fleet["results"].append(result)
         fleet_report_path.write_text(json.dumps(fleet, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if pending:
+        manifest_path = args.log_dir / f"cluster_fleet_push_{run_id}_unreal_manifest.json"
+        checkpoint_path = args.log_dir / f"cluster_fleet_push_{run_id}_unreal_checkpoint.json"
+        batch_report_path = args.log_dir / f"cluster_fleet_push_{run_id}_unreal_report.json"
+        manifest = {
+            "schema_version": 1,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "checkpoint_path": str(checkpoint_path.resolve()),
+            "report_path": str(batch_report_path.resolve()),
+            "max_item_crash_retries": 2,
+            "items": [entry["item"] for entry in pending],
+        }
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        fleet["unreal_manifest"] = str(manifest_path)
+        fleet["unreal_checkpoint"] = str(checkpoint_path)
+        fleet["unreal_report"] = str(batch_report_path)
+        fleet_report_path.write_text(
+            json.dumps(fleet, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        try:
+            batch_result = run_headless_manifest(
+                manifest_path,
+                checkpoint_path,
+                batch_report_path,
+                unreal_project=args.unreal_project,
+                unreal_editor_cmd=args.unreal_editor_cmd,
+            )
+            for entry in pending:
+                result = entry["result"]
+                report = merge_unreal_result(entry["outputs"], batch_result)
+                verification = validate_live_result(report, entry["target"])
+                result["verification"] = verification
+                if verification["ok"]:
+                    result["status"] = "verified_in_unreal"
+                else:
+                    result["status"] = "failed"
+                    result["error"] = "; ".join(verification["problems"])
+        except (ExactPushError, OSError, ValueError, RuntimeError) as exc:
+            for entry in pending:
+                result = entry["result"]
+                if result["status"] == "exported_pending_unreal":
+                    result["status"] = "failed"
+                    result["error"] = str(exc)
+        fleet_report_path.write_text(
+            json.dumps(fleet, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     failed = [row for row in fleet["results"] if row["status"] != "verified_in_unreal"]
     fleet["status"] = "ok" if not failed else "failed"
