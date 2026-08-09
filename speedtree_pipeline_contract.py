@@ -1321,6 +1321,45 @@ def validate_preflight_report(report_path, spm_path, require_ok=True):
         raise ValueError(
             f"SpeedTree material preflight status is not ok: {payload.get('status')!r}"
         )
+    if payload.get("historical_identity_fields_are_diagnostic") is True:
+        spm = _canonical_path(spm_path)
+        canonical_spm = payload.get("canonical_spm")
+        if canonical_spm and canonical_path_key(canonical_spm) != canonical_path_key(spm):
+            raise ValueError(
+                "current SpeedTree execution contract belongs to another model path"
+            )
+        previous = payload.get("speedtree_pipeline_contract")
+        if not isinstance(previous, dict):
+            raise ValueError("SpeedTree pipeline contract is not an object")
+        descriptor = previous.get("speedtree_handoff_contract") or {}
+        recorded_mesh_name = str(descriptor.get("mesh_name") or "")
+        if recorded_mesh_name.casefold() != spm.stem.casefold():
+            raise ValueError(
+                "current SpeedTree execution contract belongs to another mesh"
+            )
+
+        # The wrapper is created immediately before Repair, while its embedded
+        # material envelope comes from the preceding Repair report. Legitimate
+        # authoring edits therefore change the SPM bytes by design. Rebuild the
+        # execution envelope from the current path/current STMAT and retain the
+        # previous identities only as diagnostics. The exact SpeedTree export
+        # later in the same BWR job refreshes the STMAT contract again.
+        rebound = build_preflight_envelope(
+            spm,
+            speedtree_stmat_path(spm),
+            outcome=previous.get("outcome") or "ok",
+            texture_readiness=None,
+            issues=previous.get("issues") or [],
+        )
+        payload = copy.deepcopy(payload)
+        payload["speedtree_pipeline_contract"] = rebound
+        payload["current_execution_source_rebind"] = {
+            "status": "rebound",
+            "basis": "historical_identity_fields_are_diagnostic",
+            "previous_source": copy.deepcopy(previous.get("source") or {}),
+            "current_source": copy.deepcopy(rebound.get("source") or {}),
+            "asset_failure": False,
+        }
     validate_preflight_envelope(
         payload.get("speedtree_pipeline_contract"),
         spm_path,
