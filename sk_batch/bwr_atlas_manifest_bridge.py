@@ -10,7 +10,7 @@ from atlas_manifest_resolver import (
 )
 
 
-def install_bwr_atlas_manifest_resolver(bwr_core, target_spm):
+def install_bwr_atlas_manifest_resolver(addon_runtime, target_spm):
     """Replace BWR's rolling-global lookup for one exact exported target.
 
     The installed BWR add-on predates the shared resolver.  Its legacy lookup
@@ -44,7 +44,10 @@ def install_bwr_atlas_manifest_resolver(bwr_core, target_spm):
             ):
                 selected_paths.append(path)
 
-    original = getattr(bwr_core, "_speedtree_manifest_paths", None)
+    original = addon_runtime.operation(
+        "speedtree_bone_weight_repair",
+        "speedtree_manifest_paths",
+    )
     if not callable(original):
         raise RuntimeError(
             "Installed speedtree_bone_weight_repair add-on does not expose "
@@ -57,7 +60,11 @@ def install_bwr_atlas_manifest_resolver(bwr_core, target_spm):
             return list(selected_paths)
         return original(source_fbx_path, stmat_material)
 
-    bwr_core._speedtree_manifest_paths = exact_target_manifest_paths
+    addon_runtime.replace_operation(
+        "speedtree_bone_weight_repair",
+        "speedtree_manifest_paths",
+        exact_target_manifest_paths,
+    )
     evidence = resolution_evidence(resolution)
     evidence["consumer"] = "speedtree_bone_weight_repair"
     evidence["adapter"] = "shared_exact_target_manifest_paths"

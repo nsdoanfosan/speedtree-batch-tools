@@ -7,14 +7,13 @@ import sys
 import traceback
 from pathlib import Path
 
-import addon_utils
-
 TOOL_DIR = Path(__file__).resolve().parents[1]
 REPO_DIR = TOOL_DIR.parent
 sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(TOOL_DIR))
 
 from mutation_plan_authority import validate_child_authority
+from blender_addon_gateway import prepare_runtime
 
 
 def parse_args():
@@ -50,20 +49,24 @@ def main():
     cleanups = []
     registry_path = None
     registry_bytes = None
+    addon_runtime = None
     try:
         authority = validate_child_authority(
             args.authority_json,
             args.authority_sha256,
         )
-        enabled = addon_utils.enable(
-            "atlas_leaf_mesh_builder", default_set=False, persistent=False
+        addon_runtime = prepare_runtime(
+            "pcg_st9_texture_batch.jobs.atlas_target_remove_job",
+            {"atlas_leaf_mesh_builder": ("target_registry_v1",)},
         )
-        if enabled is None:
-            raise RuntimeError("Could not enable atlas_leaf_mesh_builder")
-        from atlas_leaf_mesh_builder.speedtree import remove_blend_target_from_spm
-        from atlas_leaf_mesh_builder.target_registry import (
-            load_target_registry,
-            save_target_registry,
+        remove_blend_target_from_spm = addon_runtime.operation(
+            "atlas_leaf_mesh_builder", "remove_blend_target_from_spm"
+        )
+        load_target_registry = addon_runtime.operation(
+            "atlas_leaf_mesh_builder", "load_target_registry"
+        )
+        save_target_registry = addon_runtime.operation(
+            "atlas_leaf_mesh_builder", "save_target_registry"
         )
 
         blend = Path(args.blend).expanduser().absolute()
@@ -109,6 +112,7 @@ def main():
                 "parent_authority_sha256"
             ),
             "authority_unit": authority.get("unit_id"),
+            "blender_addon_runtime": addon_runtime.receipt,
         }
     except Exception as exc:
         restored = restore_cleanups(cleanups)
@@ -122,6 +126,8 @@ def main():
             "results": cleanups,
             "authority_document_sha256": args.authority_sha256,
         }
+        if addon_runtime is not None:
+            report["blender_addon_runtime"] = addon_runtime.receipt
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(
         json.dumps(report, indent=2, ensure_ascii=False) + "\n",

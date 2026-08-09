@@ -1823,6 +1823,11 @@ def cook_sbs_graph_package(sbs_path, graph_names, cache_root, cfg=None,
     stat = sbs_path.stat()
     tree = ET.parse(sbs_path)
     root = tree.getroot()
+    # SBSCooker may reinterpret a relative package dependency after unrelated
+    # graphs are removed. Pin the existing Cluster_System dependency to the
+    # configured package in this temporary document only; the authored SBS is
+    # never modified.
+    _rebind_cluster_dependency_for_isolated_cook(root, cfg)
     graphs = {
         graph.find("identifier").get("v", "").lower(): graph
         for graph in root.iter("graph")
@@ -2299,6 +2304,17 @@ def _find_dependency_uid(root, predicate):
         if fn is not None and uid is not None and predicate(fn.get("v", "")):
             return uid.get("v")
     return None
+
+
+def _rebind_cluster_dependency_for_isolated_cook(root, cfg):
+    configured = str(cluster_sbsar(cfg)).replace("\\", "/")
+    for dep in root.iter("dependency"):
+        filename = dep.find("filename")
+        if filename is None:
+            continue
+        basename = filename.get("v", "").replace("\\", "/").split("/")[-1]
+        if basename.lower() == "cluster_system_01.sbsar":
+            filename.set("v", configured)
 
 
 def _ensure_cluster_dependency(root, sbs_path, cfg, used_uids):

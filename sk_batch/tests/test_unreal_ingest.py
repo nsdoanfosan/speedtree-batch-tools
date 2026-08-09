@@ -250,6 +250,180 @@ class DynamicWindFinalSkeletonContractTests(unittest.TestCase):
                     }
                 )
 
+    def test_shared_none_preset_accepts_effective_state_from_unreal_profile(self):
+        result = json.dumps(
+            {
+                "success": True,
+                "skeleton_contract": "final_skeleton_v2",
+                "skeleton_hash": "1" * 40,
+                "final_bones": 1688,
+                "resolved_joints": 1688,
+                "response_preset_contract": "shared_response_v1",
+                "response_preset": "NONE",
+                "response_profile_applied": True,
+                "source_default_is_enabled": False,
+                "effective_is_enabled": True,
+                "is_enabled": True,
+                "disabled_coefficients_zeroed": False,
+                "production_provider_contract": "shared_provider_v1",
+                "production_provider": "/Game/Codex/DynamicWind/DW_Vegetation_WindProvider.DW_Vegetation_WindProvider",
+                "pcg_provider_sync": {
+                    "success": True,
+                    "contract": "shared_provider_v1",
+                    "provider": "/Game/Codex/DynamicWind/DW_Vegetation_WindProvider.DW_Vegetation_WindProvider",
+                    "matched_rows": 3,
+                    "changed_rows": 2,
+                    "target_assets": ["/Game/PCG/DataBase/DA_Test_SK"],
+                    "changed_assets": ["/Game/PCG/DataBase/DA_Test_SK"],
+                },
+            }
+        )
+        runner = self._runner_with_result(result)
+        with tempfile.TemporaryDirectory() as temporary:
+            wind_json = Path(temporary) / "wind.json"
+            wind_json.write_text(
+                json.dumps(
+                    {
+                        "bIsEnabled": False,
+                        "WindResponsePresetContract": {
+                            "SchemaVersion": 1,
+                            "Preset": "NONE",
+                            "SimulationGroupBases": [],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report = runner._apply_dynamic_wind(
+                {"wind_json": str(wind_json), "mesh_path": "/Game/Test/SK_Dead"}
+            )
+
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["result"]["response_preset"], "NONE")
+        self.assertIs(report["result"]["effective_is_enabled"], True)
+
+    def test_shared_response_contract_requires_provider_sync_confirmation(self):
+        result = json.dumps(
+            {
+                "success": True,
+                "skeleton_contract": "final_skeleton_v2",
+                "skeleton_hash": "1" * 40,
+                "final_bones": 1688,
+                "resolved_joints": 1688,
+                "response_preset_contract": "shared_response_v1",
+                "response_preset": "WEED",
+                "response_profile_applied": True,
+                "effective_is_enabled": True,
+            }
+        )
+        runner = self._runner_with_result(result)
+        with tempfile.TemporaryDirectory() as temporary:
+            wind_json = Path(temporary) / "wind.json"
+            wind_json.write_text(
+                json.dumps(
+                    {
+                        "WindResponsePresetContract": {
+                            "SchemaVersion": 1,
+                            "Preset": "WEED",
+                            "SimulationGroupBases": [],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "shared_provider_v1"):
+                runner._apply_dynamic_wind(
+                    {
+                        "wind_json": str(wind_json),
+                        "mesh_path": "/Game/Test/SK_Weed",
+                    }
+                )
+
+    def test_provider_checkout_preview_adds_exact_pcg_targets(self):
+        runner = load_runner()
+        checked_out = []
+        runner.unreal.EditorAssetLibrary = types.SimpleNamespace(
+            does_asset_exist=lambda _path: True
+        )
+        runner.unreal.EditorAssetSubsystem = object()
+        runner.unreal.get_editor_subsystem = lambda _kind: types.SimpleNamespace(
+            checkout_asset=lambda path: checked_out.append(path) or True
+        )
+        provider = "/Game/Codex/DynamicWind/DW_Vegetation_WindProvider.DW_Vegetation_WindProvider"
+        runner.unreal.CodexDynamicWindResponseLibrary = types.SimpleNamespace(
+            get_pcg_provider_binding_targets_for_mesh_path=lambda _path: json.dumps(
+                {
+                    "success": True,
+                    "contract": "shared_provider_v1",
+                    "provider": provider,
+                    "target_assets": ["/Game/PCG/DataBase/DA_Test_SK"],
+                }
+            )
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            wind_json = Path(temporary) / "wind.json"
+            wind_json.write_text(
+                json.dumps(
+                    {
+                        "WindResponsePresetContract": {
+                            "SchemaVersion": 1,
+                            "Preset": "WEED",
+                            "SimulationGroupBases": [],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            item = {
+                "wind_json": str(wind_json),
+                "mesh_path": "/Game/Test/SK_Weed",
+                "checkout_asset_paths": ["/Game/Test/SK_Weed"],
+            }
+            report = runner._checkout_existing_assets(item)
+
+        self.assertEqual(
+            checked_out,
+            ["/Game/Test/SK_Weed", "/Game/PCG/DataBase/DA_Test_SK"],
+        )
+        self.assertEqual(report["provider_binding"]["provider"], provider)
+        self.assertEqual(
+            item["_pcg_provider_binding_checkout"]["target_assets"],
+            ["/Game/PCG/DataBase/DA_Test_SK"],
+        )
+
+    def test_shared_response_contract_requires_importer_confirmation(self):
+        result = json.dumps(
+            {
+                "success": True,
+                "skeleton_contract": "final_skeleton_v2",
+                "skeleton_hash": "1" * 40,
+                "final_bones": 1688,
+                "resolved_joints": 1688,
+            }
+        )
+        runner = self._runner_with_result(result)
+        with tempfile.TemporaryDirectory() as temporary:
+            wind_json = Path(temporary) / "wind.json"
+            wind_json.write_text(
+                json.dumps(
+                    {
+                        "WindResponsePresetContract": {
+                            "SchemaVersion": 1,
+                            "Preset": "TREE",
+                            "SimulationGroupBases": [],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "shared_response_v1"):
+                runner._apply_dynamic_wind(
+                    {
+                        "wind_json": str(wind_json),
+                        "mesh_path": "/Game/Test/SK_Tree",
+                    }
+                )
+
     def test_normalized_cluster_prototype_skips_source_rig_wind(self):
         runner = load_runner()
         report = runner._apply_dynamic_wind(
@@ -1002,6 +1176,56 @@ def test_matching_terminal_fingerprint_is_not_reimported(tmp_path, monkeypatch):
     result = runner.run_manifest(manifest)
 
     assert result["items"]["cached"]["status"] == "imported_ok"
+
+
+class NaniteVoxelMaterialUsageTests(unittest.TestCase):
+    class FakeMaterial:
+        def __init__(self, values):
+            self.values = dict(values)
+
+        def get_path_name(self):
+            return "/Game/Material/M_TreeMaster.M_TreeMaster"
+
+        def get_editor_property(self, name):
+            return self.values[name]
+
+        def set_editor_property(self, name, value):
+            self.values[name] = value
+
+    def test_missing_voxel_usage_is_checked_out_and_set(self):
+        runner = load_runner()
+        material = self.FakeMaterial({
+            "used_with_skeletal_mesh": True,
+            "used_with_nanite": True,
+            "used_with_voxels": False,
+        })
+        checkouts = []
+        runner.unreal.EditorAssetSubsystem = object()
+        runner.unreal.get_editor_subsystem = lambda _type: types.SimpleNamespace(
+            checkout_asset=lambda path: checkouts.append(path) or True
+        )
+
+        result = runner._ensure_nanite_voxel_material_usage(material)
+
+        self.assertTrue(material.values["used_with_voxels"])
+        self.assertEqual(checkouts, [material.get_path_name()])
+        self.assertTrue(result["changed"])
+
+    def test_current_usage_is_read_only(self):
+        runner = load_runner()
+        material = self.FakeMaterial({
+            "used_with_skeletal_mesh": True,
+            "used_with_nanite": True,
+            "used_with_voxels": True,
+        })
+        runner.unreal.EditorAssetSubsystem = object()
+        runner.unreal.get_editor_subsystem = lambda _type: self.fail(
+            "current material must not be checked out"
+        )
+
+        result = runner._ensure_nanite_voxel_material_usage(material)
+
+        self.assertFalse(result["changed"])
 
 
 class UnrealIngestSaveTests(unittest.TestCase):

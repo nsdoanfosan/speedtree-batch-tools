@@ -5,7 +5,7 @@ import math
 import sys
 import tempfile
 import unittest
-from collections import namedtuple
+from collections import Counter, namedtuple
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -32,6 +32,8 @@ from cluster_assembly_builder import (  # noqa: E402
     scope_material_pipeline_for_destination,
     scope_material_pipeline_to_codex_tests,
     _attachment_vertex_correspondence,
+    _validate_base_export_parent_chain,
+    _attachment_point_correspondence,
     _assembly_fit_summary,
     _build_unreal_assembly_provenance_payload,
     _coalesce_normalized_external_parts,
@@ -46,6 +48,7 @@ from cluster_assembly_builder import (  # noqa: E402
     _strip_fbx_scene_textures,
     _validate_role_component_claims,
     _vertex_descriptors,
+    _weighted_vertex_attachment_tolerance,
     validate_binding_hierarchy,
     validate_manifest_artifacts,
     validate_normalized_prototype_unit_contract,
@@ -55,6 +58,47 @@ from cluster_assembly_builder import (  # noqa: E402
     validate_wind_json_against_skeleton,
     validate_persisted_residual_gate,
 )
+
+
+class WeightedVertexAttachmentToleranceTests(unittest.TestCase):
+    def test_large_tree_allows_one_percent_local_weight_lookup(self):
+        self.assertAlmostEqual(
+            _weighted_vertex_attachment_tolerance([1.2, 14.92359162, 0.8]),
+            0.1492359162,
+        )
+
+    def test_small_asset_keeps_one_centimeter_floor(self):
+        self.assertEqual(
+            _weighted_vertex_attachment_tolerance([0.2, 0.4, 0.1]),
+            0.01,
+        )
+
+
+class BaseExportParentChainTests(unittest.TestCase):
+    def test_accepts_complete_contiguous_full_export_parent_chain(self):
+        armature = SimpleNamespace(name="Root", parent=None)
+        first = SimpleNamespace(name="ExportRoot", parent=armature)
+        second = SimpleNamespace(name="MeshUnit", parent=first)
+        mesh = SimpleNamespace(name="NA_Base", parent=second)
+
+        self.assertIsNone(
+            _validate_base_export_parent_chain(
+                armature,
+                [first, second],
+                mesh,
+            )
+        )
+
+    def test_rejects_unselected_gap_in_export_parent_chain(self):
+        armature = SimpleNamespace(name="Root", parent=None)
+        missing = SimpleNamespace(name="MissingParent", parent=armature)
+        mesh = SimpleNamespace(name="NA_Base", parent=missing)
+
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "detached from its replicated Full export chain",
+        ):
+            _validate_base_export_parent_chain(armature, [], mesh)
 
 
 def seam_split_test_mesh(split_second_face=False):
@@ -147,6 +191,28 @@ def stacked_uv_test_mesh(*, identical_faces=False, reverse_polygons=False):
     )
 
 
+def edge_attachment_test_mesh(*, y_offset=0.0):
+    coordinates = [
+        (-1.0, y_offset, 0.0),
+        (1.0, y_offset, 0.0),
+        (0.0, y_offset + 1.0, 0.0),
+    ]
+    uvs = [(0.0, 0.0), (1.0, 0.0), (0.5, 1.0)]
+    return SimpleNamespace(
+        vertices=[SimpleNamespace(co=value) for value in coordinates],
+        polygons=[SimpleNamespace(
+            index=0,
+            vertices=(0, 1, 2),
+            loop_indices=(0, 1, 2),
+        )],
+        loops=[SimpleNamespace(vertex_index=index) for index in range(3)],
+        uv_layers=SimpleNamespace(active=SimpleNamespace(data=[
+            SimpleNamespace(uv=SimpleNamespace(x=uv[0], y=uv[1]))
+            for uv in uvs
+        ])),
+    )
+
+
 class ComponentTopologyTests(unittest.TestCase):
     def test_position_weld_preserves_card_topology_across_seam_split(self):
         source = seam_split_test_mesh(False)
@@ -203,6 +269,57 @@ class ComponentTopologyTests(unittest.TestCase):
             [1, 2],
         )
 
+    def test_touching_duplicate_edge_cards_recover_as_two_plan_instances(self):
+        source = seam_split_test_mesh(False)
+        source_component = _component_groups(source, [0, 1])[0]
+        target = seam_split_test_mesh(False)
+        vertex_offset = len(target.vertices)
+        loop_offset = len(target.loops)
+        target.vertices.extend([
+            SimpleNamespace(co=tuple(vertex.co))
+            for vertex in target.vertices[:vertex_offset]
+        ])
+        target.loops.extend([
+            SimpleNamespace(vertex_index=loop.vertex_index + vertex_offset)
+            for loop in target.loops[:loop_offset]
+        ])
+        target.uv_layers.active.data.extend([
+            SimpleNamespace(
+                uv=SimpleNamespace(x=row.uv.x, y=row.uv.y)
+            )
+            for row in target.uv_layers.active.data[:loop_offset]
+        ])
+        target.polygons.extend([
+            SimpleNamespace(
+                index=polygon.index + 2,
+                vertices=tuple(
+                    value + vertex_offset for value in polygon.vertices
+                ),
+                loop_indices=tuple(
+                    value + loop_offset for value in polygon.loop_indices
+                ),
+            )
+            for polygon in target.polygons[:2]
+        ])
+        welded = _component_groups(target, [0, 1, 2, 3])
+        self.assertEqual(len(welded), 1)
+        prototype = {
+            "object": SimpleNamespace(data=source),
+            "component": source_component,
+        }
+
+        matched, preserved = _partition_normalized_render_components(
+            {_component_signature(source, source_component): prototype},
+            target,
+            welded,
+        )
+
+        self.assertEqual(preserved, [])
+        self.assertEqual(
+            sum(len(row["instances"]) for row in matched.values()),
+            2,
+        )
+
     def test_unique_uv_face_subset_uses_the_normalized_prototype(self):
         source = seam_split_test_mesh(False)
         target = seam_split_test_mesh(True)
@@ -226,6 +343,140 @@ class ComponentTopologyTests(unittest.TestCase):
         )
         self.assertEqual(len(source_indices), 3)
         self.assertEqual(len(target_indices), 3)
+
+    def test_speedtree_boundary_clipping_accepts_unique_twenty_percent_subset(self):
+        source_component = object()
+        target_component = object()
+        prototype = {
+            "object": SimpleNamespace(data=object()),
+            "component": source_component,
+        }
+        source_faces = Counter({("face", index): 1 for index in range(100)})
+
+        def select_counter(_mesh, component):
+            if component is source_component:
+                return source_faces
+            return Counter({("face", index): 1 for index in range(84)})
+
+        with mock.patch(
+            "cluster_assembly_builder._component_signature",
+            return_value="target",
+        ), mock.patch(
+            "cluster_assembly_builder._component_uv_face_counter",
+            side_effect=select_counter,
+        ):
+            selected = _normalized_prototype_for_component(
+                {"source": prototype}, object(), target_component
+            )
+        self.assertIs(selected, prototype)
+
+        def reject_counter(_mesh, component):
+            if component is source_component:
+                return source_faces
+            return Counter({("face", index): 1 for index in range(79)})
+
+        with mock.patch(
+            "cluster_assembly_builder._component_signature",
+            return_value="target",
+        ), mock.patch(
+            "cluster_assembly_builder._component_uv_face_counter",
+            side_effect=reject_counter,
+        ):
+            rejected = _normalized_prototype_for_component(
+                {"source": prototype}, object(), target_component
+            )
+        self.assertIsNone(rejected)
+
+    def test_speedtree_two_sided_render_matches_clipped_normalized_prototype(self):
+        source_component = object()
+        target_component = object()
+        prototype = {
+            "object": SimpleNamespace(data=object()),
+            "component": source_component,
+        }
+        source_faces = Counter({("face", index): 1 for index in range(63)})
+        rendered_faces = Counter({("face", index): 2 for index in range(52)})
+
+        def select_counter(_mesh, component):
+            return source_faces if component is source_component else rendered_faces
+
+        with mock.patch(
+            "cluster_assembly_builder._component_signature",
+            return_value="target",
+        ), mock.patch(
+            "cluster_assembly_builder._component_uv_face_counter",
+            side_effect=select_counter,
+        ):
+            selected = _normalized_prototype_for_component(
+                {"source": prototype}, object(), target_component
+            )
+        self.assertIs(selected, prototype)
+
+    def test_speedtree_face_triplication_is_not_a_card_conversion(self):
+        source_component = object()
+        target_component = object()
+        prototype = {
+            "object": SimpleNamespace(data=object()),
+            "component": source_component,
+        }
+        source_faces = Counter({("face", index): 1 for index in range(63)})
+        rendered_faces = Counter({("face", index): 3 for index in range(52)})
+
+        def select_counter(_mesh, component):
+            return source_faces if component is source_component else rendered_faces
+
+        with mock.patch(
+            "cluster_assembly_builder._component_signature",
+            return_value="target",
+        ), mock.patch(
+            "cluster_assembly_builder._component_uv_face_counter",
+            side_effect=select_counter,
+        ):
+            selected = _normalized_prototype_for_component(
+                {"source": prototype}, object(), target_component
+            )
+        self.assertIsNone(selected)
+
+    def test_two_sided_render_keeps_uv_vertex_correspondence(self):
+        source = seam_split_test_mesh(False)
+        target = seam_split_test_mesh(False)
+        originals = list(target.polygons)
+        for polygon in originals:
+            duplicated_loops = []
+            for loop_index in polygon.loop_indices:
+                source_loop = target.loops[loop_index]
+                source_uv = target.uv_layers.active.data[loop_index].uv
+                duplicated_loops.append(len(target.loops))
+                target.loops.append(SimpleNamespace(
+                    vertex_index=source_loop.vertex_index
+                ))
+                target.uv_layers.active.data.append(SimpleNamespace(
+                    uv=SimpleNamespace(x=source_uv.x, y=source_uv.y)
+                ))
+            target.polygons.append(SimpleNamespace(
+                index=len(target.polygons),
+                vertices=tuple(polygon.vertices),
+                loop_indices=tuple(duplicated_loops),
+            ))
+        source_component = _component_groups(source, [0, 1])[0]
+        target_component = _component_groups(target, [0, 1, 2, 3])[0]
+        prototype = {
+            "object": SimpleNamespace(data=source),
+            "component": source_component,
+        }
+
+        selected = _normalized_prototype_for_component(
+            {"source": prototype}, target, target_component
+        )
+        self.assertIs(selected, prototype)
+        source_indices, target_indices = _ordered_cross_object_correspondence(
+            SimpleNamespace(data=source),
+            source_component,
+            SimpleNamespace(data=target),
+            target_component,
+        )
+        self.assertEqual(len(source_indices), len(target_indices))
+        self.assertGreaterEqual(len(source_indices), 3)
 
     def test_duplicate_uv_uses_topology_not_first_vertex_iteration_order(self):
         target = stacked_uv_test_mesh()
@@ -341,6 +592,81 @@ class ComponentTopologyTests(unittest.TestCase):
                 SimpleNamespace(data=target),
                 target_component,
                 [0.0, 0.0],
+            )
+
+    def test_fbx_float_noise_keeps_one_attachment_correspondence(self):
+        source = seam_split_test_mesh(False)
+        target = seam_split_test_mesh(True)
+        for mesh in (source, target):
+            for vertex in mesh.vertices:
+                vertex.co = tuple(float(value) * 0.01 for value in vertex.co)
+        # One float32-scale round trip at meter-space coordinates can split a
+        # seam vertex by ~1e-7 m.  It remains the same authored attachment.
+        target.vertices[4].co = (1.2e-7, 0.0, 0.0)
+        source_component = _component_groups(source, [0, 1])[0]
+        target_component = {
+            "vertices": list(range(len(target.vertices))),
+            "polygons": [0, 1],
+        }
+
+        attachment = _attachment_point_correspondence(
+            SimpleNamespace(data=source),
+            source_component,
+            SimpleNamespace(data=target),
+            target_component,
+            [0.0, 0.0],
+        )
+        source_indices, target_indices = _ordered_cross_object_correspondence(
+            SimpleNamespace(data=source),
+            source_component,
+            SimpleNamespace(data=target),
+            target_component,
+        )
+
+        self.assertEqual(attachment["source_index"], 0)
+        self.assertEqual(attachment["target_index"], 0)
+        self.assertEqual(len(source_indices), len(target_indices))
+        self.assertGreaterEqual(len(source_indices), 3)
+
+    def test_loose_attachment_vertex_recovers_from_matching_uv_edges(self):
+        source = edge_attachment_test_mesh()
+        target = edge_attachment_test_mesh(y_offset=5.0)
+        source_component = _component_groups(source, [0])[0]
+        target_component = _component_groups(target, [0])[0]
+
+        result = _attachment_point_correspondence(
+            SimpleNamespace(data=source),
+            source_component,
+            SimpleNamespace(data=target),
+            target_component,
+            [0.5, 0.0],
+        )
+
+        self.assertIsNone(result["source_index"])
+        self.assertIsNone(result["target_index"])
+        self.assertEqual(result["source_coordinate"], (0.0, 0.0, 0.0))
+        self.assertEqual(result["target_coordinate"], (0.0, 5.0, 0.0))
+        self.assertEqual(
+            result["evidence"]["policy"],
+            "normalized_origin_uv_edge_interpolation_v1",
+        )
+
+    def test_uv_edge_fallback_rejects_a_non_origin_source_point(self):
+        source = edge_attachment_test_mesh(y_offset=1.0)
+        target = edge_attachment_test_mesh(y_offset=5.0)
+        source_component = _component_groups(source, [0])[0]
+        target_component = _component_groups(target, [0])[0]
+
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "does not resolve to the normalized source origin",
+        ):
+            _attachment_point_correspondence(
+                SimpleNamespace(data=source),
+                source_component,
+                SimpleNamespace(data=target),
+                target_component,
+                [0.5, 0.0],
             )
 
 
@@ -800,91 +1126,42 @@ class ContentDecisionTests(unittest.TestCase):
         ):
             _validate_role_component_claims(role_build_plans)
 
-    def test_topology_fallback_zero_match_fails_before_publishing_outputs(self):
-        handoff = ready_handoff()
-        for role in handoff["assembly"]["part_builder_inputs"]:
-            role["assignments"][0]["used_polygon_count"] = 1
-        merged = SimpleNamespace(
-            type="MESH",
-            data=SimpleNamespace(
-                materials=[
-                    SimpleNamespace(name="M_branch_elm_01"),
-                    SimpleNamespace(name="M_Bark_elm_01"),
-                ],
-                polygons=[
-                    SimpleNamespace(index=0, material_index=0),
-                    SimpleNamespace(index=1, material_index=1),
-                ],
-            ),
-        )
-        fake_bpy = SimpleNamespace(
-            context=SimpleNamespace(
-                scene=SimpleNamespace(
-                    unit_settings=SimpleNamespace(
-                        system="METRIC",
-                        scale_length=1.0,
-                    )
-                )
-            ),
-            data=SimpleNamespace(
-                objects={},
-                armatures={},
-                meshes={},
-            ),
-        )
+    def test_unmatched_provider_topology_stays_in_base_when_other_part_matches(self):
+        preserved = {
+            "topology_signature": "rendered-only",
+            "instance_count": 3,
+            "polygon_count": 104,
+        }
+        role_build_plans = {
+            "branch:branch_elm_01": {
+                "matched": {
+                    "branch_signature": {
+                        "instances": [{"polygons": [4, 5]}],
+                    }
+                },
+                "preserved": [],
+            },
+            "leaf:cluster_elm_07": {
+                "matched": {},
+                "preserved": [preserved],
+            },
+        }
 
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            full = root / "SK_tree_elm_01.fbx"
-            full.write_bytes(b"full")
-            output = root / "assembly"
-            partition_results = [
-                (
-                    {
-                        "branch_signature": {
-                            "prototype": {},
-                            "instances": [{"polygons": [0]}],
-                        }
-                    },
-                    [],
-                ),
-                ({}, [{"polygons": [1]}]),
-            ]
+        claimed = _validate_role_component_claims(role_build_plans)
 
-            with mock.patch.dict(sys.modules, {"bpy": fake_bpy}), \
-                    mock.patch(
-                        "cluster_assembly_builder.snapshot_blender_armature",
-                        return_value=skeleton_snapshot(),
-                    ), mock.patch(
-                        "cluster_assembly_builder.validate_file_fingerprint",
-                        return_value={},
-                    ), mock.patch(
-                        "cluster_assembly_builder._import_normalized_plan_prototypes",
-                        return_value=([{}], []),
-                    ), mock.patch(
-                        "cluster_assembly_builder._component_groups",
-                        side_effect=lambda _mesh, polygons: [
-                            {"polygons": list(polygons)}
-                        ],
-                    ), mock.patch(
-                        "cluster_assembly_builder._partition_normalized_render_components",
-                        side_effect=partition_results,
-                    ):
-                with self.assertRaisesRegex(
-                    ClusterAssemblyBuildError,
-                    "matched zero normalized prototype components: leaf",
-                ):
-                    build_blender_assembly_inputs(
-                        handoff,
-                        SimpleNamespace(),
-                        merged,
-                        output,
-                        full,
-                        root / "wind.json",
-                    )
+        self.assertEqual(set(claimed), {(id(None), 4), (id(None), 5)})
 
-            self.assertFalse(output.exists())
-            self.assertFalse(list(root.glob("**/*cluster_assembly_bindings.json")))
+    def test_zero_match_without_preserved_geometry_still_fails(self):
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "matched zero normalized prototype components: leaf",
+        ):
+            _validate_role_component_claims({
+                "leaf": {
+                    "matched": {},
+                    "preserved": [],
+                },
+            })
 
     def test_ready_is_automatic_content_driven_build(self):
         self.assertEqual(content_build_decision(ready_handoff()), "build")
@@ -1030,6 +1307,91 @@ class PhysicalProductionContractTests(unittest.TestCase):
         )
         self.assertEqual(report["instance_fit"], "uniform_similarity_3d")
         self.assertFalse(report["role_specific_scale_patch"])
+
+    def test_same_role_providers_keep_independent_variant_ordinals(self):
+        manifest = physical_production_manifest()
+        for row in manifest["parts"]:
+            if row["role"] == "branch":
+                row["provider_key"] = "branch:provider_a"
+        for row in manifest["registered_variants"]:
+            if row["role"] == "branch":
+                row["provider_key"] = "branch:provider_a"
+
+        source_receipt = next(
+            row["receipt"]
+            for row in manifest["normalized_variant_receipts"]
+            if row["role"] == "branch"
+        )
+        second_receipt = json.loads(json.dumps(source_receipt))
+        second_asset = "SK_branch_sample_02_01"
+        second_card = "branch_sample_02_01"
+        second_receipt["prototypes"] = [
+            second_receipt["prototypes"][0]
+        ]
+        second_receipt["prototypes"][0]["skeletal_asset"] = second_asset
+        second_receipt["variants"] = [second_receipt["variants"][0]]
+        second_receipt["variants"][0]["skeletal_asset"] = second_asset
+        second_receipt["variants"][0]["plan"] = second_card
+        capture = second_receipt["physical_capture_contract"]
+        capture["attachment_pivots"] = [capture["attachment_pivots"][0]]
+        capture["attachment_pivots"][0]["prototype_asset"] = second_asset
+        capture_payload = {
+            key: value
+            for key, value in capture.items()
+            if key != "contract_sha256"
+        }
+        capture["contract_sha256"] = __import__("hashlib").sha256(
+            json.dumps(
+                capture_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        second_receipt["physical_capture_contract_sha256"] = capture[
+            "contract_sha256"
+        ]
+        manifest["normalized_variant_receipts"].append({
+            "role": "branch",
+            "provider_key": "branch:provider_b",
+            "receipt": second_receipt,
+        })
+
+        second_part = json.loads(json.dumps(next(
+            row
+            for row in manifest["parts"]
+            if row["role"] == "branch"
+            and row["logical_subpart_index"] == 1
+        )))
+        second_part.update({
+            "provider_key": "branch:provider_b",
+            "prototype_id": "branch_provider_b_normalized_01",
+            "asset_name": second_asset,
+        })
+        manifest["parts"].append(second_part)
+        second_variant = json.loads(json.dumps(next(
+            row
+            for row in manifest["registered_variants"]
+            if row["role"] == "branch" and row["ordinal"] == 1
+        )))
+        second_variant.update({
+            "provider_key": "branch:provider_b",
+            "card_name": second_card,
+            "skeletal_asset_name": second_asset,
+        })
+        manifest["registered_variants"].append(second_variant)
+
+        report = validate_normalized_prototype_unit_contract(manifest)
+
+        self.assertEqual(report["roles"]["branch"], 3)
+        self.assertEqual(
+            report["provider_ordinals"]["branch:provider_a"],
+            [1, 2],
+        )
+        self.assertEqual(
+            report["provider_ordinals"]["branch:provider_b"],
+            [1],
+        )
 
     def test_registered_variants_must_be_unique_and_exactly_match_parts(self):
         manifest = physical_production_manifest()
@@ -1760,7 +2122,7 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
         self.assertEqual(set(stripped.templates), {b"Material"})
         self.assertEqual(stripped.connections, [(b"OP", 50, 60, b"DiffuseColor")])
 
-    def test_assembly_fbx_uses_the_full_sk_stock_export_contract(self):
+    def test_assembly_fbx_preserves_geometry_with_send2ue_unreal_axes(self):
         class DummyObject:
             mode = "OBJECT"
             hide_viewport = False
@@ -2423,6 +2785,38 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(ClusterAssemblyBuildError, "Y/Z-swapped"):
             validate_unreal_bounds_contract(full, sideways_base)
+
+    def test_normalized_replacement_base_defers_shape_axis_inference(self):
+        full = {
+            "origin": [0.0, 0.0, 0.0],
+            "size": [744.7081298828125, 643.5247802734375, 779.087890625],
+        }
+        replacement_only_base = {
+            "origin": [0.0, 0.0, 0.0],
+            "size": [581.3819580078125, 639.5263671875, 460.2229919433594],
+        }
+
+        with self.assertRaisesRegex(ClusterAssemblyBuildError, "Y/Z-swapped"):
+            validate_unreal_bounds_contract(full, replacement_only_base)
+
+        pending = validate_unreal_bounds_contract(
+            full,
+            replacement_only_base,
+            allow_normalized_prototype_dominance=True,
+        )
+        self.assertEqual(pending["status"], "base_axis_ok")
+        self.assertEqual(
+            pending["base_axis_shape_validation"],
+            "deferred_to_final_assembly",
+        )
+
+        complete = validate_unreal_bounds_contract(
+            full,
+            replacement_only_base,
+            full,
+            allow_normalized_prototype_dominance=True,
+        )
+        self.assertEqual(complete["status"], "complete")
 
     def test_bounds_gate_reports_observed_100x_error_as_absolute_unit_mismatch(self):
         full = {

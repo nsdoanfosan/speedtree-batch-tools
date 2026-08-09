@@ -2,7 +2,7 @@
 
 Run:
   blender.exe -b --python bwr_headless_job.py -- --spm X.spm --blend X.blend
-      --wind TREE|BUSH|GRASS|NONE --material-contract preflight.json
+      --wind TREE|BUSH|WEED|NONE --material-contract preflight.json
       --report result.json
 
 Runs with --factory-startup and enables only the junction-installed
@@ -77,6 +77,7 @@ from cluster_bark_source_resolution import (
     ClusterBarkSourceResolutionError,
     load_current_isolated_bark_manifest,
 )
+from blender_addon_gateway import prepare_runtime
 
 
 VERTEX_COLOR_ISSUE_TEXT = {
@@ -100,7 +101,12 @@ def parse_args():
     parser.add_argument("--spm", required=True)
     parser.add_argument("--speedtree-spm", default="")
     parser.add_argument("--blend", required=True)
-    parser.add_argument("--wind", default="GRASS", choices=["TREE", "BUSH", "GRASS", "NONE"])
+    parser.add_argument(
+        "--wind",
+        default="WEED",
+        choices=["TREE", "BUSH", "WEED", "NONE", "GRASS"],
+        help="Immutable response preset ID (legacy GRASS is accepted as WEED)",
+    )
     parser.add_argument("--material-contract", required=True)
     parser.add_argument("--bark-normalization-manifest", default="")
     parser.add_argument("--cluster-source-build-only", action="store_true")
@@ -469,25 +475,35 @@ def main():
                 "speedtree_pipeline_contract"
             ]
             report["speedtree_pipeline_contract_required"] = True
-        import addon_utils
-
-        _default_enabled, loaded = addon_utils.check("speedtree_bone_weight_repair")
-        if not loaded:
-            addon_utils.enable(
-                "speedtree_bone_weight_repair",
-                default_set=False,
-                persistent=False,
-            )
-        _default_enabled, loaded = addon_utils.check("speedtree_bone_weight_repair")
-        if not loaded:
-            raise RuntimeError("speedtree_bone_weight_repair add-on enable failed")
+        addon_runtime = prepare_runtime(
+            "sk_batch.jobs.bwr_headless_job",
+            {
+                "speedtree_bone_weight_repair": (
+                    "spm_sk_preflight_v1",
+                    "speedtree_export_v1",
+                    "repair_pipeline_v1",
+                    "atlas_manifest_consumer_v1",
+                ),
+            },
+        )
+        report["blender_addon_runtime"] = addon_runtime.receipt
+        require_spm_sk_ready = addon_runtime.operation(
+            "speedtree_bone_weight_repair",
+            "require_spm_sk_ready",
+        )
+        run_speedtree_cli_export = addon_runtime.operation(
+            "speedtree_bone_weight_repair",
+            "run_speedtree_cli_export",
+        )
+        run_import_and_repair = addon_runtime.operation(
+            "speedtree_bone_weight_repair",
+            "run_import_and_repair",
+        )
 
         # Reject authored-but-disabled Branch skeletons before creating an
         # empty .blend. BranchMesh-only assets remain valid and use the rigid
         # one-bone fallback inside the add-on.
         if not args.manual_bones_locked:
-            from speedtree_bone_weight_repair.core import require_spm_sk_ready
-
             require_spm_sk_ready(str(speedtree_spm))
 
         blend_path = os.path.abspath(args.blend)
@@ -533,17 +549,9 @@ def main():
             if args.material_contract
             else ""
         )
-        if args.wind == "NONE":
-            # Dead vegetation: keep the JSON contract but zero all sway.
-            # flexibility=0.0 makes the add-on emit all-zero non-trunk groups
-            # and bIsEnabled=false (trunk groups would still rock in Unreal's
-            # shader regardless of influence, so the add-on avoids them).
-            settings.wind_preset = "CUSTOM"
-            settings.dynamic_wind_flexibility = 0.0
-            settings.dynamic_wind_gust_attenuation = 0.0
-            settings.dynamic_wind_ground_cover = False
-        else:
-            settings.wind_preset = args.wind
+        # The batch owns only the immutable category assignment. Numeric
+        # response values are shared per preset and edited centrally in Unreal.
+        settings.wind_preset = "WEED" if args.wind == "GRASS" else args.wind
         settings.write_unreal_json = True
         settings.write_dynamic_wind_json = True
         is_cluster_source = is_cluster_normalization_spm(canonical_spm)
@@ -577,17 +585,15 @@ def main():
         # export and the repaired Blender output.  Cluster pairs deliberately
         # have two identities, so perform those two existing core stages with
         # explicit stems instead of deriving one by removing ``SK_``.
-        from speedtree_bone_weight_repair import core as bwr_core
-
         report["atlas_manifest_resolution"] = (
             install_bwr_atlas_manifest_resolver(
-                bwr_core,
+                addon_runtime,
                 speedtree_spm,
             )
         )
 
         export_settings = settings.as_dict()
-        speedtree_export = bwr_core.run_speedtree_cli_export(
+        speedtree_export = run_speedtree_cli_export(
             str(speedtree_spm),
             speedtree_exe_path=export_settings["speedtree_exe_path"],
             export_options_path=export_settings["speedtree_export_options_path"],
@@ -667,7 +673,7 @@ def main():
             if source_spm_path == speedtree_spm:
                 assembly_source_export = speedtree_export
             else:
-                assembly_source_export = bwr_core.run_speedtree_cli_export(
+                assembly_source_export = run_speedtree_cli_export(
                     str(source_spm_path),
                     speedtree_exe_path=export_settings[
                         "speedtree_exe_path"
@@ -808,7 +814,7 @@ def main():
                 bpy.data,
                 canonical_spm.stem,
             )
-        result = bwr_core.run_import_and_repair(repair_settings)
+        result = run_import_and_repair(repair_settings)
         try:
             unassigned_geometry_cleanup = (
                 validate_unassigned_geometry_cleanup_evidence(

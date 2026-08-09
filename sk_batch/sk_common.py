@@ -42,13 +42,19 @@ from process_lifecycle import (
     owned_popen,
     terminate_owned_process,
 )
+from blender_addon_contract import discover_installed_addon_source
 
 
 def _default_addon_dir():
-    """Locate the separately checked-out Blender add-on repository."""
+    """Use the same BWR source that the newest Blender install will load."""
     override = os.environ.get("SPEEDTREE_BWR_ADDON_DIR")
     if override:
         return Path(override).expanduser()
+    installed = discover_installed_addon_source(
+        "speedtree_bone_weight_repair"
+    )
+    if installed is not None:
+        return installed
     return (
         REPO_ROOT.parent
         / "speedtree-bone-weight-repair-addon"
@@ -1223,8 +1229,17 @@ def prepare_cluster_spm_pair_for_job(spm_path):
     )
 
 
-# Wind preset from the file name (checklist item 4). Dead vegetation must not
-# sway at all, so it wins over every other token.
+# Wind preset from the file name (checklist item 4). Dead vegetation maps to
+# the shared NONE response slot, whose default values are zero.
+def normalize_wind_override(value):
+    normalized = str(value or "auto").strip().upper()
+    if normalized == "AUTO":
+        return "auto"
+    if normalized == "GRASS":
+        return "WEED"
+    return normalized if normalized in {"TREE", "BUSH", "WEED", "NONE"} else "auto"
+
+
 def wind_preset_for(stem):
     s = stem.lower()
     if "deadleave" in s or "deadbranch" in s:
@@ -1234,8 +1249,8 @@ def wind_preset_for(stem):
     if "bush" in s:
         return "BUSH"
     if "weed" in s or "grass" in s:
-        return "GRASS"
-    return "GRASS"
+        return "WEED"
+    return "WEED"
 
 
 def wind_preset_for_spm(spm_path):

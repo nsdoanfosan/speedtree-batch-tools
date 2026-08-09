@@ -7133,10 +7133,6 @@ class App:
                 "현재 작업이 끝난 뒤 전체 재추출을 다시 누르세요."
             )
             return
-        if not self._require_live_mutation_items(
-            list((self.report or {}).get("items") or ())
-        ):
-            return
         if not messagebox.askyesno(
             "③ 전체 다시 뽑기",
             (
@@ -7185,13 +7181,72 @@ class App:
                 )
             )
             plan = self._build_step3_force_execution_plan()
-            self._validate_step3_plan_live_evidence(plan)
+            self._seal_step3_force_execution_plan(plan)
         except Exception as exc:
             error = exc
         self._ui(
             lambda result=plan, failure=error, claimed=lease:
             self._step3_planning_done(result, failure, claimed)
         )
+
+    def _seal_step3_force_execution_plan(self, plan):
+        """Seal only the concrete render inputs for a manual full rerender.
+
+        The normal Step 3 path re-audits every affected folder and requires
+        the newly derived semantic report to be byte-for-byte equivalent to
+        the report currently displayed by the GUI.  That is appropriate for
+        SPM normalization, but it made the explicit "전체 다시 뽑기" action
+        fail before sbsrender was launched whenever unrelated audit evidence
+        changed.  A manual full rerender is already rebuilt from the current
+        board after its shared-queue turn, so seal its concrete SBS/bitmap,
+        output, configuration, and tool inputs directly without the redundant
+        affected-folder semantic gate.
+        """
+        plan["pending_manifest_rows"] = list(
+            (plan or {}).get("pending_manifest_rows")
+            or getattr(self, "_pending_step3_manifest_rows", [])
+            or []
+        )
+        baseline = seal_exact_mutation_baseline(
+            [],
+            action="step3_texture_force",
+            plan_payload=step3_exact_plan_payload(plan),
+            authority_units=step3_authority_units(plan),
+            config_projection=mutation_config_projection(
+                self.cfg,
+                (
+                    "designer_dir",
+                    "cluster_sbsar",
+                    "cluster_sbsar_normal_behavior",
+                    "sbsrender_timeout",
+                    "tree_root",
+                    "unreal_texture_sync_enabled",
+                    "unreal_project",
+                    "unreal_editor_cmd",
+                    "unreal_texture_destination",
+                    "unreal_texture_sync_timeout",
+                ),
+            ),
+            tool_paths=[
+                Path(self.cfg.get("designer_dir") or "") / "sbsrender.exe",
+                Path(self.cfg.get("designer_dir") or "") / "sbscooker.exe",
+                self.cfg.get("cluster_sbsar"),
+                self.cfg.get("unreal_editor_cmd"),
+                mutation_source_path(run_texture_job),
+                mutation_source_path(normalize_spms_transactionally),
+                mutation_source_path(sync_texture_files),
+            ],
+            receipt_path=(
+                REPORT_DIR
+                / (
+                    "mutation_authority_step3_texture_force_"
+                    + datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                    + ".json"
+                )
+            ),
+        )
+        plan["_exact_mutation_baseline"] = baseline
+        return baseline
 
     def _validate_step3_plan_live_evidence(self, plan):
         plan["pending_manifest_rows"] = list(

@@ -58,6 +58,17 @@ MANIFEST_KIND = "sk_batch_cluster_nanite_assembly_inputs"
 PLACEMENT_CONTRACT_VERSION = 1
 MAX_ASSEMBLY_RESIDUAL_RELATIVE_RMS = 1.0e-2
 MAX_ASSEMBLY_PIVOT_ERROR_METERS = 1.0e-8
+MAX_NORMALIZED_PLAN_FACE_LOSS_RATIO = 0.20
+MAX_SPEEDTREE_RENDER_FACE_MULTIPLICITY = 2
+MAX_WEIGHT_BINDING_DISTANCE_SPAN_RATIO = 1.0e-2
+MIN_WEIGHT_BINDING_DISTANCE_METERS = 1.0e-2
+# Blender stores imported FBX coordinates as 32-bit floats.  At the meter-scale
+# positions used by this pipeline, one exporter round-trip can separate an
+# authored coincident vertex by roughly 1e-7 m.  Every topology/correspondence
+# stage must share the same floor; deriving a smaller tolerance from one tiny
+# card after the role-level weld makes the same vertex coincident in one stage
+# and ambiguous in the next.
+MIN_FBX_COORDINATE_TOLERANCE_METERS = 1.0e-6
 PASS_THROUGH_PROVENANCE_SCHEMA_VERSION = 1
 PASS_THROUGH_PROVENANCE_REASON = (
     "selected_target_contract_handoff_pass_through"
@@ -94,6 +105,7 @@ def _coalesce_normalized_external_parts(parts):
             passthrough.append(part)
             continue
         role = str(part.get("role") or "").casefold()
+        provider_key = str(part.get("provider_key") or role).casefold()
         asset_name = str(part.get("asset_name") or "")
         relative_folder = str(
             external.get("unreal_relative_folder") or ""
@@ -102,7 +114,12 @@ def _coalesce_normalized_external_parts(parts):
             raise ClusterAssemblyBuildError(
                 "normalized external part cannot be logically grouped"
             )
-        key = (role, relative_folder.casefold(), asset_name.casefold())
+        key = (
+            role,
+            provider_key,
+            relative_folder.casefold(),
+            asset_name.casefold(),
+        )
         incoming_bindings = list(part.get("bindings") or [])
         accumulator = grouped.get(key)
         if accumulator is None:
@@ -135,7 +152,12 @@ def _coalesce_normalized_external_parts(parts):
         accumulator["bindings"].extend(incoming_bindings)
 
     collapsed = []
-    for (role, relative_folder, asset_name), part in grouped.items():
+    for (
+        role,
+        _provider_key,
+        relative_folder,
+        asset_name,
+    ), part in grouped.items():
         external = part["external_source"]
         ordinals = sorted({
             int(value)
@@ -1124,13 +1146,11 @@ def _validate_capture_receipt(contract, role):
         )
     plane = str(frame.get("plane") or "").upper()
     rotation = float(frame.get("rotation_degrees", math.nan))
-    expected_rotation = 90.0 if role == "leaf_side" else 0.0
+    expected_rotation = 0.0 if plane == "XY" else 90.0
     if (
         plane not in {"XY", "XZ", "YZ"}
         or not math.isfinite(rotation)
         or abs(rotation - expected_rotation) > 1.0e-6
-        or (role == "leaf_side" and plane == "XY")
-        or (role != "leaf_side" and plane != "XY")
     ):
         raise ClusterAssemblyBuildError(
             f"{role} physical capture plane/rotation is invalid"
@@ -1433,15 +1453,18 @@ def validate_normalized_prototype_unit_contract(manifest):
     prototype_ids = set()
     asset_names = set()
     role_ordinals = defaultdict(list)
+    provider_role_ordinals = defaultdict(list)
     for part in parts:
         role = str(part.get("role") or "").casefold()
+        provider_key = str(part.get("provider_key") or role).casefold()
         ordinal = _part_ordinal(part)
         prototype_id = str(part.get("prototype_id") or "")
         asset_name = str(part.get("asset_name") or "")
         external = part.get("external_source") or {}
-        key = (role, ordinal)
+        key = (provider_key, role, ordinal)
         if (
             role not in ROLE_ORDER
+            or not provider_key
             or ordinal <= 0
             or not prototype_id
             or not asset_name
@@ -1563,17 +1586,26 @@ def validate_normalized_prototype_unit_contract(manifest):
         prototype_ids.add(prototype_id)
         asset_names.add(asset_name.casefold())
         role_ordinals[role].append(ordinal)
+        provider_role_ordinals[(provider_key, role)].append(ordinal)
 
     variant_rows = {}
     instanced_variant_rows = {}
     for variant in variants:
         role = str(variant.get("role") or "").casefold()
+        provider_key = str(
+            variant.get("provider_key") or role
+        ).casefold()
         try:
             ordinal = int(variant.get("ordinal") or 0)
         except (TypeError, ValueError):
             ordinal = 0
-        key = (role, ordinal)
-        if role not in ROLE_ORDER or ordinal <= 0 or key in variant_rows:
+        key = (provider_key, role, ordinal)
+        if (
+            role not in ROLE_ORDER
+            or not provider_key
+            or ordinal <= 0
+            or key in variant_rows
+        ):
             raise ClusterAssemblyBuildError(
                 "registered normalized variant is invalid or duplicated"
             )
@@ -1626,38 +1658,59 @@ def validate_normalized_prototype_unit_contract(manifest):
     for role, receipt in receipts["normalized"]:
         if role in role_ordinals:
             normalized_by_role[role].append(receipt)
-    capture_by_role = defaultdict(list)
-    for role, receipt in receipts["capture"]:
-        if role in role_ordinals:
-            capture_by_role[role].append(receipt)
     if set(normalized_by_role) != set(role_ordinals):
         raise ClusterAssemblyBuildError(
             "every normalized prototype role requires a production normalization receipt"
         )
-    if set(capture_by_role) != set(role_ordinals):
-        raise ClusterAssemblyBuildError(
-            "every normalized prototype role requires a direct-capture receipt"
-        )
 
     capture_reports = {}
     receipt_variant_rows = {}
-    for role in role_ordinals:
-        normalized_receipts = {
+    available_receipts_by_role = {
+        role: {
             _canonical_json(value): value
             for value in normalized_by_role[role]
         }
-        capture_receipts = {
-            _canonical_json(value): value
-            for value in capture_by_role[role]
-        }
-        if len(normalized_receipts) != 1 or len(capture_receipts) != 1:
-            raise ClusterAssemblyBuildError(
-                f"{role} has ambiguous production normalization/capture receipts"
+        for role in role_ordinals
+    }
+    used_receipts_by_role = defaultdict(set)
+    for provider_role, ordinals in sorted(provider_role_ordinals.items()):
+        provider_key, role = provider_role
+        expected_assets = {
+            str(variant.get("skeletal_asset_name") or "")
+            for (
+                variant_provider,
+                variant_role,
+                _ordinal,
+            ), variant in variant_rows.items()
+            if (
+                variant_provider == provider_key
+                and variant_role == role
             )
-        normalized = next(iter(normalized_receipts.values()))
-        capture = next(iter(capture_receipts.values()))
+        }
+        normalized_matches = []
+        for receipt_hash, candidate in (
+            available_receipts_by_role[role].items()
+        ):
+            candidate_assets = {
+                str(row.get("skeletal_asset") or "")
+                for row in candidate.get("prototypes") or []
+                if isinstance(row, dict)
+            }
+            if candidate_assets == expected_assets:
+                normalized_matches.append((receipt_hash, candidate))
+        if len(normalized_matches) != 1:
+            raise ClusterAssemblyBuildError(
+                f"{provider_key} has ambiguous production normalization receipts"
+            )
+        receipt_hash, normalized = normalized_matches[0]
+        if receipt_hash in used_receipts_by_role[role]:
+            raise ClusterAssemblyBuildError(
+                f"{provider_key} reuses another provider's normalization receipt"
+            )
+        used_receipts_by_role[role].add(receipt_hash)
+        capture = normalized.get("physical_capture_contract") or {}
         capture_report = _validate_capture_receipt(capture, role)
-        capture_reports[role] = capture_report
+        capture_reports[provider_role] = capture_report
         if (
             normalized.get("direct_uv_source") != _DIRECT_CAPTURE_UV_SOURCE
             or normalized.get("size_policy")
@@ -1673,11 +1726,6 @@ def validate_normalized_prototype_unit_contract(manifest):
                 f"{role} normalization receipt is not the physical direct-capture contract"
             )
 
-        expected_assets = {
-            str(variant.get("skeletal_asset_name") or "")
-            for (variant_role, _ordinal), variant in variant_rows.items()
-            if variant_role == role
-        }
         receipt_prototypes = normalized.get("prototypes") or []
         receipt_assets = {
             str(row.get("skeletal_asset") or "")
@@ -1695,10 +1743,11 @@ def validate_normalized_prototype_unit_contract(manifest):
             or receipt_assets != expected_assets
             or len(pivot_rows) != len(expected_assets)
             or pivot_assets != expected_assets
-        ):
-            raise ClusterAssemblyBuildError(
-                f"{role} normalized prototype receipts do not match native prototype specs"
-            )
+            ):
+                raise ClusterAssemblyBuildError(
+                    f"{provider_key} normalized prototype receipts do not "
+                    "match native prototype specs"
+                )
         for pivot in pivot_rows:
             local = pivot.get("normalized_local")
             if (
@@ -1707,7 +1756,7 @@ def validate_normalized_prototype_unit_contract(manifest):
                 or max(abs(float(value)) for value in local) > 1.0e-8
             ):
                 raise ClusterAssemblyBuildError(
-                    f"{role} attachment pivot is not baked to (0,0,0)"
+                    f"{provider_key} attachment pivot is not baked to (0,0,0)"
                 )
         target_units = capture_report["target_blender_units"]
         bounds_tolerance = max(max(target_units) * 1.0e-6, 1.0e-9)
@@ -1724,7 +1773,8 @@ def validate_normalized_prototype_unit_contract(manifest):
                 or float(size[1]) > target_units[1] + bounds_tolerance
             ):
                 raise ClusterAssemblyBuildError(
-                    f"{role} prototype physical bounds exceed the declared 0.1m capture contract"
+                    f"{provider_key} prototype physical bounds exceed the "
+                    "declared 0.1m capture contract"
                 )
 
         for receipt_variant in normalized.get("variants") or []:
@@ -1736,7 +1786,7 @@ def validate_normalized_prototype_unit_contract(manifest):
                 )
             except (TypeError, ValueError):
                 ordinal = 0
-            key = (role, ordinal)
+            key = (provider_key, role, ordinal)
             transfer = receipt_variant.get("plan_uv_transfer") or {}
             try:
                 attachment_index = int(
@@ -1762,13 +1812,19 @@ def validate_normalized_prototype_unit_contract(manifest):
                 or any(not math.isfinite(value) for value in attachment_uv)
             ):
                 raise ClusterAssemblyBuildError(
-                    f"{role} normalized variant direct-capture evidence is invalid"
+                    f"{provider_key} normalized variant direct-capture "
+                    "evidence is invalid"
                 )
             receipt_variant_rows[key] = receipt_variant
+    for role, available in available_receipts_by_role.items():
+        if used_receipts_by_role[role] != set(available):
+            raise ClusterAssemblyBuildError(
+                f"{role} normalization receipts do not map one-to-one to providers"
+            )
     relevant_variant_rows = {
         key: variant
         for key, variant in variant_rows.items()
-        if key[0] in role_ordinals
+        if (key[0], key[1]) in provider_role_ordinals
     }
     if set(receipt_variant_rows) != set(relevant_variant_rows):
         raise ClusterAssemblyBuildError(
@@ -1824,6 +1880,12 @@ def validate_normalized_prototype_unit_contract(manifest):
         "role_ordinals": {
             role: sorted(ordinals)
             for role, ordinals in sorted(role_ordinals.items())
+        },
+        "provider_ordinals": {
+            provider_key: sorted(ordinals)
+            for (provider_key, _role), ordinals in sorted(
+                provider_role_ordinals.items()
+            )
         },
         "physical_target_meters": unit_probe["physical_target_meters"],
         "downstream_unit_scale": unit_probe["effective_scale"],
@@ -1900,6 +1962,8 @@ def normalize_role_identity(value):
     name = name.strip().replace("\\", "/").rsplit("/", 1)[-1]
     if "::" in name:
         name = name.rsplit("::", 1)[-1]
+    while re.search(r"\.\d{3}$", name):
+        name = re.sub(r"\.\d{3}$", "", name)
     if name.casefold().endswith("_mat"):
         name = name[:-4]
     if name.casefold().startswith("m_"):
@@ -1938,10 +2002,17 @@ def content_build_decision(handoff):
     seen = set()
     for row in inputs:
         role = str(row.get("role") or "").casefold()
-        if role not in ROLE_ORDER or role in seen:
-            raise ClusterAssemblyBuildError(f"invalid or duplicate Assembly role: {role}")
-        seen.add(role)
-        if not row.get("assignments"):
+        provider_key = str(row.get("provider_key") or role).casefold()
+        if role not in ROLE_ORDER or not provider_key or provider_key in seen:
+            raise ClusterAssemblyBuildError(
+                "invalid or duplicate Assembly provider: "
+                f"role={role}, provider={provider_key}"
+            )
+        seen.add(provider_key)
+        if not (
+            row.get("assignments")
+            or row.get("rendered_provider_expansion_covered") is True
+        ):
             raise ClusterAssemblyBuildError(
                 f"{role} has no actual FBX polygon assignment evidence"
             )
@@ -3099,6 +3170,21 @@ def _rotation_matrix_to_quaternion(matrix):
     return [x / length, y / length, z / length, w / length]
 
 
+def _fbx_coordinate_tolerance(coordinates):
+    points = [tuple(float(value) for value in point) for point in coordinates]
+    if not points:
+        return MIN_FBX_COORDINATE_TOLERANCE_METERS
+    spans = [
+        max(point[axis] for point in points)
+        - min(point[axis] for point in points)
+        for axis in range(3)
+    ]
+    return max(
+        max(spans) * 2.0e-6,
+        MIN_FBX_COORDINATE_TOLERANCE_METERS,
+    )
+
+
 def _component_groups(mesh, polygon_indices):
     polygon_indices = sorted(set(int(value) for value in polygon_indices))
     if not polygon_indices:
@@ -3126,15 +3212,10 @@ def _component_groups(mesh, polygon_indices):
         index: tuple(float(mesh.vertices[index].co[axis]) for axis in range(3))
         for index in used_vertices
     }
-    spans = [
-        max(value[axis] for value in coordinates.values())
-        - min(value[axis] for value in coordinates.values())
-        for axis in range(3)
-    ]
     # Relative to the current role extent, not a species-specific world size.
     # This reconnects seam-split FBX/BWR vertices whose skinning differs only
     # by float noise while remaining far below authored card edge lengths.
-    weld_tolerance = max(max(spans) * 2.0e-6, 1.0e-9)
+    weld_tolerance = _fbx_coordinate_tolerance(coordinates.values())
     weld_tolerance_sq = weld_tolerance * weld_tolerance
     vertex_parent = {index: index for index in used_vertices}
 
@@ -3195,6 +3276,59 @@ def _component_groups(mesh, polygon_indices):
             }
         )
     return sorted(result, key=lambda row: row["polygons"][0])
+
+
+def _exact_index_component_groups(mesh, polygon_indices):
+    """Split polygons only when they share a real mesh edge.
+
+    The normal component pass welds seam-split FBX vertices by position.  Two
+    independent cards can nevertheless touch along the same authored pivot
+    edge and be merged by that weld.  This narrower view is used only as a
+    recovery candidate when the welded component matches no normalized plan;
+    every recovered subcomponent must independently match a plan.
+    """
+    indices = sorted(set(int(value) for value in polygon_indices))
+    if not indices:
+        return []
+    parent = {index: index for index in indices}
+
+    def find(value):
+        while parent[value] != value:
+            parent[value] = parent[parent[value]]
+            value = parent[value]
+        return value
+
+    def union(left, right):
+        left = find(left)
+        right = find(right)
+        if left != right:
+            parent[right] = left
+
+    edge_owners = {}
+    for polygon_index in indices:
+        vertices = sorted(
+            set(int(value) for value in mesh.polygons[polygon_index].vertices)
+        )
+        for edge in itertools.combinations(vertices, 2):
+            previous = edge_owners.setdefault(edge, polygon_index)
+            union(polygon_index, previous)
+    groups = defaultdict(lambda: {"vertices": set(), "polygons": []})
+    for polygon_index in indices:
+        row = groups[find(polygon_index)]
+        row["polygons"].append(polygon_index)
+        row["vertices"].update(
+            int(value) for value in mesh.polygons[polygon_index].vertices
+        )
+    return sorted(
+        (
+            {
+                "vertices": sorted(row["vertices"]),
+                "polygons": sorted(row["polygons"]),
+            }
+            for row in groups.values()
+        ),
+        key=lambda row: row["polygons"][0],
+    )
 
 
 def _component_signature(mesh, component):
@@ -3307,12 +3441,7 @@ def _coincident_candidate_groups(obj, component, candidates):
         tuple(float(value) for value in obj.data.vertices[index].co)
         for index in component["vertices"]
     ]
-    spans = [
-        max(point[axis] for point in component_coordinates)
-        - min(point[axis] for point in component_coordinates)
-        for axis in range(3)
-    ]
-    tolerance = max(max(spans) * 2.0e-6, 1.0e-9)
+    tolerance = _fbx_coordinate_tolerance(component_coordinates)
     groups = []
     for index in sorted(candidates):
         group = next((
@@ -3336,7 +3465,27 @@ def _coincident_candidate_groups(obj, component, candidates):
 
 
 def _counter_subset(left, right):
-    return not (left - right)
+    """Match rendered topology after bounded SpeedTree face duplication.
+
+    SpeedTree can emit a two-sided rendered card by duplicating every
+    surviving source UV face.  UV identity remains authoritative, while raw
+    Counter multiplicity does not.  Keep the conversion bounded so accidental
+    stacked geometry cannot silently collapse into one Assembly instance.
+    """
+    return bool(left) and all(
+        int(right.get(key, 0)) > 0
+        and int(count)
+        <= int(right[key]) * MAX_SPEEDTREE_RENDER_FACE_MULTIPLICITY
+        for key, count in left.items()
+    )
+
+
+def _counter_missing_identity_count(source, rendered):
+    return sum(
+        int(count)
+        for key, count in source.items()
+        if key not in rendered
+    )
 
 
 def _match_uv_candidate_groups(
@@ -3380,9 +3529,11 @@ def _match_uv_candidate_groups(
             ):
                 valid = False
                 break
-            score += sum((source["faces"] - target["faces"]).values())
-            score += sum(
-                (source["neighbors"] - target["neighbors"]).values()
+            score += _counter_missing_identity_count(
+                source["faces"], target["faces"]
+            )
+            score += _counter_missing_identity_count(
+                source["neighbors"], target["neighbors"]
             )
         if valid:
             possibilities.append((score, source_order))
@@ -3436,12 +3587,7 @@ def _coincident_uv_vertex_index(obj, component, key):
         tuple(float(value) for value in obj.data.vertices[index].co)
         for index in component["vertices"]
     ]
-    spans = [
-        max(point[axis] for point in component_coordinates)
-        - min(point[axis] for point in component_coordinates)
-        for axis in range(3)
-    ]
-    tolerance = max(max(spans) * 2.0e-6, 1.0e-9)
+    tolerance = _fbx_coordinate_tolerance(component_coordinates)
     ordered = sorted(indices)
     reference = tuple(
         float(value) for value in obj.data.vertices[ordered[0]].co
@@ -3510,6 +3656,217 @@ def _attachment_vertex_correspondence(
     return source_index, target_index
 
 
+def _attachment_uv_edge_point(obj, component, attachment_uv):
+    """Resolve one UV point on a unique geometric edge of a component."""
+    uv_layer = obj.data.uv_layers.active
+    candidates = []
+    uv_tolerance = 2.0e-6
+    for polygon_index in component["polygons"]:
+        polygon = obj.data.polygons[polygon_index]
+        loops = list(polygon.loop_indices)
+        for offset, first_loop in enumerate(loops):
+            second_loop = loops[(offset + 1) % len(loops)]
+            first_uv = uv_layer.data[first_loop].uv
+            second_uv = uv_layer.data[second_loop].uv
+            delta = (
+                float(second_uv.x) - float(first_uv.x),
+                float(second_uv.y) - float(first_uv.y),
+            )
+            length_squared = delta[0] * delta[0] + delta[1] * delta[1]
+            if length_squared <= 1.0e-20:
+                continue
+            relative = (
+                float(attachment_uv[0]) - float(first_uv.x),
+                float(attachment_uv[1]) - float(first_uv.y),
+            )
+            parameter = (
+                relative[0] * delta[0] + relative[1] * delta[1]
+            ) / length_squared
+            if parameter < -uv_tolerance or parameter > 1.0 + uv_tolerance:
+                continue
+            parameter = max(0.0, min(1.0, parameter))
+            projected = (
+                float(first_uv.x) + delta[0] * parameter,
+                float(first_uv.y) + delta[1] * parameter,
+            )
+            residual = math.dist(projected, attachment_uv)
+            if residual > uv_tolerance:
+                continue
+            first_index = int(obj.data.loops[first_loop].vertex_index)
+            second_index = int(obj.data.loops[second_loop].vertex_index)
+            first_coordinate = obj.data.vertices[first_index].co
+            second_coordinate = obj.data.vertices[second_index].co
+            coordinate = tuple(
+                float(first_coordinate[axis]) * (1.0 - parameter)
+                + float(second_coordinate[axis]) * parameter
+                for axis in range(3)
+            )
+            candidates.append({
+                "coordinate": coordinate,
+                "edge_vertices": [first_index, second_index],
+                "parameter": float(parameter),
+                "uv_residual": float(residual),
+            })
+    if not candidates:
+        return None
+
+    coordinates = [
+        tuple(float(value) for value in obj.data.vertices[index].co)
+        for index in component["vertices"]
+    ]
+    coordinate_tolerance = _fbx_coordinate_tolerance(coordinates)
+    groups = []
+    for candidate in sorted(
+        candidates,
+        key=lambda row: (
+            row["uv_residual"],
+            row["edge_vertices"],
+            row["parameter"],
+        ),
+    ):
+        group = next((
+            row for row in groups
+            if math.dist(row["coordinate"], candidate["coordinate"])
+            <= coordinate_tolerance
+        ), None)
+        if group is None:
+            groups.append({
+                "coordinate": candidate["coordinate"],
+                "candidates": [candidate],
+            })
+        else:
+            group["candidates"].append(candidate)
+    if len(groups) != 1:
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment UV crosses multiple geometric edges"
+        )
+    best = groups[0]["candidates"][0]
+    return {
+        "coordinate": groups[0]["coordinate"],
+        "edge_vertices": best["edge_vertices"],
+        "parameter": best["parameter"],
+        "uv_residual": best["uv_residual"],
+        "candidate_edge_count": len(candidates),
+    }
+
+
+def _attachment_point_correspondence(
+    source_obj,
+    source_component,
+    target_obj,
+    target_component,
+    attachment_uv,
+):
+    """Resolve an attachment as an exact vertex or a strict UV-edge point.
+
+    Older normalized plans can contain an authored origin vertex that is not
+    referenced by a face.  FBX removes that loose vertex, while preserving the
+    boundary edge on which the authored UV lies.  The compatibility path below
+    is limited to exact source/target topology matches and requires the source
+    edge interpolation to reconstruct local origin.
+    """
+    if (
+        not isinstance(attachment_uv, (list, tuple))
+        or len(attachment_uv) != 2
+    ):
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment vertex UV is missing or invalid"
+        )
+    try:
+        resolved_uv = tuple(float(value) for value in attachment_uv)
+    except (TypeError, ValueError) as exc:
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment vertex UV is missing or invalid"
+        ) from exc
+    if any(not math.isfinite(value) for value in resolved_uv):
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment vertex UV is missing or invalid"
+        )
+    if (
+        source_obj.data.uv_layers.active is None
+        or target_obj.data.uv_layers.active is None
+    ):
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment correspondence requires UV layers"
+        )
+
+    key = tuple(round(value, 6) for value in resolved_uv)
+    source_index = _coincident_uv_vertex_index(
+        source_obj, source_component, key
+    )
+    target_index = _coincident_uv_vertex_index(
+        target_obj, target_component, key
+    )
+    if source_index is not None and target_index is not None:
+        return {
+            "source_index": source_index,
+            "target_index": target_index,
+            "source_coordinate": tuple(
+                float(value) for value in source_obj.data.vertices[source_index].co
+            ),
+            "target_coordinate": tuple(
+                float(value) for value in target_obj.data.vertices[target_index].co
+            ),
+            "evidence": {
+                "policy": "exact_attachment_uv_vertex_v1",
+                "attachment_uv": list(resolved_uv),
+            },
+        }
+
+    if _component_signature(
+        source_obj.data, source_component
+    ) != _component_signature(target_obj.data, target_component):
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment pivot UV is absent from the "
+            "source/target render component"
+        )
+
+    source_edge = _attachment_uv_edge_point(
+        source_obj, source_component, resolved_uv
+    )
+    target_edge = _attachment_uv_edge_point(
+        target_obj, target_component, resolved_uv
+    )
+    if source_edge is None or target_edge is None:
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment pivot UV is absent from the "
+            "source/target render component"
+        )
+
+    source_coordinates = [
+        tuple(float(value) for value in source_obj.data.vertices[index].co)
+        for index in source_component["vertices"]
+    ]
+    spans = [
+        max(point[axis] for point in source_coordinates)
+        - min(point[axis] for point in source_coordinates)
+        for axis in range(3)
+    ]
+    origin_tolerance = max(max(spans) * 2.0e-6, 1.0e-8)
+    source_origin_error = math.dist(
+        source_edge["coordinate"], (0.0, 0.0, 0.0)
+    )
+    if source_origin_error > origin_tolerance:
+        raise ClusterAssemblyBuildError(
+            "normalized plan attachment UV edge does not resolve to the "
+            "normalized source origin"
+        )
+    return {
+        "source_index": source_index,
+        "target_index": target_index,
+        "source_coordinate": source_edge["coordinate"],
+        "target_coordinate": target_edge["coordinate"],
+        "evidence": {
+            "policy": "normalized_origin_uv_edge_interpolation_v1",
+            "attachment_uv": list(resolved_uv),
+            "source_origin_error": float(source_origin_error),
+            "source_origin_tolerance": float(origin_tolerance),
+            "source_edge": source_edge,
+            "target_edge": target_edge,
+        },
+    }
+
+
 def _normalized_prototype_for_component(prototypes, target_mesh, target_component):
     signature = _component_signature(target_mesh, target_component)
     exact = prototypes.get(signature)
@@ -3524,10 +3881,27 @@ def _normalized_prototype_for_component(prototypes, target_mesh, target_componen
             prototype["object"].data,
             prototype["component"],
         )
-        if source_faces is None or target_faces - source_faces:
+        if source_faces is None or not _counter_subset(
+            target_faces, source_faces
+        ):
             continue
-        missing_faces = sum((source_faces - target_faces).values())
-        allowed_missing = max(1, int(math.ceil(sum(source_faces.values()) * 0.1)))
+        missing_faces = _counter_missing_identity_count(
+            source_faces, target_faces
+        )
+        # SpeedTree 10.1 removes fully clipped boundary triangles when it
+        # expands an external cutout mesh into the rendered tree FBX. Reed's
+        # current cards lose 7.9-15.6% while retaining an exact UV-face
+        # subset. Keep subset and unique-candidate checks strict, but accept
+        # that measured exporter loss envelope.
+        allowed_missing = max(
+            1,
+            int(
+                math.ceil(
+                    sum(source_faces.values())
+                    * MAX_NORMALIZED_PLAN_FACE_LOSS_RATIO
+                )
+            ),
+        )
         if missing_faces <= allowed_missing:
             candidates.append((missing_faces, prototype))
     if not candidates:
@@ -3541,6 +3915,69 @@ def _normalized_prototype_for_component(prototypes, target_mesh, target_componen
             + signature
         )
     return best[0]
+
+
+def _normalized_prototype_match_diagnostics(
+    prototypes,
+    target_mesh,
+    target_component,
+):
+    target_faces = _component_uv_face_counter(target_mesh, target_component)
+    if target_faces is None:
+        return [{"reason": "target_has_no_active_uv"}]
+    rows = []
+    for signature, prototype in prototypes.items():
+        source_faces = _component_uv_face_counter(
+            prototype["object"].data,
+            prototype["component"],
+        )
+        if source_faces is None:
+            rows.append({
+                "prototype_signature": signature,
+                "reason": "prototype_has_no_active_uv",
+            })
+            continue
+        source_count = sum(source_faces.values())
+        target_only = sum(
+            int(count)
+            for key, count in target_faces.items()
+            if key not in source_faces
+        )
+        source_only = _counter_missing_identity_count(
+            source_faces, target_faces
+        )
+        rendered_face_multiplicity = max(
+            (
+                int(count) / float(source_faces[key])
+                for key, count in target_faces.items()
+                if int(source_faces.get(key, 0)) > 0
+            ),
+            default=0.0,
+        )
+        rows.append({
+            "prototype_signature": signature,
+            "plan_name": str(
+                (prototype.get("variant") or {}).get("plan_name") or ""
+            ),
+            "source_face_count": source_count,
+            "target_face_count": sum(target_faces.values()),
+            "target_only_face_count": target_only,
+            "source_only_face_count": source_only,
+            "maximum_rendered_face_multiplicity": (
+                rendered_face_multiplicity
+            ),
+            "source_face_loss_ratio": (
+                float(source_only) / float(source_count)
+                if source_count
+                else None
+            ),
+        })
+    rows.sort(key=lambda row: (
+        int(row.get("target_only_face_count") or 0),
+        int(row.get("source_only_face_count") or 0),
+        str(row.get("prototype_signature") or ""),
+    ))
+    return rows[:8]
 
 
 def _partition_normalized_render_components(
@@ -3562,18 +3999,95 @@ def _partition_normalized_render_components(
     matched = {}
     preserved = []
     for signature, instances in sorted(by_signature.items()):
-        prototype = _normalized_prototype_for_component(
-            prototypes,
-            target_mesh,
-            instances[0],
-        )
+        prototype = prototypes.get(signature)
+        exact_components = []
+        if prototype is None and len(instances) == 1:
+            exact_components = _exact_index_component_groups(
+                target_mesh,
+                instances[0]["polygons"],
+            )
+            strict_matches = []
+            if len(exact_components) > 1:
+                for component in exact_components:
+                    exact_prototype = prototypes.get(
+                        _component_signature(target_mesh, component)
+                    )
+                    if exact_prototype is None:
+                        strict_matches = []
+                        break
+                    strict_matches.append((component, exact_prototype))
+            if strict_matches:
+                for component, exact_prototype in strict_matches:
+                    recovered_signature = _component_signature(
+                        target_mesh,
+                        component,
+                    )
+                    recovered = matched.setdefault(
+                        recovered_signature,
+                        {
+                            "prototype": exact_prototype,
+                            "instances": [],
+                        },
+                    )
+                    if recovered["prototype"] is not exact_prototype:
+                        raise ClusterAssemblyBuildError(
+                            "exact-index component recovery resolved one "
+                            "render signature to multiple normalized plans"
+                        )
+                    recovered["instances"].append(component)
+                continue
         if prototype is None:
+            prototype = _normalized_prototype_for_component(
+                prototypes,
+                target_mesh,
+                instances[0],
+            )
+        if prototype is None:
+            exact_matches = []
+            if len(instances) == 1 and len(exact_components) > 1:
+                for component in exact_components:
+                    exact_prototype = _normalized_prototype_for_component(
+                        prototypes,
+                        target_mesh,
+                        component,
+                    )
+                    if exact_prototype is None:
+                        exact_matches = []
+                        break
+                    exact_matches.append((component, exact_prototype))
+            if exact_matches:
+                for component, exact_prototype in exact_matches:
+                    recovered_signature = _component_signature(
+                        target_mesh,
+                        component,
+                    )
+                    recovered = matched.setdefault(
+                        recovered_signature,
+                        {
+                            "prototype": exact_prototype,
+                            "instances": [],
+                        },
+                    )
+                    if recovered["prototype"] is not exact_prototype:
+                        raise ClusterAssemblyBuildError(
+                            "exact-index component recovery resolved one "
+                            "render signature to multiple normalized plans"
+                        )
+                    recovered["instances"].append(component)
+                continue
             preserved.append({
                 "topology_signature": signature,
                 "instance_count": len(instances),
                 "polygon_count": sum(
                     len(component["polygons"])
                     for component in instances
+                ),
+                "prototype_match_diagnostics": (
+                    _normalized_prototype_match_diagnostics(
+                        prototypes,
+                        target_mesh,
+                        instances[0],
+                    )
                 ),
             })
             continue
@@ -3642,12 +4156,7 @@ def _vertex_descriptors(obj, component):
         tuple(float(value) for value in mesh.vertices[index].co)
         for index in component["vertices"]
     ]
-    spans = [
-        max(point[axis] for point in component_coordinates)
-        - min(point[axis] for point in component_coordinates)
-        for axis in range(3)
-    ]
-    tolerance = max(max(spans) * 2.0e-6, 1.0e-9)
+    tolerance = _fbx_coordinate_tolerance(component_coordinates)
     resolved_representatives = {}
     for logical_vertex, indices in representative.items():
         ordered = sorted(indices)
@@ -3836,6 +4345,20 @@ def _world_points(obj, vertex_indices):
     ]
 
 
+def _world_coordinate(obj, coordinate):
+    matrix = obj.matrix_world
+    return tuple(
+        float(
+            sum(
+                float(matrix[row][axis]) * float(coordinate[axis])
+                for axis in range(3)
+            )
+            + float(matrix[row][3])
+        )
+        for row in range(3)
+    )
+
+
 def _component_influences(obj, component):
     totals = Counter()
     for vertex_index in component["vertices"]:
@@ -3850,6 +4373,88 @@ def _component_influences(obj, component):
         for name, value in totals.most_common()
         if value > 0.0
     ]
+
+
+def _weighted_vertex_locator(obj):
+    try:
+        from mathutils.kdtree import KDTree
+    except ImportError as exc:  # pragma: no cover - Blender-only dependency.
+        raise ClusterAssemblyBuildError(
+            "Blender KDTree is required for source-role skeleton binding"
+        ) from exc
+    weighted = [
+        vertex for vertex in obj.data.vertices
+        if list(vertex.groups)
+    ]
+    if not weighted:
+        raise ClusterAssemblyBuildError(
+            "final merged mesh has no weighted vertices for Assembly binding"
+        )
+    tree = KDTree(len(weighted))
+    for vertex in weighted:
+        tree.insert(obj.matrix_world @ vertex.co, int(vertex.index))
+    tree.balance()
+    world_points = [
+        tuple(float(value) for value in (obj.matrix_world @ vertex.co))
+        for vertex in weighted
+    ]
+    spans = [
+        max(point[axis] for point in world_points)
+        - min(point[axis] for point in world_points)
+        for axis in range(3)
+    ]
+    return {
+        "tree": tree,
+        "tolerance_meters": _weighted_vertex_attachment_tolerance(spans),
+    }
+
+
+def _weighted_vertex_attachment_tolerance(spans):
+    """Bound nearest-weight inheritance by one percent of the Full-SK span.
+
+    Authored attachment pivots can sit just outside the rendered branch skin.
+    A half-percent gate rejected valid large-tree pivots by only a few
+    millimeters; one percent still keeps the lookup local to the attachment
+    while covering the branch radius and SpeedTree export clipping margin.
+    """
+    values = [abs(float(value)) for value in spans]
+    if not values:
+        return MIN_WEIGHT_BINDING_DISTANCE_METERS
+    return max(
+        max(values) * MAX_WEIGHT_BINDING_DISTANCE_SPAN_RATIO,
+        MIN_WEIGHT_BINDING_DISTANCE_METERS,
+    )
+
+
+def _nearest_weighted_vertex_influences(obj, locator, world_point):
+    _coordinate, vertex_index, distance = locator["tree"].find(world_point)
+    tolerance = float(locator["tolerance_meters"])
+    if vertex_index is None or float(distance) > tolerance:
+        raise ClusterAssemblyBuildError(
+            "Assembly source-role attachment has no nearby weighted Full-SK "
+            f"vertex: distance={float(distance):.9g} tolerance={tolerance:.9g}"
+        )
+    vertex = obj.data.vertices[int(vertex_index)]
+    totals = Counter()
+    for item in vertex.groups:
+        group = obj.vertex_groups[item.group]
+        totals[str(group.name)] += float(item.weight)
+    total = sum(totals.values())
+    if total <= 0.0:
+        raise ClusterAssemblyBuildError(
+            "nearest Full-SK attachment vertex has no skeleton weights"
+        )
+    influences = [
+        {"bone": name, "weight": value / total}
+        for name, value in totals.most_common()
+        if value > 0.0
+    ]
+    return influences, {
+        "policy": "nearest_weighted_full_sk_vertex_v1",
+        "vertex_index": int(vertex_index),
+        "distance_meters": float(distance),
+        "tolerance_meters": tolerance,
+    }
 
 
 def _copy_component_as_rigid_part(bpy, source_obj, component, name):
@@ -4056,6 +4661,29 @@ def _replicate_full_export_parent_chain(
     return created
 
 
+def _validate_base_export_parent_chain(
+    base_armature,
+    export_parents,
+    base_obj,
+):
+    """Prove the copied Base hierarchy matches the Full-SK source chain."""
+    expected_parent = base_armature
+    ordered_parents = list(export_parents or [])
+    for parent in ordered_parents:
+        if parent.parent is not expected_parent:
+            raise ClusterAssemblyBuildError(
+                "Assembly base export parent chain is not contiguous: "
+                f"object={parent.name}, expected_parent={expected_parent.name}"
+            )
+        expected_parent = parent
+    if base_obj.parent is not expected_parent:
+        raise ClusterAssemblyBuildError(
+            "Assembly base mesh is detached from its replicated Full export "
+            f"chain: mesh={base_obj.name}, expected_parent={expected_parent.name}"
+        )
+    return None
+
+
 def _strip_fbx_scene_textures(scene_data, get_fbx_uuid_from_key):
     """Keep material slots but remove FBX Texture/Video records and links.
 
@@ -4126,8 +4754,14 @@ def _textureless_fbx_scene_data(bpy):
         export_fbx_bin.fbx_data_from_scene = original
 
 
-def _validate_textureless_fbx(bpy, path, *, full_skeleton_root=False):
-    """Fail closed on texture records or a second raw-FBX object scale."""
+def _validate_textureless_fbx(
+    bpy,
+    path,
+    *,
+    full_skeleton_root=False,
+    expected_geometry_bounds=None,
+):
+    """Fail closed on textures, unit drift, axis drift, or geometry baking."""
     if not hasattr(bpy, "app"):
         return {
             "status": "not_available_in_mock",
@@ -4146,10 +4780,34 @@ def _validate_textureless_fbx(bpy, path, *, full_skeleton_root=False):
     texture_records = 0
     video_records = 0
     model_scales = []
+    geometry_bounds = {}
     if objects is not None:
         texture_records = sum(item.id == b"Texture" for item in objects.elems)
         video_records = sum(item.id == b"Video" for item in objects.elems)
         for item in objects.elems:
+            if item.id == b"Geometry" and len(item.props) >= 2:
+                vertices = next(
+                    (child for child in item.elems if child.id == b"Vertices"),
+                    None,
+                )
+                values = (
+                    list(vertices.props[0])
+                    if vertices is not None and vertices.props
+                    else []
+                )
+                axes = [values[index::3] for index in range(3)]
+                raw_name = item.props[1]
+                geometry_name = (
+                    raw_name.decode("utf-8", errors="replace")
+                    if isinstance(raw_name, bytes)
+                    else str(raw_name)
+                ).split("\x00", 1)[0]
+                geometry_bounds[geometry_name] = {
+                    "vertex_count": len(values) // 3,
+                    "minimum": [min(axis) if axis else 0.0 for axis in axes],
+                    "maximum": [max(axis) if axis else 0.0 for axis in axes],
+                }
+                continue
             if item.id != b"Model" or len(item.props) < 3:
                 continue
             if item.props[2] not in {b"Mesh", b"Null"}:
@@ -4159,6 +4817,7 @@ def _validate_textureless_fbx(bpy, path, *, full_skeleton_root=False):
                 None,
             )
             scale = [1.0, 1.0, 1.0]
+            rotation = [0.0, 0.0, 0.0]
             if properties is not None:
                 scaling = next(
                     (
@@ -4172,6 +4831,20 @@ def _validate_textureless_fbx(bpy, path, *, full_skeleton_root=False):
                 )
                 if scaling is not None and len(scaling.props) >= 3:
                     scale = [float(value) for value in scaling.props[-3:]]
+                local_rotation = next(
+                    (
+                        child
+                        for child in properties.elems
+                        if child.id == b"P"
+                        and child.props
+                        and child.props[0] == b"Lcl Rotation"
+                    ),
+                    None,
+                )
+                if local_rotation is not None and len(local_rotation.props) >= 3:
+                    rotation = [
+                        float(value) for value in local_rotation.props[-3:]
+                    ]
             raw_name = item.props[1]
             name = (
                 raw_name.decode("utf-8", errors="replace")
@@ -4183,6 +4856,7 @@ def _validate_textureless_fbx(bpy, path, *, full_skeleton_root=False):
                 "type": str(item.props[2]),
                 "is_null": item.props[2] == b"Null",
                 "scale": scale,
+                "rotation": rotation,
             })
     if texture_records or video_records:
         raise ClusterAssemblyBuildError(
@@ -4210,6 +4884,45 @@ def _validate_textureless_fbx(bpy, path, *, full_skeleton_root=False):
             "Assembly FBX model scale does not match its Full SK/part root "
             f"contract: {unexpected_model_scales}, path={path}"
         )
+    expected_model_rotation = [90.0, 0.0, 0.0]
+    unexpected_model_rotations = []
+    for row in model_scales:
+        row["expected_rotation"] = expected_model_rotation
+        if any(
+            abs((value - expected + 180.0) % 360.0 - 180.0) > 1.0e-3
+            for value, expected in zip(
+                row["rotation"], expected_model_rotation
+            )
+        ):
+            unexpected_model_rotations.append(row)
+    if unexpected_model_rotations:
+        raise ClusterAssemblyBuildError(
+            "Assembly FBX model rotation does not match the Unreal Z-up axis "
+            f"contract: {unexpected_model_rotations}, path={path}"
+        )
+    geometry_mismatches = []
+    for name, expected in (expected_geometry_bounds or {}).items():
+        actual = geometry_bounds.get(name)
+        if actual is None:
+            geometry_mismatches.append({"name": name, "reason": "missing"})
+            continue
+        mismatched = actual["vertex_count"] != expected["vertex_count"]
+        for key in ("minimum", "maximum"):
+            mismatched = mismatched or any(
+                abs(float(actual_value) - float(expected_value)) > 1.0e-5
+                for actual_value, expected_value in zip(
+                    actual[key], expected[key]
+                )
+            )
+        if mismatched:
+            geometry_mismatches.append(
+                {"name": name, "expected": expected, "actual": actual}
+            )
+    if geometry_mismatches:
+        raise ClusterAssemblyBuildError(
+            "Assembly FBX changed local geometry bounds during export: "
+            f"{geometry_mismatches}, path={path}"
+        )
     return {
         "status": "textureless",
         "fbx_version": version,
@@ -4217,8 +4930,12 @@ def _validate_textureless_fbx(bpy, path, *, full_skeleton_root=False):
         "video_records": video_records,
         "model_scales": model_scales,
         "expected_model_scale": expected_model_scale,
+        "expected_model_rotation": expected_model_rotation,
         "full_skeleton_root": bool(full_skeleton_root),
         "all_model_scales_match_contract": True,
+        "all_model_rotations_match_contract": True,
+        "geometry_bounds": geometry_bounds,
+        "all_geometry_bounds_match_contract": True,
         "material_source": "material_pipeline_json_sidecar",
     }
 
@@ -4276,6 +4993,26 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
         raise ClusterAssemblyBuildError(
             "generated Assembly FBX requires one armature and at least one mesh"
         )
+    expected_geometry_bounds = None
+    if hasattr(bpy, "app"):
+        expected_geometry_bounds = {}
+        for obj in meshes:
+            coordinates = [vertex.co for vertex in obj.data.vertices]
+            expected_geometry_bounds[obj.data.name] = {
+                "vertex_count": len(coordinates),
+                "minimum": [
+                    min(float(co[index]) for co in coordinates)
+                    if coordinates
+                    else 0.0
+                    for index in range(3)
+                ],
+                "maximum": [
+                    max(float(co[index]) for co in coordinates)
+                    if coordinates
+                    else 0.0
+                    for index in range(3)
+                ],
+            }
     for obj in armatures + meshes:
         scale = [float(value) for value in obj.matrix_world.to_scale()]
         if any(abs(value - 1.0) > 1.0e-5 for value in scale):
@@ -4292,19 +5029,15 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
             "generated Assembly coordinates must preserve the Full SK meter "
             "scene-unit contract"
         )
+    addon_runtime = None
     try:
         if not hasattr(bpy, "app"):
-            # Lightweight unit-test mocks exercise the stock operator call
-            # contract without importing Blender add-ons.
+            # Lightweight unit-test mocks exercise the operator settings
+            # without importing Blender add-ons.
             result = bpy.ops.export_scene.fbx(
                 filepath=str(path),
                 use_selection=True,
                 object_types={"ARMATURE", "MESH"},
-                # Keep BASE/PART reference poses on the exact stock-FBX contract
-                # used by speedtree_bone_weight_repair.core for the Full SK.  A
-                # separate unit-scale or modifier policy changes the imported
-                # armature-object root (bone 0), even when every authored Blender
-                # bone has the same name/order/parent/bind matrix.
                 use_mesh_modifiers=False,
                 mesh_smooth_type="FACE",
                 use_custom_props=False,
@@ -4314,9 +5047,9 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
                 armature_nodetype="NULL",
                 bake_anim=False,
                 path_mode="AUTO",
+                global_scale=1.0,
                 apply_unit_scale=True,
                 apply_scale_options="FBX_SCALE_NONE",
-                global_scale=1.0,
                 axis_forward="Y",
                 axis_up="Z",
                 bake_space_transform=False,
@@ -4324,21 +5057,19 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
             if "FINISHED" not in result:
                 raise ClusterAssemblyBuildError(f"FBX export failed: {result}")
         else:
-            # Use the same scale/bind-pose exporter as the real Send to Unreal
-            # Full mesh.  Its armature correction is part of PARK's existing
-            # handoff contract; the stock Blender exporter writes a 100x
-            # armature-object root even when all visible world transforms are
-            # identical.
-            import addon_utils
+            # The Full SK is exported through Send2UE's armature-aware FBX
+            # patch. Use that same bind/root-scale contract for generated
+            # BASE/part assets, then independently prove that it did not bake
+            # or shrink their local geometry.
+            from blender_addon_gateway import prepare_runtime
 
-            _default, loaded = addon_utils.check("send2ue")
-            if not loaded:
-                addon_utils.enable(
-                    "send2ue",
-                    default_set=False,
-                    persistent=False,
-                )
-            from send2ue.core.io import fbx_b4 as send2ue_fbx
+            addon_runtime = prepare_runtime(
+                "sk_batch.cluster_assembly_builder.fbx_export",
+                {"send2ue": ("fbx_export_v1",)},
+            )
+            send2ue_fbx_export = addon_runtime.operation(
+                "send2ue", "fbx_export"
+            )
 
             bpy.context.scene.send2ue.export_object_name_as_root = True
             bpy.context.scene.send2ue.export_custom_root_name = ""
@@ -4349,7 +5080,7 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
             previous_flag = bpy.app.driver_namespace.get(textureless_flag)
             bpy.app.driver_namespace[textureless_flag] = True
             try:
-                send2ue_fbx.export(
+                send2ue_fbx_export(
                     filepath=str(path),
                     use_selection=True,
                     object_types={"ARMATURE", "MESH", "EMPTY"},
@@ -4358,15 +5089,6 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
                     mesh_smooth_type="FACE",
                     use_mesh_edges=False,
                     use_subsurf=False,
-                    use_tspace=False,
-                    use_custom_props=False,
-                    add_leaf_bones=False,
-                    primary_bone_axis="Y",
-                    secondary_bone_axis="X",
-                    use_armature_deform_only=False,
-                    armature_nodetype="NULL",
-                    bake_anim=False,
-                    bake_anim_use_all_bones=True,
                     bake_anim_use_nla_strips=True,
                     bake_anim_use_all_actions=False,
                     bake_anim_force_startend_keying=True,
@@ -4392,11 +5114,15 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
             obj.hide_set(hidden)
     if not path.is_file():
         raise ClusterAssemblyBuildError(f"FBX export produced no file: {path}")
-    return _validate_textureless_fbx(
+    validation = _validate_textureless_fbx(
         bpy,
         path,
         full_skeleton_root=full_skeleton_root,
+        expected_geometry_bounds=expected_geometry_bounds,
     )
+    if addon_runtime is not None:
+        validation["blender_addon_runtime"] = addon_runtime.receipt
+    return validation
 
 
 def _write_assembly_source_blend(bpy, path, objects, contract):
@@ -4473,7 +5199,16 @@ def _write_assembly_source_blend(bpy, path, objects, contract):
     return file_fingerprint(target)
 
 
-def _role_material_polygons(merged_mesh, role_inputs):
+def _role_builder_key(row):
+    return str(row.get("provider_key") or row.get("role") or "").casefold()
+
+
+def _role_material_polygons(
+    merged_mesh,
+    role_inputs,
+    *,
+    allow_topology_fallback=True,
+):
     materials = list(merged_mesh.data.materials)
     slots_by_identity = defaultdict(set)
     for index, material in enumerate(materials):
@@ -4485,6 +5220,7 @@ def _role_material_polygons(merged_mesh, role_inputs):
     missing_slot_rows = []
     for row in role_inputs:
         role = str(row["role"]).casefold()
+        provider_key = _role_builder_key(row)
         identity_values = [
             row.get("role_identity"),
             *(row.get("role_identity_aliases") or []),
@@ -4506,25 +5242,26 @@ def _role_material_polygons(merged_mesh, role_inputs):
         }
         for slot in sorted(slots):
             owner = claimed_slots.get(slot)
-            if owner is not None and owner != role:
+            if owner is not None and owner != provider_key:
                 raise ClusterAssemblyBuildError(
                     "Assembly material slot is claimed by multiple roles: "
-                    f"slot={slot}, roles={owner},{role}"
+                    f"slot={slot}, roles={owner},{provider_key}"
                 )
-            claimed_slots[slot] = role
+            claimed_slots[slot] = provider_key
         polygons = [
             int(polygon.index)
             for polygon in merged_mesh.data.polygons
             if int(polygon.material_index) in slots
         ]
         if not slots:
-            missing_slot_rows.append((role, row, identities))
+            missing_slot_rows.append((provider_key, role, row, identities))
             continue
         if not polygons:
             normalized = deepcopy(row.get("normalized_variants"))
             variants = list((normalized or {}).get("variants") or [])
-            prepared_unused[role] = {
+            prepared_unused[provider_key] = {
                 "role": role,
+                "provider_key": provider_key,
                 "role_identity": row.get("role_identity"),
                 "role_identity_aliases": deepcopy(
                     row.get("role_identity_aliases") or []
@@ -4542,8 +5279,9 @@ def _role_material_polygons(merged_mesh, role_inputs):
                 ],
             }
             continue
-        result[role] = {
+        result[provider_key] = {
             "role": role,
+            "provider_key": provider_key,
             "role_identity": row.get("role_identity"),
             "role_identity_aliases": deepcopy(
                 row.get("role_identity_aliases") or []
@@ -4573,7 +5311,7 @@ def _role_material_polygons(merged_mesh, role_inputs):
         for polygon in merged_mesh.data.polygons
         if int(polygon.index) not in claimed_polygons
     ]
-    for role, row, identities in missing_slot_rows:
+    for provider_key, role, row, identities in missing_slot_rows:
         normalized = deepcopy(row.get("normalized_variants"))
         variants = list((normalized or {}).get("variants") or [])
         assignments = [
@@ -4584,9 +5322,18 @@ def _role_material_polygons(merged_mesh, role_inputs):
                 and int(assignment.get("used_polygon_count") or 0) > 0
             )
         ]
-        if topology_candidates and variants and assignments:
-            result[role] = {
+        if (
+            allow_topology_fallback
+            and topology_candidates
+            and variants
+            and (
+                assignments
+                or row.get("rendered_provider_expansion_covered") is True
+            )
+        ):
+            result[provider_key] = {
                 "role": role,
+                "provider_key": provider_key,
                 "role_identity": row.get("role_identity"),
                 "role_identity_aliases": deepcopy(
                     row.get("role_identity_aliases") or []
@@ -4598,8 +5345,9 @@ def _role_material_polygons(merged_mesh, role_inputs):
                 "selection_basis": "normalized_topology_fallback",
             }
             continue
-        prepared_unused[role] = {
+        prepared_unused[provider_key] = {
             "role": role,
+            "provider_key": provider_key,
             "role_identity": row.get("role_identity"),
             "role_identity_aliases": deepcopy(
                 row.get("role_identity_aliases") or []
@@ -4619,10 +5367,104 @@ def _role_material_polygons(merged_mesh, role_inputs):
     return result, prepared_unused
 
 
+def _role_geometry_sources(bpy_module, final_merged_mesh, role_inputs):
+    """Resolve rendered role geometry before BWR's intentional base split.
+
+    Cluster/leaf placement meshes can remain in ``SpeedTree_Source`` without
+    an armature and therefore do not belong to the repaired Full-SK base. Their
+    exact material identity is nevertheless the authoritative Assembly
+    placement geometry. Prefer those exact source objects before falling back
+    to topology search on the final merged base.
+    """
+    exact_final, _unused = _role_material_polygons(
+        final_merged_mesh,
+        role_inputs,
+        allow_topology_fallback=False,
+    )
+    roles = dict(exact_final)
+    targets = {
+        provider_key: final_merged_mesh
+        for provider_key in exact_final
+    }
+    unresolved = [
+        row for row in role_inputs
+        if _role_builder_key(row) not in roles
+    ]
+    final_property_getter = getattr(final_merged_mesh, "get", None)
+    source_fbx = _normalized_contract_path(
+        final_property_getter("codex_source_fbx", "")
+        if callable(final_property_getter)
+        else ""
+    )
+    source_objects = []
+    for obj in bpy_module.data.objects:
+        if obj is final_merged_mesh or getattr(obj, "type", "") != "MESH":
+            continue
+        collections = {
+            str(getattr(collection, "name", ""))
+            for collection in getattr(obj, "users_collection", ()) or ()
+        }
+        if "SpeedTree_Source" not in collections:
+            continue
+        property_getter = getattr(obj, "get", None)
+        tagged_fbx = _normalized_contract_path(
+            property_getter("codex_source_fbx", "")
+            if callable(property_getter)
+            else ""
+        )
+        if source_fbx and tagged_fbx != source_fbx:
+            continue
+        source_objects.append(obj)
+
+    still_unresolved = []
+    for row in unresolved:
+        provider_key = _role_builder_key(row)
+        matches = []
+        for obj in source_objects:
+            rendered, _prepared = _role_material_polygons(
+                obj,
+                [row],
+                allow_topology_fallback=False,
+            )
+            if provider_key in rendered:
+                matches.append((obj, rendered[provider_key]))
+        if len(matches) > 1:
+            raise ClusterAssemblyBuildError(
+                "Assembly provider material resolves to multiple current "
+                f"SpeedTree source meshes: provider={provider_key}, "
+                f"objects={sorted(obj.name for obj, _row in matches)}"
+            )
+        if len(matches) == 1:
+            target, role_row = matches[0]
+            role_row["selection_basis"] = (
+                "speedtree_source_material_identity"
+            )
+            roles[provider_key] = role_row
+            targets[provider_key] = target
+        else:
+            still_unresolved.append(row)
+
+    prepared_unused = {}
+    if still_unresolved:
+        fallback, prepared_unused = _role_material_polygons(
+            final_merged_mesh,
+            still_unresolved,
+            allow_topology_fallback=True,
+        )
+        roles.update(fallback)
+        targets.update({
+            provider_key: final_merged_mesh
+            for provider_key in fallback
+        })
+    return roles, prepared_unused, targets
+
+
 def _validate_role_component_claims(role_build_plans):
     claimed_polygons = {}
     unmatched_roles = []
-    for role, plan in role_build_plans.items():
+    for provider_key, plan in role_build_plans.items():
+        role = str(plan.get("role") or provider_key)
+        target_identity = id(plan.get("target_object"))
         matched_component_count = 0
         for matched in (plan.get("matched") or {}).values():
             instances = list(matched.get("instances") or [])
@@ -4630,21 +5472,35 @@ def _validate_role_component_claims(role_build_plans):
             for component in instances:
                 for polygon in component.get("polygons") or []:
                     polygon = int(polygon)
-                    owner = claimed_polygons.get(polygon)
-                    if owner is not None and owner != role:
+                    claim_key = (target_identity, polygon)
+                    owner = claimed_polygons.get(claim_key)
+                    if owner is not None and owner != provider_key:
                         raise ClusterAssemblyBuildError(
                             "one rendered mesh component matched multiple "
                             "normalized Assembly roles: "
-                            f"polygon={polygon}, roles={owner},{role}"
+                            f"polygon={polygon}, roles={owner},{provider_key}"
                         )
-                    claimed_polygons[polygon] = role
-        if matched_component_count == 0:
-            unmatched_roles.append(str(role))
+                    claimed_polygons[claim_key] = provider_key
+        # A normalized provider can legitimately cover only a subset of the
+        # rendered variants.  `_partition_normalized_render_components`
+        # deliberately leaves unknown topologies in the Full-SK Base so no
+        # geometry is invented or discarded.  Do not turn that preservation
+        # result back into a provider-wide failure here.  A role with neither
+        # a matched nor a preserved component is still invalid, and the final
+        # builder also rejects a handoff where no provider produced any part.
+        if matched_component_count == 0 and not plan.get("preserved"):
+            unmatched_roles.append({
+                "provider_key": str(provider_key),
+                "preserved": deepcopy(plan.get("preserved") or []),
+            })
     if unmatched_roles:
+        unmatched_roles.sort(key=lambda row: row["provider_key"])
         raise ClusterAssemblyBuildError(
             "requested rendered Assembly roles matched zero normalized "
             "prototype components: "
-            + ", ".join(sorted(unmatched_roles))
+            + ", ".join(row["provider_key"] for row in unmatched_roles)
+            + "; diagnostics="
+            + _canonical_json(unmatched_roles)
         )
     return claimed_polygons
 
@@ -4686,7 +5542,8 @@ def build_blender_assembly_inputs(
     checked_snapshot, skeleton_by_name = _skeleton_maps(snapshot)
     snapshot = checked_snapshot
     role_inputs = list((handoff.get("assembly") or {}).get("part_builder_inputs") or [])
-    roles, prepared_unused_roles = _role_material_polygons(
+    roles, prepared_unused_roles, role_targets = _role_geometry_sources(
+        bpy,
         final_merged_mesh,
         role_inputs,
     )
@@ -4701,7 +5558,7 @@ def build_blender_assembly_inputs(
                 ),
                 "reason": row.get("reason"),
             }
-            for role, row in sorted(prepared_unused_roles.items())
+            for _provider_key, row in sorted(prepared_unused_roles.items())
         ]
         raise ClusterAssemblyBuildError(
             "Assembly handoff requested rendered roles that disappeared before "
@@ -4727,6 +5584,7 @@ def build_blender_assembly_inputs(
     degraded_authored_binding_count = 0
     legacy_fallback_binding_count = 0
     authored_component_cache = {}
+    weighted_vertex_locator = None
     authored_assignment_report = None
     base_obj = None
     base_armature = None
@@ -4742,10 +5600,17 @@ def build_blender_assembly_inputs(
             f"contract, got system={source_unit_system} scale={source_scale_length}"
         )
     try:
-        for role in ROLE_ORDER:
-            role_row = roles.get(role)
-            if role_row is None:
-                continue
+        provider_order = sorted(
+            roles,
+            key=lambda provider_key: (
+                ROLE_ORDER.index(roles[provider_key]["role"]),
+                provider_key,
+            ),
+        )
+        for provider_key in provider_order:
+            role_row = roles[provider_key]
+            role = role_row["role"]
+            target_object = role_targets[provider_key]
             normalized_contract = role_row.get("normalized_variants")
             if not normalized_contract:
                 raise ClusterAssemblyBuildError(
@@ -4766,21 +5631,31 @@ def build_blender_assembly_inputs(
             )
             created_objects.extend(imported_objects)
             components = _component_groups(
-                final_merged_mesh.data,
+                target_object.data,
                 role_row["polygon_indices"],
             )
             matched, preserved = _partition_normalized_render_components(
                 prototypes,
-                final_merged_mesh.data,
+                target_object.data,
                 components,
             )
-            role_build_plans[role] = {
+            if preserved and target_object is not final_merged_mesh:
+                raise ClusterAssemblyBuildError(
+                    "current SpeedTree source role contains geometry absent "
+                    "from its normalized provider plans: "
+                    f"provider={provider_key}, preserved={preserved}"
+                )
+            role_build_plans[provider_key] = {
+                "role": role,
+                "provider_key": provider_key,
+                "target_object": target_object,
                 "matched": matched,
                 "preserved": preserved,
             }
             for row in preserved:
                 preserved_render_components.append({
                     "role": role,
+                    "provider_key": provider_key,
                     "role_identity": role_row["role_identity"],
                     **row,
                 })
@@ -4799,7 +5674,11 @@ def build_blender_assembly_inputs(
             ) from exc
         if authored_node_table.get("available"):
             component_rows = []
-            for role, role_plan in sorted(role_build_plans.items()):
+            for provider_key, role_plan in sorted(
+                role_build_plans.items()
+            ):
+                role = role_plan["role"]
+                target_object = role_plan["target_object"]
                 for signature, match in sorted(
                     role_plan["matched"].items()
                 ):
@@ -4818,25 +5697,26 @@ def build_blender_assembly_inputs(
                         match["instances"]
                     ):
                         component_id = (
-                            f"{role}:{signature}:{instance_index}:"
+                            f"{provider_key}:{signature}:{instance_index}:"
                             f"{component['polygons'][0]}"
                         )
-                        (
-                            source_attachment_index,
-                            target_attachment_index,
-                        ) = _attachment_vertex_correspondence(
+                        attachment = _attachment_point_correspondence(
                             source_obj,
                             source_component,
-                            final_merged_mesh,
+                            target_object,
                             component,
                             variant.get("attachment_vertex_uv"),
                         )
-                        source_attachment = _world_points(
-                            source_obj, [source_attachment_index]
-                        )[0]
-                        target_attachment = _world_points(
-                            final_merged_mesh, [target_attachment_index]
-                        )[0]
+                        source_attachment_index = attachment["source_index"]
+                        target_attachment_index = attachment["target_index"]
+                        source_attachment = _world_coordinate(
+                            source_obj,
+                            attachment["source_coordinate"],
+                        )
+                        target_attachment = _world_coordinate(
+                            target_object,
+                            attachment["target_coordinate"],
+                        )
                         authored_component_cache[component_id] = {
                             "source_attachment_index": (
                                 source_attachment_index
@@ -4846,6 +5726,7 @@ def build_blender_assembly_inputs(
                             ),
                             "source_attachment": source_attachment,
                             "target_attachment": target_attachment,
+                            "attachment_correspondence": attachment["evidence"],
                         }
                         component_rows.append({
                             "component_id": component_id,
@@ -4889,6 +5770,7 @@ def build_blender_assembly_inputs(
         excluded_polygons = sorted({
             polygon_index
             for plan in role_build_plans.values()
+            if plan["target_object"] is final_merged_mesh
             for row in plan["matched"].values()
             for component in row["instances"]
             for polygon_index in component["polygons"]
@@ -4926,6 +5808,11 @@ def build_blender_assembly_inputs(
         final_armature.name = source_armature_name + "__FullSource"
         base_armature.name = source_armature_name
         try:
+            _validate_base_export_parent_chain(
+                base_armature,
+                base_export_parents,
+                base_obj,
+            )
             base_fbx_texture_contract = _export_selected_fbx(
                 bpy,
                 base_fbx,
@@ -4935,15 +5822,22 @@ def build_blender_assembly_inputs(
         finally:
             base_armature.name = normalized_armature_name
             final_armature.name = source_armature_name
-        for role in ROLE_ORDER:
-            role_row = roles.get(role)
-            if role_row is None:
-                continue
+        if any(
+            target is not final_merged_mesh
+            for target in role_targets.values()
+        ):
+            weighted_vertex_locator = _weighted_vertex_locator(
+                final_merged_mesh
+            )
+        for provider_key in provider_order:
+            role_row = roles[provider_key]
+            role = role_row["role"]
+            target_object = role_targets[provider_key]
             normalized_contract = role_row.get("normalized_variants")
             if normalized_contract:
                 composite_accumulators = {}
                 for signature, match in sorted(
-                    role_build_plans[role]["matched"].items()
+                    role_build_plans[provider_key]["matched"].items()
                 ):
                     prototype = match["prototype"]
                     instances = match["instances"]
@@ -4986,7 +5880,7 @@ def build_blender_assembly_inputs(
                     bindings = []
                     for instance_index, component in enumerate(instances):
                         component_id = (
-                            f"{role}:{signature}:{instance_index}:"
+                            f"{provider_key}:{signature}:{instance_index}:"
                             f"{component['polygons'][0]}"
                         )
                         cached_placement = authored_component_cache.get(
@@ -5005,25 +5899,32 @@ def build_blender_assembly_inputs(
                             target_attachment = cached_placement[
                                 "target_attachment"
                             ]
+                            attachment_correspondence = cached_placement[
+                                "attachment_correspondence"
+                            ]
                         else:
-                            (
-                                source_attachment_index,
-                                target_attachment_index,
-                            ) = _attachment_vertex_correspondence(
+                            attachment = _attachment_point_correspondence(
                                 source_obj,
                                 source_component,
-                                final_merged_mesh,
+                                target_object,
                                 component,
                                 attachment_vertex_uv,
                             )
-                            source_attachment = _world_points(
+                            source_attachment_index = attachment[
+                                "source_index"
+                            ]
+                            target_attachment_index = attachment[
+                                "target_index"
+                            ]
+                            source_attachment = _world_coordinate(
                                 source_obj,
-                                [source_attachment_index],
-                            )[0]
-                            target_attachment = _world_points(
-                                final_merged_mesh,
-                                [target_attachment_index],
-                            )[0]
+                                attachment["source_coordinate"],
+                            )
+                            target_attachment = _world_coordinate(
+                                target_object,
+                                attachment["target_coordinate"],
+                            )
+                            attachment_correspondence = attachment["evidence"]
                         authored_node = (
                             (cached_placement or {}).get("authored_node")
                         )
@@ -5070,7 +5971,7 @@ def build_blender_assembly_inputs(
                             ) = _ordered_cross_object_correspondence(
                                 source_obj,
                                 source_component,
-                                final_merged_mesh,
+                                target_object,
                                 component,
                                 include_evidence=True,
                             )
@@ -5079,7 +5980,7 @@ def build_blender_assembly_inputs(
                                 source_indices,
                             )
                             target_world = _world_points(
-                                final_merged_mesh,
+                                target_object,
                                 target_indices,
                             )
                         except ClusterAssemblyBuildError as exc:
@@ -5176,6 +6077,9 @@ def build_blender_assembly_inputs(
                         transform["correspondence_evidence"] = (
                             correspondence_evidence
                         )
+                        transform["attachment_correspondence"] = deepcopy(
+                            attachment_correspondence
+                        )
                         if authored_node is not None:
                             transform["attachment_pivot_error_scope"] = (
                                 "authored_spm_node_absolute_translation"
@@ -5240,16 +6144,29 @@ def build_blender_assembly_inputs(
                                 not authored_node_table.get("available")
                             ),
                         )
-                        influences = _component_influences(
-                            final_merged_mesh,
-                            component,
-                        )
+                        if target_object is final_merged_mesh:
+                            influences = _component_influences(
+                                target_object,
+                                component,
+                            )
+                            influence_source = {
+                                "policy": "render_component_weights_v1",
+                            }
+                        else:
+                            influences, influence_source = (
+                                _nearest_weighted_vertex_influences(
+                                    final_merged_mesh,
+                                    weighted_vertex_locator,
+                                    target_attachment,
+                                )
+                            )
                         binding = {
                             "instance": instance_index,
                             "card_ordinal": ordinal,
                             "component_polygon_indices": component["polygons"],
                             "transform": transform,
                             "bone_influences": influences,
+                            "bone_influence_source": influence_source,
                         }
                         hierarchy = validate_binding_hierarchy(
                             binding,
@@ -5324,6 +6241,7 @@ def build_blender_assembly_inputs(
                                     "asset_name": subpart_asset,
                                     "export_stem": subpart_asset,
                                     "role": role,
+                                    "provider_key": provider_key,
                                     "role_identity": role_row["role_identity"],
                                     "topology_signature": "composite_subpart",
                                     "logical_group_index": ROLE_ORDER.index(role),
@@ -5448,6 +6366,7 @@ def build_blender_assembly_inputs(
                         "asset_name": part_asset_name,
                         "export_stem": part_asset_name,
                         "role": role,
+                        "provider_key": provider_key,
                         "role_identity": role_row["role_identity"],
                         "topology_signature": signature,
                         "external_source": external_source,
@@ -5508,18 +6427,29 @@ def build_blender_assembly_inputs(
             if not ordinals:
                 ordinals = [int(external.get("ordinal") or 0)]
             used_variant_keys.update(
-                (str(part.get("role") or "").casefold(), int(ordinal))
+                (
+                    str(
+                        part.get("provider_key")
+                        or part.get("role")
+                        or ""
+                    ).casefold(),
+                    int(ordinal),
+                )
                 for ordinal in ordinals
                 if int(ordinal) > 0
             )
         registered_role_rows = dict(prepared_unused_roles)
         registered_role_rows.update(roles)
-        for role, role_row in sorted(registered_role_rows.items()):
+        for provider_key, role_row in sorted(
+            registered_role_rows.items()
+        ):
+            role = str(role_row.get("role") or "").casefold()
             normalized = role_row.get("normalized_variants") or {}
             for variant in normalized.get("variants") or []:
                 ordinal = int(variant.get("ordinal") or 0)
                 registered_variants.append({
                     "role": role,
+                    "provider_key": provider_key,
                     "ordinal": ordinal,
                     "card_name": str(variant.get("plan_name") or ""),
                     "skeletal_asset_name": str(
@@ -5547,7 +6477,9 @@ def build_blender_assembly_inputs(
                         float(value)
                         for value in variant.get("attachment_vertex_uv")
                     ],
-                    "instanced": (role.casefold(), ordinal) in used_variant_keys,
+                    "instanced": (
+                        provider_key.casefold(), ordinal
+                    ) in used_variant_keys,
                 })
         authored_spm_after = validate_file_fingerprint(
             handoff.get("spm"),
@@ -6296,9 +7228,9 @@ def _apply_generated_fbx_import_contract(manifest_asset):
         )
 
     overrides = {
-        # Generated FBX geometry and bones are already baked to centimeters
-        # with object transforms normalized to 1, so consume them with the
-        # same no-extra-conversion policy as the Full SK.
+        # Generated FBX geometry stays in the Full SK local coordinate space,
+        # while its object transforms already carry the same Unreal Z-up axis
+        # conversion as Send2UE. Consume it without a second conversion.
         "convert_scene": False,
         "convert_scene_unit": False,
         "force_front_x_axis": False,
@@ -6653,8 +7585,14 @@ def validate_unreal_bounds_contract(
         + abs(full_normalized[1] - base_normalized[2])
         + abs(full_normalized[2] - base_normalized[1])
     )
+    base_axis_shape_validation = (
+        "deferred_to_final_assembly"
+        if allow_normalized_prototype_dominance
+        else "full_base_shape"
+    )
     if (
-        not base_scale_outside_limit
+        not allow_normalized_prototype_dominance
+        and not base_scale_outside_limit
         and yz_swapped_error + 0.05 < direct_error
     ):
         raise ClusterAssemblyBuildError(
@@ -6668,6 +7606,7 @@ def validate_unreal_bounds_contract(
         "base": base_bounds,
         "base_direct_shape_error": direct_error,
         "base_yz_swapped_shape_error": yz_swapped_error,
+        "base_axis_shape_validation": base_axis_shape_validation,
         "base_axis_scale_ratios": axis_scale_ratios,
         "base_absolute_scale_ratio": absolute_scale_ratio,
         "base_absolute_scale_ratio_limit": ratio_limit,

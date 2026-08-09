@@ -147,20 +147,76 @@ def _material_pipeline_checkouts():
     return sorted(paths)
 
 
+def _pcg_provider_binding_checkout(item):
+    wind_json = item.get("wind_json")
+    if not wind_json or not Path(str(wind_json)).is_file():
+        return None
+    try:
+        wind_contract = json.loads(Path(str(wind_json)).read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"cannot read DynamicWind contract before provider checkout: {wind_json}"
+        ) from exc
+    if not isinstance(wind_contract, dict):
+        raise RuntimeError("dynamic wind JSON root must be an object")
+    if wind_contract.get("WindResponsePresetContract") is None:
+        return None
+
+    library = getattr(unreal, "CodexDynamicWindResponseLibrary", None)
+    preview = getattr(
+        library,
+        "get_pcg_provider_binding_targets_for_mesh_path",
+        None,
+    )
+    if not callable(preview):
+        raise RuntimeError(
+            "CodexDynamicWindResponseLibrary provider-binding preview is required "
+            "for the shared response contract"
+        )
+    try:
+        payload = json.loads(str(preview(str(item.get("mesh_path") or ""))))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("provider-binding checkout preview returned invalid JSON") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("success") is not True
+        or payload.get("contract") != "shared_provider_v1"
+        or not payload.get("provider")
+        or not isinstance(payload.get("target_assets"), list)
+    ):
+        raise RuntimeError(
+            "provider-binding checkout preview did not confirm shared_provider_v1: "
+            + str(payload)
+        )
+    return payload
+
+
 def _checkout_existing_assets(item):
     candidates = list(item.get("checkout_asset_paths") or [])
+    provider_binding = _pcg_provider_binding_checkout(item)
+    if provider_binding:
+        item["_pcg_provider_binding_checkout"] = provider_binding
+        candidates.extend(provider_binding["target_assets"])
     existing = [
         path
-        for path in candidates
+        for path in dict.fromkeys(candidates)
         if path and unreal.EditorAssetLibrary.does_asset_exist(path)
     ]
     if not existing:
-        return {"existing": [], "checked_out": []}
+        return {
+            "existing": [],
+            "checked_out": [],
+            "provider_binding": provider_binding,
+        }
     subsystem = unreal.get_editor_subsystem(unreal.EditorAssetSubsystem)
     failed = [path for path in existing if not subsystem.checkout_asset(path)]
     if failed:
         raise RuntimeError("source-control checkout failed: " + ", ".join(failed))
-    return {"existing": existing, "checked_out": existing}
+    return {
+        "existing": existing,
+        "checked_out": existing,
+        "provider_binding": provider_binding,
+    }
 
 
 @contextmanager
@@ -1791,6 +1847,20 @@ def _apply_dynamic_wind(item):
         requested_enabled = wind_contract["bIsEnabled"]
         if not isinstance(requested_enabled, bool):
             raise RuntimeError("dynamic wind bIsEnabled must be a boolean")
+    response_contract = wind_contract.get("WindResponsePresetContract")
+    response_preset = None
+    if response_contract is not None:
+        if not isinstance(response_contract, dict):
+            raise RuntimeError("dynamic wind response preset contract must be an object")
+        if response_contract.get("SchemaVersion") != 1:
+            raise RuntimeError("dynamic wind response preset schema must be version 1")
+        response_preset = str(response_contract.get("Preset") or "").upper()
+        if response_preset == "GRASS":
+            response_preset = "WEED"
+        if response_preset not in {"TREE", "BUSH", "WEED", "NONE"}:
+            raise RuntimeError("dynamic wind response preset ID is invalid")
+        if not isinstance(response_contract.get("SimulationGroupBases"), list):
+            raise RuntimeError("dynamic wind response preset has no group basis array")
     mesh_path = item.get("mesh_path")
     mesh = unreal.EditorAssetLibrary.load_asset(mesh_path)
     if not mesh:
@@ -1819,7 +1889,59 @@ def _apply_dynamic_wind(item):
         )
     if not payload.get("skeleton_hash"):
         raise RuntimeError("dynamic wind importer returned no skeleton hash")
-    if requested_enabled is not None:
+    if response_contract is not None:
+        if payload.get("response_preset_contract") != "shared_response_v1":
+            raise RuntimeError(
+                "dynamic wind importer did not confirm shared_response_v1 contract"
+            )
+        if payload.get("response_preset") != response_preset:
+            raise RuntimeError(
+                "dynamic wind importer response preset differs from the JSON contract"
+            )
+        if payload.get("response_profile_applied") is not True:
+            raise RuntimeError(
+                "dynamic wind importer did not apply the shared response profile"
+            )
+        if not isinstance(payload.get("effective_is_enabled"), bool):
+            raise RuntimeError(
+                "dynamic wind importer did not report the effective shared response state"
+            )
+        if payload.get("production_provider_contract") != "shared_provider_v1":
+            raise RuntimeError(
+                "dynamic wind importer did not confirm shared_provider_v1 contract"
+            )
+        production_provider = str(payload.get("production_provider") or "")
+        provider_sync = payload.get("pcg_provider_sync")
+        if (
+            not production_provider
+            or not isinstance(provider_sync, dict)
+            or provider_sync.get("success") is not True
+            or provider_sync.get("contract") != "shared_provider_v1"
+            or provider_sync.get("provider") != production_provider
+            or not isinstance(provider_sync.get("matched_rows"), int)
+            or not isinstance(provider_sync.get("changed_rows"), int)
+            or not isinstance(provider_sync.get("target_assets"), list)
+            or not isinstance(provider_sync.get("changed_assets"), list)
+        ):
+            raise RuntimeError(
+                "dynamic wind importer did not synchronize the canonical "
+                "production provider: "
+                + str(provider_sync)
+            )
+        checkout_preview = item.get("_pcg_provider_binding_checkout")
+        if checkout_preview:
+            preview_targets = set(checkout_preview.get("target_assets") or [])
+            changed_targets = set(provider_sync.get("changed_assets") or [])
+            if checkout_preview.get("provider") != production_provider:
+                raise RuntimeError(
+                    "production provider changed between checkout and import"
+                )
+            if not changed_targets.issubset(preview_targets):
+                raise RuntimeError(
+                    "provider synchronization changed a PCG asset that was not "
+                    "declared by the checkout preview"
+                )
+    elif requested_enabled is not None:
         imported_enabled = payload.get("is_enabled")
         if not isinstance(imported_enabled, bool):
             raise RuntimeError(
@@ -2245,6 +2367,49 @@ def _ingest_cluster_assembly(send2ue_unreal, item, full_wind):
     }
 
 
+def _ensure_nanite_voxel_material_usage(base_material):
+    """Persist every usage flag required by UE 5.8 voxelized Nanite SKs."""
+    material_path = base_material.get_path_name()
+    properties = (
+        "used_with_skeletal_mesh",
+        "used_with_nanite",
+        "used_with_voxels",
+    )
+    before = {
+        name: bool(base_material.get_editor_property(name))
+        for name in properties
+    }
+    missing = [name for name, enabled in before.items() if not enabled]
+    checked_out = False
+    if missing:
+        subsystem = unreal.get_editor_subsystem(unreal.EditorAssetSubsystem)
+        if not subsystem.checkout_asset(material_path):
+            raise RuntimeError(
+                "source-control checkout failed for Nanite voxel material: "
+                + material_path
+            )
+        checked_out = True
+        for name in missing:
+            base_material.set_editor_property(name, True)
+    after = {
+        name: bool(base_material.get_editor_property(name))
+        for name in properties
+    }
+    if not all(after.values()):
+        raise RuntimeError(
+            "Nanite voxel material usage postcondition failed: "
+            + material_path
+        )
+    return {
+        "material": material_path,
+        "before": before,
+        "after": after,
+        "changed": bool(missing),
+        "checked_out": checked_out,
+        "saved": False,
+    }
+
+
 def _material_compile_and_slot_validation(mesh_path):
     mesh = unreal.EditorAssetLibrary.load_asset(mesh_path)
     if not mesh:
@@ -2256,6 +2421,7 @@ def _material_compile_and_slot_validation(mesh_path):
     details = []
     missing = []
     compiled_base_materials = set()
+    usage_validation = []
     compile_errors = []
     for index, slot in enumerate(slots):
         slot_name = str(slot.get_editor_property("material_slot_name"))
@@ -2275,8 +2441,20 @@ def _material_compile_and_slot_validation(mesh_path):
         if base_path in compiled_base_materials:
             continue
         compiled_base_materials.add(base_path)
+        usage = _ensure_nanite_voxel_material_usage(base_material)
         errors = unreal.MaterialEditingLibrary.recompile_material(base_material) or []
         compile_errors.extend(f"{base_path}: {error}" for error in errors)
+        if usage["changed"]:
+            if not unreal.EditorAssetLibrary.save_asset(
+                base_path,
+                only_if_is_dirty=False,
+            ):
+                raise RuntimeError(
+                    "failed to persist Nanite voxel material usage: "
+                    + base_path
+                )
+            usage["saved"] = True
+        usage_validation.append(usage)
 
     if missing:
         raise RuntimeError("unassigned material slots: " + ", ".join(missing))
@@ -2291,6 +2469,7 @@ def _material_compile_and_slot_validation(mesh_path):
         "mesh": mesh_path,
         "slots": details,
         "compiled_base_materials": sorted(compiled_base_materials),
+        "nanite_voxel_material_usage": usage_validation,
         "section_material_validation": section_validation,
     }
 
@@ -2413,6 +2592,14 @@ def ingest_item(item):
         dict.fromkeys(list(checkout["checked_out"]) + material_checkouts)
     )
     wind = _apply_dynamic_wind(item)
+    provider_sync = (wind.get("result") or {}).get("pcg_provider_sync") or {}
+    imported_assets.extend(
+        {
+            "asset_path": asset_path,
+            "asset_type": "PCGDynamicWindProviderBinding",
+        }
+        for asset_path in provider_sync.get("changed_assets") or []
+    )
     final_skeleton_saved = {}
     if (
         wind.get("status") == "ok"

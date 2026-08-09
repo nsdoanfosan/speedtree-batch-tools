@@ -181,6 +181,7 @@ from sk_common import (
     speedtree_output_spm_for,
     terminate_process_tree,
     unreal_remote_execution_settings,
+    normalize_wind_override,
     wind_preset_for_spm,
 )
 from spm_leaf_handoff_contract import (
@@ -274,7 +275,7 @@ WIND_OPTIONS = (
     ("자동 (식생 종류 기준)", "auto"),
     ("TREE", "TREE"),
     ("BUSH", "BUSH"),
-    ("GRASS", "GRASS"),
+    ("WEED", "WEED"),
     ("NONE", "NONE"),
 )
 BONE_MODE_OPTIONS = (("자동 계산", "auto"), ("수동 본 유지", "manual"))
@@ -3567,10 +3568,10 @@ class App:
                     calibration_cache["settings_signature"] = (
                         self.spm_calibration_signature
                     )
-            wind_override = entry.get("wind_override", "auto")
-            if wind_override not in {value for _label, value in WIND_OPTIONS}:
-                wind_override = "auto"
-                entry["wind_override"] = "auto"
+            saved_wind_override = entry.get("wind_override", "auto")
+            wind_override = normalize_wind_override(saved_wind_override)
+            if wind_override != saved_wind_override:
+                entry["wind_override"] = wind_override
             manual_bones_locked = is_manual_bones_locked(spm, entry)
             if manual_bones_locked:
                 entry["manual_bones_locked"] = True
@@ -11653,18 +11654,15 @@ class App:
         cached = self.__dict__.get("_material_preflight_cache_context_value")
         if isinstance(cached, dict):
             return cached
-        semantic_files = (
-            Path(fbx_ini),
-            Path(speedtree_cli),
-            TOOL_DIR / "jobs" / "speedtree_material_preflight.py",
-            REPO_DIR / "speedtree_pipeline_contract.py",
-            TOOL_DIR / "spm_leaf_handoff_contract.py",
-            TOOL_DIR / "atlas_consumer_integrity.py",
-            TOOL_DIR / "cluster_assembly_handoff_contract.py",
-            REPO_DIR
-            / "pcg_st9_texture_batch"
-            / "pcg_cluster_assembly_contract.py",
-        )
+        # Re-export is an asset operation, not a source-code migration.  The
+        # cache module's explicit contract version is the opt-in migration
+        # boundary for intentional semantic changes; hashing implementation
+        # .py files here made every ordinary code edit re-run the expensive
+        # SpeedTree FBX/STMAT export for unchanged data.  Only the actual
+        # export preset and installed SpeedTree identity belong in this
+        # automatic runtime signature.  A user force-run still bypasses the
+        # cache through the existing path.
+        semantic_files = (Path(fbx_ini),)
         cache_dir = Path(
             self.cfg.get("material_preflight_cache_dir")
             or (TOOL_DIR / "cache" / "material_preflight")

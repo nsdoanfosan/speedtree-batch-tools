@@ -246,8 +246,12 @@ phase 상태를 다시 해석하지 않는다.
 
 ## 주의
 
-- 각 행의 Wind `현재값 ▼`을 눌러 자동(파일명 기준) 또는 TREE/BUSH/GRASS/NONE을
+- 각 행의 Wind `현재값 ▼`을 눌러 자동(파일명 기준) 또는 TREE/BUSH/WEED/NONE을
   명시적으로 선택한다. 더블클릭 순환 방식은 사용하지 않는다.
+- 이 값은 변경 불가능한 에셋 반응 프리셋 ID다. 수치 조정은 Unreal의
+  `Project Settings > MyProject2 > Dynamic Wind Response Presets`에서 프리셋별로 한 번만 하며,
+  레벨/날씨 Wind Source의 속도·진폭·방향 설정과는 별개다. `NONE`도 같은
+  조정 창에 표시되고 기본 수치만 0이다.
 - 백업은 각 폴더의 `_spm_backups\` 하위 폴더에만 쌓인다 (작업 폴더 오염 없음)
 - 기존 UE 에셋을 다시 push할 때 .uasset이 Perforce read-only면 임포트가
   조용히 실패한다 → 먼저 p4 edit로 체크아웃할 것
