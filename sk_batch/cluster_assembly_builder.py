@@ -8138,6 +8138,10 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
         manifest["final_skeleton"]
     )
     del checked_skeleton
+    # Binding validity is defined by the final imported Skeleton.  Wind JSON
+    # generation/import is verified independently and must not be used as a
+    # second, narrower authority for which Assembly bones are allowed.
+    wind_bones = set(skeleton_by_name)
     base_contract = manifest.get("base") or {}
     base_weighted_bones = list(base_contract.get("weighted_bones") or [])
     if (
