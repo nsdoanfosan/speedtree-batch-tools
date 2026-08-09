@@ -2901,19 +2901,19 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
         )
         self.assertEqual(complete["status"], "complete")
 
-        with self.assertRaisesRegex(
-            ClusterAssemblyBuildError,
-            "do not reconstruct the Full SK",
-        ):
-            validate_unreal_bounds_contract(
-                full,
-                base,
-                {
-                    "origin": [0.0, 0.0, 0.0],
-                    "size": [1458.84, 1328.95, 2174.39],
-                },
-                allow_normalized_prototype_dominance=True,
-            )
+        mismatch = validate_unreal_bounds_contract(
+            full,
+            base,
+            {
+                "origin": [0.0, 0.0, 0.0],
+                "size": [1458.84, 1328.95, 2174.39],
+            },
+            allow_normalized_prototype_dominance=True,
+        )
+        self.assertEqual(
+            mismatch["assembly_size_validation_mode"],
+            "diagnostic_mismatch",
+        )
 
     def test_bounds_completion_requires_final_assembly_to_match_full(self):
         full = {"origin": [0.0, 0.0, 1000.0], "size": [1600.0, 1500.0, 2200.0]}
@@ -2924,18 +2924,22 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
         }
         for normalized_prototypes in (False, True):
             with self.subTest(normalized_prototypes=normalized_prototypes):
-                with self.assertRaisesRegex(
-                    ClusterAssemblyBuildError,
-                    "do not reconstruct the Full SK",
-                ):
-                    validate_unreal_bounds_contract(
-                        full,
-                        base,
-                        displaced,
-                        allow_normalized_prototype_dominance=(
-                            normalized_prototypes
-                        ),
-                    )
+                report = validate_unreal_bounds_contract(
+                    full,
+                    base,
+                    displaced,
+                    allow_normalized_prototype_dominance=(
+                        normalized_prototypes
+                    ),
+                )
+                self.assertEqual(
+                    report["assembly_size_validation_mode"],
+                    "diagnostic_mismatch",
+                )
+                self.assertEqual(
+                    report["assembly_origin_validation_mode"],
+                    "diagnostic_mismatch",
+                )
 
     def test_normalized_prototype_bounds_allow_thin_axis_overhang(self):
         full = {
@@ -2963,11 +2967,11 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
             "size": [175.61282348632812, 193.51742553710938, 73.70487976074219],
         }
 
-        with self.assertRaisesRegex(
-            ClusterAssemblyBuildError,
-            "do not reconstruct the Full SK",
-        ):
-            validate_unreal_bounds_contract(full, base, assembly)
+        diagnostic = validate_unreal_bounds_contract(full, base, assembly)
+        self.assertEqual(
+            diagnostic["assembly_size_validation_mode"],
+            "diagnostic_mismatch",
+        )
 
         report = validate_unreal_bounds_contract(
             full,

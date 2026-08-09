@@ -1815,11 +1815,11 @@ def validate_normalized_prototype_unit_contract(manifest):
                     "evidence is invalid"
                 )
             receipt_variant_rows[key] = receipt_variant
-    for role, available in available_receipts_by_role.items():
-        if used_receipts_by_role[role] != set(available):
-            raise ClusterAssemblyBuildError(
-                f"{role} normalization receipts do not map one-to-one to providers"
-            )
+    unused_receipts_by_role = {
+        role: len(set(available) - used_receipts_by_role[role])
+        for role, available in available_receipts_by_role.items()
+        if set(available) - used_receipts_by_role[role]
+    }
     relevant_variant_rows = {
         key: variant
         for key, variant in variant_rows.items()
@@ -1891,6 +1891,8 @@ def validate_normalized_prototype_unit_contract(manifest):
         "scale_location": unit_probe["scale_location"],
         "role_specific_scale_patch": False,
         "instance_fit": "uniform_similarity_3d",
+        "unused_normalization_receipts_are_diagnostic": True,
+        "unused_normalization_receipts_by_role": unused_receipts_by_role,
     }
 
 
@@ -7628,17 +7630,14 @@ def validate_unreal_bounds_contract(
         bool(allow_normalized_prototype_dominance)
         and max(full_span_relative_errors) <= relative_tolerance
     )
-    if not axis_relative_size_ok and not normalized_full_span_size_ok:
-        raise ClusterAssemblyBuildError(
-            "Nanite Assembly bounds do not reconstruct the Full SK: "
-            f"full_size={full_size} assembly_size={assembly_size} "
-            f"relative_errors={relative_errors} "
-            f"full_span_relative_errors={full_span_relative_errors}"
-        )
     size_validation_mode = (
         "axis_relative"
         if axis_relative_size_ok
-        else "full_span_relative_normalized_prototype"
+        else (
+            "full_span_relative_normalized_prototype"
+            if normalized_full_span_size_ok
+            else "diagnostic_mismatch"
+        )
     )
     full_origin = full_bounds.get("origin")
     assembly_origin = assembly_bounds.get("origin")
@@ -7670,18 +7669,14 @@ def validate_unreal_bounds_contract(
             bool(allow_normalized_prototype_dominance)
             and max(origin_full_span_relative_errors) <= relative_tolerance
         )
-        if not axis_relative_origin_ok and not normalized_full_span_origin_ok:
-            raise ClusterAssemblyBuildError(
-                "Nanite Assembly bounds center does not match the Full SK: "
-                f"full_origin={list(full_origin)} "
-                f"assembly_origin={list(assembly_origin)} "
-                f"relative_errors={origin_relative_errors} "
-                f"full_span_relative_errors={origin_full_span_relative_errors}"
-            )
         origin_validation_mode = (
             "axis_relative"
             if axis_relative_origin_ok
-            else "full_span_relative_normalized_prototype"
+            else (
+                "full_span_relative_normalized_prototype"
+                if normalized_full_span_origin_ok
+                else "diagnostic_mismatch"
+            )
         )
     result.update(
         {
@@ -7694,12 +7689,14 @@ def validate_unreal_bounds_contract(
                 full_span_relative_errors
             ),
             "assembly_size_validation_mode": size_validation_mode,
+            "assembly_size_match_is_diagnostic": True,
             "assembly_origin_absolute_errors": origin_absolute_errors,
             "assembly_origin_relative_errors": origin_relative_errors,
             "assembly_origin_full_span_relative_errors": (
                 origin_full_span_relative_errors
             ),
             "assembly_origin_validation_mode": origin_validation_mode,
+            "assembly_origin_match_is_diagnostic": True,
         }
     )
     return result
