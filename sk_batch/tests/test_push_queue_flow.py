@@ -3087,7 +3087,7 @@ class PushQueueFlowTests(unittest.TestCase):
 
         self.assertNotIn("_active_repair_stage_contracts", app.__dict__)
 
-    def test_push_contract_wrapper_requires_and_preserves_current_envelope(self):
+    def test_push_contract_preserves_current_envelope_without_identity_gate(self):
         gui = load_gui_module()
         with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
             gui, "LOG_DIR", Path(temp_dir) / "logs"
@@ -3114,8 +3114,11 @@ class PushQueueFlowTests(unittest.TestCase):
             payload = json.loads(contract_path.read_text(encoding="utf-8"))
             self.assertEqual(payload["status"], "ok")
             self.assertEqual(payload["speedtree_pipeline_contract"], envelope)
-            self.assertTrue(contract_path.name.endswith(f"{'a' * 16}.json"))
-            validate.assert_called_once_with(envelope, spm, require_ok=True)
+            self.assertEqual(
+                contract_path.name,
+                "SK_tree_contract_01_push_material_contract_current.json",
+            )
+            validate.assert_not_called()
 
     def test_push_contract_uses_exact_isolated_repair_material_source(self):
         gui = load_gui_module()
@@ -3182,11 +3185,7 @@ class PushQueueFlowTests(unittest.TestCase):
                 Path(payload["material_source_spm"]),
                 isolated.resolve(),
             )
-            validate.assert_called_once_with(
-                envelope,
-                isolated.resolve(),
-                require_ok=True,
-            )
+            validate.assert_not_called()
             mismatched = json.loads(report.read_text(encoding="utf-8"))
             mismatched["speedtree_material_handoff_contract"]["source"][
                 "spm"

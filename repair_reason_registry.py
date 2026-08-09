@@ -526,9 +526,6 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "blender_addon_public_api_missing": ReasonRow(
         UNSUPPORTED, "blender_addon_gateway.py", "worker_runtime",
     ),
-    "blender_addon_source_invalid": ReasonRow(
-        UNSUPPORTED, "blender_addon_gateway.py", "worker_runtime",
-    ),
     "blender_addon_source_mismatch": ReasonRow(
         UNSUPPORTED, "blender_addon_gateway.py", "worker_runtime",
     ),
@@ -1205,22 +1202,7 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "physical_capture_changed": ReasonRow(
         UNCLASSIFIED, "cluster_blend_sync.py", "",
     ),
-    "physical_capture_coverage_invalid": ReasonRow(
-        UNCLASSIFIED, "cluster_blend_sync.py", "",
-    ),
-    "physical_capture_extent_invalid": ReasonRow(
-        UNCLASSIFIED, "cluster_blend_sync.py", "",
-    ),
-    "physical_capture_fingerprint_mismatch": ReasonRow(
-        UNCLASSIFIED, "cluster_blend_sync.py", "",
-    ),
     "physical_capture_manifest_missing": ReasonRow(
-        UNCLASSIFIED, "cluster_blend_sync.py", "",
-    ),
-    "physical_capture_orientation_mismatch": ReasonRow(
-        UNCLASSIFIED, "cluster_blend_sync.py", "",
-    ),
-    "physical_capture_schema_invalid": ReasonRow(
         UNCLASSIFIED, "cluster_blend_sync.py", "",
     ),
     "path_alias_missing": ReasonRow(
@@ -2110,10 +2092,7 @@ _classify(
 _classify(
     REPAIRABLE, "cluster_refresh",
     "canonical_source_changed", "canonical_source_structural_changed",
-    "physical_capture_changed", "physical_capture_coverage_invalid",
-    "physical_capture_extent_invalid", "physical_capture_fingerprint_mismatch",
-    "physical_capture_manifest_missing", "physical_capture_orientation_mismatch",
-    "physical_capture_schema_invalid",
+    "physical_capture_changed", "physical_capture_manifest_missing",
     "recorded_source_missing", "relation_physical_proof_incomplete",
     "source_fbx_changed", "source_fbx_missing", "target_scope_changed",
 )

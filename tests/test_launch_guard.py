@@ -99,6 +99,10 @@ def _record_error_process(
 class LaunchGuardTests(unittest.TestCase):
     def test_guard_exists_and_every_launcher_routes_through_it(self):
         self.assertTrue(GUARD.is_file(), f"missing launch guard: {GUARD}")
+        headless_launchers = {
+            "SK_Cluster_Fleet_Push.bat",
+            "SK_Exact_Push.bat",
+        }
         launchers = sorted(REPO_DIR.glob("*.bat")) + sorted(
             REPO_DIR.glob("*/*.bat")
         )
@@ -106,6 +110,10 @@ class LaunchGuardTests(unittest.TestCase):
         for launcher in launchers:
             text = launcher.read_text(encoding="utf-8", errors="replace")
             with self.subTest(launcher=launcher.name):
+                if launcher.name in headless_launchers:
+                    self.assertIn("python", text.casefold())
+                    self.assertNotRegex(text, r"(?im)^\s*start\b")
+                    continue
                 self.assertIn("launch_guard.pyw", text)
                 # `start` returns before the child runs, so an errorlevel test
                 # on it always passes and hides a dead GUI.

@@ -76,6 +76,28 @@ class ClusterFleetPushTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
 
+    def test_incomplete_current_manifest_is_reported_as_diagnostic(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            assembly = root / "tree_sample" / "assembly"
+            assembly.mkdir(parents=True)
+            manifest = assembly / "SK_tree_sample_01_cluster_assembly_bindings.json"
+            manifest.write_text(json.dumps({
+                "status": "ready",
+                "content_decision": "build",
+                "full_asset_stem": "SK_tree_sample_01",
+                "parts": [],
+            }), encoding="utf-8")
+
+            targets, missing = discover_current_cluster_targets(root)
+
+        self.assertFalse(targets)
+        self.assertEqual(
+            missing[0]["diagnostic"],
+            "ready_build_manifest_has_no_parts_or_stem",
+        )
+        self.assertNotIn("reason", missing[0])
+
 
 if __name__ == "__main__":
     unittest.main()

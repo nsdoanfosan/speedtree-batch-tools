@@ -1382,10 +1382,6 @@ class RelationAndAuthorityTests(unittest.TestCase):
             return_value=semantic,
         ) as structural, mock.patch.object(
             cluster_sync,
-            "validate_physical_capture_manifest",
-            return_value={"contract_sha256": "capture-v1"},
-        ) as validate_capture, mock.patch.object(
-            cluster_sync,
             "inspect_normalization_source_identity",
             return_value={"refresh_reasons": []},
         ):
@@ -1406,7 +1402,6 @@ class RelationAndAuthorityTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(sha256_file.call_count, 2)
         self.assertEqual(structural.call_count, 1)
-        self.assertEqual(validate_capture.call_count, 1)
 
     def test_relation_directory_membership_change_invalidates_cache(self):
         rows = [{"blend": self.folder / "leaf.blend", "spms": []}]

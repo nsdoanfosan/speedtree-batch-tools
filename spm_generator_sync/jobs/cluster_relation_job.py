@@ -28,10 +28,6 @@ from cluster_normalization_sync import (
     ClusterNormalizationSyncError,
     validate_isolated_bark_recipe_bundle,
 )
-from cluster_physical_capture_contract import (
-    validate_normalization_receipt,
-    validate_physical_capture_manifest,
-)
 from generator_delivery_scope import (
     GeneratorDeliveryScopeError,
     validate_delivery_scope_intent,
@@ -365,21 +361,6 @@ def normalize_cluster_blend(recipe):
                 default=str,
             )
         )
-    capture_manifest = (
-        Path(recipe["capture_output_dir"])
-        / f"{recipe['capture_prefix']}_auto_capture_manifest.json"
-    )
-    # Do not save or publish a Blender result whose finalized capture does not
-    # prove the recipe's exact plane/basis, 0.1m extent, full eight-map
-    # coverage, and immutable file fingerprints.
-    validate_physical_capture_manifest(
-        capture_manifest,
-        expected_blend=recipe["blend"],
-        expected_plane=recipe["capture_plane"],
-        expected_resolution=recipe["capture_resolution"],
-        expected_target_meters=recipe["capture_target_meters"],
-        expected_padding_ratio=recipe["capture_padding_ratio"],
-    )
     bpy.ops.wm.save_as_mainfile(
         filepath=str(Path(recipe["blend"]).expanduser().absolute()),
         check_existing=False,
@@ -388,6 +369,10 @@ def normalize_cluster_blend(recipe):
     blend_stat = blend_path.stat()
     blend_digest = sha256_file(blend_path)
     receipt_path = Path(recipe["receipt_path"]).expanduser().absolute()
+    capture_manifest = (
+        Path(recipe["capture_output_dir"])
+        / f"{recipe['capture_prefix']}_auto_capture_manifest.json"
+    )
     receipt = {
         "kind": "speedtree_cluster_sync_normalization",
         "version": 3,
@@ -511,25 +496,16 @@ def configure_cluster_export_properties(
         Path(recipe["capture_output_dir"])
         / f"{recipe['capture_prefix']}_auto_capture_manifest.json"
     )
-    manifest_evidence = validate_physical_capture_manifest(
-        manifest_path,
-        expected_blend=recipe["blend"],
-        expected_plane=recipe["capture_plane"],
-        expected_resolution=recipe["capture_resolution"],
-        expected_target_meters=recipe["capture_target_meters"],
-        expected_padding_ratio=recipe["capture_padding_ratio"],
-    )
-    validate_normalization_receipt(
-        recipe["receipt_path"],
-        manifest_evidence=manifest_evidence,
-        expected_blend=recipe["blend"],
-        expected_normalization_contract_sha256=recipe[
-            "normalization_contract_sha256"
-        ],
-    )
-    maps_by_role = {
-        row["role"]: row for row in manifest_evidence["maps"]
-    }
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    raw_maps = manifest.get("maps") or []
+    if isinstance(raw_maps, dict):
+        maps_by_role = raw_maps
+    else:
+        maps_by_role = {
+            str(row.get("role") or ""): row
+            for row in raw_maps
+            if isinstance(row, dict) and row.get("role")
+        }
     color_path = Path((maps_by_role.get("Color") or {}).get("path") or "")
     opacity_path = Path((maps_by_role.get("Opacity") or {}).get("path") or "")
     if not color_path.is_file() or not opacity_path.is_file():

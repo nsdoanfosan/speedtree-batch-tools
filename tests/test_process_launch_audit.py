@@ -35,7 +35,13 @@ BAT_LAUNCHERS = {
     "SpeedTree_Batch_Tools.bat",
     "pcg_st9_texture_batch/PCG_ST9_Texture_Batch.bat",
     "sk_batch/SK_Batch.bat",
+    "sk_batch/SK_Cluster_Fleet_Push.bat",
+    "sk_batch/SK_Exact_Push.bat",
     "spm_generator_sync/SPM_Generator_Sync.bat",
+}
+HEADLESS_BAT_LAUNCHERS = {
+    "sk_batch/SK_Cluster_Fleet_Push.bat",
+    "sk_batch/SK_Exact_Push.bat",
 }
 
 
@@ -114,7 +120,12 @@ class ProcessLaunchAuditTests(unittest.TestCase):
         )
         for launcher in launchers:
             text = launcher.read_text(encoding="utf-8", errors="replace")
+            relative = launcher.relative_to(REPO_DIR).as_posix()
             with self.subTest(launcher=launcher.name):
+                if relative in HEADLESS_BAT_LAUNCHERS:
+                    self.assertIn("python", text.casefold())
+                    self.assertNotRegex(text, r"(?im)^\s*start\b")
+                    continue
                 self.assertIn("SPEEDTREE_BATCH_LAUNCH_SOURCE", text)
                 self.assertIn("launch_guard.pyw", text)
                 self.assertRegex(text, r"(?im)^\s*start\s+\"\"")
