@@ -725,7 +725,7 @@ class OriginalFailureAndProjectionTests(RecoveryTestCase):
             ],
         )
 
-    def test_issue_13_black_locast_evidence_is_sanitized_and_fail_closed(self):
+    def test_issue_13_black_locast_evidence_separates_delivery_and_maintenance(self):
         fixture_path = (
             Path(__file__).parent
             / "fixtures"
@@ -827,6 +827,118 @@ class OriginalFailureAndProjectionTests(RecoveryTestCase):
                 "canonical_postimage_preserved_but_not_accepted"
             ]
         )
+
+        self.assertEqual(evidence["schema_version"], 2)
+        current = evidence["current_resolution_audit"]
+        self.assertEqual(current["causal_contract_source_issue"], 174)
+        self.assertTrue(current["read_only"])
+        self.assertFalse(
+            current["prior_two_guid_970_orphan_conclusion_reused"]
+        )
+
+        current_source = current["source"]
+        self.assertEqual(
+            current_source["raw_sha256"],
+            "83c7c714d26ed9818874bc65fe1fb3ed73c00d5ae4a63fb9b540c9198c29bdf5",
+        )
+        self.assertEqual(
+            current_source["raw_sha256_before"],
+            current_source["raw_sha256_after"],
+        )
+        self.assertNotEqual(current_source["raw_sha256"], tree04["raw_sha256"])
+        self.assertTrue(current_source["bytes_unchanged_by_audit"])
+        self.assertTrue(current_source["stale"])
+        self.assertEqual(current_source["generator_count"], 85)
+        self.assertEqual(current_source["node_table_owner_count"], 88)
+        self.assertEqual(current_source["orphan_owner_count"], 5)
+        self.assertEqual(current_source["orphan_node_count"], 16842)
+        self.assertEqual(current_source["total_node_count"], 39256)
+        self.assertTrue(current_source["regex_elementtree_parity"])
+
+        scope = current["scope_authority"]
+        required_pairs = {
+            tuple(row) for row in scope["required_live_pairs"]
+        }
+        self.assertEqual(
+            required_pairs,
+            {
+                (2, 79),
+                (12, 82),
+                (12, 83),
+                (12, 84),
+                (12, 85),
+                (13, 86),
+                (13, 87),
+            },
+        )
+        self.assertEqual(
+            {tuple(row) for row in scope["authoring_pairs"]},
+            required_pairs,
+        )
+        self.assertTrue(scope["manifests_unchanged_by_audit"])
+
+        pair_rows = current["binding_local_required_live"]
+        self.assertEqual(
+            {
+                (row["material_id"], row["mesh_id"])
+                for row in pair_rows
+            },
+            required_pairs,
+        )
+        self.assertTrue(all(
+            row["required_live_pair_delivered"]
+            and row["participating_binding_count"] > 0
+            and row["fail_closed_binding_count"] == 0
+            and row["binding_local_orphan_ancestor_count"] == 0
+            for row in pair_rows
+        ))
+
+        operational = current["operational_verdict"]
+        self.assertEqual(operational["report_status"], "ok")
+        self.assertEqual(operational["item_status"], "ready")
+        self.assertEqual(operational["target_status"], "ready")
+        self.assertEqual(operational["actions"], [])
+        self.assertEqual(operational["assembly_handoff_status"], "ready")
+        self.assertEqual(operational["assembly_issue_codes"], [])
+        self.assertEqual(operational["assembly_error_codes"], [])
+        self.assertTrue(operational["current_live_pairs_all_covered"])
+        self.assertTrue(operational["spm_material_mesh_pairs_all_complete"])
+        self.assertTrue(operational["fbx_material_mesh_pairs_all_complete"])
+        self.assertTrue(operational["legacy_scope_drift_diagnostic_present"])
+        self.assertEqual(
+            operational["legacy_scope_drift_code"],
+            "live_generator_slot_not_declared_exactly_once",
+        )
+        self.assertEqual(operational["legacy_scope_drift_pair"], [2, 79])
+        self.assertFalse(operational["legacy_scope_drift_blocks_handoff"])
+
+        maintenance = current["maintenance_verdict"]
+        self.assertTrue(maintenance["saved_node_table_still_stale"])
+        self.assertFalse(maintenance["orphan_cleanup_complete"])
+        self.assertFalse(
+            maintenance["modeler_resave_required_for_current_delivery"]
+        )
+        self.assertTrue(
+            maintenance["modeler_resave_required_for_zero_orphan_asset_hygiene"]
+        )
+
+        interaction = current["production_interaction"]
+        self.assertFalse(interaction["spm_written"])
+        self.assertFalse(interaction["scope_manifest_written"])
+        self.assertFalse(interaction["modeler_launched"])
+        self.assertFalse(interaction["modeler_terminated"])
+        self.assertFalse(interaction["backup_required"])
+        self.assertFalse(interaction["receipt_required"])
+
+        disposition = current["issue_disposition"]
+        self.assertTrue(disposition["issue_13_operational_acceptance_proven"])
+        self.assertTrue(
+            disposition[
+                "legacy_resave_remedy_superseded_for_delivery_by_issue_174"
+            ]
+        )
+        self.assertTrue(disposition["asset_hygiene_debt_remains_nonblocking"])
+        self.assertTrue(disposition["close_issue_13"])
 
     def test_core_v6_accepts_only_exact_disabled_default_planar_2(self):
         before = spm_text(stale=True)

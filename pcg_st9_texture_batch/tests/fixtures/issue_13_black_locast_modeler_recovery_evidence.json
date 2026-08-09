@@ -1,6 +1,6 @@
 {
-  "contract": "speedtree_issue_13_black_locast_modeler_recovery_evidence_v1",
-  "schema_version": 1,
+  "contract": "speedtree_issue_13_black_locast_modeler_recovery_evidence_v2",
+  "schema_version": 2,
   "source_issue": 13,
   "repo_baseline": "0e85e461c2f64a5917b1e95cac08a7828f9ca87b",
   "asset_recovery_branch": "codex/issue-13-black-locast-modeler-recovery",
@@ -242,6 +242,173 @@
     "modeler_windows_left_open_and_untouched": true,
     "canonical_postimage_preserved_but_not_accepted": true,
     "stale_session_lock_removed_after_watcher_exit": true
+  },
+  "current_resolution_audit": {
+    "observed_at_local": "2026-08-09",
+    "repo_baseline": "df6eb6efce35c233c20dc4532a8069696af93e1b",
+    "causal_contract_source_issue": 174,
+    "read_only": true,
+    "prior_two_guid_970_orphan_conclusion_reused": false,
+    "source": {
+      "asset_name": "SK_tree_black_locast_04.spm",
+      "raw_sha256": "83c7c714d26ed9818874bc65fe1fb3ed73c00d5ae4a63fb9b540c9198c29bdf5",
+      "raw_sha256_before": "83c7c714d26ed9818874bc65fe1fb3ed73c00d5ae4a63fb9b540c9198c29bdf5",
+      "raw_sha256_after": "83c7c714d26ed9818874bc65fe1fb3ed73c00d5ae4a63fb9b540c9198c29bdf5",
+      "spm_text_sha256": "15bac9b1721e16aea637b41030f9d8f0fc6f3cf29397701b9ada6c1a5ea9be0b",
+      "size": 2207135,
+      "stale": true,
+      "generator_count": 85,
+      "node_table_owner_count": 88,
+      "orphan_owner_count": 5,
+      "orphan_node_count": 16842,
+      "total_node_count": 39256,
+      "eligible_node_count": 39247,
+      "generator_membership_fingerprint": "3ee94259d7131b17362e6514425000d98794c6ceb718a2a894b067ecef3d965f",
+      "eligible_owner_counts_fingerprint": "812652e8fd5467c087938f181ee54382c4939960b80dd2aac0e10f5bc715d516",
+      "regex_elementtree_parity": true,
+      "bytes_unchanged_by_audit": true
+    },
+    "scope_authority": {
+      "manifest_count": 5,
+      "requested_scope_count": 3,
+      "manifests_unchanged_by_audit": true,
+      "authoring_pairs": [
+        [2, 79],
+        [12, 82],
+        [12, 83],
+        [12, 84],
+        [12, 85],
+        [13, 86],
+        [13, 87]
+      ],
+      "required_live_pairs": [
+        [2, 79],
+        [12, 82],
+        [12, 83],
+        [12, 84],
+        [12, 85],
+        [13, 86],
+        [13, 87]
+      ]
+    },
+    "binding_local_required_live": [
+      {
+        "material_id": 2,
+        "mesh_id": 79,
+        "binding_count": 4,
+        "participating_binding_count": 4,
+        "eligible_node_counts": [69, 485, 2663, 2663],
+        "fail_closed_binding_count": 0,
+        "binding_local_orphan_ancestor_count": 0,
+        "required_live_pair_delivered": true
+      },
+      {
+        "material_id": 12,
+        "mesh_id": 82,
+        "binding_count": 2,
+        "participating_binding_count": 2,
+        "eligible_node_counts": [429, 592],
+        "fail_closed_binding_count": 0,
+        "binding_local_orphan_ancestor_count": 0,
+        "required_live_pair_delivered": true
+      },
+      {
+        "material_id": 12,
+        "mesh_id": 83,
+        "binding_count": 1,
+        "participating_binding_count": 1,
+        "eligible_node_counts": [592],
+        "fail_closed_binding_count": 0,
+        "binding_local_orphan_ancestor_count": 0,
+        "required_live_pair_delivered": true
+      },
+      {
+        "material_id": 12,
+        "mesh_id": 84,
+        "binding_count": 1,
+        "participating_binding_count": 1,
+        "eligible_node_counts": [592],
+        "fail_closed_binding_count": 0,
+        "binding_local_orphan_ancestor_count": 0,
+        "required_live_pair_delivered": true
+      },
+      {
+        "material_id": 12,
+        "mesh_id": 85,
+        "binding_count": 1,
+        "participating_binding_count": 1,
+        "eligible_node_counts": [592],
+        "fail_closed_binding_count": 0,
+        "binding_local_orphan_ancestor_count": 0,
+        "required_live_pair_delivered": true
+      },
+      {
+        "material_id": 13,
+        "mesh_id": 86,
+        "binding_count": 2,
+        "participating_binding_count": 2,
+        "eligible_node_counts": [429, 592],
+        "fail_closed_binding_count": 0,
+        "binding_local_orphan_ancestor_count": 0,
+        "required_live_pair_delivered": true
+      },
+      {
+        "material_id": 13,
+        "mesh_id": 87,
+        "binding_count": 1,
+        "participating_binding_count": 1,
+        "eligible_node_counts": [429],
+        "fail_closed_binding_count": 0,
+        "binding_local_orphan_ancestor_count": 0,
+        "required_live_pair_delivered": true
+      }
+    ],
+    "operational_verdict": {
+      "report_status": "ok",
+      "item_status": "ready",
+      "target_status": "ready",
+      "actions": [],
+      "assembly_handoff_status": "ready",
+      "assembly_issue_codes": [],
+      "assembly_error_codes": [],
+      "current_live_pair_dependency_count": 3,
+      "current_live_pairs_all_covered": true,
+      "spm_material_mesh_pairs_all_complete": true,
+      "fbx_material_mesh_pairs_all_complete": true,
+      "legacy_scope_drift_diagnostic_present": true,
+      "legacy_scope_drift_code": "live_generator_slot_not_declared_exactly_once",
+      "legacy_scope_drift_pair": [2, 79],
+      "legacy_scope_drift_blocks_handoff": false,
+      "resolution": "operational_block_resolved_under_current_live_pair_contract"
+    },
+    "maintenance_verdict": {
+      "saved_node_table_still_stale": true,
+      "orphan_cleanup_complete": false,
+      "modeler_resave_required_for_current_delivery": false,
+      "modeler_resave_required_for_zero_orphan_asset_hygiene": true,
+      "clean_resave_acceptance": {
+        "stale": false,
+        "orphan_owner_count": 0,
+        "orphan_node_count": 0,
+        "generator_membership_unchanged": true,
+        "authoring_semantics_unchanged": true,
+        "required_live_pairs_still_delivered": true
+      }
+    },
+    "production_interaction": {
+      "spm_written": false,
+      "scope_manifest_written": false,
+      "modeler_launched": false,
+      "modeler_terminated": false,
+      "backup_required": false,
+      "receipt_required": false
+    },
+    "issue_disposition": {
+      "issue_13_operational_acceptance_proven": true,
+      "legacy_resave_remedy_superseded_for_delivery_by_issue_174": true,
+      "asset_hygiene_debt_remains_nonblocking": true,
+      "close_issue_13": true
+    }
   },
   "sanitization": {
     "contains_raw_spm_or_xml": false,
