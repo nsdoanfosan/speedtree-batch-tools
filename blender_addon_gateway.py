@@ -11,6 +11,7 @@ import hashlib
 import importlib
 import json
 import os
+import sys
 from pathlib import Path
 
 from blender_addon_contract import (
@@ -106,9 +107,29 @@ def _replace_symbol(specification, replacement):
     return previous
 
 
-def _enable_addon(addon_id):
+def _enable_addon(addon_id, expected_source=None):
     specification = ADDONS[addon_id]
     module_name = specification["module"]
+    if expected_source and module_name not in sys.modules:
+        expected = _resolved(expected_source)
+        package_dir = expected.parent if expected.is_file() else expected
+        if not (package_dir / "__init__.py").is_file():
+            candidate = package_dir / module_name
+            if candidate.is_dir():
+                package_dir = candidate
+        if not (package_dir / "__init__.py").is_file():
+            raise BlenderAddonGatewayError(
+                f"configured {addon_id} source is not an importable add-on "
+                f"package: {expected}",
+                failure_contract={
+                    "code": "BLENDER_ADDON_SOURCE_INVALID",
+                    "addon": addon_id,
+                    "expected": str(expected),
+                },
+            )
+        package_parent = str(package_dir.parent)
+        if package_parent not in sys.path:
+            sys.path.insert(0, package_parent)
     try:
         import addon_utils  # type: ignore
     except ImportError as exc:
@@ -279,7 +300,10 @@ def prepare_runtime(job, requirements, *, expected_sources=None):
     rows = []
     try:
         for addon_id, capabilities in request["requirements"].items():
-            package = _enable_addon(addon_id)
+            package = _enable_addon(
+                addon_id,
+                request["expected_sources"].get(addon_id),
+            )
             identity = _module_identity(package)
             expected = _validate_expected_source(
                 addon_id,
