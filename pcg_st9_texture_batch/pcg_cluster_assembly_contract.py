@@ -5072,6 +5072,16 @@ def _tree_identity_paths(contract):
     return sorted(set(paths))
 
 
+def _tree_target_identity_paths(contract):
+    """Return only production target identities, excluding source aliases."""
+    return sorted({
+        _normalized_identity_path(path)
+        for row in contract.get("tree_source_identities") or []
+        for path in [(row.get("target_spm") or {}).get("path")]
+        if path
+    })
+
+
 def source_path_identity(contract):
     """Return the stable folder receipt identity derived only from source paths."""
     paths = sorted({
@@ -5622,9 +5632,11 @@ def cluster_assembly_receipt_resolution(spm_path, receipt_dir=None):
     """Resolve one semantically unambiguous hash-current receipt.
 
     Persisted receipts are cache evidence, so filesystem time and discovery
-    order cannot make one current contract authoritative over another.  Exact
-    full-contract duplicates may share one deterministic I/O representative;
-    divergent current contracts require a new live audit.
+    order cannot make one current contract authoritative over another. The
+    narrowest target scope is authoritative for one requested SPM because
+    wider live audits contain dependency unions for unrelated targets. Exact
+    full-contract duplicates at that scope may share one deterministic I/O
+    representative; divergent equally narrow contracts fail closed.
     """
     requested = _normalized_identity_path(spm_path)
     directory = Path(receipt_dir) if receipt_dir else DEFAULT_RECEIPT_DIR
@@ -5655,6 +5667,7 @@ def cluster_assembly_receipt_resolution(spm_path, receipt_dir=None):
         current.append({
             "path": path,
             "contract_sha256": _cluster_assembly_contract_digest(contract),
+            "target_scope_count": len(_tree_target_identity_paths(contract)),
         })
 
     if not current:
@@ -5676,36 +5689,53 @@ def cluster_assembly_receipt_resolution(spm_path, receipt_dir=None):
         {
             "path": str(row["path"]),
             "contract_sha256": row["contract_sha256"],
+            "target_scope_count": row["target_scope_count"],
         }
         for row in current
     ]
-    digests = {row["contract_sha256"] for row in current}
+    minimum_scope = min(row["target_scope_count"] for row in current)
+    scoped = [
+        row for row in current
+        if row["target_scope_count"] == minimum_scope
+    ]
+    scoped_rows = [
+        row for row in current_rows
+        if row["target_scope_count"] == minimum_scope
+    ]
+    superseded_rows = [
+        row for row in current_rows
+        if row["target_scope_count"] > minimum_scope
+    ]
+    digests = {row["contract_sha256"] for row in scoped}
     if len(digests) != 1:
         details = "; ".join(
             f"{Path(row['path']).name}={row['contract_sha256'][:16]}"
-            for row in current_rows
+            for row in scoped_rows
         )
         raise ClusterAssemblyReceiptAmbiguityError(
-            "hash-current Cluster Assembly receipts disagree for "
+            "equally narrow hash-current Cluster Assembly receipts disagree for "
             f"{spm_path}: {details}; run a live Cluster Assembly audit"
         )
 
-    selected = current[0]
+    selected = scoped[0]
     equivalent_paths = [
-        row["path"] for row in current_rows[1:]
+        row["path"] for row in scoped_rows[1:]
     ]
     return {
         "policy": (
-            "unique_hash_current_receipt"
-            if len(current) == 1
+            "narrowest_hash_current_receipt_scope"
+            if superseded_rows
+            else "unique_hash_current_receipt"
+            if len(scoped) == 1
             else "equivalent_hash_current_receipts"
         ),
         "requested_spm": str(spm_path),
         "selected_receipt": str(selected["path"]),
         "contract_sha256": selected["contract_sha256"],
+        "selected_target_scope_count": minimum_scope,
         "current_candidates": current_rows,
         "equivalent_current_receipts": equivalent_paths,
-        "superseded_current_receipts": [],
+        "superseded_current_receipts": superseded_rows,
         "ignored_stale_candidates": stale,
     }
 
