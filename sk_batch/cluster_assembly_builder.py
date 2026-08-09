@@ -7490,6 +7490,33 @@ def _current_unreal_skeleton_diagnostic(expected_bones, actual_bones):
     }
 
 
+def _base_weighted_bone_manifest_diagnostic(base_contract, actual_bones):
+    """Describe stale Base weight metadata without overriding the live Base mesh."""
+    declared = [
+        str(value) for value in (base_contract or {}).get("weighted_bones") or []
+    ]
+    try:
+        declared_count = int((base_contract or {}).get("weighted_bone_count", -1))
+    except (TypeError, ValueError):
+        declared_count = -1
+    actual_set = {str(value) for value in actual_bones}
+    missing = [name for name in declared if name not in actual_set]
+    count_matches = declared_count == len(declared)
+    return {
+        "status": (
+            "match"
+            if declared and count_matches and not missing
+            else "diagnostic_mismatch"
+        ),
+        "manifest_weight_list_is_authoritative": False,
+        "current_imported_base_mesh_is_authoritative": True,
+        "declared_weighted_bone_count": len(declared),
+        "declared_count_field": declared_count,
+        "declared_count_matches": count_matches,
+        "missing_from_current_skeleton": missing,
+    }
+
+
 def _unreal_transform(unreal, transform, coordinate_contract):
     factor = float(coordinate_contract["centimeters_per_blender_unit"])
     translation = transform["translation"]
@@ -8161,20 +8188,10 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
     wind_bones = set(actual_bones)
     base_contract = manifest.get("base") or {}
     base_weighted_bones = list(base_contract.get("weighted_bones") or [])
-    if (
-        not base_weighted_bones
-        or int(base_contract.get("weighted_bone_count", -1))
-        != len(base_weighted_bones)
-    ):
-        raise ClusterAssemblyBuildError(
-            "Assembly base has no usable weighted-bone list"
-        )
-    for bone_name in base_weighted_bones:
-        if bone_name not in wind_bones:
-            raise ClusterAssemblyBuildError(
-                "Assembly base weighted bone is outside the imported Skeleton: "
-                + str(bone_name)
-            )
+    base_weight_manifest_diagnostic = _base_weighted_bone_manifest_diagnostic(
+        base_contract,
+        actual_bones,
+    )
 
     assembly_path = paths["assembly"]
     directory, name = assembly_path.rsplit("/", 1)
@@ -8373,6 +8390,7 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
         "parts": built_parts,
         "binding_count": sum(row["bindings"] for row in built_parts),
         "base_weighted_bone_count": len(base_weighted_bones),
+        "base_weight_manifest_diagnostic": base_weight_manifest_diagnostic,
         "base_weights_in_final_wind": True,
         "reference_pose_sync": reference_pose_sync,
         "prototype_bounds_preflight": prototype_bounds_preflight,

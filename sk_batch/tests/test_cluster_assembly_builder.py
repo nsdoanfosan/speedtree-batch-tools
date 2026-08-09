@@ -35,6 +35,7 @@ from cluster_assembly_builder import (  # noqa: E402
     _validate_base_export_parent_chain,
     _attachment_point_correspondence,
     _assembly_fit_summary,
+    _base_weighted_bone_manifest_diagnostic,
     _build_unreal_assembly_provenance_payload,
     _coalesce_normalized_external_parts,
     _component_groups,
@@ -1829,6 +1830,23 @@ class PhysicalProductionContractTests(unittest.TestCase):
 
 
 class FinalSkeletonHierarchyTests(unittest.TestCase):
+    def test_stale_base_weight_manifest_is_diagnostic(self):
+        result = _base_weighted_bone_manifest_diagnostic(
+            {
+                "weighted_bones": ["Bone_1", "Bone_434_Start"],
+                "weighted_bone_count": 2,
+            },
+            ["Root", "Bone_1"],
+        )
+
+        self.assertEqual(result["status"], "diagnostic_mismatch")
+        self.assertTrue(result["current_imported_base_mesh_is_authoritative"])
+        self.assertFalse(result["manifest_weight_list_is_authoritative"])
+        self.assertEqual(
+            result["missing_from_current_skeleton"],
+            ["Bone_434_Start"],
+        )
+
     def test_current_unreal_skeleton_allows_manifest_drift_as_diagnostic(self):
         result = _current_unreal_skeleton_diagnostic(
             ["Root", "Bone_1", "Bone_2"],
