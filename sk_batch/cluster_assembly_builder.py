@@ -4661,6 +4661,29 @@ def _replicate_full_export_parent_chain(
     return created
 
 
+def _validate_base_export_parent_chain(
+    base_armature,
+    export_parents,
+    base_obj,
+):
+    """Prove the copied Base hierarchy matches the Full-SK source chain."""
+    expected_parent = base_armature
+    ordered_parents = list(export_parents or [])
+    for parent in ordered_parents:
+        if parent.parent is not expected_parent:
+            raise ClusterAssemblyBuildError(
+                "Assembly base export parent chain is not contiguous: "
+                f"object={parent.name}, expected_parent={expected_parent.name}"
+            )
+        expected_parent = parent
+    if base_obj.parent is not expected_parent:
+        raise ClusterAssemblyBuildError(
+            "Assembly base mesh is detached from its replicated Full export "
+            f"chain: mesh={base_obj.name}, expected_parent={expected_parent.name}"
+        )
+    return None
+
+
 def _strip_fbx_scene_textures(scene_data, get_fbx_uuid_from_key):
     """Keep material slots but remove FBX Texture/Video records and links.
 
@@ -4731,8 +4754,14 @@ def _textureless_fbx_scene_data(bpy):
         export_fbx_bin.fbx_data_from_scene = original
 
 
-def _validate_textureless_fbx(bpy, path, *, full_skeleton_root=False):
-    """Fail closed on texture records or a second raw-FBX object scale."""
+def _validate_textureless_fbx(
+    bpy,
+    path,
+    *,
+    full_skeleton_root=False,
+    expected_geometry_bounds=None,
+):
+    """Fail closed on textures, unit drift, axis drift, or geometry baking."""
     if not hasattr(bpy, "app"):
         return {
             "status": "not_available_in_mock",
@@ -4751,10 +4780,34 @@ def _validate_textureless_fbx(bpy, path, *, full_skeleton_root=False):
     texture_records = 0
     video_records = 0
     model_scales = []
+    geometry_bounds = {}
     if objects is not None:
         texture_records = sum(item.id == b"Texture" for item in objects.elems)
         video_records = sum(item.id == b"Video" for item in objects.elems)
         for item in objects.elems:
+            if item.id == b"Geometry" and len(item.props) >= 2:
+                vertices = next(
+                    (child for child in item.elems if child.id == b"Vertices"),
+                    None,
+                )
+                values = (
+                    list(vertices.props[0])
+                    if vertices is not None and vertices.props
+                    else []
+                )
+                axes = [values[index::3] for index in range(3)]
+                raw_name = item.props[1]
+                geometry_name = (
+                    raw_name.decode("utf-8", errors="replace")
+                    if isinstance(raw_name, bytes)
+                    else str(raw_name)
+                ).split("\x00", 1)[0]
+                geometry_bounds[geometry_name] = {
+                    "vertex_count": len(values) // 3,
+                    "minimum": [min(axis) if axis else 0.0 for axis in axes],
+                    "maximum": [max(axis) if axis else 0.0 for axis in axes],
+                }
+                continue
             if item.id != b"Model" or len(item.props) < 3:
                 continue
             if item.props[2] not in {b"Mesh", b"Null"}:
@@ -4764,6 +4817,7 @@ def _validate_textureless_fbx(bpy, path, *, full_skeleton_root=False):
                 None,
             )
             scale = [1.0, 1.0, 1.0]
+            rotation = [0.0, 0.0, 0.0]
             if properties is not None:
                 scaling = next(
                     (
@@ -4777,6 +4831,20 @@ def _validate_textureless_fbx(bpy, path, *, full_skeleton_root=False):
                 )
                 if scaling is not None and len(scaling.props) >= 3:
                     scale = [float(value) for value in scaling.props[-3:]]
+                local_rotation = next(
+                    (
+                        child
+                        for child in properties.elems
+                        if child.id == b"P"
+                        and child.props
+                        and child.props[0] == b"Lcl Rotation"
+                    ),
+                    None,
+                )
+                if local_rotation is not None and len(local_rotation.props) >= 3:
+                    rotation = [
+                        float(value) for value in local_rotation.props[-3:]
+                    ]
             raw_name = item.props[1]
             name = (
                 raw_name.decode("utf-8", errors="replace")
@@ -4788,6 +4856,7 @@ def _validate_textureless_fbx(bpy, path, *, full_skeleton_root=False):
                 "type": str(item.props[2]),
                 "is_null": item.props[2] == b"Null",
                 "scale": scale,
+                "rotation": rotation,
             })
     if texture_records or video_records:
         raise ClusterAssemblyBuildError(
@@ -4815,6 +4884,45 @@ def _validate_textureless_fbx(bpy, path, *, full_skeleton_root=False):
             "Assembly FBX model scale does not match its Full SK/part root "
             f"contract: {unexpected_model_scales}, path={path}"
         )
+    expected_model_rotation = [90.0, 0.0, 0.0]
+    unexpected_model_rotations = []
+    for row in model_scales:
+        row["expected_rotation"] = expected_model_rotation
+        if any(
+            abs((value - expected + 180.0) % 360.0 - 180.0) > 1.0e-3
+            for value, expected in zip(
+                row["rotation"], expected_model_rotation
+            )
+        ):
+            unexpected_model_rotations.append(row)
+    if unexpected_model_rotations:
+        raise ClusterAssemblyBuildError(
+            "Assembly FBX model rotation does not match the Unreal Z-up axis "
+            f"contract: {unexpected_model_rotations}, path={path}"
+        )
+    geometry_mismatches = []
+    for name, expected in (expected_geometry_bounds or {}).items():
+        actual = geometry_bounds.get(name)
+        if actual is None:
+            geometry_mismatches.append({"name": name, "reason": "missing"})
+            continue
+        mismatched = actual["vertex_count"] != expected["vertex_count"]
+        for key in ("minimum", "maximum"):
+            mismatched = mismatched or any(
+                abs(float(actual_value) - float(expected_value)) > 1.0e-5
+                for actual_value, expected_value in zip(
+                    actual[key], expected[key]
+                )
+            )
+        if mismatched:
+            geometry_mismatches.append(
+                {"name": name, "expected": expected, "actual": actual}
+            )
+    if geometry_mismatches:
+        raise ClusterAssemblyBuildError(
+            "Assembly FBX changed local geometry bounds during export: "
+            f"{geometry_mismatches}, path={path}"
+        )
     return {
         "status": "textureless",
         "fbx_version": version,
@@ -4822,8 +4930,12 @@ def _validate_textureless_fbx(bpy, path, *, full_skeleton_root=False):
         "video_records": video_records,
         "model_scales": model_scales,
         "expected_model_scale": expected_model_scale,
+        "expected_model_rotation": expected_model_rotation,
         "full_skeleton_root": bool(full_skeleton_root),
         "all_model_scales_match_contract": True,
+        "all_model_rotations_match_contract": True,
+        "geometry_bounds": geometry_bounds,
+        "all_geometry_bounds_match_contract": True,
         "material_source": "material_pipeline_json_sidecar",
     }
 
@@ -4881,6 +4993,26 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
         raise ClusterAssemblyBuildError(
             "generated Assembly FBX requires one armature and at least one mesh"
         )
+    expected_geometry_bounds = None
+    if hasattr(bpy, "app"):
+        expected_geometry_bounds = {}
+        for obj in meshes:
+            coordinates = [vertex.co for vertex in obj.data.vertices]
+            expected_geometry_bounds[obj.data.name] = {
+                "vertex_count": len(coordinates),
+                "minimum": [
+                    min(float(co[index]) for co in coordinates)
+                    if coordinates
+                    else 0.0
+                    for index in range(3)
+                ],
+                "maximum": [
+                    max(float(co[index]) for co in coordinates)
+                    if coordinates
+                    else 0.0
+                    for index in range(3)
+                ],
+            }
     for obj in armatures + meshes:
         scale = [float(value) for value in obj.matrix_world.to_scale()]
         if any(abs(value - 1.0) > 1.0e-5 for value in scale):
@@ -4900,17 +5032,12 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
     addon_runtime = None
     try:
         if not hasattr(bpy, "app"):
-            # Lightweight unit-test mocks exercise the stock operator call
-            # contract without importing Blender add-ons.
+            # Lightweight unit-test mocks exercise the operator settings
+            # without importing Blender add-ons.
             result = bpy.ops.export_scene.fbx(
                 filepath=str(path),
                 use_selection=True,
                 object_types={"ARMATURE", "MESH"},
-                # Keep BASE/PART reference poses on the exact stock-FBX contract
-                # used by speedtree_bone_weight_repair.core for the Full SK.  A
-                # separate unit-scale or modifier policy changes the imported
-                # armature-object root (bone 0), even when every authored Blender
-                # bone has the same name/order/parent/bind matrix.
                 use_mesh_modifiers=False,
                 mesh_smooth_type="FACE",
                 use_custom_props=False,
@@ -4920,9 +5047,9 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
                 armature_nodetype="NULL",
                 bake_anim=False,
                 path_mode="AUTO",
+                global_scale=1.0,
                 apply_unit_scale=True,
                 apply_scale_options="FBX_SCALE_NONE",
-                global_scale=1.0,
                 axis_forward="Y",
                 axis_up="Z",
                 bake_space_transform=False,
@@ -4930,11 +5057,10 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
             if "FINISHED" not in result:
                 raise ClusterAssemblyBuildError(f"FBX export failed: {result}")
         else:
-            # Use the same scale/bind-pose exporter as the real Send to Unreal
-            # Full mesh.  Its armature correction is part of PARK's existing
-            # handoff contract; the stock Blender exporter writes a 100x
-            # armature-object root even when all visible world transforms are
-            # identical.
+            # The Full SK is exported through Send2UE's armature-aware FBX
+            # patch. Use that same bind/root-scale contract for generated
+            # BASE/part assets, then independently prove that it did not bake
+            # or shrink their local geometry.
             from blender_addon_gateway import prepare_runtime
 
             addon_runtime = prepare_runtime(
@@ -4963,15 +5089,6 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
                     mesh_smooth_type="FACE",
                     use_mesh_edges=False,
                     use_subsurf=False,
-                    use_tspace=False,
-                    use_custom_props=False,
-                    add_leaf_bones=False,
-                    primary_bone_axis="Y",
-                    secondary_bone_axis="X",
-                    use_armature_deform_only=False,
-                    armature_nodetype="NULL",
-                    bake_anim=False,
-                    bake_anim_use_all_bones=True,
                     bake_anim_use_nla_strips=True,
                     bake_anim_use_all_actions=False,
                     bake_anim_force_startend_keying=True,
@@ -5001,6 +5118,7 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
         bpy,
         path,
         full_skeleton_root=full_skeleton_root,
+        expected_geometry_bounds=expected_geometry_bounds,
     )
     if addon_runtime is not None:
         validation["blender_addon_runtime"] = addon_runtime.receipt
@@ -5690,6 +5808,11 @@ def build_blender_assembly_inputs(
         final_armature.name = source_armature_name + "__FullSource"
         base_armature.name = source_armature_name
         try:
+            _validate_base_export_parent_chain(
+                base_armature,
+                base_export_parents,
+                base_obj,
+            )
             base_fbx_texture_contract = _export_selected_fbx(
                 bpy,
                 base_fbx,
@@ -7105,9 +7228,9 @@ def _apply_generated_fbx_import_contract(manifest_asset):
         )
 
     overrides = {
-        # Generated FBX geometry and bones are already baked to centimeters
-        # with object transforms normalized to 1, so consume them with the
-        # same no-extra-conversion policy as the Full SK.
+        # Generated FBX geometry stays in the Full SK local coordinate space,
+        # while its object transforms already carry the same Unreal Z-up axis
+        # conversion as Send2UE. Consume it without a second conversion.
         "convert_scene": False,
         "convert_scene_unit": False,
         "force_front_x_axis": False,
