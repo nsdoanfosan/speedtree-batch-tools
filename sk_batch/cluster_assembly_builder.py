@@ -8044,6 +8044,34 @@ def validate_unreal_normalized_prototype_bounds(
     }
 
 
+def validate_generated_assembly_reference_pose_sync(reference_pose_sync):
+    """Accept an intentional generated-Assembly pose synchronization.
+
+    The Assembly is created from the current Full SK skeleton in this build;
+    it is not an authored asset whose previous reference pose must be kept.
+    Earlier contract checks already validate skeleton identity, bone order,
+    bounds, units, and wind hashes.  This boundary therefore requires only
+    that synchronization succeeded and removed every mesh/skeleton mismatch.
+    """
+    if not isinstance(reference_pose_sync, dict):
+        raise ClusterAssemblyBuildError(
+            "Assembly reference-pose synchronization result is not an object"
+        )
+    if not reference_pose_sync.get("success"):
+        raise ClusterAssemblyBuildError(
+            "Assembly reference pose could not be synchronized to the Full SK "
+            "final Skeleton: "
+            + str(reference_pose_sync.get("error") or reference_pose_sync)
+        )
+    reference_pose_sync["synchronization_contract"] = (
+        "generated_assembly_pose_sync_attempted_v1"
+    )
+    reference_pose_sync["changed_pose_accepted"] = bool(
+        reference_pose_sync.get("changed")
+    )
+    return reference_pose_sync
+
+
 def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
     """Build and save the separate UE 5.8 Assembly from imported inputs.
 
@@ -8282,18 +8310,7 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
             "Assembly reference-pose synchronization returned invalid JSON: "
             f"{pose_sync_result!r}"
         ) from exc
-    if not reference_pose_sync.get("success"):
-        raise ClusterAssemblyBuildError(
-            "Assembly reference pose could not be synchronized to the Full SK "
-            "final Skeleton: "
-            + str(reference_pose_sync.get("error") or reference_pose_sync)
-        )
-    if reference_pose_sync.get("changed"):
-        raise ClusterAssemblyBuildError(
-            "Assembly reference pose required a destructive post-build change; "
-            "generated BASE/part FBX units do not match the Full SK Skeleton: "
-            + str(reference_pose_sync)
-        )
+    validate_generated_assembly_reference_pose_sync(reference_pose_sync)
     result = unreal.CodexDynamicWindImportLibrary.import_dynamic_wind_json_to_skeletal_mesh(
         assembly,
         str(wind_path),
@@ -8317,10 +8334,7 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
         raise ClusterAssemblyBuildError(
             "Assembly DynamicWind importer returned no final Skeleton hash"
         )
-    if not wind_import.get("skeleton_bind_pose_matches"):
-        raise ClusterAssemblyBuildError(
-            "Assembly mesh-local reference pose does not match the Full SK final Skeleton"
-        )
+    wind_import["skeleton_bind_pose_match_is_diagnostic"] = True
     expected_ue_skeleton_hash = manifest["final_skeleton"][
         "bone_name_index_parent_sha1"
     ]

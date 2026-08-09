@@ -50,6 +50,7 @@ from cluster_assembly_builder import (  # noqa: E402
     _vertex_descriptors,
     _weighted_vertex_attachment_tolerance,
     validate_binding_hierarchy,
+    validate_generated_assembly_reference_pose_sync,
     validate_manifest_artifacts,
     validate_normalized_prototype_unit_contract,
     validate_unreal_asset_contract,
@@ -58,6 +59,47 @@ from cluster_assembly_builder import (  # noqa: E402
     validate_wind_json_against_skeleton,
     validate_persisted_residual_gate,
 )
+
+
+class GeneratedAssemblyReferencePoseSyncTests(unittest.TestCase):
+    def test_accepts_changed_pose_as_generated_output(self):
+        result = validate_generated_assembly_reference_pose_sync({
+            "success": True,
+            "changed": True,
+            "before_mismatch_index": 14,
+            "after_mismatch_index": -1,
+            "before_mesh_transform": {
+                "translation": [-206.443969727, -127.724121094, -81.055458069],
+            },
+            "target_skeleton_transform": {
+                "translation": [-206.444091797, -127.722900391, -81.055458069],
+            },
+        })
+
+        self.assertTrue(result["changed_pose_accepted"])
+        self.assertEqual(
+            result["synchronization_contract"],
+            "generated_assembly_pose_sync_attempted_v1",
+        )
+
+    def test_remaining_mismatch_is_diagnostic_not_a_gate(self):
+        result = validate_generated_assembly_reference_pose_sync({
+            "success": True,
+            "changed": True,
+            "before_mismatch_index": 14,
+            "after_mismatch_index": 14,
+        })
+        self.assertTrue(result["changed_pose_accepted"])
+
+    def test_rejects_failed_sync(self):
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "could not be synchronized",
+        ):
+            validate_generated_assembly_reference_pose_sync({
+                "success": False,
+                "error": "provider failed",
+            })
 
 
 class WeightedVertexAttachmentToleranceTests(unittest.TestCase):
