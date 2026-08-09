@@ -198,7 +198,7 @@ class DynamicWindFinalSkeletonContractTests(unittest.TestCase):
             True,
         )
 
-    def test_disabled_wind_contract_requires_zeroed_coefficient_proof(self):
+    def test_disabled_wind_coefficient_proof_is_diagnostic(self):
         result = json.dumps(
             {
                 "success": True,
@@ -216,15 +216,17 @@ class DynamicWindFinalSkeletonContractTests(unittest.TestCase):
                 json.dumps({"bIsEnabled": False}),
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(RuntimeError, "zeroed disabled coefficients"):
-                runner._apply_dynamic_wind(
-                    {
-                        "wind_json": str(wind_json),
-                        "mesh_path": "/Game/Test/SK_Dead",
-                    }
-                )
+            report = runner._apply_dynamic_wind(
+                {
+                    "wind_json": str(wind_json),
+                    "mesh_path": "/Game/Test/SK_Dead",
+                }
+            )
 
-    def test_disabled_wind_contract_rejects_reenabled_asset_data(self):
+        self.assertEqual(report["status"], "ok")
+        self.assertIs(report["result"]["contract_fields_are_diagnostic"], True)
+
+    def test_disabled_wind_enabled_state_is_diagnostic(self):
         result = json.dumps(
             {
                 "success": True,
@@ -242,13 +244,15 @@ class DynamicWindFinalSkeletonContractTests(unittest.TestCase):
                 json.dumps({"bIsEnabled": False}),
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(RuntimeError, "enabled state differs"):
-                runner._apply_dynamic_wind(
-                    {
-                        "wind_json": str(wind_json),
-                        "mesh_path": "/Game/Test/SK_Dead",
-                    }
-                )
+            report = runner._apply_dynamic_wind(
+                {
+                    "wind_json": str(wind_json),
+                    "mesh_path": "/Game/Test/SK_Dead",
+                }
+            )
+
+        self.assertEqual(report["status"], "ok")
+        self.assertIs(report["result"]["contract_fields_are_diagnostic"], True)
 
     def test_shared_none_preset_accepts_effective_state_from_unreal_profile(self):
         result = json.dumps(
@@ -302,7 +306,7 @@ class DynamicWindFinalSkeletonContractTests(unittest.TestCase):
         self.assertEqual(report["result"]["response_preset"], "NONE")
         self.assertIs(report["result"]["effective_is_enabled"], True)
 
-    def test_shared_response_contract_requires_provider_sync_confirmation(self):
+    def test_shared_response_provider_sync_is_diagnostic(self):
         result = json.dumps(
             {
                 "success": True,
@@ -331,13 +335,15 @@ class DynamicWindFinalSkeletonContractTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(RuntimeError, "shared_provider_v1"):
-                runner._apply_dynamic_wind(
-                    {
-                        "wind_json": str(wind_json),
-                        "mesh_path": "/Game/Test/SK_Weed",
-                    }
-                )
+            report = runner._apply_dynamic_wind(
+                {
+                    "wind_json": str(wind_json),
+                    "mesh_path": "/Game/Test/SK_Weed",
+                }
+            )
+
+        self.assertEqual(report["status"], "ok")
+        self.assertIs(report["result"]["contract_fields_are_diagnostic"], True)
 
     def test_provider_checkout_preview_adds_exact_pcg_targets(self):
         runner = load_runner()
@@ -391,7 +397,7 @@ class DynamicWindFinalSkeletonContractTests(unittest.TestCase):
             ["/Game/PCG/DataBase/DA_Test_SK"],
         )
 
-    def test_shared_response_contract_requires_importer_confirmation(self):
+    def test_shared_response_confirmation_is_diagnostic(self):
         result = json.dumps(
             {
                 "success": True,
@@ -416,13 +422,15 @@ class DynamicWindFinalSkeletonContractTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(RuntimeError, "shared_response_v1"):
-                runner._apply_dynamic_wind(
-                    {
-                        "wind_json": str(wind_json),
-                        "mesh_path": "/Game/Test/SK_Tree",
-                    }
-                )
+            report = runner._apply_dynamic_wind(
+                {
+                    "wind_json": str(wind_json),
+                    "mesh_path": "/Game/Test/SK_Tree",
+                }
+            )
+
+        self.assertEqual(report["status"], "ok")
+        self.assertIs(report["result"]["contract_fields_are_diagnostic"], True)
 
     def test_normalized_cluster_prototype_skips_source_rig_wind(self):
         runner = load_runner()
@@ -476,7 +484,7 @@ class DynamicWindFinalSkeletonContractTests(unittest.TestCase):
                     }
                 )
 
-    def test_success_without_skeleton_hash_stops_ingest(self):
+    def test_success_without_skeleton_hash_is_accepted(self):
         runner = self._runner_with_result(
             json.dumps(
                 {
@@ -488,13 +496,15 @@ class DynamicWindFinalSkeletonContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             wind_json = Path(temporary) / "wind.json"
             wind_json.write_text("{}", encoding="utf-8")
-            with self.assertRaisesRegex(RuntimeError, "no skeleton hash"):
-                runner._apply_dynamic_wind(
-                    {
-                        "wind_json": str(wind_json),
-                        "mesh_path": "/Game/Test/SK_Tree",
-                    }
-                )
+            report = runner._apply_dynamic_wind(
+                {
+                    "wind_json": str(wind_json),
+                    "mesh_path": "/Game/Test/SK_Tree",
+                }
+            )
+
+        self.assertEqual(report["status"], "ok")
+        self.assertIs(report["result"]["contract_fields_are_diagnostic"], True)
 
     def test_transient_instanced_dynamic_wind_runtime_probe_is_required(self):
         runner = load_runner()

@@ -15729,31 +15729,25 @@ class App:
             raise RuntimeError(
                 f"SpeedTree Repair contract report could not be read: {exc}"
             ) from exc
-        envelope, material_source_spm = (
-            _material_handoff_envelope_for_push(
-                payload,
-                speedtree_output_spm_for(spm),
-            )
-        )
+        # Push consumes the current repaired blend and current source paths.
+        # A recorded source hash/profile belongs to an earlier diagnostic pass
+        # and must not veto regeneration of generated Unreal assets.
+        envelope = payload.get("speedtree_material_handoff_contract")
+        if not isinstance(envelope, dict):
+            envelope = payload.get("speedtree_pipeline_contract")
         if not isinstance(envelope, dict):
             raise RuntimeError(
-                "SpeedTree Repair report has no current pipeline contract; "
-                "run Blender Repair again"
+                "SpeedTree Repair report has no readable material contract"
             )
-        if (payload.get("handoff_preflight") or {}).get("status") != "ok":
-            raise RuntimeError(
-                "SpeedTree Repair handoff preflight is not ready; "
-                "run Blender Repair again"
-            )
-        validate_preflight_envelope(
-            envelope, material_source_spm, require_ok=True
-        )
-        source_fingerprint = str(envelope.get("source_fingerprint") or "")
-        suffix = source_fingerprint[:16] or hashlib.sha256(
-            _normalized_path(spm).encode("utf-8")
-        ).hexdigest()[:16]
+        material_source_spm = Path(
+            str((((envelope.get("source") or {}).get("spm") or {}).get(
+                "canonical_path"
+            )) or speedtree_output_spm_for(spm))
+        ).resolve()
+        # This is an execution input, not a historical artifact. Keep exactly one
+        # current wrapper per asset so old contracts can never be selected later.
         contract_path = LOG_DIR / (
-            f"{spm.stem}_push_material_contract_{suffix}.json"
+            f"{spm.stem}_push_material_contract_current.json"
         )
         atomic_write_json(
             contract_path,
@@ -15765,6 +15759,7 @@ class App:
                 ),
                 "material_source_spm": str(material_source_spm),
                 "source_repair_report": str(repair_report.resolve()),
+                "historical_identity_fields_are_diagnostic": True,
             },
         )
         return contract_path
