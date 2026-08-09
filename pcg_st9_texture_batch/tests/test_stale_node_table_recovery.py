@@ -5,6 +5,7 @@ import gzip
 import hashlib
 import io
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -38,6 +39,7 @@ from stale_node_table_recovery import (  # noqa: E402
     _legacy_authoring_graph_core_v4_projection,
     _legacy_target_binding_fingerprint,
     _preimage_receipt,
+    _refresh_session_lock,
     _release_session_lock,
     _resolve_receipt_dialect,
     _resolve_target_scopes,
@@ -2992,6 +2994,55 @@ class SemanticUIARecoveryTests(RecoveryTestCase):
             self.assertEqual(blocked["semantic_uia"]["owned_process_id"], 4242)
             self.assertEqual(blocked["semantic_uia"]["operation"], "save")
 
+    def test_interruption_runs_bounded_session_cleanup_and_records_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, executable, root = self.make_files(folder)
+            state = {}
+            calls = []
+
+            class Session:
+                def save_document(inner_self, _executable, observed_spm):
+                    calls.append("save")
+                    state["cancelled"] = True
+                    return self.semantic_receipt(observed_spm, "save")
+
+                def close_document(inner_self, _observed_spm):
+                    calls.append("close")
+
+                def cleanup_after_failure(inner_self, observed_spm):
+                    calls.append(("cleanup", Path(observed_spm).name))
+                    return {
+                        "cleanup_status": "owned_process_exited_gracefully",
+                        "owned_process_id": 4242,
+                        "exact_document_closed": True,
+                        "force_termination_used": False,
+                    }
+
+            with self.assertRaises(StaleNodeTableRecoveryError) as caught:
+                self.recover_with_save(
+                    spm,
+                    executable,
+                    root,
+                    guards=open_guards(state),
+                    modeler_session=Session(),
+                )
+
+            self.assertEqual(caught.exception.reason_token, "initiating_job_cancelled")
+            self.assertEqual(calls, ["save", ("cleanup", "model.spm")])
+            cleanup = caught.exception.evidence["semantic_uia_cleanup"]
+            self.assertEqual(cleanup["owned_process_id"], 4242)
+            self.assertFalse(cleanup["force_termination_used"])
+            blocked = json.loads(
+                (root / caught.exception.evidence["blocked_event"]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                blocked["semantic_uia_cleanup"]["cleanup_status"],
+                "owned_process_exited_gracefully",
+            )
+
 
 class QuiescenceAndGraphGateTests(RecoveryTestCase):
     def test_graph_change_and_stale_false_alone_never_continue(self):
@@ -3523,6 +3574,175 @@ class ContinuationAndRaceTests(RecoveryTestCase):
             finally:
                 _release_session_lock(lock, token)
             self.assertEqual(launched, [])
+
+    def test_session_lock_seals_pid_start_time_and_monotonic_heartbeat(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, _executable, root = self.make_files(folder)
+            root.mkdir()
+            identity = _capture_immutable_snapshot(
+                spm, TARGET_MESH_IDS
+            )["source_identity"]
+            lock, token = _acquire_session_lock(root, identity)
+            try:
+                initial = json.loads(lock.read_text(encoding="utf-8"))
+                self.assertEqual(initial["schema_version"], 2)
+                self.assertEqual(initial["owner_pid"], os.getpid())
+                self.assertTrue(initial["owner_process_start_identity"])
+                self.assertIn("owner_process_started_at_utc", initial)
+                self.assertEqual(initial["heartbeat_sequence"], 0)
+                self.assertIsInstance(
+                    initial["heartbeat_monotonic_seconds"],
+                    (int, float),
+                )
+                refreshed = _refresh_session_lock(lock, token)
+                self.assertEqual(refreshed["heartbeat_sequence"], 1)
+                self.assertGreaterEqual(
+                    refreshed["heartbeat_monotonic_seconds"],
+                    initial["heartbeat_monotonic_seconds"],
+                )
+            finally:
+                _release_session_lock(lock, token)
+
+    def test_dead_interrupted_owner_is_reclaimed_but_live_owner_is_not(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, _executable, root = self.make_files(folder)
+            root.mkdir()
+            identity = _capture_immutable_snapshot(
+                spm, TARGET_MESH_IDS
+            )["source_identity"]
+            lock, old_token = _acquire_session_lock(
+                root,
+                identity,
+                owner_pid=4100,
+                owner_process_start_identity="creation-old",
+            )
+            try:
+                with self.assertRaises(StaleNodeTableRecoveryError) as active:
+                    _acquire_session_lock(
+                        root,
+                        identity,
+                        owner_pid=4200,
+                        owner_process_start_identity="creation-new",
+                        liveness_fn=lambda pid, start: True,
+                    )
+                self.assertEqual(
+                    active.exception.reason_token,
+                    "recovery_session_already_active",
+                )
+                self.assertEqual(
+                    json.loads(lock.read_text(encoding="utf-8"))["session_token"],
+                    old_token,
+                )
+
+                new_lock, new_token = _acquire_session_lock(
+                    root,
+                    identity,
+                    owner_pid=4200,
+                    owner_process_start_identity="creation-new",
+                    liveness_fn=lambda pid, start: False,
+                )
+                current = json.loads(new_lock.read_text(encoding="utf-8"))
+                self.assertEqual(current["owner_pid"], 4200)
+                self.assertEqual(
+                    current["owner_process_start_identity"],
+                    "creation-new",
+                )
+                self.assertNotEqual(current["session_token"], old_token)
+                self.assertEqual(len(list(root.glob("reclaimed.session.*.json"))), 1)
+            finally:
+                _release_session_lock(
+                    lock,
+                    locals().get("new_token", old_token),
+                    owner_pid=4200 if "new_token" in locals() else 4100,
+                    owner_process_start_identity=(
+                        "creation-new" if "new_token" in locals() else "creation-old"
+                    ),
+                )
+
+    def test_pid_reuse_does_not_make_the_interrupted_owner_look_alive(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, _executable, root = self.make_files(folder)
+            root.mkdir()
+            identity = _capture_immutable_snapshot(
+                spm, TARGET_MESH_IDS
+            )["source_identity"]
+            lock, old_token = _acquire_session_lock(
+                root,
+                identity,
+                owner_pid=5100,
+                owner_process_start_identity="creation-before-reuse",
+            )
+            observed = []
+
+            def reused_pid_is_not_exact_owner(pid, start_identity):
+                observed.append((pid, start_identity))
+                # PID 5100 exists again, but its creation identity differs.
+                return False
+
+            new_lock, new_token = _acquire_session_lock(
+                root,
+                identity,
+                owner_pid=5200,
+                owner_process_start_identity="creation-recovery",
+                liveness_fn=reused_pid_is_not_exact_owner,
+            )
+            try:
+                self.assertEqual(
+                    observed,
+                    [(5100, "creation-before-reuse")],
+                )
+                current = json.loads(new_lock.read_text(encoding="utf-8"))
+                self.assertEqual(current["session_token"], new_token)
+                self.assertNotEqual(current["session_token"], old_token)
+            finally:
+                _release_session_lock(
+                    new_lock,
+                    new_token,
+                    owner_pid=5200,
+                    owner_process_start_identity="creation-recovery",
+                )
+
+    def test_legacy_or_malformed_lock_is_never_stolen_without_owner_proof(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            spm, _executable, root = self.make_files(folder)
+            root.mkdir()
+            identity = _capture_immutable_snapshot(
+                spm, TARGET_MESH_IDS
+            )["source_identity"]
+            lock = root / (
+                "session."
+                + identity["source_identity_sha256"][:24]
+                + ".lock.json"
+            )
+            legacy = {
+                "kind": "speedtree_stale_node_table_recovery_session_lock",
+                "schema_version": 1,
+                **identity,
+                "session_token": "a" * 32,
+            }
+            lock.write_text(json.dumps(legacy), encoding="utf-8")
+
+            with self.assertRaises(StaleNodeTableRecoveryError) as caught:
+                _acquire_session_lock(
+                    root,
+                    identity,
+                    owner_pid=6200,
+                    owner_process_start_identity="creation-new",
+                    liveness_fn=lambda _pid, _start: False,
+                )
+
+            self.assertEqual(
+                caught.exception.reason_token,
+                "recovery_session_lock_ownership_unverifiable",
+            )
+            self.assertEqual(
+                json.loads(lock.read_text(encoding="utf-8")),
+                legacy,
+            )
 
     def test_simultaneous_lock_contenders_have_one_winner_repeatedly(self):
         with tempfile.TemporaryDirectory() as temporary:
