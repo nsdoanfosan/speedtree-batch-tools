@@ -2253,7 +2253,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 expected,
             )
 
-    def test_divergent_current_overlapping_receipts_fail_closed(self):
+    def test_narrower_current_receipt_wins_over_divergent_wider_scope(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             receipt_dir = root / "receipts"
@@ -2297,16 +2297,59 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             os.utime(first, ns=(1_000_000_000, 1_000_000_000))
             os.utime(second, ns=(2_000_000_000, 2_000_000_000))
 
-            with self.assertRaisesRegex(
-                ClusterAssemblyReceiptAmbiguityError,
-                "run a live Cluster Assembly audit",
-            ):
-                cluster_assembly_receipt_resolution(target, receipt_dir)
+            resolution = cluster_assembly_receipt_resolution(
+                target, receipt_dir
+            )
+            self.assertEqual(
+                resolution["policy"],
+                "narrowest_hash_current_receipt_scope",
+            )
+            self.assertEqual(Path(resolution["selected_receipt"]), first)
+            self.assertEqual(resolution["selected_target_scope_count"], 1)
+            self.assertEqual(
+                [Path(row["path"]) for row in resolution[
+                    "superseded_current_receipts"
+                ]],
+                [second],
+            )
 
             os.utime(first, ns=(3_000_000_000, 3_000_000_000))
             os.utime(second, ns=(1_000_000_000, 1_000_000_000))
-            with self.assertRaises(ClusterAssemblyReceiptAmbiguityError):
-                locate_cluster_assembly_receipt(target, receipt_dir)
+            self.assertEqual(
+                locate_cluster_assembly_receipt(target, receipt_dir),
+                first,
+            )
+
+    def test_divergent_equally_narrow_current_receipts_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            receipt_dir = root / "receipts"
+            target = root / "SK_Tree_elm_01.spm"
+            source = root / "Tree_elm_01.spm"
+            target.write_bytes(b"target")
+            source.write_bytes(b"source")
+            base = {
+                "folder": str(root),
+                "tree_source_identities": [{
+                    "target_spm": file_fingerprint(target),
+                    "authoritative_tree_source": file_fingerprint(source),
+                }],
+                "dependencies": [],
+                "handoff": {"cluster_dependencies": []},
+            }
+            first = persist_cluster_assembly_receipt(
+                base, receipt_dir=receipt_dir
+            )
+            second_payload = json.loads(first.read_text(encoding="utf-8"))
+            second_payload["cluster_assembly"]["handoff"]["status"] = "ok"
+            second = receipt_dir / "cluster_assembly_divergent.json"
+            second.write_text(json.dumps(second_payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                ClusterAssemblyReceiptAmbiguityError,
+                "equally narrow",
+            ):
+                cluster_assembly_receipt_resolution(target, receipt_dir)
 
     def test_persisted_receipt_tracks_nested_physical_source_artifacts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
