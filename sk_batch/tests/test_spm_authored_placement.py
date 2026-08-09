@@ -187,7 +187,7 @@ class SpmAuthoredPlacementTests(unittest.TestCase):
                 matched["match_evidence"]["claimed_nearer_node_count"], 1
             )
 
-    def test_global_assignment_is_one_to_one_and_unmatched_is_degraded_evidence(self):
+    def test_global_assignment_reuses_nodes_for_additional_render_components(self):
         text = spm_xml([
             node_xml("a", (0, 0, 0)),
             node_xml("b", (0.01, 0, 0)),
@@ -215,17 +215,19 @@ class SpmAuthoredPlacementTests(unittest.TestCase):
                     },
                 ],
             )
-            self.assertEqual(result["assigned_count"], 2)
-            self.assertEqual(result["unmatched_count"], 1)
+            self.assertEqual(result["assigned_count"], 3)
+            self.assertEqual(result["unmatched_count"], 0)
             self.assertEqual(
                 result["assignments"]["component-a"]["node_guid"], "a"
             )
             self.assertEqual(
                 result["assignments"]["component-b"]["node_guid"], "b"
             )
-            self.assertEqual(
-                result["unmatched"][0]["match_diagnostic"],
-                "global_one_to_one_candidate_exhausted",
+            self.assertEqual(result["shared_node_component_recovery_count"], 1)
+            self.assertTrue(
+                result["assignments"]["component-unmatched"][
+                    "match_evidence"
+                ]["shared_authored_node"]
             )
 
             def emitted_mapping_keys(value):
@@ -240,6 +242,62 @@ class SpmAuthoredPlacementTests(unittest.TestCase):
             self.assertTrue(
                 REASON_KEYS.isdisjoint(emitted_mapping_keys(result)),
                 "placement diagnostics must not masquerade as repair reasons",
+            )
+
+    def test_global_assignment_keeps_truly_node_less_target_unmatched(self):
+        text = spm_xml([
+            node_xml("inactive", (0, 0, 0), valid=False),
+        ])
+        with tempfile.TemporaryDirectory() as root:
+            table = parse_spm_authored_placement(self._write(root, text))
+            result = assign_authored_nodes_to_components(
+                table,
+                [{
+                    "component_id": "component-without-node",
+                    "target_mesh_id": 999,
+                    "position_meters": [1.0, 0.0, 0.0],
+                }],
+            )
+
+            self.assertEqual(result["assigned_count"], 0)
+            self.assertEqual(result["unmatched_count"], 1)
+            self.assertEqual(
+                result["unmatched"][0]["match_diagnostic"],
+                "no_active_authored_node_candidate",
+            )
+
+    def test_global_unbounded_recovery_avoids_dense_graph_and_then_shares(self):
+        text = spm_xml([
+            node_xml("a", (0, 0, 0)),
+            node_xml("b", (1, 0, 0)),
+        ])
+        with tempfile.TemporaryDirectory() as root:
+            table = parse_spm_authored_placement(self._write(root, text))
+            result = assign_authored_nodes_to_components(
+                table,
+                [
+                    {
+                        "component_id": f"component-{index}",
+                        "target_mesh_id": 999,
+                        "position_meters": [10.0 + index, 0.0, 0.0],
+                    }
+                    for index in range(5)
+                ],
+                tolerance_meters=0.01,
+            )
+
+            self.assertEqual(result["assigned_count"], 5)
+            self.assertEqual(result["unmatched_count"], 0)
+            self.assertEqual(
+                result["global_out_of_tolerance_recovery_count"], 2
+            )
+            self.assertEqual(result["shared_node_component_recovery_count"], 3)
+            self.assertEqual(
+                len({
+                    row["node_guid"]
+                    for row in result["assignments"].values()
+                }),
+                2,
             )
 
     def test_global_assignment_preserves_maximum_bounded_cardinality(self):

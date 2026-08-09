@@ -370,6 +370,11 @@ def select_cluster_assembly_build_handoff(receipt_contract, inspected_handoff):
         and inspected_handoff.get("status") == "ready"
     ):
         return "build", inspected_handoff
+    if (
+        isinstance(inspected_handoff, dict)
+        and inspected_handoff.get("status") == "pass_through"
+    ):
+        return "pass_through", inspected_handoff
 
     receipt_handoff = {}
     if isinstance(receipt_contract, dict):

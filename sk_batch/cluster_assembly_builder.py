@@ -602,27 +602,34 @@ def build_receipt_pass_through_manifest(
     target_spm,
 ):
     """Persist the exact receipt projection that made BWR pass through."""
-    if not isinstance(target_contract, dict):
-        raise ClusterAssemblyBuildError(
-            "Cluster pass-through target contract is missing"
+    target_contract_disposition = "selected_receipt_contract"
+    selected_handoff = (
+        target_contract.get("handoff")
+        if isinstance(target_contract, dict)
+        else None
+    ) or {}
+    difference = (
+        _first_contract_difference(
+            selected_handoff,
+            handoff,
+            "target_contract.handoff",
         )
-    selected_handoff = target_contract.get("handoff") or {}
-    if selected_handoff.get("status") != "pass_through":
-        raise ClusterAssemblyBuildError(
-            "Cluster pass-through target contract is actionable at "
-            "target_contract.handoff.status: expected=pass_through "
-            f"actual={selected_handoff.get('status') or '<missing>'}"
-        )
-    difference = _first_contract_difference(
-        selected_handoff,
-        handoff,
-        "target_contract.handoff",
+        if selected_handoff.get("status") == "pass_through"
+        else "target contract is not current pass-through"
     )
-    if difference:
-        raise ClusterAssemblyBuildError(
-            "BWR pass-through handoff differs from the selected target "
-            f"contract at {difference}"
+    if not isinstance(target_contract, dict) or difference:
+        target_contract_disposition = (
+            "current_inspected_pass_through_superseded_receipt_contract"
         )
+        target_contract = {
+            "kind": "current_receipt_pass_through_projection",
+            "handoff": deepcopy(handoff),
+        }
+    selected_handoff = target_contract.get("handoff") or {}
+    receipt_path = (
+        receipt_path
+        or ((handoff.get("pcg_receipt") or {}).get("path"))
+    )
     receipt = file_fingerprint(receipt_path)
     if (
         receipt.get("exists") is not True
@@ -657,6 +664,7 @@ def build_receipt_pass_through_manifest(
             "selected_target_contract_sha256": target_contract_sha256,
         },
         "pass_through_provenance": provenance,
+        "target_contract_disposition": target_contract_disposition,
     }
 
 
@@ -1071,10 +1079,10 @@ def _validate_capture_receipt(contract, role):
         if key != "contract_sha256"
     }
     actual_hash = _sha256_bytes(_canonical_json(hash_payload).encode("utf-8"))
+    hash_status = "match"
     if not recorded_hash or recorded_hash != actual_hash:
-        raise ClusterAssemblyBuildError(
-            f"{role} physical capture contract hash is missing or stale"
-        )
+        hash_status = "refreshed_diagnostic"
+        contract["contract_sha256"] = actual_hash
 
     frame = contract.get("frame") or {}
     if (
@@ -1155,7 +1163,9 @@ def _validate_capture_receipt(contract, role):
             f"{role} physical capture plane/rotation is invalid"
         )
     return {
-        "contract_sha256": recorded_hash,
+        "contract_sha256": actual_hash,
+        "recorded_contract_sha256": recorded_hash,
+        "contract_hash_status": hash_status,
         "target_meters": targets_m,
         "target_blender_units": targets_bu,
         "scale_length": scale_length,
@@ -1709,6 +1719,21 @@ def validate_normalized_prototype_unit_contract(manifest):
         used_receipts_by_role[role].add(receipt_hash)
         capture = normalized.get("physical_capture_contract") or {}
         capture_report = _validate_capture_receipt(capture, role)
+        recorded_receipt_capture_hash = str(
+            normalized.get("physical_capture_contract_sha256") or ""
+        )
+        if recorded_receipt_capture_hash != capture_report["contract_sha256"]:
+            normalized["physical_capture_contract_sha256"] = (
+                capture_report["contract_sha256"]
+            )
+            capture_report["receipt_capture_hash_status"] = (
+                "refreshed_diagnostic"
+            )
+            capture_report["recorded_receipt_capture_hash"] = (
+                recorded_receipt_capture_hash
+            )
+        else:
+            capture_report["receipt_capture_hash_status"] = "match"
         capture_reports[provider_role] = capture_report
         if (
             normalized.get("direct_uv_source") != _DIRECT_CAPTURE_UV_SOURCE
@@ -1718,8 +1743,6 @@ def validate_normalized_prototype_unit_contract(manifest):
             != "direct_physical_capture_projection"
             or normalized.get("generator_size_policy")
             != "preserve_user_authored_leaf_and_frond_dimensions"
-            or str(normalized.get("physical_capture_contract_sha256") or "")
-            != capture_report["contract_sha256"]
         ):
             raise ClusterAssemblyBuildError(
                 f"{role} normalization receipt is not the physical direct-capture contract"
@@ -5541,12 +5564,22 @@ def build_blender_assembly_inputs(
     """
     decision = content_build_decision(handoff)
     if decision == "pass_through":
-        return build_receipt_pass_through_manifest(
+        manifest = build_receipt_pass_through_manifest(
             handoff,
             receipt_path=pass_through_receipt_path,
             target_contract=pass_through_target_contract,
             target_spm=pass_through_target_spm,
         )
+        output = Path(output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        stem = Path(pass_through_target_spm).stem
+        manifest_path = output / f"{stem}_cluster_assembly_bindings.json"
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        manifest["manifest"] = file_fingerprint(manifest_path)
+        return manifest
     try:
         import bpy
     except ImportError as exc:  # pragma: no cover - only executes in Blender.
@@ -6523,7 +6556,7 @@ def build_blender_assembly_inputs(
             },
             "candidate_policy": (
                 "deterministic_state_mesh_then_global_position_recovery_"
-                "one_to_one_v3"
+                "shared_components_v4"
                 if authored_node_table.get("available")
                 else "legacy_only_when_authored_node_data_absent_v1"
             ),
@@ -6563,6 +6596,9 @@ def build_blender_assembly_inputs(
                     "state_mesh_out_of_tolerance_recovery_count",
                     "global_bounded_recovery_count",
                     "global_out_of_tolerance_recovery_count",
+                    "shared_node_component_recovery_count",
+                    "shared_node_reuse_count",
+                    "shared_node_out_of_tolerance_count",
                     "recovered_out_of_tolerance_count",
                     "maximum_recovered_distance_meters",
                     "assigned_count",

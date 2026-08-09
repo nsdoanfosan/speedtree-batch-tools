@@ -580,36 +580,88 @@ def assign_authored_nodes_to_components(
         component_id for component_id in unresolved_ids
         if component_id not in global_bounded_component_node
     ]
-    global_recovery_adjacency = defaultdict(list)
-    for component_id in global_unbounded_ids:
+    # Every unresolved component is compatible with every remaining active
+    # Node in this final global recovery pass. Building that complete graph and
+    # running augmenting paths is both unnecessary and quadratic in memory/time
+    # (Chestnut 02 previously spent ~72 minutes on 6,665 x 3,139). A nearest
+    # remaining-node scan has the same maximum cardinality on a complete graph
+    # and preserves deterministic distance/GUID ordering.
+    active_by_guid = {
+        str(record["node_guid"]): record for record in active_candidates
+    }
+    remaining_node_guids = set(active_by_guid) - used_node_guids
+    global_recovered_component_node = {}
+    unique_recovery_order = sorted(
+        global_unbounded_ids,
+        key=lambda component_id: (
+            nearest_global_by_component.get(
+                component_id, (float("inf"), "")
+            ),
+            component_id,
+        ),
+    )
+    for component_id in unique_recovery_order:
+        if not remaining_node_guids:
+            break
         row = rows_by_id[component_id]
-        for record in active_candidates:
-            node_guid = str(record["node_guid"])
-            if node_guid in used_node_guids:
-                continue
-            distance = math.dist(
-                row["position_meters"], record["position_meters"]
+        distance, node_guid = min(
+            (
+                math.dist(
+                    row["position_meters"],
+                    active_by_guid[candidate_guid]["position_meters"],
+                ),
+                candidate_guid,
             )
-            global_recovery_adjacency[component_id].append(
-                (distance, node_guid)
-            )
-            global_edge_records[(component_id, node_guid)] = record
-            global_distances[(component_id, node_guid)] = distance
-        global_recovery_adjacency[component_id].sort()
-    (
-        global_recovered_component_node,
-        global_recovered_node_guids,
-    ) = maximum_matching(global_recovery_adjacency, global_unbounded_ids)
+            for candidate_guid in remaining_node_guids
+        )
+        global_recovered_component_node[component_id] = node_guid
+        global_edge_records[(component_id, node_guid)] = active_by_guid[
+            node_guid
+        ]
+        global_distances[(component_id, node_guid)] = distance
+        remaining_node_guids.remove(node_guid)
+    global_recovered_node_guids = set(
+        global_recovered_component_node.values()
+    )
     component_node.update(global_recovered_component_node)
     used_node_guids.update(global_recovered_node_guids)
+
+    # One authored generator Node can emit several disconnected render
+    # components (multiple cards/role surfaces). Once every unique Node has
+    # been used, bind additional components to their deterministic nearest
+    # authored Node instead of degrading them to render-attachment placement.
+    # Truly node-less targets remain unmatched and reportable.
+    shared_component_node = {}
+    for component_id in global_unbounded_ids:
+        if component_id in global_recovered_component_node:
+            continue
+        nearest = nearest_global_by_component.get(component_id)
+        if nearest is None:
+            continue
+        distance, node_guid = nearest
+        shared_component_node[component_id] = node_guid
+        global_edge_records[(component_id, node_guid)] = active_by_guid[
+            node_guid
+        ]
+        global_distances[(component_id, node_guid)] = distance
+    component_node.update(shared_component_node)
+    shared_out_of_tolerance_count = sum(
+        global_distances[(component_id, node_guid)] > threshold
+        for component_id, node_guid in shared_component_node.items()
+    )
 
     assignments = {}
     for component_id, node_guid in sorted(component_node.items()):
         state_mesh_compatible = component_id in (
             bounded_component_node | recovered_component_node
         )
-        outside_threshold = component_id in (
-            recovered_component_node | global_recovered_component_node
+        outside_threshold = (
+            component_id in recovered_component_node
+            or component_id in global_recovered_component_node
+            or (
+                component_id in shared_component_node
+                and global_distances[(component_id, node_guid)] > threshold
+            )
         )
         if state_mesh_compatible:
             record = compatible_edge_records[(component_id, node_guid)]
@@ -626,7 +678,7 @@ def assign_authored_nodes_to_components(
             "match_evidence": {
                 "policy": (
                     "deterministic_state_mesh_then_global_position_"
-                    "recovery_one_to_one_v3"
+                    "recovery_shared_components_v4"
                 ),
                 "threshold_meters": threshold,
                 "selected_distance_meters": selected_distance,
@@ -635,7 +687,14 @@ def assign_authored_nodes_to_components(
                 "candidate_scope": (
                     "state_mesh"
                     if state_mesh_compatible
-                    else "global_authored_position"
+                    else (
+                        "global_authored_position_shared"
+                        if component_id in shared_component_node
+                        else "global_authored_position"
+                    )
+                ),
+                "shared_authored_node": (
+                    component_id in shared_component_node
                 ),
                 "component_id": component_id,
                 "target_mesh_id": rows_by_id[component_id]["target_mesh_id"],
@@ -663,7 +722,7 @@ def assign_authored_nodes_to_components(
     return {
         "policy": (
             "deterministic_state_mesh_then_global_position_recovery_"
-            "one_to_one_v3"
+            "shared_components_v4"
         ),
         "threshold_meters": threshold,
         "component_count": len(rows),
@@ -679,9 +738,15 @@ def assign_authored_nodes_to_components(
         "global_out_of_tolerance_recovery_count": len(
             global_recovered_component_node
         ),
+        "shared_node_component_recovery_count": len(shared_component_node),
+        "shared_node_reuse_count": len(shared_component_node),
+        "shared_node_out_of_tolerance_count": (
+            shared_out_of_tolerance_count
+        ),
         "recovered_out_of_tolerance_count": (
             len(recovered_component_node)
             + len(global_recovered_component_node)
+            + shared_out_of_tolerance_count
         ),
         "maximum_recovered_distance_meters": max(
             (
@@ -699,6 +764,7 @@ def assign_authored_nodes_to_components(
                 in {
                     **recovered_component_node,
                     **global_recovered_component_node,
+                    **shared_component_node,
                 }.items()
             ),
             default=0.0,

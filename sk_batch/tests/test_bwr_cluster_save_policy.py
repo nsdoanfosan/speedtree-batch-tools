@@ -86,6 +86,15 @@ class ClusterSavePolicyTests(unittest.TestCase):
         self.assertEqual(mode, "pass_through")
         self.assertIs(selected, receipt_handoff)
 
+    def test_inspected_pass_through_is_not_misclassified_as_build(self):
+        helper = load_assembly_selection_helper()
+        inspected_handoff = {"status": "pass_through", "source": "fbx"}
+
+        mode, selected = helper(None, inspected_handoff)
+
+        self.assertEqual(mode, "pass_through")
+        self.assertIs(selected, inspected_handoff)
+
     def test_cluster_save_disables_version_backup_for_operator_only(self):
         helper = load_save_helper()
         blender = FakeBlender(save_version=3)
