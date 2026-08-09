@@ -83,20 +83,17 @@ def test_retry_metadata_is_copied_from_manifest_to_batch_report(tmp_path):
 
 
 class DynamicWindFinalSkeletonContractTests(unittest.TestCase):
-    def test_dependency_orchestrated_tree_cannot_skip_missing_assembly(self):
+    def test_dependency_orchestrated_tree_can_skip_missing_assembly_payload(self):
         runner = load_runner()
-        with self.assertRaisesRegex(
-            RuntimeError,
-            "dependency-orchestrated Tree has no.*Assembly manifest",
-        ):
-            runner._ingest_cluster_assembly(
-                None,
-                {
-                    "dependency_orchestrated": True,
-                    "cluster_assembly": None,
-                },
-                {"status": "ok"},
-            )
+        result = runner._ingest_cluster_assembly(
+            None,
+            {
+                "dependency_orchestrated": True,
+                "cluster_assembly": None,
+            },
+            {"status": "ok"},
+        )
+        self.assertEqual(result["status"], "skipped")
 
     def test_ordinary_non_cluster_asset_can_skip_missing_assembly(self):
         runner = load_runner()

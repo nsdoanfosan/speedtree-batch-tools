@@ -94,7 +94,22 @@ from blender_addon_gateway import prepare_runtime
 
 
 def load_cluster_assembly_manifest(blend_dir, spm_path):
-    """Load the BWR-produced additive manifest, if this content has one."""
+    """Load the current asset-local Assembly manifest as the authority."""
+    direct_path = (
+        Path(blend_dir)
+        / "assembly"
+        / f"{Path(spm_path).stem}_cluster_assembly_bindings.json"
+    )
+    if direct_path.is_file():
+        manifest = json.loads(direct_path.read_text(encoding="utf-8"))
+        manifest["manifest"] = cluster_file_fingerprint(direct_path)
+        if manifest.get("kind") != "sk_batch_cluster_nanite_assembly_inputs":
+            raise RuntimeError("unsupported BWR Cluster Assembly manifest kind")
+        validate_manifest_artifacts(manifest)
+        return manifest
+
+    # Pass-through content can legitimately have no direct build manifest.
+    # Its latest Repair report remains useful only for that content decision.
     pipeline_path = (
         Path(blend_dir)
         / "reports"

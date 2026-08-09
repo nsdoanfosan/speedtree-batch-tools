@@ -2118,14 +2118,6 @@ def _best_effort_cancel_instanced_dynamic_wind_runtime(probe_token):
 def _ingest_cluster_assembly(send2ue_unreal, item, full_wind):
     payload = item.get("cluster_assembly")
     if not payload:
-        if (
-            item.get("dependency_orchestrated")
-            or item.get("depends_on_queue_ids")
-        ):
-            raise RuntimeError(
-                "dependency-orchestrated Tree has no content-driven "
-                "Cluster Assembly manifest"
-            )
         return {"status": "skipped", "reason": "no content-driven Assembly manifest"}
     plan = payload.get("ingest_plan") or {}
     if plan.get("status") == "pass_through":
