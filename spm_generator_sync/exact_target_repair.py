@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import copy
 import importlib.util
+import json
 import os
 import sys
 from pathlib import Path
@@ -22,7 +23,14 @@ from connected_run import (
     dependency_identity,
 )
 from exact_target_command import build_exact_target_request, run_exact_target_request
+from atlas_slot_ownership import (
+    AtlasSlotOwnershipError,
+    apply_atlas_slot_ownership_reconciliation,
+    plan_atlas_slot_ownership_reconciliation,
+    validate_atlas_slot_ownership_plan,
+)
 from repair_orchestration import (
+    ATLAS_SLOT_OWNERSHIP_RECONCILE,
     CLUSTER_REFRESH,
     GENERATOR_SYNC,
     GENERATOR_SYNC_AND_CLUSTER,
@@ -189,9 +197,118 @@ class _ProgressReport:
             raise WaitCancelled("exact-target Generator repair cancelled")
 
 
+def _sealed_ownership_plan_from_request(request: Mapping):
+    if request.get("repair_action") != ATLAS_SLOT_OWNERSHIP_RECONCILE:
+        raise ValueError("request is not an Atlas slot ownership action")
+    targets = list(request.get("target_spms") or ())
+    if len(targets) != 1:
+        raise ValueError(
+            "Atlas slot ownership reconciliation requires one exact target"
+        )
+    target = Path(targets[0]).expanduser().absolute()
+    if not target.is_file() or target.suffix.casefold() != ".spm":
+        raise FileNotFoundError(
+            f"exact Atlas ownership target does not exist: {target}"
+        )
+    provenance = request.get("provenance") or {}
+    supplied = provenance.get("ownership_plan")
+    if not isinstance(supplied, Mapping):
+        raise AtlasSlotOwnershipError(
+            "exact_live_spm_ownership_plan_missing",
+            "Exact repair request has no sealed live-SPM ownership plan.",
+        )
+    sealed = validate_atlas_slot_ownership_plan(
+        supplied,
+        target_spm=target,
+        require_repairable=True,
+    )
+    return target, sealed
+
+
+def build_exact_atlas_slot_ownership_plan(request: Mapping):
+    """Build and validate a fresh plan without mutating manifests or the SPM."""
+
+    target, sealed = _sealed_ownership_plan_from_request(request)
+    fresh = plan_atlas_slot_ownership_reconciliation(target)
+    fresh = validate_atlas_slot_ownership_plan(
+        fresh,
+        target_spm=target,
+        require_repairable=True,
+    )
+    if fresh["plan_sha256"] != sealed["plan_sha256"]:
+        raise AtlasSlotOwnershipError(
+            "exact_live_spm_ownership_plan_changed",
+            "Live SPM or Atlas manifests changed after the repair plan was sealed.",
+            evidence={
+                "sealed_plan_sha256": sealed["plan_sha256"],
+                "fresh_plan_sha256": fresh["plan_sha256"],
+            },
+        )
+    return fresh
+
+
+def execute_exact_atlas_slot_ownership_request(
+    request: Mapping, *, progress, cancel_event, lease
+):
+    """Apply only a freshly reproduced, exact, CAS-protected ownership plan."""
+
+    if cancel_event.is_set():
+        raise WaitCancelled("Atlas slot ownership reconciliation cancelled")
+    renew = getattr(lease, "renew_and_check_current", lambda: True)
+    if not renew():
+        raise RuntimeError("shared queue ownership is not current")
+    progress(
+        "Atlas slot ownership plan 검증",
+        completed=0,
+        remaining=1,
+        unit_stage="atlas_slot_ownership_reconcile",
+    )
+    fresh = build_exact_atlas_slot_ownership_plan(request)
+    if cancel_event.is_set():
+        raise WaitCancelled("Atlas slot ownership reconciliation cancelled")
+    if not renew():
+        raise RuntimeError("shared queue ownership became stale")
+    progress(
+        "Atlas slot ownership 영수증 갱신",
+        completed=0,
+        remaining=1,
+        unit_stage="atlas_slot_ownership_reconcile",
+    )
+    result = apply_atlas_slot_ownership_reconciliation(fresh)
+    if result.get("apply_status") != "reconciled":
+        return {
+            "status": "failed",
+            "outcome": "failed",
+            "shared_queue_success": False,
+            "reason": "ownership reconciliation did not commit",
+            "result": result,
+        }
+    progress(
+        "Atlas slot ownership 영수증 갱신",
+        completed=1,
+        remaining=0,
+        unit_stage="atlas_slot_ownership_reconcile",
+    )
+    return {
+        "status": "completed",
+        "outcome": "completed",
+        "shared_queue_success": True,
+        "exact_targets": [fresh["target_spm"]],
+        "plan_sha256": fresh["plan_sha256"],
+        "apply_result": result,
+    }
+
+
 def execute_exact_generator_request(
     request: Mapping, *, progress, cancel_event, lease
 ):
+    if request.get("repair_action") == ATLAS_SLOT_OWNERSHIP_RECONCILE:
+        return execute_exact_atlas_slot_ownership_request(
+            request,
+            progress=progress,
+            cancel_event=cancel_event,
+            lease=lease,
+        )
     (
         module,
         cfg,
@@ -268,8 +385,17 @@ def _parser():
     )
     parser.add_argument(
         "--repair-action",
-        choices=[GENERATOR_SYNC, CLUSTER_REFRESH, GENERATOR_SYNC_AND_CLUSTER],
+        choices=[
+            GENERATOR_SYNC,
+            CLUSTER_REFRESH,
+            GENERATOR_SYNC_AND_CLUSTER,
+            ATLAS_SLOT_OWNERSHIP_RECONCILE,
+        ],
         required=True,
+    )
+    parser.add_argument(
+        "--ownership-plan",
+        help="sealed Atlas slot ownership plan JSON (required for its action)",
     )
     parser.add_argument("--target-spm", action="append", required=True)
     parser.add_argument("--parent-retry-id", required=True)
@@ -280,16 +406,30 @@ def _parser():
 
 
 def main(argv=None) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    provenance = {
+        "source": "SPM_Generator_Sync.bat",
+        "reason_codes": args.reason_code or ["public_exact_target_request"],
+    }
+    if args.repair_action == ATLAS_SLOT_OWNERSHIP_RECONCILE:
+        if not args.ownership_plan:
+            parser.error("--ownership-plan is required for Atlas slot ownership")
+        try:
+            ownership_plan = json.loads(
+                Path(args.ownership_plan).read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            parser.error(f"cannot read --ownership-plan: {exc}")
+        if not isinstance(ownership_plan, dict):
+            parser.error("--ownership-plan must contain a JSON object")
+        provenance["ownership_plan"] = ownership_plan
     request = build_exact_target_request(
         tool=GENERATOR_SYNC_TOOL,
         repair_action=args.repair_action,
         target_spms=args.target_spm,
         repair_stage=args.repair_action,
-        provenance={
-            "source": "SPM_Generator_Sync.bat",
-            "reason_codes": args.reason_code or ["public_exact_target_request"],
-        },
+        provenance=provenance,
         parent_retry_id=args.parent_retry_id,
         request_id=args.request_id,
         receipt=args.receipt,

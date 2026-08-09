@@ -154,6 +154,11 @@ ADDONS = {
                 "operations": [
                     "configure_external_plan_target",
                     "execute_external_target_transaction",
+                    "export_or_update_speedtree_spm_path_impl",
+                    "validate_staged_speedtree_targets",
+                    "target_manifest_path",
+                    "cleanup_pending_transaction_roots",
+                    "execute_atomic_target_update",
                 ],
                 "native_capabilities": [
                     "atomic_exact_target_slice_v1",
@@ -198,6 +203,25 @@ ADDONS = {
             "execute_external_target_transaction": (
                 "atlas_leaf_mesh_builder.integration_api:"
                 "execute_external_target_transaction"
+            ),
+            "export_or_update_speedtree_spm_path_impl": (
+                "atlas_leaf_mesh_builder.speedtree:"
+                "_export_or_update_speedtree_spm_path_impl"
+            ),
+            "validate_staged_speedtree_targets": (
+                "atlas_leaf_mesh_builder.speedtree:"
+                "_validate_staged_speedtree_targets"
+            ),
+            "target_manifest_path": (
+                "atlas_leaf_mesh_builder.speedtree:target_manifest_path"
+            ),
+            "cleanup_pending_transaction_roots": (
+                "atlas_leaf_mesh_builder.speedtree_transaction:"
+                "cleanup_pending_transaction_roots"
+            ),
+            "execute_atomic_target_update": (
+                "atlas_leaf_mesh_builder.speedtree_transaction:"
+                "execute_atomic_target_update"
             ),
         },
     },

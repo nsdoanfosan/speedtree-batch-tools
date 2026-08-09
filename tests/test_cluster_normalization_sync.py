@@ -646,6 +646,7 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
                                     "generator_guid": "stable-frond-guid",
                                     "slot_prefix": "Material:Frond:0",
                                     "source_mesh_id": None,
+                                    "target_material_id": 6,
                                     "target_mesh_id": 107,
                                 }
                             ],
