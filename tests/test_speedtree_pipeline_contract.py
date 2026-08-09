@@ -40,6 +40,7 @@ from speedtree_pipeline_contract import (
     spm_container_format,
     spm_file_structural_semantic_fingerprint,
     validate_preflight_envelope,
+    validate_preflight_report,
 )
 from speedtree_texture_contract import REQUIRED_TEXTURE_ROLES, resolve_texture_bindings
 import speedtree_pipeline_contract as pipeline_contract
@@ -463,6 +464,73 @@ class SpeedTreePipelineContractTests(unittest.TestCase):
             first_stmat.write_text("<SpeedTreeMaterials />", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "STMAT source is stale"):
                 validate_preflight_envelope(envelope, first)
+
+    def test_current_execution_wrapper_rebinds_historical_spm_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = write_spm(root / "SK_current.spm", compressed=False)
+            stmat = write_stmat(spm, ["M_leaf_01_Mat"])
+            previous = build_preflight_envelope(
+                spm,
+                outcome="ok",
+                texture_readiness=resolve_texture_bindings(stmat),
+            )
+            spm.write_text(spm_xml() + "\n", encoding="utf-8")
+            report_path = root / "current_wrapper.json"
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "status": "ok",
+                        "speedtree_pipeline_contract": previous,
+                        "canonical_spm": str(spm.resolve()),
+                        "historical_identity_fields_are_diagnostic": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            rebound = validate_preflight_report(report_path, spm)
+
+            self.assertEqual(
+                rebound["current_execution_source_rebind"]["status"],
+                "rebound",
+            )
+            self.assertNotEqual(
+                rebound["speedtree_pipeline_contract"]["source"]["spm"][
+                    "sha256"
+                ],
+                previous["source"]["spm"]["sha256"],
+            )
+            validate_preflight_envelope(
+                rebound["speedtree_pipeline_contract"], spm
+            )
+
+    def test_current_execution_wrapper_still_rejects_another_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = write_spm(root / "SK_first.spm", compressed=False)
+            second = write_spm(root / "SK_second.spm", compressed=False)
+            first_stmat = write_stmat(first, ["M_leaf_01_Mat"])
+            write_stmat(second, ["M_leaf_01_Mat"])
+            report_path = root / "current_wrapper.json"
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "status": "ok",
+                        "speedtree_pipeline_contract": build_preflight_envelope(
+                            first,
+                            outcome="ok",
+                            texture_readiness=resolve_texture_bindings(first_stmat),
+                        ),
+                        "canonical_spm": str(first.resolve()),
+                        "historical_identity_fields_are_diagnostic": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "another model path"):
+                validate_preflight_report(report_path, second)
 
     def test_exact_export_refresh_accepts_same_target_stmat_replacement(self):
         with tempfile.TemporaryDirectory() as temporary:
