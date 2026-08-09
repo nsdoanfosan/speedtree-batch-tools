@@ -39,6 +39,7 @@ from cluster_assembly_builder import (  # noqa: E402
     _coalesce_normalized_external_parts,
     _component_groups,
     _component_signature,
+    _current_unreal_skeleton_diagnostic,
     _expected_normalized_bounds_for_variant,
     _export_selected_fbx,
     _normalized_prototype_for_component,
@@ -1828,6 +1829,27 @@ class PhysicalProductionContractTests(unittest.TestCase):
 
 
 class FinalSkeletonHierarchyTests(unittest.TestCase):
+    def test_current_unreal_skeleton_allows_manifest_drift_as_diagnostic(self):
+        result = _current_unreal_skeleton_diagnostic(
+            ["Root", "Bone_1", "Bone_2"],
+            ["ImportedArmature", "Root", "Bone_1", "Bone_2"],
+        )
+
+        self.assertEqual(result["status"], "diagnostic_mismatch")
+        self.assertTrue(result["current_unreal_skeleton_is_authoritative"])
+        self.assertFalse(result["manifest_snapshot_is_authoritative"])
+        self.assertEqual(result["missing_from_current"], [])
+        self.assertEqual(result["added_in_current"], ["ImportedArmature"])
+
+    def test_current_unreal_skeleton_reports_missing_manifest_bones(self):
+        result = _current_unreal_skeleton_diagnostic(
+            ["Root", "Bone_1", "Bone_2"],
+            ["Root", "Bone_2"],
+        )
+
+        self.assertEqual(result["missing_from_current"], ["Bone_1"])
+        self.assertEqual(result["common_bone_count"], 2)
+
     def test_snapshot_hash_covers_count_order_parent_and_bind_pose(self):
         snapshot = skeleton_snapshot()
         self.assertEqual(snapshot["contract"], "final_skeleton_v2")
