@@ -1626,6 +1626,21 @@ class BlendLiveStatusTests(unittest.TestCase):
                             expected_fbx=fbx,
                         )
 
+    def test_missing_cleanup_telemetry_can_be_diagnostic_for_live_repair(self):
+        payload = {"status": "done"}
+        result = validate_unassigned_geometry_cleanup_evidence(
+            payload,
+            missing_is_diagnostic=True,
+        )
+        self.assertEqual(result["status"], "diagnostic_only")
+        self.assertEqual(
+            result["policy"], "optional_addon_cleanup_telemetry_v1"
+        )
+        self.assertFalse(result["telemetry_present"])
+
+        with self.assertRaises(RepairPipelineEvidenceError):
+            validate_unassigned_geometry_cleanup_evidence(payload)
+
     def test_v2_pipeline_rejects_incomplete_export_material_assignments(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

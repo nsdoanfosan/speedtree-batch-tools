@@ -50,6 +50,7 @@ from cluster_assembly_handoff_contract import (
     assembly_source_fbx_resolution,
     build_assembly_handoff,
     build_blender_fbx_inventory,
+    current_assembly_manifest_repair_handoff,
     file_fingerprint,
     load_cluster_contract,
     resolve_cluster_receipt_path,
@@ -822,6 +823,7 @@ def main():
                     expected_spm=canonical_spm,
                     expected_fbx=fbx_export["path"],
                     require_recheck=True,
+                    missing_is_diagnostic=True,
                 )
             )
         except RepairPipelineEvidenceError as exc:
@@ -836,6 +838,10 @@ def main():
         report["unassigned_geometry_cleanup"] = (
             unassigned_geometry_cleanup
         )
+        if unassigned_geometry_cleanup.get("status") == "diagnostic_only":
+            report.setdefault("warnings", []).append(
+                unassigned_geometry_cleanup["message"]
+            )
         report["speedtree_export"] = speedtree_export
         transient_export_reconciliation = None
         if cluster_export_snapshot is not None:
@@ -1121,6 +1127,25 @@ def main():
                 cluster_assembly_handoff,
             )
         )
+        if (
+            preflight["status"] == "ok"
+            and assembly_mode is None
+            and pipeline_data is not None
+            and merged_object is not None
+        ):
+            current_full_fbx = str(
+                (pipeline_data.get("paths") or {}).get("fbx") or ""
+            )
+            current_handoff = current_assembly_manifest_repair_handoff(
+                canonical_spm,
+                current_full_fbx,
+            )
+            if current_handoff is not None:
+                assembly_mode = "build"
+                selected_assembly_handoff = current_handoff
+                report["cluster_assembly_current_manifest_authority"] = (
+                    current_handoff["current_manifest_authority"]
+                )
         if preflight["status"] == "ok" and assembly_mode == "pass_through":
             # Persist "no content-driven Assembly" as a positive current
             # contract. Without this manifest, Push falls back to historical

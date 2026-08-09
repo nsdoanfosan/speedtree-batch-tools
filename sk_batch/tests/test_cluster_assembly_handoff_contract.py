@@ -21,6 +21,7 @@ from cluster_assembly_handoff_contract import (  # noqa: E402
     build_assembly_handoff,
     build_blender_fbx_inventory,
     classify_inventory_role,
+    current_assembly_manifest_repair_handoff,
     file_fingerprint,
     normalize_export_name,
     resolve_cluster_receipt_path,
@@ -29,6 +30,85 @@ from cluster_assembly_handoff_contract import (  # noqa: E402
 
 
 class CurrentFbxRoleAuthorityTests(unittest.TestCase):
+    def test_current_production_manifest_recovers_repair_handoff(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "Tree_01.spm"
+            full_fbx = root / "Tree_01.fbx"
+            assembly = root / "assembly"
+            provider = root / "Cluster"
+            assembly.mkdir()
+            provider.mkdir()
+            spm.write_bytes(b"spm-current")
+            full_fbx.write_bytes(b"fbx-current")
+            source_blend = provider / "branch.blend"
+            plan_fbx = provider / "branch_01.fbx"
+            normalized_manifest = provider / "branch.json"
+            source_blend.write_bytes(b"blend-current")
+            plan_fbx.write_bytes(b"plan-current")
+            normalized_manifest.write_bytes(b"manifest-current")
+            stale = {
+                "path": str(source_blend),
+                "exists": True,
+                "size": 1,
+                "mtime_ns": 1,
+                "sha256": "0" * 64,
+            }
+            manifest_path = (
+                assembly / "Tree_01_cluster_assembly_bindings.json"
+            )
+            manifest_path.write_text(
+                json.dumps({
+                    "kind": "sk_batch_cluster_nanite_assembly_inputs",
+                    "status": "ready",
+                    "content_decision": "build",
+                    "parts": [{"prototype_id": "branch_01"}],
+                    "handoff_evidence": {
+                        "pcg_receipt": {"path": "old-receipt.json"},
+                        "roles": {
+                            "branch:branch_01": {
+                                "role": "branch",
+                                "provider_key": "branch:branch_01",
+                                "polygon_indices": [0, 1],
+                                "normalized_variants": {
+                                    "source_blend": stale,
+                                    "manifest": {
+                                        **stale,
+                                        "path": str(normalized_manifest),
+                                    },
+                                    "variants": [{
+                                        "ordinal": 1,
+                                        "plan_fbx": {
+                                            **stale,
+                                            "path": str(plan_fbx),
+                                        },
+                                    }],
+                                },
+                            },
+                        },
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+            handoff = current_assembly_manifest_repair_handoff(
+                spm, full_fbx
+            )
+
+            self.assertEqual(handoff["status"], "ready")
+            self.assertTrue(handoff["assembly"]["requested"])
+            self.assertFalse(
+                handoff["current_manifest_authority"][
+                    "historical_receipts_consulted"
+                ]
+            )
+            role = handoff["assembly"]["part_builder_inputs"][0]
+            self.assertTrue(role["rendered_provider_expansion_covered"])
+            self.assertEqual(
+                role["normalized_variants"]["source_blend"]["sha256"],
+                file_fingerprint(source_blend)["sha256"],
+            )
+
     def test_rendered_expansion_does_not_invent_absent_fbx_geometry(self):
         decision, evidence = _reconcile_role(
             {

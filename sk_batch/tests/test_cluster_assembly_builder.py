@@ -36,6 +36,7 @@ from cluster_assembly_builder import (  # noqa: E402
     _attachment_point_correspondence,
     _assembly_fit_summary,
     _base_weighted_bone_manifest_diagnostic,
+    _base_role_polygon_indices,
     _build_unreal_assembly_provenance_payload,
     _coalesce_normalized_external_parts,
     _component_groups,
@@ -61,6 +62,39 @@ from cluster_assembly_builder import (  # noqa: E402
     validate_wind_json_against_skeleton,
     validate_persisted_residual_gate,
 )
+
+
+class AssemblyBaseRoleExclusionTests(unittest.TestCase):
+    def test_all_role_polygons_are_removed_even_when_some_are_unmatched(self):
+        final_mesh = object()
+        external_mesh = object()
+        roles = {
+            "branch": {"polygon_indices": [1, 2, 9]},
+            "leaf": {"polygon_indices": [3, 4]},
+            "external": {"polygon_indices": [99]},
+        }
+        plans = {
+            "branch": {
+                "target_object": final_mesh,
+                "matched": {"one": {"instances": [{"polygons": [1]}]}},
+                "preserved": [{"polygon_count": 2}],
+            },
+            "leaf": {
+                "target_object": final_mesh,
+                "matched": {},
+                "preserved": [{"polygon_count": 2}],
+            },
+            "external": {
+                "target_object": external_mesh,
+                "matched": {},
+                "preserved": [],
+            },
+        }
+
+        self.assertEqual(
+            _base_role_polygon_indices(plans, roles, final_mesh),
+            [1, 2, 3, 4, 9],
+        )
 
 
 class GeneratedAssemblyReferencePoseSyncTests(unittest.TestCase):

@@ -4541,6 +4541,23 @@ def _copy_component_as_rigid_part(bpy, source_obj, component, name):
     return new_obj, part_armature, center
 
 
+def _base_role_polygon_indices(role_build_plans, roles, final_merged_mesh):
+    """Remove every rendered Assembly role polygon from the generated Base.
+
+    A role component that does not match a normalized prototype is useful
+    diagnostic evidence, but preserving it in ``NA_Base`` leaves the authored
+    plan/card geometry embedded beside the generated Assembly instances.
+    """
+    return sorted({
+        int(polygon_index)
+        for provider_key, plan in role_build_plans.items()
+        if plan.get("target_object") is final_merged_mesh
+        for polygon_index in (
+            (roles.get(provider_key) or {}).get("polygon_indices") or []
+        )
+    })
+
+
 def _copy_base_without_role_polygons(bpy, source_obj, polygon_indices, name):
     import bmesh
 
@@ -5768,14 +5785,11 @@ def build_blender_assembly_inputs(
         # No public Assembly artifact may exist until every requested rendered
         # role has proven at least one normalized prototype/component match.
         output.mkdir(parents=True, exist_ok=True)
-        excluded_polygons = sorted({
-            polygon_index
-            for plan in role_build_plans.values()
-            if plan["target_object"] is final_merged_mesh
-            for row in plan["matched"].values()
-            for component in row["instances"]
-            for polygon_index in component["polygons"]
-        })
+        excluded_polygons = _base_role_polygon_indices(
+            role_build_plans,
+            roles,
+            final_merged_mesh,
+        )
         base_obj = _copy_base_without_role_polygons(
             bpy,
             final_merged_mesh,
@@ -6508,8 +6522,8 @@ def build_blender_assembly_inputs(
                 if key in authored_node_table
             },
             "candidate_policy": (
-                "deterministic_maximum_cardinality_state_mesh_filtered_"
-                "one_to_one_v1"
+                "deterministic_state_mesh_then_global_position_recovery_"
+                "one_to_one_v3"
                 if authored_node_table.get("available")
                 else "legacy_only_when_authored_node_data_absent_v1"
             ),
@@ -6544,6 +6558,13 @@ def build_blender_assembly_inputs(
                     "threshold_meters",
                     "component_count",
                     "candidate_count",
+                    "global_candidate_count",
+                    "bounded_assigned_count",
+                    "state_mesh_out_of_tolerance_recovery_count",
+                    "global_bounded_recovery_count",
+                    "global_out_of_tolerance_recovery_count",
+                    "recovered_out_of_tolerance_count",
+                    "maximum_recovered_distance_meters",
                     "assigned_count",
                     "unmatched_count",
                     "unmatched",
@@ -6592,6 +6613,13 @@ def build_blender_assembly_inputs(
                 "fbx": file_fingerprint(base_fbx),
                 "fbx_texture_contract": base_fbx_texture_contract,
                 "excluded_role_polygon_count": len(excluded_polygons),
+                "unmatched_role_components_removed_from_base": sum(
+                    int(row.get("polygon_count") or 0)
+                    for row in preserved_render_components
+                    if role_build_plans[row["provider_key"]][
+                        "target_object"
+                    ] is final_merged_mesh
+                ),
                 "final_armature": final_armature.name,
                 "weighted_bones": base_weighted_bones,
                 "weighted_bone_count": len(base_weighted_bones),

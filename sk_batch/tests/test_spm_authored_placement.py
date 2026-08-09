@@ -225,7 +225,7 @@ class SpmAuthoredPlacementTests(unittest.TestCase):
             )
             self.assertEqual(
                 result["unmatched"][0]["match_diagnostic"],
-                "no_state_mesh_candidate",
+                "global_one_to_one_candidate_exhausted",
             )
 
             def emitted_mapping_keys(value):
@@ -273,6 +273,84 @@ class SpmAuthoredPlacementTests(unittest.TestCase):
             self.assertEqual(
                 result["assignments"]["flexible"]["node_guid"],
                 "flexible-alternative",
+            )
+
+    def test_global_assignment_recovers_compatible_nodes_outside_preferred_bound(self):
+        text = spm_xml([
+            node_xml("near", (0, 0, 0)),
+            node_xml("far", (1, 0, 0)),
+        ])
+        with tempfile.TemporaryDirectory() as root:
+            table = parse_spm_authored_placement(self._write(root, text))
+            result = assign_authored_nodes_to_components(
+                table,
+                [
+                    {
+                        "component_id": "bounded",
+                        "target_mesh_id": 132,
+                        "position_meters": [0.0, 0.0, 0.0],
+                    },
+                    {
+                        "component_id": "recovered",
+                        "target_mesh_id": 132,
+                        "position_meters": [0.2, 0.0, 0.0],
+                    },
+                ],
+                tolerance_meters=0.01,
+            )
+            self.assertEqual(result["assigned_count"], 2)
+            self.assertEqual(result["unmatched_count"], 0)
+            self.assertEqual(result["bounded_assigned_count"], 1)
+            self.assertEqual(result["recovered_out_of_tolerance_count"], 1)
+            self.assertEqual(
+                result["assignments"]["bounded"]["node_guid"], "near"
+            )
+            self.assertEqual(
+                result["assignments"]["recovered"]["node_guid"], "far"
+            )
+            self.assertTrue(
+                result["assignments"]["recovered"]["match_evidence"][
+                    "outside_preferred_threshold"
+                ]
+            )
+
+    def test_global_assignment_recovers_when_provider_mesh_id_space_differs(self):
+        text = spm_xml([
+            node_xml("tree-node-a", (0, 0, 0)),
+            node_xml("tree-node-b", (1, 0, 0)),
+        ])
+        with tempfile.TemporaryDirectory() as root:
+            table = parse_spm_authored_placement(self._write(root, text))
+            result = assign_authored_nodes_to_components(
+                table,
+                [
+                    {
+                        "component_id": "provider-card-a",
+                        "target_mesh_id": 999,
+                        "position_meters": [0.0, 0.0, 0.0],
+                    },
+                    {
+                        "component_id": "provider-card-b",
+                        "target_mesh_id": 999,
+                        "position_meters": [0.3048, 0.0, 0.0],
+                    },
+                ],
+            )
+            self.assertEqual(result["assigned_count"], 2)
+            self.assertEqual(result["unmatched_count"], 0)
+            self.assertEqual(result["global_bounded_recovery_count"], 2)
+            self.assertEqual(
+                result["assignments"]["provider-card-a"]["node_guid"],
+                "tree-node-a",
+            )
+            self.assertEqual(
+                result["assignments"]["provider-card-b"]["node_guid"],
+                "tree-node-b",
+            )
+            self.assertFalse(
+                result["assignments"]["provider-card-a"]["match_evidence"][
+                    "state_mesh_compatible"
+                ]
             )
 
 

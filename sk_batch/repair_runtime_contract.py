@@ -317,6 +317,7 @@ def validate_unassigned_geometry_cleanup_evidence(
     expected_spm=None,
     expected_fbx=None,
     require_recheck=True,
+    missing_is_diagnostic=False,
 ):
     """Validate exact pre-repair cleanup and its final material postcondition.
 
@@ -329,6 +330,21 @@ def validate_unassigned_geometry_cleanup_evidence(
         raise RepairPipelineEvidenceError(
             "pipeline did not complete the Blender repair"
         )
+    if (
+        missing_is_diagnostic
+        and not isinstance(payload.get("unassigned_geometry_cleanup"), dict)
+    ):
+        return {
+            "status": "diagnostic_only",
+            "policy": "optional_addon_cleanup_telemetry_v1",
+            "telemetry_present": False,
+            "cleanup_applied": None,
+            "message": (
+                "The active Blender add-on did not emit optional unassigned "
+                "geometry cleanup telemetry; completed Repair output remains "
+                "authoritative."
+            ),
+        }
     cleanup = _validate_cleanup_record(
         payload.get("unassigned_geometry_cleanup"),
         label="unassigned_geometry_cleanup",

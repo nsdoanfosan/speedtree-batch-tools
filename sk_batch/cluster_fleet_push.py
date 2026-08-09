@@ -25,9 +25,96 @@ from exact_push import (
     run_headless_manifest,
 )
 from process_lifecycle import owned_run
+from sk_common import wind_preset_for_spm
 
 
 DEFAULT_ROOT = Path(r"D:\OneDrive\Forestportfolio\02_nature\Tree")
+BWR_JOB = Path(__file__).resolve().parent / "jobs" / "bwr_headless_job.py"
+
+
+def build_repair_command(target, blender, material_contract, report_path):
+    spm = Path(target["spm"]).resolve()
+    return [
+        str(Path(blender).resolve()),
+        "--factory-startup",
+        "-b",
+        "--python",
+        str(BWR_JOB),
+        "--",
+        "--spm",
+        str(spm),
+        "--speedtree-spm",
+        str(spm),
+        "--blend",
+        str(spm.with_suffix(".blend")),
+        "--wind",
+        wind_preset_for_spm(spm),
+        "--material-contract",
+        str(Path(material_contract).resolve()),
+        "--report",
+        str(Path(report_path).resolve()),
+    ]
+
+
+def validate_repair_result(report_path, target):
+    report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+    manifest_path = Path(target["manifest"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    placement = (
+        (manifest.get("placement_contract") or {}).get(
+            "authored_node_assignment"
+        )
+        or {}
+    )
+    base = manifest.get("base") or {}
+    preserved = list(manifest.get("preserved_render_components") or [])
+    parts = list(manifest.get("parts") or [])
+    problems = []
+    if report.get("status") != "ok":
+        problems.append("repair_not_ok")
+    if placement.get("policy") != (
+        "deterministic_state_mesh_then_global_position_recovery_"
+        "one_to_one_v3"
+    ):
+        problems.append("assembly_binding_policy_not_current")
+    if int(placement.get("unmatched_count") or 0) != 0:
+        problems.append(
+            "unmatched_bindings:"
+            + str(int(placement.get("unmatched_count") or 0))
+        )
+    if int(
+        (manifest.get("placement_contract") or {}).get(
+            "degraded_authored_card_binding_count"
+        )
+        or 0
+    ) != 0:
+        problems.append("degraded_bindings_remain")
+    preserved_polygons = sum(
+        int(row.get("polygon_count") or 0) for row in preserved
+    )
+    removed_preserved = int(
+        base.get("unmatched_role_components_removed_from_base") or 0
+    )
+    if removed_preserved != preserved_polygons:
+        problems.append(
+            f"base_role_plan_residue:{removed_preserved}!={preserved_polygons}"
+        )
+    binding_count = sum(
+        len(part.get("bindings") or []) for part in parts
+    )
+    if not parts or binding_count <= 0:
+        problems.append("repair_manifest_has_no_parts_or_bindings")
+    return {
+        "ok": not problems,
+        "problems": problems,
+        "policy": placement.get("policy"),
+        "parts": len(parts),
+        "bindings": binding_count,
+        "assigned": int(placement.get("assigned_count") or 0),
+        "unmatched": int(placement.get("unmatched_count") or 0),
+        "preserved_role_polygons_removed": removed_preserved,
+        "report": str(Path(report_path).resolve()),
+    }
 
 
 def discover_current_cluster_targets(root: Path) -> tuple[list[dict], list[dict]]:
@@ -158,6 +245,7 @@ def main(argv=None):
         "status": "running",
         "root": str(args.root.expanduser().resolve()),
         "transport": "headless_commandlet",
+        "repair_policy": "always_repair_before_export_and_push",
         "birch_paper_order": "last",
         "targets": [str(row["spm"]) for row in targets],
         "missing_current_assembly_data": missing,
@@ -188,6 +276,40 @@ def main(argv=None):
                 run_id=f"fleet_{run_id}_{index:03d}",
                 unreal_project=args.unreal_project,
             )
+            repair_report = (
+                args.log_dir
+                / f"{target['stem']}_fleet_repair_{run_id}_{index:03d}.json"
+            )
+            repair_command = build_repair_command(
+                target,
+                args.blender,
+                outputs["material_contract"],
+                repair_report,
+            )
+            result["repair_report"] = str(repair_report)
+            repair_completed = owned_run(
+                repair_command,
+                source="sk_batch.cluster_fleet_push.blender_repair",
+                run_factory=subprocess.run,
+                check=False,
+            )
+            result["repair_returncode"] = repair_completed.returncode
+            if repair_completed.returncode:
+                raise RuntimeError(
+                    f"production Repair exited {repair_completed.returncode}"
+                )
+            repair_verification = validate_repair_result(
+                repair_report,
+                target,
+            )
+            result["repair_verification"] = repair_verification
+            if not repair_verification["ok"]:
+                raise RuntimeError(
+                    "production Repair postcondition failed: "
+                    + "; ".join(repair_verification["problems"])
+                )
+            target["expected_parts"] = repair_verification["parts"]
+            target["expected_bindings"] = repair_verification["bindings"]
             completed = owned_run(
                 command,
                 source="sk_batch.cluster_fleet_push.blender_export",

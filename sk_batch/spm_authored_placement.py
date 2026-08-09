@@ -351,10 +351,12 @@ def assign_authored_nodes_to_components(
 ):
     """Deterministically assign surviving Nodes across a component cohort.
 
-    The broad bound is for identity recovery from known-bad pre-fix placement,
-    not for final placement accuracy.  Assigned translations still become the
-    exact authored Node positions.  Unassigned rows are returned as degraded
-    evidence so rotation/scale recovery cannot prevent an attached export.
+    The broad bound is the preferred identity-recovery pass.  Components left
+    outside that bound are recovered against the remaining compatible
+    state/mesh Nodes with a deterministic maximum-cardinality one-to-one pass.
+    Distance remains diagnostic; a fixed positional tolerance must not discard
+    an otherwise identifiable authored Node and silently replace its placement
+    with a render-attachment fallback.
     """
     try:
         threshold = float(tolerance_meters)
@@ -393,11 +395,17 @@ def assign_authored_nodes_to_components(
             "position_meters": position,
         })
     mesh_ids_by_generator = (table or {}).get("generator_mesh_ids") or {}
-    candidates = sorted(
+    active_candidates = sorted(
         (
             record for record in (table or {}).get("nodes") or []
             if record.get("active")
-            and any(
+        ),
+        key=lambda record: str(record.get("node_guid") or ""),
+    )
+    candidates = sorted(
+        (
+            record for record in active_candidates
+            if any(
                 row["target_mesh_id"]
                 in set(mesh_ids_by_generator.get(record.get("generator_guid"), ()))
                 for row in rows
@@ -406,6 +414,8 @@ def assign_authored_nodes_to_components(
         key=lambda record: str(record.get("node_guid") or ""),
     )
     edges = []
+    compatible_edges = defaultdict(list)
+    compatible_edge_records = {}
     nearest_by_component = {}
     for row in rows:
         for record in candidates:
@@ -420,6 +430,12 @@ def assign_authored_nodes_to_components(
             nearest = (distance, str(record["node_guid"]))
             if previous is None or nearest < previous:
                 nearest_by_component[row["component_id"]] = nearest
+            compatible_edges[row["component_id"]].append(
+                (distance, str(record["node_guid"]))
+            )
+            compatible_edge_records[
+                (row["component_id"], str(record["node_guid"]))
+            ] = record
             if distance <= threshold:
                 edges.append((
                     distance,
@@ -433,78 +449,194 @@ def assign_authored_nodes_to_components(
     for distance, component_id, node_guid, record in edges:
         adjacency[component_id].append((distance, node_guid))
         edge_records[(component_id, node_guid)] = record
+    for component_id in compatible_edges:
+        compatible_edges[component_id].sort()
 
     # A shortest-edge greedy pass can strand a component even when a complete
-    # bounded one-to-one assignment exists.  Deterministic augmenting paths
-    # preserve maximum cardinality; distance/GUID ordering only disambiguates
-    # among those export-preserving assignments.
-    node_owner = {}
-    component_node = {}
+    # one-to-one assignment exists. Deterministic augmenting paths preserve
+    # maximum cardinality; distance/GUID ordering disambiguates matches.
+    def maximum_matching(current_adjacency, component_ids):
+        node_owner = {}
+        component_node = {}
 
-    def claim(start_component_id):
-        pending = [start_component_id]
-        visited_components = {start_component_id}
-        visited_nodes = set()
-        component_parent_node = {}
-        node_parent_component = {}
-        free_node = None
-        while pending and free_node is None:
-            component_id = pending.pop(0)
-            for _distance, node_guid in adjacency[component_id]:
-                if node_guid in visited_nodes:
-                    continue
-                visited_nodes.add(node_guid)
-                node_parent_component[node_guid] = component_id
-                previous_owner = node_owner.get(node_guid)
-                if previous_owner is None:
-                    free_node = node_guid
-                    break
-                if previous_owner not in visited_components:
-                    visited_components.add(previous_owner)
-                    component_parent_node[previous_owner] = node_guid
-                    pending.append(previous_owner)
-        if free_node is None:
-            return False
-        node_guid = free_node
-        while True:
-            component_id = node_parent_component[node_guid]
-            node_owner[node_guid] = component_id
-            component_node[component_id] = node_guid
-            if component_id == start_component_id:
-                return True
-            node_guid = component_parent_node[component_id]
+        def claim(start_component_id):
+            pending = [start_component_id]
+            visited_components = {start_component_id}
+            visited_nodes = set()
+            component_parent_node = {}
+            node_parent_component = {}
+            free_node = None
+            while pending and free_node is None:
+                component_id = pending.pop(0)
+                for _distance, node_guid in current_adjacency[component_id]:
+                    if node_guid in visited_nodes:
+                        continue
+                    visited_nodes.add(node_guid)
+                    node_parent_component[node_guid] = component_id
+                    previous_owner = node_owner.get(node_guid)
+                    if previous_owner is None:
+                        free_node = node_guid
+                        break
+                    if previous_owner not in visited_components:
+                        visited_components.add(previous_owner)
+                        component_parent_node[previous_owner] = node_guid
+                        pending.append(previous_owner)
+            if free_node is None:
+                return False
+            node_guid = free_node
+            while True:
+                component_id = node_parent_component[node_guid]
+                node_owner[node_guid] = component_id
+                component_node[component_id] = node_guid
+                if component_id == start_component_id:
+                    return True
+                node_guid = component_parent_node[component_id]
 
-    component_order = sorted(
-        (row["component_id"] for row in rows),
-        key=lambda component_id: (
-            len(adjacency[component_id]),
-            adjacency[component_id][0][:2]
-            if adjacency[component_id]
-            else (float("inf"), ""),
-            component_id,
-        ),
+        order = sorted(
+            component_ids,
+            key=lambda component_id: (
+                len(current_adjacency[component_id]),
+                current_adjacency[component_id][0]
+                if current_adjacency[component_id]
+                else (float("inf"), ""),
+                component_id,
+            ),
+        )
+        for component_id in order:
+            claim(component_id)
+        return component_node, set(node_owner)
+
+    all_component_ids = [row["component_id"] for row in rows]
+    bounded_component_node, bounded_node_guids = maximum_matching(
+        adjacency, all_component_ids
     )
-    for component_id in component_order:
-        claim(component_id)
 
+    # Keep every successful bounded identity, then recover only the remaining
+    # components against unclaimed compatible Nodes.  This preserves precise
+    # matches while preventing the old 1 cm cutoff from turning valid authored
+    # placements into render-attachment fallbacks.
+    recovery_adjacency = defaultdict(list)
+    for row in rows:
+        component_id = row["component_id"]
+        if component_id in bounded_component_node:
+            continue
+        recovery_adjacency[component_id] = [
+            (distance, node_guid)
+            for distance, node_guid in compatible_edges[component_id]
+            if node_guid not in bounded_node_guids
+        ]
+    state_recovery_ids = [
+        component_id for component_id in all_component_ids
+        if component_id not in bounded_component_node
+    ]
+    recovered_component_node, recovered_node_guids = maximum_matching(
+        recovery_adjacency, state_recovery_ids
+    )
+    component_node = {
+        **bounded_component_node,
+        **recovered_component_node,
+    }
+
+    # Normalized provider plans can carry mesh IDs from a different SPM than
+    # the Full tree.  When those numeric ID spaces differ, exact authored Node
+    # positions remain the shared identity.  Preserve all state/mesh matches,
+    # then recover the unresolved cohort against remaining active Nodes.
+    used_node_guids = bounded_node_guids | recovered_node_guids
+    unresolved_ids = [
+        component_id for component_id in all_component_ids
+        if component_id not in component_node
+    ]
+    global_bounded_adjacency = defaultdict(list)
+    global_edge_records = {}
+    global_distances = {}
+    nearest_global_by_component = {}
     rows_by_id = {row["component_id"]: row for row in rows}
+    for component_id in unresolved_ids:
+        row = rows_by_id[component_id]
+        for record in active_candidates:
+            node_guid = str(record["node_guid"])
+            distance = math.dist(
+                row["position_meters"], record["position_meters"]
+            )
+            nearest = nearest_global_by_component.get(component_id)
+            candidate = (distance, node_guid)
+            if nearest is None or candidate < nearest:
+                nearest_global_by_component[component_id] = candidate
+            if node_guid in used_node_guids:
+                continue
+            if distance <= threshold:
+                global_bounded_adjacency[component_id].append(candidate)
+                global_edge_records[(component_id, node_guid)] = record
+                global_distances[(component_id, node_guid)] = distance
+        global_bounded_adjacency[component_id].sort()
+    (
+        global_bounded_component_node,
+        global_bounded_node_guids,
+    ) = maximum_matching(global_bounded_adjacency, unresolved_ids)
+    component_node.update(global_bounded_component_node)
+    used_node_guids.update(global_bounded_node_guids)
+
+    global_unbounded_ids = [
+        component_id for component_id in unresolved_ids
+        if component_id not in global_bounded_component_node
+    ]
+    global_recovery_adjacency = defaultdict(list)
+    for component_id in global_unbounded_ids:
+        row = rows_by_id[component_id]
+        for record in active_candidates:
+            node_guid = str(record["node_guid"])
+            if node_guid in used_node_guids:
+                continue
+            distance = math.dist(
+                row["position_meters"], record["position_meters"]
+            )
+            global_recovery_adjacency[component_id].append(
+                (distance, node_guid)
+            )
+            global_edge_records[(component_id, node_guid)] = record
+            global_distances[(component_id, node_guid)] = distance
+        global_recovery_adjacency[component_id].sort()
+    (
+        global_recovered_component_node,
+        global_recovered_node_guids,
+    ) = maximum_matching(global_recovery_adjacency, global_unbounded_ids)
+    component_node.update(global_recovered_component_node)
+    used_node_guids.update(global_recovered_node_guids)
+
     assignments = {}
     for component_id, node_guid in sorted(component_node.items()):
-        record = edge_records[(component_id, node_guid)]
-        selected_distance = next(
-            distance
-            for distance, candidate_guid in adjacency[component_id]
-            if candidate_guid == node_guid
+        state_mesh_compatible = component_id in (
+            bounded_component_node | recovered_component_node
         )
+        outside_threshold = component_id in (
+            recovered_component_node | global_recovered_component_node
+        )
+        if state_mesh_compatible:
+            record = compatible_edge_records[(component_id, node_guid)]
+            selected_distance = next(
+                distance
+                for distance, candidate_guid in compatible_edges[component_id]
+                if candidate_guid == node_guid
+            )
+        else:
+            record = global_edge_records[(component_id, node_guid)]
+            selected_distance = global_distances[(component_id, node_guid)]
         assignments[component_id] = {
             **record,
             "match_evidence": {
                 "policy": (
-                    "deterministic_maximum_cardinality_state_mesh_filtered_"
-                    "one_to_one_v1"
+                    "deterministic_state_mesh_then_global_position_"
+                    "recovery_one_to_one_v3"
                 ),
                 "threshold_meters": threshold,
                 "selected_distance_meters": selected_distance,
+                "outside_preferred_threshold": outside_threshold,
+                "state_mesh_compatible": state_mesh_compatible,
+                "candidate_scope": (
+                    "state_mesh"
+                    if state_mesh_compatible
+                    else "global_authored_position"
+                ),
                 "component_id": component_id,
                 "target_mesh_id": rows_by_id[component_id]["target_mesh_id"],
             },
@@ -513,13 +645,16 @@ def assign_authored_nodes_to_components(
     for row in rows:
         if row["component_id"] in assignments:
             continue
-        nearest = nearest_by_component.get(row["component_id"])
+        nearest = (
+            nearest_global_by_component.get(row["component_id"])
+            or nearest_by_component.get(row["component_id"])
+        )
         unmatched.append({
             **row,
             "match_diagnostic": (
-                "no_state_mesh_candidate"
+                "no_active_authored_node_candidate"
                 if nearest is None
-                else "bounded_one_to_one_candidate_unavailable"
+                else "global_one_to_one_candidate_exhausted"
             ),
             "nearest_distance_meters": nearest[0] if nearest else None,
             "nearest_node_guid": nearest[1] if nearest else None,
@@ -527,12 +662,47 @@ def assign_authored_nodes_to_components(
         })
     return {
         "policy": (
-            "deterministic_maximum_cardinality_state_mesh_filtered_"
-            "one_to_one_v1"
+            "deterministic_state_mesh_then_global_position_recovery_"
+            "one_to_one_v3"
         ),
         "threshold_meters": threshold,
         "component_count": len(rows),
         "candidate_count": len(candidates),
+        "global_candidate_count": len(active_candidates),
+        "bounded_assigned_count": len(bounded_component_node),
+        "state_mesh_out_of_tolerance_recovery_count": len(
+            recovered_component_node
+        ),
+        "global_bounded_recovery_count": len(
+            global_bounded_component_node
+        ),
+        "global_out_of_tolerance_recovery_count": len(
+            global_recovered_component_node
+        ),
+        "recovered_out_of_tolerance_count": (
+            len(recovered_component_node)
+            + len(global_recovered_component_node)
+        ),
+        "maximum_recovered_distance_meters": max(
+            (
+                (
+                    next(
+                        distance
+                        for distance, candidate_guid
+                        in compatible_edges[component_id]
+                        if candidate_guid == node_guid
+                    )
+                    if component_id in recovered_component_node
+                    else global_distances[(component_id, node_guid)]
+                )
+                for component_id, node_guid
+                in {
+                    **recovered_component_node,
+                    **global_recovered_component_node,
+                }.items()
+            ),
+            default=0.0,
+        ),
         "assigned_count": len(assignments),
         "unmatched_count": len(unmatched),
         "assignments": assignments,

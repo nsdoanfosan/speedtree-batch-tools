@@ -12,12 +12,68 @@ if str(SK_BATCH) not in sys.path:
     sys.path.insert(0, str(SK_BATCH))
 
 from cluster_fleet_push import (  # noqa: E402
+    build_repair_command,
     discover_current_cluster_targets,
+    validate_repair_result,
     validate_live_result,
 )
 
 
 class ClusterFleetPushTests(unittest.TestCase):
+    def test_fleet_repair_command_precedes_push_with_current_inputs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "Tree_01.spm"
+            blend = spm.with_suffix(".blend")
+            blender = root / "blender.exe"
+            contract = root / "material.json"
+            report = root / "repair.json"
+            for path in (spm, blend, blender, contract):
+                path.write_bytes(b"current")
+
+            command = build_repair_command(
+                {"spm": spm}, blender, contract, report
+            )
+
+            self.assertIn("bwr_headless_job.py", " ".join(command))
+            self.assertEqual(command[command.index("--spm") + 1], str(spm))
+            self.assertEqual(
+                command[command.index("--material-contract") + 1],
+                str(contract),
+            )
+
+    def test_repair_result_requires_complete_v3_binding_and_plan_free_base(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report = root / "repair.json"
+            manifest = root / "assembly.json"
+            report.write_text(json.dumps({"status": "ok"}), encoding="utf-8")
+            manifest.write_text(json.dumps({
+                "placement_contract": {
+                    "authored_node_assignment": {
+                        "policy": (
+                            "deterministic_state_mesh_then_global_position_"
+                            "recovery_one_to_one_v3"
+                        ),
+                        "assigned_count": 2,
+                        "unmatched_count": 0,
+                    },
+                    "degraded_authored_card_binding_count": 0,
+                },
+                "base": {
+                    "unmatched_role_components_removed_from_base": 3,
+                },
+                "preserved_render_components": [{"polygon_count": 3}],
+                "parts": [{"bindings": [{"id": 1}, {"id": 2}]}],
+            }), encoding="utf-8")
+
+            result = validate_repair_result(
+                report, {"manifest": manifest}
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["bindings"], 2)
+
     def _manifest(self, root, asset, stem, *, birch=False):
         asset_dir = root / asset
         assembly = asset_dir / "assembly"
