@@ -32,6 +32,7 @@ from cluster_assembly_builder import (  # noqa: E402
     scope_material_pipeline_for_destination,
     scope_material_pipeline_to_codex_tests,
     _attachment_vertex_correspondence,
+    _validate_base_export_parent_chain,
     _attachment_point_correspondence,
     _assembly_fit_summary,
     _build_unreal_assembly_provenance_payload,
@@ -71,6 +72,33 @@ class WeightedVertexAttachmentToleranceTests(unittest.TestCase):
             _weighted_vertex_attachment_tolerance([0.2, 0.4, 0.1]),
             0.01,
         )
+
+
+class BaseExportParentChainTests(unittest.TestCase):
+    def test_accepts_complete_contiguous_full_export_parent_chain(self):
+        armature = SimpleNamespace(name="Root", parent=None)
+        first = SimpleNamespace(name="ExportRoot", parent=armature)
+        second = SimpleNamespace(name="MeshUnit", parent=first)
+        mesh = SimpleNamespace(name="NA_Base", parent=second)
+
+        self.assertIsNone(
+            _validate_base_export_parent_chain(
+                armature,
+                [first, second],
+                mesh,
+            )
+        )
+
+    def test_rejects_unselected_gap_in_export_parent_chain(self):
+        armature = SimpleNamespace(name="Root", parent=None)
+        missing = SimpleNamespace(name="MissingParent", parent=armature)
+        mesh = SimpleNamespace(name="NA_Base", parent=missing)
+
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "detached from its replicated Full export chain",
+        ):
+            _validate_base_export_parent_chain(armature, [], mesh)
 
 
 def seam_split_test_mesh(split_second_face=False):
@@ -2094,7 +2122,7 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
         self.assertEqual(set(stripped.templates), {b"Material"})
         self.assertEqual(stripped.connections, [(b"OP", 50, 60, b"DiffuseColor")])
 
-    def test_assembly_fbx_uses_the_full_sk_stock_export_contract(self):
+    def test_assembly_fbx_preserves_geometry_with_send2ue_unreal_axes(self):
         class DummyObject:
             mode = "OBJECT"
             hide_viewport = False
