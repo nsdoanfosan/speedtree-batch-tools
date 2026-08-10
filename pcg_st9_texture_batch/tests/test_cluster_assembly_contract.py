@@ -17,6 +17,7 @@ TOOL_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TOOL_DIR))
 
 from pcg_cluster_assembly_contract import (
+    ClusterAssemblyInternalContractError,
     ClusterAssemblyReceiptAmbiguityError,
     ClusterAssemblyReceiptError,
     ClusterAssemblyReceiptStaleError,
@@ -3692,6 +3693,64 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                     for row in stale_contract["handoff"]["issues"]
                 ],
             )
+
+            receipt_error = (
+                "Atlas normalized role has multiple current receipts: "
+                "SK_branch_elm_01"
+            )
+            with mock.patch(
+                "pcg_cluster_assembly_contract._atlas_normalized_variants",
+                side_effect=ClusterAssemblyReceiptError(receipt_error),
+            ):
+                conflict_contract = build_cluster_assembly_contract(
+                    folder,
+                    [target],
+                    [first, second],
+                    cluster_usage=usage,
+                    assembly_source_spms=[source],
+                )
+
+            conflict_primary = next(
+                row for row in conflict_contract["dependencies"]
+                if row["primary_role_source"]
+            )
+            self.assertIsNone(conflict_primary["normalized_variants"])
+            self.assertEqual(
+                conflict_primary["normalized_variants_stale"]["status"],
+                "receipt_conflict",
+            )
+            self.assertEqual(
+                conflict_primary["normalized_variants_stale"]["error"],
+                receipt_error,
+            )
+            self.assertEqual(
+                conflict_contract["handoff"]["status"],
+                "ready",
+            )
+            self.assertIn(
+                "NORMALIZED_VARIANTS_REQUIRED",
+                [
+                    row["code"]
+                    for row in conflict_contract["handoff"]["issues"]
+                ],
+            )
+            with mock.patch(
+                "pcg_cluster_assembly_contract._atlas_normalized_variants",
+                side_effect=ClusterAssemblyInternalContractError(
+                    "shared invariant failed"
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    ClusterAssemblyInternalContractError,
+                    "shared invariant failed",
+                ):
+                    build_cluster_assembly_contract(
+                        folder,
+                        [target],
+                        [first, second],
+                        cluster_usage=usage,
+                        assembly_source_spms=[source],
+                    )
             self.assertEqual(
                 dependencies["SK_branch_elm_01"]["texture_contract_source"],
                 "atlas_physical_capture",
