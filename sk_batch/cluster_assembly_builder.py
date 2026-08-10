@@ -45,6 +45,12 @@ from nanite_assembly_materials import (
     NaniteAssemblyMaterialError,
     normalize_unreal_nanite_assembly_materials,
 )
+from na_base_provider_contamination import (
+    NaBaseProviderContaminationError,
+    rendered_provider_inventory,
+    validate_base_provider_contamination,
+)
+from pcg_st9_texture_batch.pcg_texture_audit import visible_material_names
 from spm_authored_placement import (
     AUTHORED_NODE_GLOBAL_ASSIGNMENT_TOLERANCE_METERS,
     SpmAuthoredPlacementError,
@@ -4581,6 +4587,27 @@ def _base_role_polygon_indices(role_build_plans, roles, final_merged_mesh):
     })
 
 
+def _rendered_provider_inventory_from_handoff(handoff, spm_fingerprint):
+    """Load provider authority independently of reconciled role inputs."""
+    receipt_fingerprint = validate_file_fingerprint(
+        handoff.get("pcg_receipt"),
+        "PCG rendered-provider inventory receipt",
+    )
+    try:
+        receipt = json.loads(
+            Path(receipt_fingerprint["path"]).read_text(encoding="utf-8")
+        )
+        inventory = rendered_provider_inventory(
+            receipt,
+            visible_material_names(spm_fingerprint["path"]),
+        )
+    except (OSError, ValueError, NaBaseProviderContaminationError) as exc:
+        raise ClusterAssemblyBuildError(
+            "rendered-provider inventory is invalid: " + str(exc)
+        ) from exc
+    return inventory
+
+
 def _copy_base_without_role_polygons(bpy, source_obj, polygon_indices, name):
     import bmesh
 
@@ -5628,6 +5655,8 @@ def build_blender_assembly_inputs(
     all_bindings = []
     role_build_plans = {}
     preserved_render_components = []
+    rendered_provider_material_inventory = None
+    base_provider_contamination = None
     authored_node_table = None
     authored_spm_fingerprint = None
     claimed_authored_node_guids = set()
@@ -5714,6 +5743,12 @@ def build_blender_assembly_inputs(
         authored_spm_fingerprint = validate_file_fingerprint(
             handoff.get("spm"),
             "target SPM authored Node placement",
+        )
+        rendered_provider_material_inventory = (
+            _rendered_provider_inventory_from_handoff(
+                handoff,
+                authored_spm_fingerprint,
+            )
         )
         try:
             authored_node_table = parse_spm_authored_placement(
@@ -5829,6 +5864,15 @@ def build_blender_assembly_inputs(
             excluded_polygons,
             base_export_stem,
         )
+        try:
+            base_provider_contamination = (
+                validate_base_provider_contamination(
+                    base_obj,
+                    rendered_provider_material_inventory,
+                )
+            )
+        except NaBaseProviderContaminationError as exc:
+            raise ClusterAssemblyBuildError(str(exc)) from exc
         base_armature = _copy_normalized_base_armature(
             bpy,
             final_armature,
@@ -6649,6 +6693,9 @@ def build_blender_assembly_inputs(
                 "fbx": file_fingerprint(base_fbx),
                 "fbx_texture_contract": base_fbx_texture_contract,
                 "excluded_role_polygon_count": len(excluded_polygons),
+                "rendered_provider_contamination": (
+                    base_provider_contamination
+                ),
                 "unmatched_role_components_removed_from_base": sum(
                     int(row.get("polygon_count") or 0)
                     for row in preserved_render_components
