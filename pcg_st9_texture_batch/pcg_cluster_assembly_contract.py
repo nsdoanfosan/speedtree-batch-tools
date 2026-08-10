@@ -4711,15 +4711,15 @@ def build_cluster_assembly_contract(
         ):
             # Each live same-role provider owns a distinct normalization
             # receipt. Never bind a sibling to the primary provider's plans.
-            normalized_variants = _atlas_normalized_variants(
-                folder,
-                expected_identity,
-                full_target_spms,
-                audit=audit,
-                physical_receipt_cache=physical_receipt_cache,
-                atlas_resolution_reader=atlas_resolution_reader,
-            )
             try:
+                normalized_variants = _atlas_normalized_variants(
+                    folder,
+                    expected_identity,
+                    full_target_spms,
+                    audit=audit,
+                    physical_receipt_cache=physical_receipt_cache,
+                    atlas_resolution_reader=atlas_resolution_reader,
+                )
                 _validate_normalized_source_dependency(
                     normalized_variants,
                     output_spm,
@@ -4736,6 +4736,23 @@ def build_cluster_assembly_contract(
                     "remediation": (
                         "Re-run the Atlas/PCG physical normalization for "
                         f"{output_spm.name}"
+                    ),
+                }
+            except ClusterAssemblyInternalContractError:
+                raise
+            except ClusterAssemblyReceiptError as exc:
+                # Conflicting or malformed role receipts must remain
+                # fail-closed for Assembly handoff, but they are a local row
+                # state rather than a reason to abort the GUI's initial
+                # read-only audit.  Preserve the exact error for repair while
+                # withholding every ambiguous normalized variant.
+                normalized_variants = None
+                normalized_variants_stale = {
+                    "status": "receipt_conflict",
+                    "error": str(exc),
+                    "remediation": (
+                        "Resolve the Atlas normalization receipts for "
+                        f"{output_spm.name}, then re-run the audit"
                     ),
                 }
         if not primary_role_source and not current_live_pair_covered:
