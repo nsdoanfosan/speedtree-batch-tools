@@ -2834,6 +2834,7 @@ class App:
                 report(f"{label} · {stage}", overall)
 
             cancelled_exc = None
+            forced_status = None
             for unit_index, unit in enumerate(runtime_units):
                 runtime_unit = runtime_by_id[unit["unit_id"]]
                 if unit["stage"] == "generator_sync":
@@ -2993,6 +2994,11 @@ class App:
                         outcome="failed",
                         failure=failure,
                     )
+                    # Connected units consume state produced by their
+                    # predecessors.  Continuing after a failed handoff turns
+                    # one pipeline defect into a misleading fan-out of
+                    # failures, so stop before the next unit can mutate data.
+                    forced_status = "failed"
                 payload["summary"] = summarize_unit_results(
                     payload["unit_results"]
                 )
@@ -3000,6 +3006,8 @@ class App:
                     payload,
                     report_path,
                 )
+                if forced_status is not None:
+                    break
 
             report("실행 보고서 저장 중", 98)
             report_path = self._finish_connected_payload(
@@ -3008,6 +3016,7 @@ class App:
                 settings,
                 report_path,
                 cancelled=cancelled_exc is not None,
+                forced_status=forced_status,
             )
             if cancelled_exc is not None:
                 cancelled_exc.report_payload = payload
@@ -3452,6 +3461,7 @@ class App:
                         outcome="failed",
                         failure=failure,
                     )
+                    forced_status = "failed"
 
                 # A Cluster retry may share generated artifacts with a unit
                 # that already succeeded. Rescan after every attempted

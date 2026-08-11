@@ -1426,16 +1426,19 @@ def summarize_unit_results(unit_results: Iterable[Mapping[str, Any]]) -> dict:
 
 def status_from_unit_results(unit_results, *, cancelled: bool = False) -> str:
     summary = summarize_unit_results(unit_results)
-    succeeded = summary["generator"]["succeeded"] + summary["cluster"]["succeeded"]
     failed = summary["failures"]
     pending = summary["generator"]["pending"] + summary["cluster"]["pending"]
     if cancelled:
         return "cancelled"
+    # A connected run is one pipeline, not a bag of independent jobs.  Once
+    # one unit fails, reporting the earlier mutations as a successful
+    # "partial" terminal outcome hides a broken handoff.  Historical partial
+    # reports remain readable, but newly sealed runs fail as a whole.
+    if failed:
+        return "failed"
     if pending:
         return "incomplete"
-    if not failed:
-        return "ok"
-    return "partial" if succeeded else "failed"
+    return "ok"
 
 
 def update_unit_result(

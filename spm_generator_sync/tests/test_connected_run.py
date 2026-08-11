@@ -26,6 +26,7 @@ from connected_run import (  # noqa: E402
     scope_dependency_identities,
     selected_failed_units,
     shared_queue_result,
+    status_from_unit_results,
     update_unit_result,
     validate_failed_retry_plan,
     validate_preserved_unit_identities,
@@ -53,6 +54,15 @@ def retryable_publish_error(message="Permission denied: registry.json.tmp"):
 
 
 class ConnectedRunContractTests(unittest.TestCase):
+    def test_connected_failure_is_never_reported_as_partial_success(self):
+        unit_results = [
+            {"stage": "generator_sync", "outcome": "succeeded"},
+            {"stage": "cluster_refresh", "outcome": "failed"},
+            {"stage": "cluster_refresh", "outcome": "pending"},
+        ]
+
+        self.assertEqual(status_from_unit_results(unit_results), "failed")
+
     def test_production_shaped_fixture_preserves_partial_counts_and_nine_units(self):
         payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
 

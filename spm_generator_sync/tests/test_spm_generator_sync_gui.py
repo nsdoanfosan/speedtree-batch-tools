@@ -830,7 +830,7 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
         )
         self.assertEqual(scope["skipped"], [])
 
-    def test_connected_board_batch_continues_to_cluster_after_sync_failure(self):
+    def test_connected_board_batch_stops_before_cluster_after_sync_failure(self):
         owner = Path(r"D:\Trees\Tree_elm")
         blend = owner / "Cluster" / "SK_branch_elm_01.blend"
         target = owner / "SK_Tree_elm_01.spm"
@@ -917,58 +917,19 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
         self.assertTrue(
             sync.call_args.kwargs["skip_blocked_scale"]
         )
-        prepare.assert_called_once()
-        refresh.assert_called_once_with(
-            blend,
-            [target],
-            enabled=True,
-            blender_exe=Path(r"C:\Blender\blender.exe"),
-            unit_probe_path=GUI.DEFAULT_CLUSTER_UNIT_PROBE,
-            capture_resolution=1024,
-            repair_runtime_config=app.config,
-            force_refresh=True,
-            progress_callback=mock.ANY,
-        )
-        self.assertEqual(captured["status"], "partial")
+        prepare.assert_not_called()
+        refresh.assert_not_called()
+        self.assertEqual(captured["status"], "failed")
         self.assertEqual(len(captured["failures"]), 1)
-        self.assertEqual(len(captured["cluster_refresh"]), 1)
-        cluster_report = captured["cluster_refresh"][0]
-        self.assertEqual(
-            cluster_report["refresh_reasons"],
-            ["blender_source_content_changed"],
-        )
-        self.assertEqual(
-            cluster_report["refresh_reason_categories"],
-            ["geometry_ownership"],
-        )
-        self.assertEqual(
-            cluster_report["result"]["planned_refresh_reasons"],
-            ["blender_source_content_changed"],
-        )
-        self.assertEqual(
-            cluster_report["result"]["refresh_reasons"],
-            ["blender_source_content_changed"],
-        )
-        self.assertEqual(
-            cluster_report["result"]["source_content_identity"][
-                "status"
-            ],
-            "ok",
-        )
+        self.assertEqual(captured["cluster_refresh"], [])
+        self.assertEqual(captured["summary"]["cluster"]["pending"], 1)
         cluster_unit = next(
             entry
             for entry in captured["unit_results"]
             if entry["stage"] == "cluster_refresh"
         )
-        self.assertEqual(cluster_unit["outcome"], "succeeded")
-        self.assertEqual(
-            cluster_unit["result"]["planned_refresh_reasons"],
-            ["blender_source_content_changed"],
-        )
-        self.assertEqual(
-            cluster_unit["result"]["refresh_reason_categories"],
-            ["geometry_ownership"],
-        )
+        self.assertEqual(cluster_unit["outcome"], "pending")
+        self.assertNotIn("result", cluster_unit)
         app.refresh.assert_called_once()
         self.assertIn(
             "실패 1",
