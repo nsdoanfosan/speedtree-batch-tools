@@ -44,6 +44,7 @@ from connected_run import (
     legacy_or_current_summary,
     load_exact_report,
     new_unit_results,
+    rebase_authorized_dependency_identities,
     report_file_identity,
     scope_dependency_identities,
     selected_failed_units,
@@ -2564,6 +2565,31 @@ class App:
             expected_identity=expected_identity,
         )
 
+    @staticmethod
+    def _record_connected_identity_rebases(
+        unit_results,
+        execution_identities,
+        updates,
+    ):
+        """Persist compact evidence for authorized predecessor writes."""
+
+        by_id = {entry.get("unit_id"): entry for entry in unit_results}
+        for unit_id, update in updates.items():
+            entry = by_id.get(unit_id)
+            if entry is None:
+                raise ValueError(
+                    f"missing unit result for dependency rebase: {unit_id}"
+                )
+            execution_identities[unit_id] = copy.deepcopy(update["identity"])
+            receipt = {
+                key: copy.deepcopy(value)
+                for key, value in update.items()
+                if key != "identity"
+            }
+            entry.setdefault("authorized_dependency_rebases", []).append(
+                receipt
+            )
+
     def _finish_connected_payload(
         self,
         payload,
@@ -2758,6 +2784,7 @@ class App:
                 runtime_units,
                 settings,
             )
+            execution_identities = copy.deepcopy(planned_identities)
             payload = {
                 "schema_version": CONNECTED_REPORT_SCHEMA_VERSION,
                 "run_id": uuid.uuid4().hex,
@@ -2851,7 +2878,7 @@ class App:
                         job_config,
                         verify,
                         settings,
-                        planned_identities[unit["unit_id"]],
+                        execution_identities[unit["unit_id"]],
                         report,
                         lambda stage, percent, i=unit_index, text=label:
                         unit_report(i, text, stage, percent),
@@ -2913,6 +2940,17 @@ class App:
                             ),
                             "result": summary,
                         })
+                    rebase_updates = rebase_authorized_dependency_identities(
+                        unit,
+                        runtime_units[unit_index + 1:],
+                        execution_identities,
+                        settings,
+                    )
+                    self._record_connected_identity_rebases(
+                        payload["unit_results"],
+                        execution_identities,
+                        rebase_updates,
+                    )
                 else:
                     failure = {
                         "unit_id": unit["unit_id"],
@@ -3263,8 +3301,11 @@ class App:
             cancelled_exc = None
             forced_status = None
             total = len(plan["units"])
+            retry_execution_identities = copy.deepcopy(
+                plan["current_identities"]
+            )
             for retry_index, unit in enumerate(plan["units"]):
-                baseline = plan["current_identities"][unit["unit_id"]]
+                baseline = retry_execution_identities[unit["unit_id"]]
                 current = dependency_identity(unit, settings)
                 if current.get("digest") != baseline.get("digest"):
                     payload["retry_invalidated"] = [
@@ -3367,6 +3408,17 @@ class App:
                             ],
                             "result": result_summary,
                         })
+                    rebase_updates = rebase_authorized_dependency_identities(
+                        unit,
+                        plan["units"][retry_index + 1:],
+                        retry_execution_identities,
+                        settings,
+                    )
+                    self._record_connected_identity_rebases(
+                        payload["unit_results"],
+                        retry_execution_identities,
+                        rebase_updates,
+                    )
                 else:
                     failure = {
                         "unit_id": unit["unit_id"],
@@ -3421,7 +3473,7 @@ class App:
                     )
                     for remaining_unit in plan["units"][retry_index + 1:]:
                         guarded_identities[remaining_unit["unit_id"]] = (
-                            copy.deepcopy(plan["current_identities"][
+                            copy.deepcopy(retry_execution_identities[
                                 remaining_unit["unit_id"]
                             ])
                         )
