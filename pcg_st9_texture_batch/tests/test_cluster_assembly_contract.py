@@ -38,6 +38,7 @@ from pcg_cluster_assembly_contract import (
     _canonical_cluster_texture_refs,
     _current_live_pair_covered,
     _normalized_generator_delivery,
+    _rendered_provider_material_names,
     _tga_basename_validation,
     _validate_normalized_source_dependency,
 )
@@ -652,7 +653,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 [row["code"] for row in contract["handoff"]["errors"]],
             )
 
-    def test_explicit_off_registry_overrides_same_named_rendered_role(self):
+    def test_rendered_role_overrides_stale_explicit_off_registry(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary) / "tree_lauraceae"
             cluster_dir = folder / "Cluster"
@@ -677,25 +678,50 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             save_target_registry(provider_blend, [])
             usage = cluster_material_usage([target], [provider])
 
-            contract = build_cluster_assembly_contract(
-                folder,
-                [target],
-                [provider],
-                cluster_usage=usage,
-            )
+            normalized = {
+                "status": "ready",
+                "variants": [{"ordinal": 1, "target_mesh_id": 7}],
+                "delivery_mode": "asset_registration_only",
+            }
+            with mock.patch(
+                "pcg_cluster_assembly_contract._atlas_normalized_variants",
+                return_value=normalized,
+            ), mock.patch(
+                "pcg_cluster_assembly_contract."
+                "_validate_normalized_source_dependency",
+            ):
+                contract = build_cluster_assembly_contract(
+                    folder,
+                    [target],
+                    [provider],
+                    cluster_usage=usage,
+                )
 
-            self.assertEqual(contract["dependencies"], [])
-            self.assertEqual(contract["handoff"]["status"], "pass_through")
-            excluded = contract["relationship_policy"][
-                "excluded_cluster_sources"
-            ]
-            self.assertEqual(len(excluded), 1)
-            self.assertEqual(
-                excluded[0]["reason"],
-                "explicit_target_relation_off",
+            self.assertEqual(len(contract["dependencies"]), 1)
+            self.assertTrue(
+                contract["handoff"]["separate_nanite_assembly_requested"]
             )
             self.assertEqual(
-                excluded[0]["target_relation"]["status"],
+                contract["handoff"]["roles"][0]["decision"],
+                "pass_through",
+            )
+            self.assertTrue(
+                contract["handoff"]["requires_actual_fbx_revalidation"]
+            )
+            self.assertEqual(
+                contract["relationship_policy"]["excluded_cluster_sources"],
+                [],
+            )
+            diagnostics = contract["relationship_policy"][
+                "registry_diagnostics"
+            ]
+            self.assertEqual(len(diagnostics), 1)
+            self.assertEqual(
+                diagnostics[0]["reason"],
+                "explicit_target_relation_off_diagnostic_only",
+            )
+            self.assertEqual(
+                diagnostics[0]["target_relation"]["status"],
                 "explicit_off",
             )
 
@@ -1604,6 +1630,20 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                     audit=audit_module,
                 )
             )
+            full_fbx_authoritative = _atlas_normalized_variants(
+                folder,
+                "branch_elm_01",
+                [target],
+                audit=audit_module,
+                full_fbx_role_present=True,
+            )
+            self.assertEqual(full_fbx_authoritative["status"], "ready")
+            self.assertEqual(
+                full_fbx_authoritative["source_spm_drift_validation"][
+                    "status"
+                ],
+                "deferred",
+            )
             source_spm.write_bytes(original_spm)
 
             original_fbx = source_fbx.read_bytes()
@@ -1758,7 +1798,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                     audit=audit_module,
                 )
 
-    def test_physical_scope_coverage_follows_explicit_target_registry(self):
+    def test_physical_scope_registry_is_diagnostic_for_rendered_full_fbx(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             folder = Path(temp_dir) / "Tree_elm"
             blend = folder / "SK_branch_elm_01.blend"
@@ -1848,6 +1888,26 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                         audit=None,
                     )
                 )
+
+            # A stale empty child registry cannot hide prototypes when the
+            # latest Full FBX has already proved this role rendered.
+            save_target_registry(blend, [])
+            with mock.patch(
+                "pcg_cluster_assembly_contract._normalized_variant_contract",
+                return_value=normalized,
+            ):
+                rendered_contract = _atlas_normalized_variants(
+                    folder,
+                    "branch_elm_01",
+                    [first],
+                    audit=None,
+                    full_fbx_role_present=True,
+                )
+            self.assertEqual(rendered_contract["status"], "ready")
+            self.assertEqual(
+                rendered_contract["target_registry_diagnostic"]["status"],
+                "stale_or_missing_for_rendered_full_fbx_role",
+            )
 
     def test_same_delivery_to_several_targets_is_one_role_contract(self):
         # A Cluster blend that is ON for more than one tree SPM writes one
@@ -2038,6 +2098,48 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                             targets,
                             audit=audit_module,
                         )
+
+                    selected = _atlas_normalized_variants(
+                        folder,
+                        "branch_elm_01",
+                        [targets[0]],
+                        audit=audit_module,
+                    )
+                    self.assertEqual(selected["status"], "ready")
+                    self.assertEqual(
+                        selected["normalization_receipt_selection"][
+                            "policy"
+                        ],
+                        "requested_targets_before_registered_siblings_v1",
+                    )
+                    self.assertGreater(
+                        selected["normalization_receipt_selection"][
+                            "ignored_registered_sibling_candidates"
+                        ],
+                        0,
+                    )
+
+    def test_rendered_provider_discovery_includes_cutout_only_material(self):
+        fake_audit = mock.Mock()
+        fake_audit.visible_material_names.return_value = ["M_leaf_main_01"]
+        fake_audit.extract_material_image_refs.return_value = [
+            {
+                "material_name": "M_leaf_main_01",
+                "cutout_mesh_ids": ["10"],
+            },
+            {
+                "material_name": "M_leaf_side_01",
+                "cutout_mesh_ids": ["11", "12"],
+            },
+            {
+                "material_name": "M_unused_library_01",
+                "cutout_mesh_ids": [],
+            },
+        ]
+        self.assertEqual(
+            _rendered_provider_material_names(fake_audit, "tree.spm"),
+            ["M_leaf_main_01", "M_leaf_side_01"],
+        )
 
     def test_diverging_plan_delivery_still_reports_multiple_receipts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3552,7 +3654,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                         fixture["production_spm"],
                     )
 
-    def test_same_role_secondary_keeps_its_own_normalized_provider(self):
+    def test_same_role_secondary_is_reference_only_when_full_fbx_absent(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary) / "Tree_elm"
             cluster_dir = folder / "Cluster"
@@ -3644,7 +3746,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             )
             self.assertEqual(
                 dependencies["SK_branch_elm_02"]["decision"],
-                "normalize_part",
+                "reference_only",
             )
             self.assertFalse(
                 dependencies["SK_branch_elm_02"]["primary_role_source"]
@@ -3652,6 +3754,11 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             self.assertIs(
                 dependencies["SK_branch_elm_02"]["normalized_variants"],
                 normalized,
+            )
+            self.assertTrue(
+                dependencies["SK_branch_elm_02"][
+                    "spm_only_provider_candidate"
+                ]
             )
 
             with mock.patch(
@@ -3706,7 +3813,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 dependencies["SK_branch_elm_02"][
                     "tga_basename_validation"
                 ]["status"],
-                "basename_mismatch",
+                "not_applicable",
             )
 
     def test_owner_folder_bark_identity_is_canonical_content(self):
@@ -3747,6 +3854,104 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             self.assertEqual(contract["status"], "canonical")
             self.assertEqual(contract["canonical_material"], bark_name)
             self.assertEqual(len(contract["canonical_sources"]), 1)
+
+    def test_same_role_sibling_cannot_claim_other_provider_full_fbx_slot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "tree_densiflora"
+            cluster_dir = folder / "cluster"
+            first = cluster_dir / "SK_cluster_densiflora_01.spm"
+            sibling = cluster_dir / "SK_cluster_densiflora_03.spm"
+            target = folder / "SK_tree_densiflora_05.spm"
+            source = folder / "tree_densiflora_05.spm"
+            write_spm(
+                target,
+                [("1", "M_cluster_densiflora_01", [], ("1",))],
+                mesh_ids=("1",),
+            )
+            write_spm(
+                source,
+                [("1", "M_cluster_densiflora_01", [], ("1",))],
+                mesh_ids=("1",),
+            )
+            for provider in (first, sibling):
+                write_spm(provider, [("1", provider.stem, [], ("1",))])
+                (cluster_dir / f"{provider.stem}.tga").write_bytes(b"texture")
+            write_ascii_fbx(
+                folder / "fbx" / "tree_densiflora_05.fbx",
+                material_names=["M_cluster_densiflora_01_Mat"],
+                mesh_names=["M_cluster_densiflora_01_mesh"],
+                pairs=[(
+                    "M_cluster_densiflora_01_Mat",
+                    "M_cluster_densiflora_01_mesh",
+                )],
+            )
+            usage = {
+                str(first).casefold(): {
+                    "spms": [str(target)],
+                    "material_names": ["M_cluster_densiflora_01"],
+                    "material_names_by_spm": {
+                        str(source): ["M_cluster_densiflora_01"],
+                    },
+                    "source_refs": [str(cluster_dir / f"{first.stem}.tga")],
+                },
+                str(sibling).casefold(): {
+                    "spms": [str(target)],
+                    # Stale lower relationship data points at provider 01.
+                    "material_names": ["M_cluster_densiflora_01"],
+                    "material_names_by_spm": {
+                        str(source): ["M_cluster_densiflora_01"],
+                    },
+                    "source_refs": [
+                        str(cluster_dir / f"{sibling.stem}.tga")
+                    ],
+                },
+            }
+
+            def normalized_variants(_folder, identity, *_args, **_kwargs):
+                return {
+                    "status": "ready",
+                    "material": identity.replace("SK_", "M_"),
+                    "variants": [{"ordinal": 1}],
+                    "production_normalization": {
+                        "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
+                    },
+                }
+
+            with mock.patch(
+                "pcg_cluster_assembly_contract._atlas_normalized_variants",
+                side_effect=normalized_variants,
+            ), mock.patch(
+                "pcg_cluster_assembly_contract."
+                "_validate_normalized_source_dependency",
+            ):
+                contract = build_cluster_assembly_contract(
+                    folder,
+                    [target],
+                    [first, sibling],
+                    cluster_usage=usage,
+                    assembly_source_spms=[source],
+                )
+
+            dependencies = {
+                row["name"]: row for row in contract["dependencies"]
+            }
+            self.assertEqual(
+                dependencies[first.stem]["decision"], "normalize_part"
+            )
+            self.assertEqual(
+                dependencies[sibling.stem]["decision"], "reference_only"
+            )
+            sibling_target = dependencies[sibling.stem]["targets"][0]
+            self.assertEqual(
+                sibling_target[
+                    "fbx_material_mesh_pair_usage_diagnostic"
+                ]["status"],
+                "complete_pair",
+            )
+            self.assertEqual(
+                sibling_target["fbx_material_mesh_pair"]["status"],
+                "absent",
+            )
 
     def test_multiple_provider_signatures_are_preserved_live_variants(
         self,

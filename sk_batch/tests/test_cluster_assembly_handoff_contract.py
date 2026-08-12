@@ -772,7 +772,7 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                 handoff["skeleton_wind_contract"]["production_310_bone_hard_gate"]
             )
 
-    def test_complete_target_spm_material_is_a_content_driven_role_alias(self):
+    def test_target_spm_material_alias_is_diagnostic_not_provider_presence(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             spm = root / "SK_tree_provider_current_01.spm"
@@ -822,25 +822,21 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                 identities["leaf"],
                 ["leaf_provider_current_01", "M_leaf_provider_legacy_01"],
             )
-            self.assertEqual(handoff["status"], "ready")
+            self.assertEqual(handoff["status"], "pass_through")
             leaf = next(
                 row for row in handoff["roles"] if row["role"] == "leaf"
             )
             self.assertEqual(
                 leaf["role_identity"],
-                "leaf_provider_current_01",
+                "M_leaf_provider_legacy_01",
             )
-            self.assertEqual(leaf["status"], "complete_pair")
+            self.assertEqual(leaf["status"], "absent")
+            self.assertEqual(leaf["decision"], "pass_through")
             self.assertEqual(
-                leaf["role_identity_aliases"],
-                ["M_leaf_provider_legacy_01"],
+                leaf["fbx_material_mesh_pair_usage_diagnostic"]["status"],
+                "complete_pair",
             )
-            self.assertEqual(
-                handoff["assembly"]["part_builder_inputs"][0][
-                    "role_identity_aliases"
-                ],
-                ["M_leaf_provider_legacy_01"],
-            )
+            self.assertEqual(handoff["assembly"]["part_builder_inputs"], [])
 
     def test_actionable_role_without_normalized_variants_uses_live_pair(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -872,7 +868,7 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
             )
             self.assertEqual(handoff["issues"], [])
 
-    def test_actual_pair_overrides_asset_registration_only_metadata(self):
+    def test_full_fbx_pair_overrides_stale_asset_only_delivery(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             spm = root / "SK_Tree_elm_01.spm"
@@ -914,10 +910,14 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
             self.assertEqual(branch["decision"], "normalize_part")
             self.assertEqual(
                 branch["reconciliation"],
-                "current_fbx_pair_overrides_asset_registration_only",
+                (
+                    "current_full_fbx_pair_and_normalized_topology_override_"
+                    "asset_registration_only"
+                ),
             )
+            self.assertEqual(handoff["role_demotions"], [])
 
-    def test_target_alias_does_not_override_unconnected_provider_name(self):
+    def test_full_fbx_target_alias_does_not_claim_other_provider(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             spm = root / "SK_Tree_elm_01.spm"
@@ -963,12 +963,13 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
             self.assertEqual(handoff["status"], "pass_through")
             self.assertEqual(cluster["decision"], "pass_through")
             self.assertFalse(cluster["provider_identity_matches_actual"])
+            self.assertEqual(cluster["status"], "absent")
             self.assertEqual(
-                cluster["reconciliation"],
-                "asset_registration_only_provider_name_mismatch",
+                cluster["fbx_material_mesh_pair_usage_diagnostic"]["status"],
+                "complete_pair",
             )
 
-    def test_actual_pair_overrides_incomplete_connection_metadata(self):
+    def test_full_fbx_pair_overrides_stale_incomplete_delivery(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             spm = root / "SK_Tree_elm_01.spm"
@@ -1009,11 +1010,197 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
             self.assertEqual(branch["decision"], "normalize_part")
             self.assertEqual(
                 branch["reconciliation"],
-                "current_fbx_pair_overrides_connection_incomplete",
+                (
+                    "current_full_fbx_pair_and_normalized_topology_override_"
+                    "connection_incomplete"
+                ),
             )
             self.assertEqual(handoff["issues"], [])
 
-    def test_target_alias_does_not_override_incomplete_provider_name(self):
+    def test_final_full_fbx_recovers_normalization_omitted_by_old_registry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_Tree_lauraceae_10.spm"
+            fbx = root / "tree.fbx"
+            receipt = root / "receipt.json"
+            spm.write_bytes(b"spm")
+            fbx.write_bytes(b"fbx")
+            write_receipt(
+                receipt,
+                spm,
+                fbx,
+                [("cluster", "cluster_lauraceae_01", "normalize_part")],
+            )
+            inventory = build_blender_fbx_inventory(
+                [
+                    role_object(
+                        fbx,
+                        material="M_cluster_lauraceae_01",
+                    )
+                ],
+                fbx,
+                {"cluster": "M_cluster_lauraceae_01"},
+            )
+            recovered = {
+                "status": "ready",
+                "variants": [{"ordinal": 1}],
+            }
+
+            with mock.patch(
+                "cluster_assembly_handoff_contract."
+                "_recover_full_fbx_normalized_variants",
+                return_value=(
+                    recovered,
+                    "recovered_from_current_provider_normalization",
+                ),
+            ):
+                handoff = build_assembly_handoff(receipt, spm, inventory)
+
+            cluster = next(
+                row for row in handoff["roles"]
+                if row["role"] == "cluster"
+            )
+            self.assertEqual(handoff["status"], "ready")
+            self.assertEqual(cluster["decision"], "normalize_part")
+            self.assertIs(cluster["normalized_variants"], recovered)
+            self.assertEqual(
+                cluster["normalized_variant_recovery"],
+                "recovered_from_current_provider_normalization",
+            )
+            self.assertEqual(
+                cluster["reconciliation"],
+                (
+                    "current_full_fbx_pair_and_normalized_topology_override_"
+                    "stale_or_missing_delivery_metadata"
+                ),
+            )
+            self.assertEqual(handoff["role_demotions"], [])
+
+    def test_full_fbx_pair_uses_target_local_variants_without_name_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_Tree_elm_02.spm"
+            fbx = root / "tree.fbx"
+            receipt = root / "receipt.json"
+            spm.write_bytes(b"spm")
+            fbx.write_bytes(b"fbx")
+            write_receipt(
+                receipt,
+                spm,
+                fbx,
+                [("leaf", "cluster_leaf_provider_01", "normalize_part")],
+                normalized_by_role={
+                    "leaf": {
+                        "status": "ready",
+                        "material": "M_cluster_leaf_provider_01",
+                        "material_id": 1,
+                        "variants": [{
+                            "ordinal": 1,
+                            "target_mesh_id": 10,
+                        }],
+                        "delivery_mode": "connection_incomplete",
+                        "target_deliveries": [{
+                            "schema_version": 3,
+                            "spm": str(spm),
+                            "delivery_mode": "connection_incomplete",
+                            "target_material_id": 7,
+                            "normalized_variants": [{
+                                "ordinal": 1,
+                                "target_mesh_id": 42,
+                            }],
+                            "generator_bindings": [],
+                        }],
+                    },
+                },
+                target_material_by_role={"leaf": "M_leaf_target_02"},
+            )
+            inventory = build_blender_fbx_inventory(
+                [role_object(fbx, material="M_cluster_leaf_provider_01")],
+                fbx,
+                {"leaf": [
+                    "M_leaf_target_02",
+                    "M_cluster_leaf_provider_01",
+                ]},
+            )
+
+            handoff = build_assembly_handoff(receipt, spm, inventory)
+
+            self.assertEqual(handoff["status"], "ready")
+            part = handoff["assembly"]["part_builder_inputs"][0]
+            self.assertEqual(
+                part["normalized_variants"]["material_id"],
+                7,
+            )
+            self.assertEqual(
+                part["normalized_variants"]["variants"][0][
+                    "target_mesh_id"
+                ],
+                42,
+            )
+            self.assertEqual(handoff["role_demotions"], [])
+
+    def test_spm_only_provider_does_not_create_absent_full_fbx_role(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_Tree_willow_01.spm"
+            fbx = root / "tree.fbx"
+            receipt = root / "receipt.json"
+            spm.write_bytes(b"spm")
+            fbx.write_bytes(b"fbx")
+            write_receipt(
+                receipt,
+                spm,
+                fbx,
+                [("leaf_side", "leaf_willow_side_01", "normalize_part")],
+                normalized_by_role={
+                    "leaf_side": {
+                        "status": "ready",
+                        "variants": [
+                            {"ordinal": 1},
+                            {"ordinal": 2},
+                        ],
+                        "delivery_mode": "asset_registration_only",
+                        "target_deliveries": [{
+                            "schema_version": 3,
+                            "spm": str(spm),
+                            "delivery_mode": "asset_registration_only",
+                            "target_material_id": 26,
+                            "normalized_variants": [
+                                {"ordinal": 1, "target_mesh_id": 127},
+                                {"ordinal": 2, "target_mesh_id": 128},
+                            ],
+                            "generator_bindings": [],
+                        }],
+                    },
+                },
+            )
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+            role = payload["items"][0]["cluster_assembly"]["handoff"][
+                "roles"
+            ][0]
+            role["rendered_provider_expansion_covered"] = True
+            receipt.write_text(json.dumps(payload), encoding="utf-8")
+            inventory = build_blender_fbx_inventory([], fbx, {})
+
+            handoff = build_assembly_handoff(receipt, spm, inventory)
+
+            leaf_side = next(
+                row for row in handoff["roles"]
+                if row["role"] == "leaf_side"
+            )
+            self.assertEqual(handoff["status"], "pass_through")
+            self.assertEqual(leaf_side["decision"], "pass_through")
+            self.assertEqual(
+                leaf_side["reconciliation"],
+                "asset_registration_only",
+            )
+            self.assertFalse(leaf_side["provider_identity_matches_actual"])
+            self.assertEqual(
+                handoff["role_demotions"][0]["code"],
+                "CLUSTER_ROLE_NOT_ASSEMBLED",
+            )
+
+    def test_full_fbx_alias_does_not_override_provider_material_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             spm = root / "SK_Tree_elm_01.spm"
@@ -1056,9 +1243,10 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
             self.assertEqual(handoff["status"], "pass_through")
             self.assertEqual(leaf["decision"], "pass_through")
             self.assertFalse(leaf["provider_identity_matches_actual"])
+            self.assertEqual(leaf["status"], "absent")
             self.assertEqual(
-                leaf["reconciliation"],
-                "connection_incomplete_provider_name_mismatch",
+                leaf["fbx_material_mesh_pair_usage_diagnostic"]["status"],
+                "complete_pair",
             )
 
     def test_bark_normalization_metadata_does_not_block_live_pair(self):

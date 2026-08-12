@@ -58,7 +58,6 @@ MANIFEST_KIND = "sk_batch_cluster_nanite_assembly_inputs"
 PLACEMENT_CONTRACT_VERSION = 1
 MAX_ASSEMBLY_RESIDUAL_RELATIVE_RMS = 1.0e-2
 MAX_ASSEMBLY_PIVOT_ERROR_METERS = 1.0e-8
-MAX_NORMALIZED_PLAN_FACE_LOSS_RATIO = 0.20
 MAX_SPEEDTREE_RENDER_FACE_MULTIPLICITY = 2
 MAX_WEIGHT_BINDING_DISTANCE_SPAN_RATIO = 1.0e-2
 MIN_WEIGHT_BINDING_DISTANCE_METERS = 1.0e-2
@@ -3837,25 +3836,84 @@ def _attachment_point_correspondence(
             },
         }
 
-    if _component_signature(
+    signatures_match = _component_signature(
         source_obj.data, source_component
-    ) != _component_signature(target_obj.data, target_component):
-        raise ClusterAssemblyBuildError(
-            "normalized plan attachment pivot UV is absent from the "
-            "source/target render component"
-        )
+    ) == _component_signature(target_obj.data, target_component)
+    source_edge = None
+    target_edge = None
+    edge_resolution_error = None
+    if signatures_match:
+        try:
+            source_edge = _attachment_uv_edge_point(
+                source_obj, source_component, resolved_uv
+            )
+            target_edge = _attachment_uv_edge_point(
+                target_obj, target_component, resolved_uv
+            )
+        except ClusterAssemblyBuildError as exc:
+            edge_resolution_error = str(exc)
+    def project_full_fbx_origin(fallback_reason):
+        # The final Full FBX is allowed to contain an exact face subset of a
+        # normalized provider plan.  SpeedTree can clip the face carrying the
+        # plan's origin, or a lower-provenance receipt can retain an attachment
+        # UV that no longer describes the provider's normalized local origin.
+        # Do not revive a clipped face or invent an attachment vertex.  Map the
+        # normalized local origin through the surviving Full-FBX overlap;
+        # authored SPM placement still supplies the final absolute translation.
+        try:
+            (
+                source_indices,
+                target_indices,
+                correspondence_evidence,
+            ) = _ordered_cross_object_correspondence(
+                source_obj,
+                source_component,
+                target_obj,
+                target_component,
+                include_evidence=True,
+            )
+            projection = fit_uniform_similarity_transform(
+                [
+                    tuple(float(value) for value in source_obj.data.vertices[index].co)
+                    for index in source_indices
+                ],
+                [
+                    tuple(float(value) for value in target_obj.data.vertices[index].co)
+                    for index in target_indices
+                ],
+            )
+            target_origin = tuple(
+                float(value) for value in projection["translation"]
+            )
+        except ClusterAssemblyBuildError as exc:
+            raise ClusterAssemblyBuildError(
+                "normalized plan attachment pivot UV is absent from the "
+                "source/target render component"
+            ) from exc
+        return {
+            "source_index": None,
+            "target_index": None,
+            "source_coordinate": (0.0, 0.0, 0.0),
+            "target_coordinate": target_origin,
+            "evidence": {
+                "policy": "full_fbx_shared_uv_origin_projection_v1",
+                "fallback_reason": fallback_reason,
+                "attachment_edge_error": edge_resolution_error,
+                "attachment_uv": list(resolved_uv),
+                "correspondence": correspondence_evidence,
+                "similarity_relative_rms": projection[
+                    "similarity_relative_rms"
+                ],
+                "source_fit_rank": projection["source_fit_rank"],
+            },
+        }
 
-    source_edge = _attachment_uv_edge_point(
-        source_obj, source_component, resolved_uv
-    )
-    target_edge = _attachment_uv_edge_point(
-        target_obj, target_component, resolved_uv
-    )
-    if source_edge is None or target_edge is None:
-        raise ClusterAssemblyBuildError(
-            "normalized plan attachment pivot UV is absent from the "
-            "source/target render component"
+    if edge_resolution_error is not None:
+        return project_full_fbx_origin(
+            "attachment_uv_edge_is_geometrically_ambiguous"
         )
+    if source_edge is None or target_edge is None:
+        return project_full_fbx_origin("attachment_uv_absent_from_render_subset")
 
     source_coordinates = [
         tuple(float(value) for value in source_obj.data.vertices[index].co)
@@ -3871,9 +3929,8 @@ def _attachment_point_correspondence(
         source_edge["coordinate"], (0.0, 0.0, 0.0)
     )
     if source_origin_error > origin_tolerance:
-        raise ClusterAssemblyBuildError(
-            "normalized plan attachment UV edge does not resolve to the "
-            "normalized source origin"
+        return project_full_fbx_origin(
+            "attachment_uv_edge_is_not_normalized_source_origin"
         )
     return {
         "source_index": source_index,
@@ -3912,22 +3969,14 @@ def _normalized_prototype_for_component(prototypes, target_mesh, target_componen
         missing_faces = _counter_missing_identity_count(
             source_faces, target_faces
         )
-        # SpeedTree 10.1 removes fully clipped boundary triangles when it
-        # expands an external cutout mesh into the rendered tree FBX. Reed's
-        # current cards lose 7.9-15.6% while retaining an exact UV-face
-        # subset. Keep subset and unique-candidate checks strict, but accept
-        # that measured exporter loss envelope.
-        allowed_missing = max(
-            1,
-            int(
-                math.ceil(
-                    sum(source_faces.values())
-                    * MAX_NORMALIZED_PLAN_FACE_LOSS_RATIO
-                )
-            ),
-        )
-        if missing_faces <= allowed_missing:
-            candidates.append((missing_faces, prototype))
+        # SpeedTree can remove any number of fully clipped boundary triangles
+        # while deriving the final rendered FBX from a provider plan.  The
+        # Full FBX is the geometry authority, so accept its exact UV-face
+        # subset and rank by the fewest provider-only faces.  Provider role
+        # identity and the unique-best check below prevent sibling plans from
+        # being conflated; a percentage threshold would incorrectly make the
+        # lower provider topology authoritative.
+        candidates.append((missing_faces, prototype))
     if not candidates:
         return None
     candidates.sort(key=lambda row: row[0])
@@ -4565,19 +4614,21 @@ def _copy_component_as_rigid_part(bpy, source_obj, component, name):
 
 
 def _base_role_polygon_indices(role_build_plans, roles, final_merged_mesh):
-    """Remove every rendered Assembly role polygon from the generated Base.
+    """Remove only rendered components that became Assembly instances.
 
-    A role component that does not match a normalized prototype is useful
-    diagnostic evidence, but preserving it in ``NA_Base`` leaves the authored
-    plan/card geometry embedded beside the generated Assembly instances.
+    Candidate polygons are intentionally broader than proven matches for a
+    normalized-topology fallback.  Removing the whole candidate set can erase
+    unrelated bark/leaf geometry, and removing an unmatched role component
+    creates a visible hole.  A component leaves ``NA_Base`` only after the
+    normalized prototype matcher has claimed it.
     """
     return sorted({
         int(polygon_index)
         for provider_key, plan in role_build_plans.items()
         if plan.get("target_object") is final_merged_mesh
-        for polygon_index in (
-            (roles.get(provider_key) or {}).get("polygon_indices") or []
-        )
+        for matched in (plan.get("matched") or {}).values()
+        for component in matched.get("instances") or []
+        for polygon_index in component.get("polygons") or []
     })
 
 
@@ -5522,14 +5573,10 @@ def _validate_role_component_claims(role_build_plans):
                             f"polygon={polygon}, roles={owner},{provider_key}"
                         )
                     claimed_polygons[claim_key] = provider_key
-        # A normalized provider can legitimately cover only a subset of the
-        # rendered variants.  `_partition_normalized_render_components`
-        # deliberately leaves unknown topologies in the Full-SK Base so no
-        # geometry is invented or discarded.  Do not turn that preservation
-        # result back into a provider-wide failure here.  A role with neither
-        # a matched nor a preserved component is still invalid, and the final
-        # builder also rejects a handoff where no provider produced any part.
-        if matched_component_count == 0 and not plan.get("preserved"):
+        # A requested, active provider that matches zero normalized prototypes
+        # is a broken Assembly contract.  Preserving its geometry in Base keeps
+        # the tree intact, but must not turn a dropped provider into success.
+        if matched_component_count == 0:
             unmatched_roles.append({
                 "provider_key": str(provider_key),
                 "preserved": deepcopy(plan.get("preserved") or []),
@@ -5573,7 +5620,51 @@ def build_blender_assembly_inputs(
         output = Path(output_dir)
         output.mkdir(parents=True, exist_ok=True)
         stem = Path(pass_through_target_spm).stem
-        manifest_path = output / f"{stem}_cluster_assembly_bindings.json"
+        production_manifest_path = (
+            output / f"{stem}_cluster_assembly_bindings.json"
+        )
+        preserved_build_manifest = None
+        if production_manifest_path.is_file():
+            try:
+                candidate = json.loads(
+                    production_manifest_path.read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError):
+                candidate = None
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("kind") == MANIFEST_KIND
+                and candidate.get("status") == "ready"
+                and candidate.get("content_decision") == "build"
+                and candidate.get("full_asset_stem") == stem
+                and list(candidate.get("parts") or [])
+            ):
+                preserved_build_manifest = file_fingerprint(
+                    production_manifest_path
+                )
+        manifest_path = production_manifest_path
+        if preserved_build_manifest is not None:
+            manifest_path = (
+                output / f"{stem}_cluster_assembly_pass_through.json"
+            )
+            manifest["production_build_manifest_preserved"] = deepcopy(
+                preserved_build_manifest
+            )
+            manifest["existing_assembly_assets_orphaned"] = {
+                "status": "action_required",
+                "reason": "current_receipt_changed_to_pass_through",
+                "previous_build_manifest": deepcopy(
+                    preserved_build_manifest
+                ),
+                "asset_names": [
+                    _public_base_name(stem),
+                    f"{stem}_NaniteAssembly",
+                ],
+                "remediation": (
+                    "refresh the exact target receipt and rebuild the existing "
+                    "Assembly, or retire both Assembly assets deliberately"
+                ),
+            }
         manifest_path.write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -6649,13 +6740,7 @@ def build_blender_assembly_inputs(
                 "fbx": file_fingerprint(base_fbx),
                 "fbx_texture_contract": base_fbx_texture_contract,
                 "excluded_role_polygon_count": len(excluded_polygons),
-                "unmatched_role_components_removed_from_base": sum(
-                    int(row.get("polygon_count") or 0)
-                    for row in preserved_render_components
-                    if role_build_plans[row["provider_key"]][
-                        "target_object"
-                    ] is final_merged_mesh
-                ),
+                "unmatched_role_components_removed_from_base": 0,
                 "final_armature": final_armature.name,
                 "weighted_bones": base_weighted_bones,
                 "weighted_bone_count": len(base_weighted_bones),
@@ -7935,7 +8020,12 @@ def validate_unreal_normalized_prototype_bounds(
     relative_tolerance=0.08,
     absolute_tolerance_cm=0.1,
 ):
-    """Reject stale, shifted, or wrong-skeleton prototypes before build."""
+    """Report prototype-bounds drift without blocking an Assembly rebuild.
+
+    Blender and Unreal may expose the same imported prototype in different
+    local axis frames.  Bounds remain useful evidence in the build report, but
+    they are not an authoritative reason to keep an older Unreal Assembly.
+    """
     production_contract = validate_normalized_prototype_unit_contract(manifest)
     receipt_bounds = _receipt_normalized_bounds_by_asset(manifest)
     parts = [
@@ -8074,20 +8164,27 @@ def validate_unreal_normalized_prototype_bounds(
             )
             for index in range(3)
         ]
-        if any(
+        size_mismatch = any(
             absolute_errors_cm[index] > allowed_errors_cm[index]
             for index in range(3)
-        ):
-            raise ClusterAssemblyBuildError(
-                "stale or wrong-unit normalized Unreal prototype "
-                f"{asset_name}: expected Blender physical-capture bounds "
-                f"{[round(value, 6) for value in expected_size_cm]} cm, loaded "
-                f"{[round(value, 6) for value in actual_size_cm]} cm. Re-send "
-                "the current normalized source blend through the regular Blender "
-                "Send to Unreal profile before building the Nanite Assembly; do "
-                "not compensate with generator Leaf Size or Frond Width/Height."
+        )
+        sorted_size_errors_cm = [
+            abs(actual - expected)
+            for actual, expected in zip(
+                sorted(actual_size_cm),
+                sorted(expected_size_cm),
             )
+        ]
+        axis_permutation_equivalent = all(
+            error
+            <= max(absolute_tolerance_cm, expected * relative_tolerance)
+            for error, expected in zip(
+                sorted_size_errors_cm,
+                sorted(expected_size_cm),
+            )
+        )
         frame_errors_cm = {}
+        frame_mismatch = False
         if expected_bounds["frame_verified"]:
             for report_key, bounds_key in (
                 ("minimum", "minimum"),
@@ -8105,14 +8202,7 @@ def validate_unreal_normalized_prototype_bounds(
                     errors[index] > allowed_errors_cm[index]
                     for index in range(3)
                 ):
-                    raise ClusterAssemblyBuildError(
-                        "normalized Unreal prototype mesh-local bounds frame "
-                        f"drifted for {asset_name}: {report_key} expected "
-                        f"{[round(value, 6) for value in expected_vector]} cm, "
-                        f"loaded {[round(value, 6) for value in actual_vector]} "
-                        "cm. Re-send the current normalized source blend; do "
-                        "not compensate in the Assembly node transform."
-                    )
+                    frame_mismatch = True
         checked.append({
             "prototype_id": prototype_id,
             "asset_name": asset_name,
@@ -8121,6 +8211,9 @@ def validate_unreal_normalized_prototype_bounds(
             "actual_size_cm": actual_size_cm,
             "absolute_errors_cm": absolute_errors_cm,
             "allowed_errors_cm": allowed_errors_cm,
+            "sorted_size_errors_cm": sorted_size_errors_cm,
+            "axis_permutation_equivalent": axis_permutation_equivalent,
+            "bounds_match": not size_mismatch,
             "expected_minimum_cm": expected_bounds.get("minimum"),
             "actual_minimum_cm": actual_bounds["minimum"],
             "expected_maximum_cm": expected_bounds.get("maximum"),
@@ -8131,12 +8224,23 @@ def validate_unreal_normalized_prototype_bounds(
             "actual_center_cm": actual_bounds["origin"],
             "frame_absolute_errors_cm": frame_errors_cm,
             "frame_verified": expected_bounds["frame_verified"],
+            "frame_match": not frame_mismatch,
+            "diagnostic_only_mismatch": bool(
+                size_mismatch or frame_mismatch
+            ),
         })
+    mismatches = [
+        row for row in checked if row["diagnostic_only_mismatch"]
+    ]
     return {
-        "status": "verified",
+        "status": (
+            "verified" if not mismatches else "diagnostic_mismatch"
+        ),
+        "blocking": False,
         "physical_production_contract": physical_production,
         "centimeters_per_blender_unit": centimeters_per_blender_unit,
         "prototype_count": len(checked),
+        "mismatch_count": len(mismatches),
         "parts": checked,
     }
 

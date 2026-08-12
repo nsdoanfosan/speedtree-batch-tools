@@ -1023,6 +1023,129 @@ def _bwr_report(blend, canonical_spm):
     )
 
 
+def _bwr_material_assignment_identity(report):
+    """Return stable evidence for the materials assigned to the BWR source.
+
+    The raw Cluster FBX can stay byte-identical while a BWR repair changes the
+    material datablocks used by the merged source.  Normalized prototypes copy
+    those datablocks, so the final BWR material intent is a physical
+    Normalizer dependency even though texture-only edits to the saved Atlas
+    plan collection are not.
+    """
+    intents = report.get("speedtree_material_intents") or {}
+    materials = []
+    for row in intents.get("materials") or []:
+        if not isinstance(row, dict):
+            continue
+        materials.append({
+            "material_name": str(row.get("material_name") or ""),
+            "material_key": str(row.get("material_key") or ""),
+            "material_instance_base": str(
+                row.get("material_instance_base") or ""
+            ),
+            "tree_part": str(row.get("tree_part") or ""),
+            "tree_shading": str(row.get("tree_shading") or ""),
+            "match_mode": str(row.get("match_mode") or ""),
+            "source_materials": sorted(
+                str(value)
+                for value in row.get("source_materials") or []
+                if str(value).strip()
+            ),
+        })
+    materials.sort(
+        key=lambda row: (
+            row["material_name"].casefold(),
+            row["material_key"].casefold(),
+        )
+    )
+    consolidation = (
+        (report.get("import") or {}).get("material_consolidation") or {}
+    )
+    production_groups = []
+    for row in consolidation.get("groups") or []:
+        if (
+            not isinstance(row, dict)
+            or row.get("mode") != "production_group_suffix"
+        ):
+            continue
+        production_groups.append({
+            "target_material": str(row.get("target_material") or ""),
+            "source_materials": sorted(
+                str(value)
+                for value in row.get("source_materials") or []
+                if str(value).strip()
+            ),
+            "group_tokens": sorted(
+                str(value)
+                for value in row.get("group_tokens") or []
+                if str(value).strip()
+            ),
+            "provenance_type": str(row.get("provenance_type") or ""),
+            "readiness_mode": str(row.get("readiness_mode") or ""),
+        })
+    production_groups.sort(
+        key=lambda row: (
+            row["target_material"].casefold(),
+            tuple(value.casefold() for value in row["source_materials"]),
+        )
+    )
+    return {
+        "intent_status": str(intents.get("status") or ""),
+        "materials": materials,
+        "unmatched_materials": sorted(
+            str(value)
+            for value in intents.get("unmatched_materials") or []
+            if str(value).strip()
+        ),
+        "production_groups": production_groups,
+    }
+
+
+def inspect_bwr_material_assignment_freshness(blend):
+    """Compare the latest BWR material assignment with the Normalizer receipt."""
+    blend = Path(blend).expanduser().absolute()
+    report_path = (
+        blend.parent
+        / "reports"
+        / f"{blend.stem}_speedtree_repair_pipeline_report_codex.json"
+    )
+    report = _read_json(report_path)
+    if not report or str(report.get("status") or "").casefold() != "done":
+        return {
+            "status": "not_available",
+            "current": True,
+            "required": False,
+            "report": str(report_path),
+            "receipt": str(normalization_receipt_path(blend)),
+            "refresh_reasons": [],
+        }
+    identity = _bwr_material_assignment_identity(report)
+    required = bool(
+        identity["materials"]
+        or identity["unmatched_materials"]
+        or identity["production_groups"]
+    )
+    expected = _canonical_sha256(identity)
+    receipt_path = normalization_receipt_path(blend)
+    receipt = _read_json(receipt_path)
+    recorded = str(
+        (receipt or {}).get("bwr_material_assignment_sha256") or ""
+    ).casefold()
+    current = bool(not required or recorded == expected.casefold())
+    return {
+        "status": "current" if current else "refresh_required",
+        "current": current,
+        "required": required,
+        "report": str(report_path),
+        "receipt": str(receipt_path),
+        "expected_sha256": expected,
+        "recorded_sha256": recorded,
+        "refresh_reasons": (
+            [] if current else ["bwr_material_assignment_changed"]
+        ),
+    }
+
+
 def _receipt_is_current(recipe):
     receipt = _read_json(recipe["receipt_path"])
     if (
@@ -1033,6 +1156,12 @@ def _receipt_is_current(recipe):
     ):
         return False
     build = receipt.get("build") or {}
+    if (
+        recipe.get("bwr_material_assignment_required")
+        and receipt.get("bwr_material_assignment_sha256")
+        != recipe.get("bwr_material_assignment_sha256")
+    ):
+        return False
     current_source_fbx = recipe.get("source_fbx_identity")
     if isinstance(current_source_fbx, dict):
         recorded_source_fbx = build.get("source_3d_contract") or {}
@@ -1295,6 +1424,15 @@ def resolve_normalization_recipe(
         )
 
     receipt = normalization_receipt_path(blend)
+    bwr_material_assignment = _bwr_material_assignment_identity(_report)
+    bwr_material_assignment_required = bool(
+        bwr_material_assignment["materials"]
+        or bwr_material_assignment["unmatched_materials"]
+        or bwr_material_assignment["production_groups"]
+    )
+    bwr_material_assignment_sha256 = _canonical_sha256(
+        bwr_material_assignment
+    )
     bwr_semantic_identity = {
         "status": str(_report.get("status") or ""),
         "source_spm_semantic_projection_version":
@@ -1304,9 +1442,10 @@ def resolve_normalization_recipe(
         "handoff_preflight_status": str(
             (_report.get("handoff_preflight") or {}).get("status") or ""
         ),
+        "material_assignment": bwr_material_assignment,
     }
     normalization_contract = {
-        "version": 5,
+        "version": 6,
         "blend": str(blend),
         "canonical_spm": str(canonical),
         "source_spm_semantic_projection_version":
@@ -1315,6 +1454,12 @@ def resolve_normalization_recipe(
         "bwr_report": str(report_path),
         "bwr_semantic_sha256": _canonical_sha256(
             bwr_semantic_identity
+        ),
+        "bwr_material_assignment_sha256": (
+            bwr_material_assignment_sha256
+        ),
+        "bwr_material_assignment_required": (
+            bwr_material_assignment_required
         ),
         "source_object": merged_name,
         "source_xml": str(source_xml),
@@ -1373,6 +1518,7 @@ def resolve_normalization_recipe(
 __all__ = [
     "ClusterNormalizationSyncError",
     "ClusterSourceBuildRequiredError",
+    "inspect_bwr_material_assignment_freshness",
     "inspect_normalization_source_identity",
     "normalization_receipt_path",
     "resolve_normalization_recipe",

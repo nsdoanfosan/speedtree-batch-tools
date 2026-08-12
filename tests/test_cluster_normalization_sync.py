@@ -1034,6 +1034,145 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
             )
             self.assertFalse(rebuilt["normalization_required"])
 
+    def test_changed_bwr_material_assignment_rebuilds_normalized_prototypes_once(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            blend, source, target, unit_probe = self.fixture(temporary)
+            report = blend.parent / "reports" / (
+                f"{blend.stem}_speedtree_repair_pipeline_report_codex.json"
+            )
+            payload = json.loads(report.read_text(encoding="utf-8"))
+            payload["speedtree_material_intents"] = {
+                "status": "applied",
+                "materials": [{
+                    "match_mode": "exact_material_key",
+                    "material_name": "M_leaf_elm_atlas_01_green",
+                    "material_key": "mleafelmatlas01green",
+                    "material_instance_base": "leaf_elm_atlas_01_green",
+                    "tree_part": "leaf",
+                    "tree_shading": "foliage",
+                    "source_materials": [
+                        "M_leaf_elm_atlas_01_green_Mat"
+                    ],
+                }],
+                "unmatched_materials": [],
+            }
+            report.write_text(json.dumps(payload), encoding="utf-8")
+            first = resolve_normalization_recipe(
+                blend,
+                [target],
+                canonical_spm=source,
+                unit_probe_path=unit_probe,
+            )
+            self.assertFalse(
+                normalization_sync.inspect_bwr_material_assignment_freshness(
+                    blend
+                )["current"]
+            )
+            capture_manifest = write_capture_manifest(first)
+            receipt = Path(first["receipt_path"])
+
+            def write_current_receipt(recipe):
+                receipt.write_text(
+                    json.dumps({
+                        "kind": "speedtree_cluster_sync_normalization",
+                        "status": "ready",
+                        "normalization_contract_sha256": recipe[
+                            "normalization_contract_sha256"
+                        ],
+                        "bwr_material_assignment_sha256": recipe.get(
+                            "bwr_material_assignment_sha256"
+                        ),
+                        "source_spm_sha256": recipe["source_spm_sha256"],
+                        "source_spm_semantic_projection_version": recipe[
+                            "source_spm_semantic_projection_version"
+                        ],
+                        "source_spm_semantic_fingerprint": recipe[
+                            "source_spm_semantic_fingerprint"
+                        ],
+                        "unit_probe_sha256": recipe["unit_probe_sha256"],
+                        "capture_manifest": str(capture_manifest.absolute()),
+                        "capture_manifest_sha256": sha256(capture_manifest),
+                        "build": {},
+                    }),
+                    encoding="utf-8",
+                )
+                seal_receipt_source_identity(blend, receipt, recipe)
+
+            write_current_receipt(first)
+            unchanged = resolve_normalization_recipe(
+                blend,
+                [target],
+                canonical_spm=source,
+                unit_probe_path=unit_probe,
+            )
+            self.assertFalse(unchanged["normalization_required"])
+            self.assertTrue(
+                normalization_sync.inspect_bwr_material_assignment_freshness(
+                    blend
+                )["current"]
+            )
+
+            payload["speedtree_material_intents"] = {
+                "status": "applied",
+                "materials": [{
+                    "match_mode": "production_group_base",
+                    "material_name": "M_leaf_elm_atlas_01",
+                    "material_key": "mleafelmatlas01",
+                    "material_instance_base": "leaf_elm_atlas_01",
+                    "tree_part": "leaf",
+                    "tree_shading": "foliage",
+                    "source_materials": [
+                        "M_leaf_elm_atlas_01_green_Mat"
+                    ],
+                }],
+                "unmatched_materials": [],
+            }
+            payload["import"] = {
+                "material_consolidation": {
+                    "groups": [{
+                        "mode": "production_group_suffix",
+                        "target_material": "M_leaf_elm_atlas_01",
+                        "source_materials": [
+                            "M_leaf_elm_atlas_01_green"
+                        ],
+                        "group_tokens": ["green"],
+                        "provenance_type": "material_intent",
+                        "readiness_mode": "material_intent",
+                    }],
+                },
+            }
+            report.write_text(json.dumps(payload), encoding="utf-8")
+            changed = resolve_normalization_recipe(
+                blend,
+                [target],
+                canonical_spm=source,
+                unit_probe_path=unit_probe,
+            )
+            self.assertTrue(changed["normalization_required"])
+            self.assertFalse(
+                normalization_sync.inspect_bwr_material_assignment_freshness(
+                    blend
+                )["current"]
+            )
+            self.assertNotEqual(
+                changed["normalization_contract_sha256"],
+                first["normalization_contract_sha256"],
+            )
+
+            write_current_receipt(changed)
+            rebuilt = resolve_normalization_recipe(
+                blend,
+                [target],
+                canonical_spm=source,
+                unit_probe_path=unit_probe,
+            )
+            self.assertFalse(rebuilt["normalization_required"])
+            self.assertTrue(
+                normalization_sync.inspect_bwr_material_assignment_freshness(
+                    blend
+                )["current"]
+            )
+
     def test_saved_atlas_collection_change_refreshes_without_normalizer_rebuild(self):
         with tempfile.TemporaryDirectory() as temporary:
             blend, source, target, unit_probe = self.fixture(temporary)
