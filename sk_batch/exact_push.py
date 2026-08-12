@@ -22,6 +22,10 @@ if str(REPO_DIR) not in sys.path:
     sys.path.insert(0, str(REPO_DIR))
 
 from process_lifecycle import owned_run  # noqa: E402
+from artifact_retention import (  # noqa: E402
+    estimate_output_reservation_bytes,
+    managed_output_reservation,
+)
 
 LOG_DIR = SK_BATCH_DIR / "logs"
 PUSH_JOB = SK_BATCH_DIR / "jobs" / "send2ue_push_job.py"
@@ -301,12 +305,29 @@ def main(argv=None):
     if args.dry_run:
         return 0
 
-    completed = owned_run(
-        command,
-        source="sk_batch.exact_push.blender_export",
-        run_factory=subprocess.run,
-        check=False,
-    )
+    blend = args.spm.expanduser().resolve().with_suffix(".blend")
+    with managed_output_reservation(
+        tuple(
+            outputs[key]
+            for key in (
+                "report",
+                "manifest",
+                "checkpoint",
+                "batch_report",
+                "item_import_report",
+                "export_root",
+            )
+        ),
+        estimate_output_reservation_bytes(
+            blend, minimum_bytes=1024**3, multiplier=4
+        ),
+    ):
+        completed = owned_run(
+            command,
+            source="sk_batch.exact_push.blender_export",
+            run_factory=subprocess.run,
+            check=False,
+        )
     if completed.returncode != 0:
         print(
             "SK Exact Push failed; production report: "

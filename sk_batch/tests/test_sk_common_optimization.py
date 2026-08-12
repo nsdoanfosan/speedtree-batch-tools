@@ -370,6 +370,96 @@ class SkCommonOptimizationTests(unittest.TestCase):
                 )
                 self.assertEqual(persisted, loaded)
 
+    def test_state_save_publishes_only_pending_unreal_references(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "sk_batch_state.json"
+            pending = root / "SK_pending.spm"
+            completed = root / "SK_completed.spm"
+            pending.write_bytes(b"pending")
+            completed.write_bytes(b"completed")
+            waiting_manifest = root / "logs" / "unreal_wait.json"
+            completed_manifest = root / "logs" / "headless_done.json"
+            state = {
+                str(pending): {
+                    "push_status_kind": "exported_pending_unreal",
+                    "push_paths": {
+                        "waiting_manifest": str(waiting_manifest),
+                    },
+                    "push_export_cache": {
+                        "manifest": str(root / "logs" / "export.json"),
+                    },
+                },
+                str(completed): {
+                    "push_status_kind": "imported_ok",
+                    "push_paths": {"manifest": str(completed_manifest)},
+                },
+            }
+
+            with mock.patch.object(sk_common, "STATE_PATH", state_path):
+                sk_common.save_state(state)
+                reference_path = root / sk_common.UNREAL_WAIT_REFERENCE_FILENAME
+                receipt = json.loads(reference_path.read_text(encoding="utf-8"))
+                self.assertEqual(receipt["kind"], "sk_batch_unreal_wait_references")
+                self.assertEqual(len(receipt["items"]), 1)
+                self.assertEqual(receipt["items"][0]["queue_id"], str(pending))
+                self.assertEqual(
+                    receipt["items"][0]["push_paths"]["waiting_manifest"],
+                    str(waiting_manifest),
+                )
+
+                state[str(pending)]["push_status_kind"] = "imported_ok"
+                sk_common.save_state(state)
+                receipt = json.loads(reference_path.read_text(encoding="utf-8"))
+                self.assertEqual(receipt["items"], [])
+
+    def test_pending_reference_remains_protective_if_final_receipt_write_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "sk_batch_state.json"
+            pending = root / "SK_pending.spm"
+            pending.write_bytes(b"pending")
+            state = {
+                str(pending): {
+                    "push_status_kind": "exported_pending_unreal",
+                    "push_paths": {
+                        "waiting_manifest": str(root / "logs" / "wait.json")
+                    },
+                }
+            }
+
+            with mock.patch.object(sk_common, "STATE_PATH", state_path):
+                sk_common.save_state(state)
+                reference_path = root / sk_common.UNREAL_WAIT_REFERENCE_FILENAME
+                state[str(pending)]["push_status_kind"] = "imported_ok"
+                original_write = sk_common._atomic_write_json
+                reference_writes = 0
+
+                def fail_final_reference(path, data):
+                    nonlocal reference_writes
+                    if Path(path) == reference_path:
+                        reference_writes += 1
+                        if reference_writes == 2:
+                            raise OSError("injected final receipt failure")
+                    return original_write(path, data)
+
+                with mock.patch.object(
+                    sk_common,
+                    "_atomic_write_json",
+                    side_effect=fail_final_reference,
+                ):
+                    with self.assertRaisesRegex(OSError, "final receipt failure"):
+                        sk_common.save_state(state)
+
+                stored = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    stored[str(pending)]["push_status_kind"],
+                    "imported_ok",
+                )
+                receipt = json.loads(reference_path.read_text(encoding="utf-8"))
+                self.assertEqual(len(receipt["items"]), 1)
+                self.assertEqual(receipt["items"][0]["queue_id"], str(pending))
+
     def test_content_cache_requires_same_file_and_settings_signature(self):
         cache = {
             "version": CALIBRATION_CACHE_VERSION,

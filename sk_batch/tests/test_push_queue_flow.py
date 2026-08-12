@@ -4158,6 +4158,22 @@ class PushQueueFlowTests(unittest.TestCase):
             app.state["SK_first.spm"]["push_status_kind"], "unreal_unavailable"
         )
 
+    def test_unreal_wait_preflight_allows_editor_to_stay_open(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.active_push_transport = "unreal_wait"
+        targets = self.targets("SK_first.spm")
+
+        with mock.patch.object(
+            app, "_unreal_running", return_value=True
+        ), mock.patch.object(
+            app, "_handoff_ready", return_value=(True, "")
+        ), mock.patch.object(gui, "save_state"):
+            ready, reason = app._push_preflight(targets)
+
+        self.assertEqual(ready, targets)
+        self.assertIsNone(reason)
+
     def test_push_batch_routes_headless_without_using_rpc_job(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -4174,6 +4190,177 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertTrue(result)
         headless.assert_called_once_with(targets, emit_done=False)
         rpc_job.assert_not_called()
+
+    def test_push_batch_routes_unreal_wait_to_deferred_headless_export(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.active_push_transport = "unreal_wait"
+        targets = self.targets("SK_first.spm")
+
+        with mock.patch.object(
+            app, "_push_preflight", return_value=(targets, None)
+        ), mock.patch.object(
+            app, "_run_headless_push_batch", return_value=True
+        ) as headless, mock.patch.object(app, "_job_push") as rpc_job:
+            result = app._run_batch("push", targets, emit_done=False)
+
+        self.assertTrue(result)
+        headless.assert_called_once_with(
+            targets,
+            emit_done=False,
+            defer_import=True,
+        )
+        rpc_job.assert_not_called()
+
+    def test_unreal_wait_persists_manifest_and_durable_pending_state(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.cfg = {"headless_item_crash_retries": 2}
+        pending = [{
+            "queue_id": "SK_wait.spm",
+            "fingerprint": "wait-v1",
+            "assets": [],
+        }]
+        targets = self.targets("SK_wait.spm")
+        app.state["SK_wait.spm"] = {
+            "push_paths": {"manifest": "export.json"},
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
+            gui, "LOG_DIR", Path(temp_dir)
+        ), mock.patch.object(gui, "save_state"):
+            result = app._persist_waiting_import_items(
+                pending,
+                targets,
+                set(),
+                emit_done=False,
+                batch_stamp="20260811_120000",
+            )
+            waiting_manifest = (
+                Path(temp_dir) / "unreal_wait_20260811_120000.json"
+            )
+            payload = json.loads(
+                waiting_manifest.read_text(encoding="utf-8")
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(payload["kind"], "sk_batch_unreal_wait_queue")
+        self.assertEqual(payload["items"][0]["queue_id"], "SK_wait.spm")
+        self.assertEqual(
+            app.state["SK_wait.spm"]["push_status_kind"],
+            "exported_pending_unreal",
+        )
+        self.assertEqual(
+            app.state["SK_wait.spm"]["push_paths"]["waiting_manifest"],
+            str(waiting_manifest),
+        )
+
+    def test_waiting_import_button_enqueues_headless_job_from_durable_state(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        iid = "SK_wait.spm"
+        target = {"spm": Path(iid), "checked": False}
+        app.items = {iid: target}
+        app.state = {
+            iid: {"push_status_kind": "exported_pending_unreal"}
+        }
+        app.root = mock.Mock()
+        app.progress_var = mock.Mock()
+        app._close_cell_editor = mock.Mock()
+        app._unreal_running = mock.Mock(return_value=False)
+        app._collect_cfg = mock.Mock(
+            return_value={"push_transport": "unreal_wait"}
+        )
+        app._snapshot_batch_request = mock.Mock(
+            return_value=({iid: target}, [target])
+        )
+        app._enqueue_batch_job = mock.Mock(return_value=17)
+
+        with mock.patch.object(gui, "save_config"):
+            result = app.start_waiting_asset_import()
+
+        self.assertEqual(result, 17)
+        job = app._enqueue_batch_job.call_args.args[0]
+        self.assertEqual(job["mode"], "waiting_import")
+        self.assertEqual(job["push_transport"], "headless")
+        self.assertEqual(job["targets"], [target])
+
+    def test_waiting_import_button_includes_durable_rows_outside_current_scan(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        iid = str(Path("offscreen") / "SK_wait.spm")
+        app.items = {}
+        app.state = {
+            iid: {"push_status_kind": "exported_pending_unreal"}
+        }
+        app.root = mock.Mock()
+        app.progress_var = mock.Mock()
+        app._close_cell_editor = mock.Mock()
+        app._unreal_running = mock.Mock(return_value=False)
+        app._collect_cfg = mock.Mock(return_value={})
+        app._snapshot_batch_request = mock.Mock(return_value=({}, []))
+        app._enqueue_batch_job = mock.Mock(return_value=23)
+
+        with mock.patch.object(gui, "save_config"):
+            result = app.start_waiting_asset_import()
+
+        self.assertEqual(result, 23)
+        job = app._enqueue_batch_job.call_args.args[0]
+        self.assertEqual(job["targets"], [{"spm": Path(iid)}])
+        self.assertIn(iid, job["inventory"])
+
+    def test_waiting_import_revalidates_manifest_then_runs_one_headless_batch(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        spm = Path("SK_wait.spm")
+        iid = str(spm)
+        target = {"spm": spm, "checked": False}
+        app.cfg = {}
+        app.force_rerun = False
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifest_path = Path(temp_dir) / "waiting.json"
+            manifest_path.write_text(
+                json.dumps({
+                    "items": [{
+                        "queue_id": iid,
+                        "fingerprint": "wait-v1",
+                        "depends_on_queue_ids": [],
+                        "assets": [],
+                    }]
+                }),
+                encoding="utf-8",
+            )
+            app.state[iid] = {
+                "push_status_kind": "exported_pending_unreal",
+                "push_export_cache": {
+                    "source_fingerprint": "source-v1",
+                    "fingerprint": "wait-v1",
+                    "manifest": str(manifest_path),
+                },
+                "push_paths": {
+                    "waiting_manifest": str(manifest_path),
+                },
+            }
+            app._unreal_running = mock.Mock(side_effect=[False, False])
+            app._source_push_fingerprint = mock.Mock(return_value="source-v1")
+            app._run_headless_import_items = mock.Mock(return_value=True)
+
+            with mock.patch.object(
+                gui, "manifest_item_files_match", return_value=True
+            ):
+                result = app._run_waiting_asset_import_batch(
+                    [target], emit_done=False
+                )
+
+        self.assertTrue(result)
+        app._run_headless_import_items.assert_called_once()
+        queued = app._run_headless_import_items.call_args.args[0]
+        self.assertEqual([item["queue_id"] for item in queued], [iid])
+        self.assertEqual(
+            app._run_headless_import_items.call_args.kwargs["progress_label"],
+            "대기 에셋 임포트",
+        )
 
     def test_watchdog_records_crash_in_checkpoint_before_restart(self):
         gui = load_gui_module()

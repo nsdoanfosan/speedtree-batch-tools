@@ -144,6 +144,10 @@ from artifact_content_key import (
     file_content_key_snapshot,
     sampled_file_content_snapshot,
 )
+from artifact_retention import (
+    estimate_output_reservation_bytes,
+    managed_output_reservation,
+)
 
 from sk_common import (
     CALIBRATION_CACHE_VERSION,
@@ -2675,20 +2679,21 @@ class App:
         transport_opts.pack(fill="x", padx=6, pady=(4, 0))
         ttk.Label(transport_opts, text="③ Unreal Push:").pack(side="left")
         self.transport_var = tk.StringVar(
-            value=self.cfg.get("push_transport", "rpc")
+            value=self.cfg.get("push_transport", "headless")
         )
         transport_combo = ttk.Combobox(
             transport_opts,
             textvariable=self.transport_var,
-            values=("rpc", "headless"),
-            width=12,
+            values=("rpc", "headless", "unreal_wait"),
+            width=14,
             state="readonly",
         )
         transport_combo.pack(side="left", padx=6)
         Tooltip(
             transport_combo,
             "rpc = 기존 열린 Unreal Editor 경로\n"
-            "headless = Blender 전체 export 후 UnrealEditor-Cmd 1회 배치 import",
+            "headless = Blender 전체 export 후 UnrealEditor-Cmd 1회 배치 import\n"
+            "unreal_wait = export만 완료하고 영구 Unreal 대기 큐에 등록",
         )
         self.night_headless_var = tk.BooleanVar(
             value=bool(self.cfg.get("night_headless", True))
@@ -2702,7 +2707,8 @@ class App:
         Tooltip(
             night_check,
             "켜면 목록 전체 자동의 마지막 Push는 열린 Unreal 없이 headless로 실행합니다. "
-            "단독 ③ Push는 왼쪽 transport 선택을 따릅니다.",
+            "단, Unreal Wait를 선택하면 전체 자동에서도 이를 덮어쓰지 않고 "
+            "영구 대기 상태로 남깁니다. 단독 ③ Push도 왼쪽 transport 선택을 따릅니다.",
         )
         ttk.Label(transport_opts, text="② Repair·③ export 동시:").pack(
             side="left", padx=(18, 0)
@@ -2840,6 +2846,18 @@ class App:
                                 "· wind JSON(핸드오프 산출물) 존재\n"
                                 "· 언리얼 에디터 실행 여부\n"
                                 "준비 안 된 항목은 이유를 표시하고 건너뛴 뒤, 준비된 것만 push합니다."))
+        self.btn_waiting_import = ttk.Button(
+            actions,
+            text="대기 에셋 임포트",
+            command=self.start_waiting_asset_import,
+        )
+        self.btn_waiting_import.pack(side="left", padx=(2, 6))
+        Tooltip(
+            self.btn_waiting_import,
+            "unreal_wait로 export가 끝난 에셋을 영구 상태에서 다시 모아 "
+            "UnrealEditor-Cmd headless 한 세션으로 임포트합니다.\n"
+            "MyProject2 Unreal Editor가 완전히 꺼진 상태에서만 시작합니다.",
+        )
         self.btn_retry_failed = ttk.Button(
             actions,
             text="↻ 전체 실패 이력 재시도",
@@ -4458,7 +4476,11 @@ class App:
                 1, min(4, int(self.blender_parallel_var.get()))
             )
             transport = self.transport_var.get()
-            cfg["push_transport"] = transport if transport in {"rpc", "headless"} else "rpc"
+            cfg["push_transport"] = (
+                transport
+                if transport in {"rpc", "headless", "unreal_wait"}
+                else "headless"
+            )
             cfg["night_headless"] = bool(self.night_headless_var.get())
         except (AttributeError, tk.TclError):
             pass
@@ -4589,6 +4611,7 @@ class App:
         # visible inventory, so only those controls are frozen.
         for name in (
             "btn_check", "btn_spm", "btn_blender", "btn_push",
+            "btn_waiting_import",
             "btn_retry_failed", "btn_retry_checked", "btn_all",
             "btn_select_all", "btn_clear_all", "btn_recent_24h",
         ):
@@ -4990,6 +5013,11 @@ class App:
                 completed = self._run_failed_unreal_recovery(
                     job["targets"],
                     job.get("recovery_requests") or [],
+                    emit_done=False,
+                )
+            elif job["mode"] == "waiting_import":
+                completed = self._run_waiting_asset_import_batch(
+                    job["targets"],
                     emit_done=False,
                 )
             elif job["mode"] == "failed_retry_repair":
@@ -5433,9 +5461,60 @@ class App:
             "inventory": inventory,
             "cfg": cfg,
             "force_rerun": bool(self.force_var.get()),
-            "push_transport": cfg.get("push_transport", "rpc"),
+            "push_transport": cfg.get("push_transport", "headless"),
         }
         self._enqueue_batch_job(job)
+
+    def start_waiting_asset_import(self):
+        """Queue every durable Unreal-wait row for one headless import run."""
+        self._close_cell_editor()
+        if self._unreal_running():
+            self.progress_var.set("대기 에셋 임포트 · Unreal Editor 종료 필요")
+            messagebox.showinfo(
+                "대기 에셋 임포트",
+                "MyProject2 Unreal Editor를 완전히 종료한 뒤 다시 실행하세요.",
+                parent=self.root,
+            )
+            return None
+
+        with self.state_lock:
+            target_iids = [
+                iid
+                for iid, entry in self.state.items()
+                if isinstance(iid, str)
+                and isinstance(entry, dict)
+                and Path(iid).suffix.casefold() == ".spm"
+                and entry.get("push_status_kind")
+                == "exported_pending_unreal"
+            ]
+        if not target_iids:
+            messagebox.showinfo(
+                "대기 에셋 임포트",
+                "영구 상태에 Unreal import를 기다리는 에셋이 없습니다.",
+                parent=self.root,
+            )
+            return None
+
+        cfg = dict(self._collect_cfg())
+        cfg["push_transport"] = "headless"
+        save_config(cfg)
+        inventory, targets = self._snapshot_batch_request(target_iids)
+        for iid in target_iids:
+            if iid not in inventory:
+                inventory[iid] = {"spm": Path(iid)}
+        targets = [inventory[iid] for iid in target_iids]
+        return self._enqueue_batch_job({
+            "label": f"대기 에셋 임포트 · {len(targets)}개",
+            "mode": "waiting_import",
+            "phase": "push",
+            "terminal_phase": "push",
+            "selected_scope": False,
+            "targets": targets,
+            "inventory": inventory,
+            "cfg": cfg,
+            "force_rerun": False,
+            "push_transport": "headless",
+        })
 
     def _failed_retry_planning_context(self):
         local = getattr(self, "_retry_thread_context", None)
@@ -8444,6 +8523,16 @@ class App:
         cfg = dict(self._collect_cfg())
         save_config(cfg)
         inventory, targets = self._snapshot_batch_request(target_iids)
+        selected_transport = cfg.get("push_transport", "headless")
+        push_transport = (
+            "unreal_wait"
+            if selected_transport == "unreal_wait"
+            else (
+                "headless"
+                if cfg.get("night_headless", True)
+                else selected_transport
+            )
+        )
         job = {
             "label": f"목록 전체 자동 ①→②→③ · {len(targets)}개",
             "mode": "pipeline",
@@ -8454,11 +8543,7 @@ class App:
             "inventory": inventory,
             "cfg": cfg,
             "force_rerun": bool(self.force_var.get()),
-            "push_transport": (
-                "headless"
-                if cfg.get("night_headless", True)
-                else cfg.get("push_transport", "rpc")
-            ),
+            "push_transport": push_transport,
         }
         self._enqueue_batch_job(job)
 
@@ -10104,6 +10189,15 @@ class App:
             and getattr(self, "active_push_transport", "rpc") == "headless"
         ):
             return self._run_headless_push_batch(targets, emit_done=emit_done)
+        if (
+            phase == "push"
+            and getattr(self, "active_push_transport", "rpc") == "unreal_wait"
+        ):
+            return self._run_headless_push_batch(
+                targets,
+                emit_done=emit_done,
+                defer_import=True,
+            )
         title = titles[phase]
         column = column_by_phase[phase]
         total = len(targets)
@@ -15335,7 +15429,15 @@ class App:
             cluster_blend_backup = (
                 LOG_DIR / f"{spm.stem}_pre_repair_{stamp}.blend"
             )
-            shutil.copy2(blend, cluster_blend_backup)
+            with managed_output_reservation(
+                cluster_blend_backup,
+                estimate_output_reservation_bytes(
+                    blend,
+                    minimum_bytes=blend.stat().st_size,
+                    multiplier=1,
+                ),
+            ):
+                shutil.copy2(blend, cluster_blend_backup)
 
         def restore_cluster_repair_outputs():
             # This backup belongs only to the raw BWR producer transaction.
@@ -16276,16 +16378,28 @@ class App:
         ))
         self._assert_active_production_source_manifest()
         try:
-            code, log_file = self._run_limited(
-                cmd,
-                export_log_name,
-                None,
-                affinity=self.cfg.get("blender_parallel_jobs", 2) <= 1,
-                inactivity_timeout=disk_export_timeout,
-                inactivity_timeout_by_marker=send2ue_inactivity_rules(
-                    stage_timeout, disk_export_timeout
+            with managed_output_reservation(
+                (
+                    cache_root,
+                    manifest_path,
+                    export_report,
+                    checkpoint_path,
+                    batch_report,
                 ),
-            )
+                estimate_output_reservation_bytes(
+                    blend, minimum_bytes=1024**3, multiplier=4
+                ),
+            ):
+                code, log_file = self._run_limited(
+                    cmd,
+                    export_log_name,
+                    None,
+                    affinity=self.cfg.get("blender_parallel_jobs", 2) <= 1,
+                    inactivity_timeout=disk_export_timeout,
+                    inactivity_timeout_by_marker=send2ue_inactivity_rules(
+                        stage_timeout, disk_export_timeout
+                    ),
+                )
         finally:
             # Send2UE output produced across two code revisions is discarded by
             # the parent restart fence and must not create an asset failure.
@@ -16723,7 +16837,12 @@ class App:
             file_prefix="failed_retry_unreal",
         )
 
-    def _run_headless_push_batch(self, targets, emit_done=True):
+    def _run_headless_push_batch(
+        self,
+        targets,
+        emit_done=True,
+        defer_import=False,
+    ):
         batch_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         total = len(targets)
         retry_metadata = copy.deepcopy(
@@ -16731,9 +16850,13 @@ class App:
         )
         export_retry = retry_metadata.get("partition") == "blender_export"
         progress_label = (
-            "실패 재시도 · Blender/Send2UE→Unreal"
-            if export_retry
-            else "Unreal Push"
+            "Unreal 대기 등록"
+            if defer_import
+            else (
+                "실패 재시도 · Blender/Send2UE→Unreal"
+                if export_retry
+                else "Unreal Push"
+            )
         )
         self._headless_progress_snapshot = None
         self.ui_queue.put(("progress", f"{progress_label} export 준비 0/{total}"))
@@ -16901,6 +17024,15 @@ class App:
                 self.ui_queue.put(("done", None))
             return not failure_count
 
+        if defer_import:
+            return self._persist_waiting_import_items(
+                pending,
+                targets,
+                failed_items,
+                emit_done=emit_done,
+                batch_stamp=batch_stamp,
+            )
+
         return self._run_headless_import_items(
             pending,
             targets,
@@ -16916,6 +17048,294 @@ class App:
                 if export_retry
                 else "headless_queue"
             ),
+        )
+
+    def _persist_waiting_import_items(
+        self,
+        pending,
+        targets,
+        failed_items,
+        *,
+        emit_done,
+        batch_stamp,
+    ):
+        """Persist immutable exports without starting UnrealEditor-Cmd."""
+        created_at = datetime.now().isoformat(timespec="seconds")
+        manifest_path = LOG_DIR / f"unreal_wait_{batch_stamp}.json"
+        checkpoint_path = LOG_DIR / (
+            f"unreal_wait_{batch_stamp}_checkpoint.json"
+        )
+        report_path = LOG_DIR / f"unreal_wait_{batch_stamp}_report.json"
+        waiting_items = copy.deepcopy(list(pending))
+        for item in waiting_items:
+            item["batch_manifest"] = str(manifest_path)
+            item["batch_report"] = str(report_path)
+        atomic_write_json(
+            manifest_path,
+            {
+                "schema_version": PUSH_MANIFEST_SCHEMA_VERSION,
+                "kind": "sk_batch_unreal_wait_queue",
+                "created_at": created_at,
+                "checkpoint_path": str(checkpoint_path),
+                "report_path": str(report_path),
+                "max_item_crash_retries": int(
+                    self.cfg.get("headless_item_crash_retries", 2)
+                ),
+                "items": waiting_items,
+            },
+        )
+
+        for position, item in enumerate(waiting_items):
+            iid = str(item["queue_id"])
+            with self.state_lock:
+                details = copy.deepcopy(
+                    self.state.get(iid, {}).get("push_paths") or {}
+                )
+            details.update({
+                "waiting_manifest": str(manifest_path),
+                "waiting_checkpoint": str(checkpoint_path),
+                "waiting_report": str(report_path),
+                "waiting_queued_at": created_at,
+                "waiting_position": position,
+            })
+            self._set_push_state(
+                iid,
+                "exported_pending_unreal",
+                "export 완료 · Unreal 영구 대기",
+                details=details,
+            )
+
+        self._phase_failed_items = set(failed_items)
+        if emit_done:
+            failure_count = len(failed_items)
+            text = f"Unreal 대기 등록 완료 · {len(waiting_items)}개"
+            if failure_count:
+                text += f" · 실패/준비 제외 {failure_count}개"
+            self.ui_queue.put(("progress", text))
+            self.ui_queue.put(("done", None))
+        self.log(
+            f"Unreal 영구 대기 큐 등록: {len(waiting_items)}개 · "
+            f"{manifest_path}"
+        )
+        return not failed_items
+
+    def _load_waiting_import_item(self, target, batch_stamp):
+        """Load one durable waiting item after revalidating its exact source."""
+        spm = Path(target["spm"])
+        iid = str(spm)
+        with self.state_lock:
+            entry = copy.deepcopy(self.state.get(iid, {}))
+        if entry.get("push_status_kind") != "exported_pending_unreal":
+            raise BatchItemError(
+                "Unreal 대기 상태가 아님",
+                kind="data_error",
+            )
+
+        export_cache = entry.get("push_export_cache") or {}
+        expected_source = str(export_cache.get("source_fingerprint") or "")
+        if not expected_source:
+            raise BatchItemError(
+                "대기 export source fingerprint 없음",
+                kind="data_error",
+            )
+        current_source = self._source_push_fingerprint(
+            blend_path_for(spm),
+            iid,
+        )
+        if current_source != expected_source:
+            raise BatchItemError(
+                "대기 export 이후 Blender/콘텐츠 계약이 변경됨; "
+                "unreal_wait export를 다시 실행하세요",
+                kind="data_error",
+            )
+
+        paths = entry.get("push_paths") or {}
+        manifest_value = (
+            paths.get("waiting_manifest")
+            or export_cache.get("manifest")
+        )
+        manifest_path = Path(str(manifest_value or ""))
+        if not manifest_path.is_file():
+            raise BatchItemError(
+                "대기 manifest 파일 없음: " + str(manifest_path),
+                kind="data_error",
+            )
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            item = next(
+                copy.deepcopy(candidate)
+                for candidate in (manifest.get("items") or [])
+                if str((candidate or {}).get("queue_id")) == iid
+            )
+        except (OSError, ValueError, StopIteration, TypeError) as exc:
+            raise BatchItemError(
+                f"대기 manifest 항목을 읽을 수 없음: {exc}",
+                kind="data_error",
+            ) from exc
+        if item.get("fingerprint") != export_cache.get("fingerprint"):
+            raise BatchItemError(
+                "대기 manifest와 export 영수증 fingerprint 불일치",
+                kind="data_error",
+            )
+        if not manifest_item_files_match(item):
+            raise BatchItemError(
+                "대기 export 파일 fingerprint 검증 실패",
+                kind="data_error",
+            )
+        item["report_path"] = str(
+            LOG_DIR / f"{spm.stem}_waiting_unreal_{batch_stamp}.json"
+        )
+        return item
+
+    @staticmethod
+    def _order_waiting_import_items(items):
+        """Return a stable dependency-first order for persisted queue items."""
+        records = [copy.deepcopy(item) for item in items]
+        by_id = {str(item["queue_id"]): item for item in records}
+        queue_ids = set(by_id)
+        for item in records:
+            item["depends_on_queue_ids"] = [
+                str(dependency)
+                for dependency in item.get("depends_on_queue_ids") or []
+                if str(dependency) in queue_ids
+            ]
+
+        emitted = set()
+        ordered = []
+        remaining = list(records)
+        while remaining:
+            ready = [
+                item
+                for item in remaining
+                if set(item.get("depends_on_queue_ids") or []).issubset(
+                    emitted
+                )
+            ]
+            if not ready:
+                cycle = ", ".join(
+                    Path(str(item.get("queue_id") or "?")).name
+                    for item in remaining
+                )
+                raise BatchItemError(
+                    "Unreal 대기 큐 dependency cycle: " + cycle,
+                    kind="data_error",
+                )
+            for item in ready:
+                ordered.append(item)
+                emitted.add(str(item["queue_id"]))
+                remaining.remove(item)
+        return ordered
+
+    def _run_waiting_asset_import_batch(self, targets, emit_done=True):
+        """Import durable Unreal-wait rows in one headless commandlet session."""
+        if self._unreal_running():
+            self._phase_failed_items = set()
+            self._phase_abort_reason = (
+                "대기 에셋 임포트는 Unreal Editor가 꺼진 상태에서만 실행됩니다"
+            )
+            self.ui_queue.put(("progress", self._phase_abort_reason))
+            if emit_done:
+                self.ui_queue.put(("done", None))
+            return False
+
+        batch_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        total = len(targets)
+        self.ui_queue.put(("batch_progress", (0, total)))
+        pending = []
+        invalid_ids = set()
+        target_by_id = {str(item["spm"]): item for item in targets}
+        for index, target in enumerate(targets, 1):
+            iid = str(target["spm"])
+            try:
+                pending.append(
+                    self._load_waiting_import_item(target, batch_stamp)
+                )
+            except Exception as exc:
+                reason = compact_error_message(exc)
+                with self.state_lock:
+                    details = copy.deepcopy(
+                        self.state.get(iid, {}).get("push_paths") or {}
+                    )
+                details["waiting_validation_error"] = reason
+                self._set_push_state(
+                    iid,
+                    "exported_pending_unreal",
+                    "Unreal 대기 유지 · export 재검증 필요",
+                    details=details,
+                )
+                self.log(f"[대기 import 검증 실패] {Path(iid).name}: {reason}")
+                invalid_ids.add(iid)
+            self.ui_queue.put(("batch_progress", (index, total)))
+            self.ui_queue.put((
+                "progress",
+                f"대기 에셋 검증 {index}/{total}",
+            ))
+
+        if not pending:
+            self._phase_failed_items = set(invalid_ids)
+            self._phase_abort_reason = "가져올 수 있는 Unreal 대기 에셋 없음"
+            self.ui_queue.put(("progress", self._phase_abort_reason))
+            if emit_done:
+                self.ui_queue.put(("done", None))
+            return False
+
+        try:
+            pending = self._order_waiting_import_items(pending)
+        except BatchItemError as exc:
+            reason = compact_error_message(exc)
+            for item in pending:
+                iid = str(item["queue_id"])
+                with self.state_lock:
+                    details = copy.deepcopy(
+                        self.state.get(iid, {}).get("push_paths") or {}
+                    )
+                details["waiting_validation_error"] = reason
+                self._set_push_state(
+                    iid,
+                    "exported_pending_unreal",
+                    "Unreal 대기 유지 · dependency 재검증 필요",
+                    details=details,
+                )
+                invalid_ids.add(iid)
+            self._phase_failed_items = set(invalid_ids)
+            self._phase_abort_reason = reason
+            self.ui_queue.put(("progress", reason))
+            if emit_done:
+                self.ui_queue.put(("done", None))
+            return False
+
+        ordered_targets = [
+            target_by_id[str(item["queue_id"])] for item in pending
+        ]
+        if self._unreal_running():
+            self._phase_failed_items = set(invalid_ids)
+            self._phase_abort_reason = (
+                "검증 중 Unreal Editor가 실행되어 headless import를 시작하지 않음"
+            )
+            self.ui_queue.put(("progress", self._phase_abort_reason))
+            if emit_done:
+                self.ui_queue.put(("done", None))
+            return False
+        return self._run_headless_import_items(
+            pending,
+            ordered_targets,
+            invalid_ids,
+            emit_done=emit_done,
+            batch_stamp=batch_stamp,
+            manifest_metadata={
+                "queue_kind": "durable_unreal_wait_import",
+                "source_waiting_manifests": sorted({
+                    str(
+                        (self.state.get(str(item["queue_id"]), {}).get(
+                            "push_paths"
+                        ) or {}).get("waiting_manifest")
+                        or ""
+                    )
+                    for item in pending
+                }),
+            },
+            progress_label="대기 에셋 임포트",
+            file_prefix="waiting_assets",
         )
 
     def _run_headless_import_items(
@@ -17220,15 +17640,28 @@ class App:
         disk_export_timeout = max(1, int(
             self.cfg.get("push_job_timeout", 1800)
         ))
-        code, log_file = self._run_limited(
-            cmd,
-            f"{spm.stem}_push_{stamp}.log",
-            None,
-            inactivity_timeout=disk_export_timeout,
-            inactivity_timeout_by_marker=send2ue_inactivity_rules(
-                stage_timeout, disk_export_timeout
+        with managed_output_reservation(
+            (
+                export_root,
+                manifest_path,
+                checkpoint_path,
+                batch_report,
+                import_report,
+                job_report,
             ),
-        )
+            estimate_output_reservation_bytes(
+                blend, minimum_bytes=1024**3, multiplier=4
+            ),
+        ):
+            code, log_file = self._run_limited(
+                cmd,
+                f"{spm.stem}_push_{stamp}.log",
+                None,
+                inactivity_timeout=disk_export_timeout,
+                inactivity_timeout_by_marker=send2ue_inactivity_rules(
+                    stage_timeout, disk_export_timeout
+                ),
+            )
         result = load_job_report(job_report)
         if code != 0 or result.get("status") != "ok":
             reason = summarize_job_failure(result, log_file)

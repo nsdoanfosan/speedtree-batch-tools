@@ -5424,6 +5424,34 @@ class SafetyTests(unittest.TestCase):
             self.assertIn("Original_Atlas_Albedo", text)
             self.assertTrue(Path(result["backup"]).is_file())
 
+    def test_source_rebind_accepts_an_already_source_named_resource(self):
+        source = Path(
+            r"D:\OneDrive\Forestportfolio\02_nature\Tree\bush_Silky_Dogwood"
+            r"\texture\bush_Silky_Dogwood_texture_set_01.sbs"
+        )
+        graph = "T_cluster_silky_dogwood_atlas_01"
+        if not source.exists():
+            self.skipTest("Silky Dogwood SBS is unavailable")
+        current = sbs_auto.parse_m_graph(source, graph)["inputs"]["Base_Color"]
+        with tempfile.TemporaryDirectory() as temp:
+            copied = Path(temp) / source.name
+            shutil.copy2(source, copied)
+
+            result = sbs_auto.rebind_managed_graph_source_inputs(
+                copied,
+                graph,
+                {"Base_Color": current},
+                output_dir=Path(temp),
+            )
+
+            mapping = result["resources"][0]
+            self.assertEqual(mapping["old_resource"], mapping["resource"])
+            self.assertEqual(
+                sbs_auto.parse_m_graph(copied, graph)["inputs"]["Base_Color"].resolve(),
+                current.resolve(),
+            )
+            self.assertTrue(Path(result["backup"]).is_file())
+
     def test_legacy_m_graph_renames_to_t_graph_with_backup(self):
         source_sbs = Path(
             r"D:\OneDrive\Forestportfolio\Texture\bark\bark_common_end_01\bark_common_end_01.sbs"

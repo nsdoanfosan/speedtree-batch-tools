@@ -2,12 +2,14 @@
 
 ## Scope
 
-`rpc` and `headless` are transport choices only. Both consume the same
-versioned manifest and execute the same Unreal-side ingest function. A transport
-must not reinterpret Send2UE settings or replace the Send2UE importer with a
-generic FBX task.
+`rpc` and `headless` are execution transports. `unreal_wait` uses the headless
+export contract but deliberately stops before Unreal starts. All three consume
+the same versioned item manifest; the later `대기 에셋 임포트` action executes
+waiting items through the same Unreal-side headless ingest function. A mode must
+not reinterpret Send2UE settings or replace the Send2UE importer with a generic
+FBX task.
 
-Both transports must also preserve the channel meanings and failure rules in
+All three modes must also preserve the channel meanings and failure rules in
 the [Tree Vertex Color contract](tree_vertex_color_contract.md); transport is
 not allowed to remap, regenerate, or discard R/G.
 
@@ -92,8 +94,14 @@ match; `--force` bypasses both caches.
 
 ## GUI compatibility
 
-- The existing `③ Unreal Push` button remains and defaults to `rpc`.
-- A transport selector permits explicit `rpc` or `headless` runs.
+- The existing `③ Unreal Push` button remains and defaults to `headless`.
+- A transport selector permits explicit `rpc`, `headless`, or `unreal_wait`
+  runs.
+- `unreal_wait` persists dependency-ordered immutable exports as
+  `exported_pending_unreal`. The state and waiting manifest survive GUI restarts.
+- `대기 에셋 임포트` revalidates source and export fingerprints, refuses to
+  start while MyProject2 Unreal Editor is open, and imports all valid waiting
+  rows in one `UnrealEditor-Cmd` session.
 - The full unattended pipeline defaults to `headless`, preserving the existing
   one-click workflow while removing its open-editor requirement.
 

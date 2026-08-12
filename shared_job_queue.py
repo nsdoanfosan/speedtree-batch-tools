@@ -27,6 +27,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, Optional
 
 SCHEMA_VERSION = 1
 DEFAULT_MAX_TERMINAL_JOBS = 100
+DEFAULT_MAX_TERMINAL_AGE_SECONDS = 3 * 24 * 60 * 60
 DEFAULT_FORCE_RELEASE_MIN_AGE_SECONDS = 15 * 60
 TERMINAL_STATUSES = frozenset(
     ("completed", "failed", "cancelled", "abandoned")
@@ -333,6 +334,7 @@ class SharedJobQueue:
         lease_seconds: float = 30.0,
         lock_timeout: float = 10.0,
         max_terminal_jobs: int = DEFAULT_MAX_TERMINAL_JOBS,
+        max_terminal_age_seconds: float = DEFAULT_MAX_TERMINAL_AGE_SECONDS,
         force_release_min_age_seconds: float = (
             DEFAULT_FORCE_RELEASE_MIN_AGE_SECONDS
         ),
@@ -352,6 +354,11 @@ class SharedJobQueue:
         if max_terminal_jobs < 0:
             raise ValueError("max_terminal_jobs must be a non-negative integer")
         self.max_terminal_jobs = max_terminal_jobs
+        self.max_terminal_age_seconds = float(max_terminal_age_seconds)
+        if self.max_terminal_age_seconds < 0:
+            raise ValueError(
+                "max_terminal_age_seconds must be non-negative"
+            )
         self.force_release_min_age_seconds = float(
             force_release_min_age_seconds
         )
@@ -868,9 +875,9 @@ class SharedJobQueue:
                 now = float(self._clock())
                 before = copy.deepcopy(state)
                 self._recover_expired_lease(state, now)
-                self._prune_terminal_jobs(state)
+                self._prune_terminal_jobs(state, now)
                 result = operation(state, now)
-                self._prune_terminal_jobs(state)
+                self._prune_terminal_jobs(state, now)
                 self._validate_state(state)
                 if state != before:
                     state["revision"] += 1
@@ -878,8 +885,8 @@ class SharedJobQueue:
                     self._write_state(state)
                 return copy.deepcopy(result)
 
-    def _prune_terminal_jobs(self, state: Dict[str, Any]) -> bool:
-        """Retain only the newest bounded terminal audit history.
+    def _prune_terminal_jobs(self, state: Dict[str, Any], now=None) -> bool:
+        """Retain terminal history only within both count and age bounds.
 
         Queued and running rows are never candidates, regardless of age.  The
         monotonically increasing ``next_sequence`` keeps future FIFO identity
@@ -902,6 +909,7 @@ class SharedJobQueue:
                     break
             return (0.0 if value is None else value, job["sequence"])
 
+        now = float(self._clock() if now is None else now)
         terminal = sorted(
             (
                 job
@@ -911,9 +919,14 @@ class SharedJobQueue:
             key=terminal_key,
             reverse=True,
         )
-        retained_ids = {
-            job["id"] for job in terminal[: self.max_terminal_jobs]
-        }
+        retained_ids = set()
+        for job in terminal:
+            terminal_time, _sequence = terminal_key(job)
+            if now - terminal_time > self.max_terminal_age_seconds:
+                continue
+            if len(retained_ids) >= self.max_terminal_jobs:
+                break
+            retained_ids.add(job["id"])
         original_count = len(state["jobs"])
         state["jobs"] = [
             job
@@ -1333,6 +1346,7 @@ def _main(argv: Optional[Iterable[str]] = None) -> int:
 __all__ = [
     "DEFAULT_FORCE_RELEASE_MIN_AGE_SECONDS",
     "DEFAULT_MAX_TERMINAL_JOBS",
+    "DEFAULT_MAX_TERMINAL_AGE_SECONDS",
     "ForceReleaseRejected",
     "JobNotCancellable",
     "JobNotFound",
