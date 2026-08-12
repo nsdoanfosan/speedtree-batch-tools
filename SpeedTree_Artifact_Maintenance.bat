@@ -1,8 +1,8 @@
 @echo off
 setlocal
 
-rem Push-independent artifact retention. With no arguments this only writes a
-rem dry-run JSON plan for logs, retry receipts, and production backup inventory.
+rem Push-independent artifact retention. With no arguments this applies the
+rem 3-day / aggregate-below-10-GiB policy. Pass --dry-run for a read-only plan.
 set "GUARD=%~dp0launch_guard.pyw"
 set "MAINTENANCE=%~dp0artifact_retention.py"
 set "SPEEDTREE_BATCH_LAUNCH_SOURCE=bat:SpeedTree_Artifact_Maintenance.bat"

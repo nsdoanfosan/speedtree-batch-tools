@@ -747,7 +747,9 @@ def rebind_managed_graph_source_inputs(
 
         occupied.discard(old_name.casefold())
         new_name = _source_resource_identifier(input_path, slot, occupied)
-        resource.find("identifier").set("v", new_name)
+        identifier_changed = new_name != old_name
+        if identifier_changed:
+            resource.find("identifier").set("v", new_name)
         resource.find("filepath").set(
             "v", _relpath_posix(input_path, sbs_path.parent)
         )
@@ -759,15 +761,16 @@ def rebind_managed_graph_source_inputs(
         pattern = re.compile(
             rf"(?i)(pkg:///resources/){re.escape(old_name)}(?=[?/#]|$)"
         )
-        replaced = False
-        for element in graph.iter():
-            value = element.get("v")
-            if not value:
-                continue
-            updated = pattern.sub(rf"\1{new_name}", value)
-            if updated != value:
-                element.set("v", updated)
-                replaced = True
+        replaced = not identifier_changed
+        if identifier_changed:
+            for element in graph.iter():
+                value = element.get("v")
+                if not value:
+                    continue
+                updated = pattern.sub(rf"\1{new_name}", value)
+                if updated != value:
+                    element.set("v", updated)
+                    replaced = True
         if not replaced:
             raise RuntimeError(
                 f"{graph_name}: bitmap reference not found: {old_name}"

@@ -333,18 +333,26 @@ class LaunchGuardTests(unittest.TestCase):
 
                 with mock.patch.object(
                     module["runpy"], "run_path", side_effect=fake_run_path
+                ), mock.patch.dict(
+                    module["main"].__globals__,
+                    {"run_startup_retention": lambda: calls.append(("retention", "ran"))},
                 ):
                     result = module["main"](["launch_guard.pyw", str(target)])
 
                 self.assertEqual(result, 0)
-                self.assertEqual(calls[0][0], module["CODE_COMPILE_GATE"])
-                self.assertEqual(calls[1], ("gate", "ran"))
-                self.assertEqual(calls[2][0], target)
+                self.assertEqual(calls[0], ("retention", "ran"))
+                self.assertEqual(calls[1][0], module["CODE_COMPILE_GATE"])
+                self.assertEqual(calls[2], ("gate", "ran"))
+                self.assertEqual(calls[3][0], target)
 
     def test_non_sk_batch_gui_skips_compile_gate(self):
         module = load_guard_module()
         target = REPO_DIR / "pcg_st9_texture_batch" / "pcg_texture_gui.pyw"
-        with mock.patch.object(module["runpy"], "run_path", return_value={}) as run:
+        with mock.patch.object(
+            module["runpy"], "run_path", return_value={}
+        ) as run, mock.patch.dict(
+            module["main"].__globals__, {"run_startup_retention": mock.Mock()}
+        ):
             result = module["main"](["launch_guard.pyw", str(target)])
 
         self.assertEqual(result, 0)
@@ -360,7 +368,10 @@ class LaunchGuardTests(unittest.TestCase):
             return_value={"run_gate": mock.Mock(side_effect=failure)},
         ), mock.patch.dict(
             module["main"].__globals__,
-            {"report": (reporter := mock.Mock())},
+            {
+                "report": (reporter := mock.Mock()),
+                "run_startup_retention": mock.Mock(),
+            },
         ):
             result = module["main"](["launch_guard.pyw", str(target)])
 
@@ -368,6 +379,24 @@ class LaunchGuardTests(unittest.TestCase):
         reporter.assert_called_once()
         self.assertIn("코드 컴파일 검사를 통과하지 못했습니다", reporter.call_args.args[1])
         self.assertIn("RuntimeError: contract regression", reporter.call_args.args[2])
+
+    def test_retention_capacity_failure_blocks_producer_before_compile_or_import(self):
+        module = load_guard_module()
+        target = REPO_DIR / "sk_batch" / "sk_batch_gui.pyw"
+        failure = module["RetentionCapacityError"]("at hard limit")
+        with mock.patch.object(module["runpy"], "run_path") as run, mock.patch.dict(
+            module["main"].__globals__,
+            {
+                "run_startup_retention": mock.Mock(side_effect=failure),
+                "report": (reporter := mock.Mock()),
+            },
+        ):
+            result = module["main"](["launch_guard.pyw", str(target)])
+
+        self.assertEqual(result, 1)
+        run.assert_not_called()
+        reporter.assert_called_once()
+        self.assertIn("artifact retention failed", reporter.call_args.args[1])
 
 
 class LauncherModuleTests(unittest.TestCase):

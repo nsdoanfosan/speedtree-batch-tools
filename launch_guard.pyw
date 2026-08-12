@@ -25,6 +25,7 @@ from process_lifecycle import (
     start_process_supervisor,
 )
 from shared_job_queue import InterprocessMutex, QueueError
+from artifact_retention import RetentionCapacityError, enforce_retention
 
 
 REPO_DIR = Path(__file__).resolve().parent
@@ -150,6 +151,11 @@ def run_code_compile_gate(target):
     return run_gate()
 
 
+def run_startup_retention():
+    """Enforce the shared age/capacity policy before any producer starts."""
+    return enforce_retention(phase="startup")
+
+
 def _run_main(argv):
     if len(argv) < 2:
         report(
@@ -166,6 +172,24 @@ def _run_main(argv):
     if not target.is_file():
         report(label, f"GUI 파일을 찾을 수 없습니다:\n{target}", f"{target}\n")
         return 2
+
+
+    try:
+        target.resolve().relative_to(REPO_DIR.resolve())
+        managed_target = True
+    except ValueError:
+        managed_target = False
+    if managed_target:
+        try:
+            run_startup_retention()
+        except (OSError, QueueError, RetentionCapacityError, ValueError) as exc:
+            report(
+                label,
+                f"{label} artifact retention failed during startup.\n\n"
+                f"{type(exc).__name__}: {exc}",
+                "".join(traceback.format_exception(exc)),
+            )
+            return 1
 
     try:
         run_code_compile_gate(target)

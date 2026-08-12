@@ -92,6 +92,30 @@ class FullPipelineScopeTests(unittest.TestCase):
         worker.start.assert_called_once_with()
         self.assertIn("2개", app.log.call_args.args[0])
 
+    def test_full_pipeline_never_overrides_unreal_wait_with_headless(self):
+        gui = load_gui_module()
+        app, _checked, _unchecked = self.make_start_app(gui)
+        app._collect_cfg = mock.Mock(return_value={
+            "night_headless": True,
+            "push_transport": "unreal_wait",
+        })
+        worker = mock.Mock()
+
+        with mock.patch.object(
+            gui, "calibration_settings_signature", return_value="current"
+        ), mock.patch.object(
+            gui, "legacy_calibration_settings_signature", return_value="legacy"
+        ), mock.patch.object(
+            app, "_production_source_revision_precheck", return_value=None
+        ), mock.patch.object(gui, "save_config"), mock.patch.object(
+            gui.threading, "Thread", return_value=worker
+        ) as thread:
+            app.start_full_pipeline()
+
+        queued_job = thread.call_args.kwargs["args"][0]
+        self.assertEqual(queued_job["push_transport"], "unreal_wait")
+        worker.start.assert_called_once_with()
+
     def test_numbered_buttons_route_to_their_required_phase_chain(self):
         gui = load_gui_module()
         for phase, expected_mode, chained in (

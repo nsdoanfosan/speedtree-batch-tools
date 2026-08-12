@@ -348,6 +348,26 @@ class SharedJobQueueTests(unittest.TestCase):
         self.assertEqual(snapshot["next_sequence"], 42)
         self.assertLess(self.state_path.stat().st_size, 10_000)
 
+    def test_terminal_history_three_day_boundary_is_strict(self):
+        clock_value = [1_000.0]
+        max_age = 3 * 24 * 60 * 60
+        queue = self.queue(
+            max_terminal_jobs=10,
+            max_terminal_age_seconds=max_age,
+            clock=lambda: clock_value[0],
+        )
+        job = queue.enqueue("pcg-st9", {"audit": "bounded"})
+        claimed = queue.claim("worker", job_id=job["id"])
+        queue.complete(job["id"], claimed["lease"]["token"])
+
+        clock_value[0] = 1_000.0 + max_age
+        self.assertEqual(
+            [row["id"] for row in queue.snapshot()["jobs"]],
+            [job["id"]],
+        )
+        clock_value[0] += 0.001
+        self.assertEqual(queue.snapshot()["jobs"], [])
+
     def test_release_request_does_not_unblock_and_requires_owner_token_ack(self):
         clock_value = [100.0]
         queue = self.queue(

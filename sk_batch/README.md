@@ -185,6 +185,16 @@ wind JSON 존재, 언리얼 에디터 실행 여부를 확인한다. 텍스처�
 headless transport의 Blender export도 기본 2개씩 처리하며 Unreal import는 한 세션에서
 안전하게 순차 실행한다. Blender 오브젝트 이름에 충돌 방지 숫자가 붙더라도 wind
 JSON은 오브젝트명이 아니라 선택한 SPM의 정규 이름으로 연결한다.
+
+기본 transport는 `headless`다. Unreal Editor를 계속 열어 둔 채 export만 준비하려면
+`unreal_wait`를 선택한다. 이 모드는 dependency 순서가 포함된 immutable manifest를
+저장하고 행을 `export 완료 · Unreal 영구 대기`로 남기며 GUI를 재시작해도 유지된다.
+Editor를 완전히 종료한 뒤 `대기 에셋 임포트` 버튼을 누르면 스캔 화면 밖을 포함한
+영구 상태의 모든 대기 행을 다시 모아 원본·export fingerprint를 검증하고, 유효한
+항목만 한 번의 `UnrealEditor-Cmd` headless 세션으로 임포트한다. 검증 중 Editor가 다시 실행되면
+commandlet을 시작하지 않고 대기 상태를 보존한다.
+대기 항목의 manifest와 export 파일은 작은 `unreal_wait_references.json` 영수증으로
+artifact retention에 등록되며, import 완료 전에는 기간·용량 정리로 삭제되지 않는다.
 같은 ①→②→③ 자동 실행에서는 ②가 이미 확정한 Repair·재질·Assembly 준비 결과를
 job 내부 계약으로 ③에 직접 전달하므로 동일한 전체 감사를 다시 하지 않는다.
 Unreal 실행 상태와 대화형 Blender의 미저장 변경은 ③ 직전에 계속 확인한다.

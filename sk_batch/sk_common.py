@@ -4,6 +4,7 @@ Pure Python (no bpy). Used by the GUI and by spm_audit; the Blender-side job
 scripts under jobs/ are self-contained on purpose (they run inside Blender).
 """
 import configparser
+import copy
 import ctypes
 import hashlib
 import ipaddress
@@ -68,6 +69,7 @@ PRESET_DIR = ADDON_DIR / "presets" / "speedtree_10_1"
 
 CONFIG_PATH = TOOL_DIR / "sk_batch_config.json"
 STATE_PATH = TOOL_DIR / "sk_batch_state.json"
+UNREAL_WAIT_REFERENCE_FILENAME = "unreal_wait_references.json"
 LOG_DIR = TOOL_DIR / "logs"
 STATE_RECOVERY_LOG_PATH = LOG_DIR / "state_recovery.log"
 STATE_RECOVERY_LOG_MAX_BYTES = 64 * 1024
@@ -149,9 +151,9 @@ DEFAULT_CONFIG = {
     # long an unattended Push tolerates a slow import before declaring failure.
     "push_rpc_timeout_min": 180,
     "push_rpc_timeout_max": 900,
-    # Preserve the established standalone Push behavior. The one-click/full
-    # unattended pipeline uses headless by default via night_headless.
-    "push_transport": "rpc",
+    # Headless is the safe default.  Interactive RPC remains available, while
+    # ``unreal_wait`` can materialize exports for a later manual headless run.
+    "push_transport": "headless",
     "night_headless": True,
     "unreal_editor_cmd": r"C:\Program Files\Epic Games\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe",
     "unreal_project": r"C:\UnrealProjects\MyProject2\MyProject2.uproject",
@@ -401,6 +403,50 @@ def _prune_state_entries(state):
     }
 
 
+def _unreal_wait_reference_path():
+    return Path(STATE_PATH).with_name(UNREAL_WAIT_REFERENCE_FILENAME)
+
+
+def _write_unreal_wait_references(state, *, previous_state=None):
+    """Publish a small retention receipt for only durable Unreal-wait rows.
+
+    ``previous_state`` keeps both sides of a state transition protected until
+    the authoritative state replace commits.
+    """
+    items = []
+    seen = set()
+    snapshots = (previous_state, state) if previous_state is not None else (state,)
+    for snapshot in snapshots:
+        for queue_id, entry in sorted(
+            snapshot.items(), key=lambda row: str(row[0])
+        ):
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("push_status_kind") != "exported_pending_unreal":
+                continue
+            item = {
+                "queue_id": str(queue_id),
+                "push_status_kind": "exported_pending_unreal",
+                "push_paths": copy.deepcopy(entry.get("push_paths") or {}),
+                "push_export_cache": copy.deepcopy(
+                    entry.get("push_export_cache") or {}
+                ),
+            }
+            signature = json.dumps(item, ensure_ascii=False, sort_keys=True)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            items.append(item)
+    _atomic_write_json(
+        _unreal_wait_reference_path(),
+        {
+            "schema_version": 1,
+            "kind": "sk_batch_unreal_wait_references",
+            "items": items,
+        },
+    )
+
+
 def load_state():
     with _JSON_WRITE_LOCK:
         with _state_mutex().acquire():
@@ -408,6 +454,7 @@ def load_state():
                 try:
                     raw = STATE_PATH.read_bytes()
                 except FileNotFoundError:
+                    _write_unreal_wait_references({})
                     return {}
                 except OSError as exc:
                     raise RuntimeError(
@@ -425,6 +472,7 @@ def load_state():
                     if not _state_bytes_unchanged(raw):
                         continue
                     _atomic_write_json(STATE_PATH, pruned)
+                _write_unreal_wait_references(pruned)
                 return pruned
     raise RuntimeError(
         "state_changed_during_load: SK Batch state changed repeatedly"
@@ -466,7 +514,9 @@ def save_state(state):
                         "state_changed_during_save: SK Batch state changed "
                         "during the locked transaction"
                     )
+            _write_unreal_wait_references(merged, previous_state=current)
             _atomic_write_json(STATE_PATH, merged)
+            _write_unreal_wait_references(merged)
 
 
 def file_content_fingerprint(path, digest_size=16):

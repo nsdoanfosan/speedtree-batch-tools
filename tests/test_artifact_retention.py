@@ -3,31 +3,37 @@ import io
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
-import zipfile
 from pathlib import Path
 from unittest import mock
 
 import artifact_retention as retention
 from artifact_retention import (
+    DEFAULT_MAX_AGE_SECONDS,
     DEFAULT_RETENTION_POLICIES,
+    DEFAULT_TARGET_BYTES,
+    HARD_MAX_BYTES,
     LOG_SCOPE,
+    PCG_REPORT_SCOPE,
     PRODUCTION_BACKUP_SCOPE,
-    RETRY_SCOPE,
+    QUEUE_STATE_SCOPE,
+    RetentionCapacityError,
     RetentionPolicy,
     apply_retention_plan,
+    generated_log_kind,
     generated_production_backup_kind,
-    is_manual_copy_inventory_artifact,
     main,
+    managed_output_reservation,
+    plan_global_retention,
     plan_retention,
-    seal_backup_transaction,
-    verify_backup_transaction_manifest,
 )
 
 
 class ArtifactRetentionTests(unittest.TestCase):
-    def _write(self, path, payload=b"0123456789", age_seconds=1_000):
+    def _write(self, path, payload=b"0123456789", age_seconds=0):
+        path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(payload)
         stamp = time.time() - age_seconds
@@ -36,865 +42,467 @@ class ArtifactRetentionTests(unittest.TestCase):
 
     @contextlib.contextmanager
     def _log_scope(self, root):
-        with mock.patch.object(
-            retention, "REPOSITORY_LOG_ROOT", root
-        ), mock.patch.dict(
+        with mock.patch.object(retention, "REPOSITORY_LOG_ROOT", Path(root)), mock.patch.dict(
             os.environ,
-            {"LOCALAPPDATA": str(Path(root).parent / "_fixture_local")},
+            {"LOCALAPPDATA": str(Path(root).parent / "LocalAppData")},
             clear=False,
         ):
             yield
 
     @contextlib.contextmanager
     def _production_scope(self, root):
-        with mock.patch.object(
-            retention, "PRODUCTION_TREE_ROOT", root
-        ), mock.patch.dict(
+        with mock.patch.object(retention, "PRODUCTION_TREE_ROOT", Path(root)), mock.patch.dict(
             os.environ,
-            {"LOCALAPPDATA": str(Path(root).parent / "_fixture_local")},
+            {"LOCALAPPDATA": str(Path(root).parent / "LocalAppData")},
             clear=False,
         ):
             yield
 
-    def _retry_environment(self, local_app_data):
-        return mock.patch.dict(
-            os.environ, {"LOCALAPPDATA": str(local_app_data)}, clear=False
+    def _mtime_is_generation_time(self):
+        return mock.patch.object(
+            retention,
+            "_creation_evidence_ns",
+            side_effect=lambda file_stat: file_stat.st_mtime_ns,
         )
 
-    def test_defaults_are_dry_run_and_manual_copy_cleanup_is_off(self):
-        self.assertTrue(DEFAULT_RETENTION_POLICIES)
-        for scope, policy in DEFAULT_RETENTION_POLICIES.items():
-            with self.subTest(scope=scope):
-                self.assertTrue(policy.dry_run)
-        self.assertFalse(
-            DEFAULT_RETENTION_POLICIES[PRODUCTION_BACKUP_SCOPE].include_manual_copies
-        )
-        self.assertFalse(
-            DEFAULT_RETENTION_POLICIES[
-                PRODUCTION_BACKUP_SCOPE
-            ].include_retained_recovery_archives
-        )
+    def test_defaults_are_automatic_three_days_and_below_ten_gib(self):
+        self.assertEqual(DEFAULT_MAX_AGE_SECONDS, 3 * 24 * 60 * 60)
+        self.assertLess(DEFAULT_TARGET_BYTES, HARD_MAX_BYTES)
+        self.assertEqual(HARD_MAX_BYTES, 10 * 1024**3)
+        for policy in DEFAULT_RETENTION_POLICIES.values():
+            self.assertFalse(policy.dry_run)
+            self.assertEqual(policy.max_age_seconds, DEFAULT_MAX_AGE_SECONDS)
+            self.assertLess(policy.max_bytes, HARD_MAX_BYTES)
 
-    def test_every_timestamped_backup_format_shares_its_asset_series(self):
+    def test_three_day_boundary_is_strictly_older_not_equal(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "Tree"
-            owner = root / "tree"
-            backup_dir = owner / "_spm_backups"
-            for index in range(3):
-                stamp = f"2026080{index + 1}_01010{index}"
-                self._write(
-                    owner / f"SK_tree.pcgtex_backup_{stamp}.spm",
-                    age_seconds=1_000 + index,
-                )
-                self._write(
-                    owner / f"SK_tree.skbatch_backup_{stamp}.spm",
-                    age_seconds=2_000 + index,
-                )
-                self._write(
-                    backup_dir / f"SK_tree.codex_backup_{stamp}.spm",
-                    age_seconds=3_000 + index,
-                )
-                self._write(
-                    backup_dir / f"__spm_sync_verify_{index}.spm",
-                    age_seconds=4_000 + index,
-                )
-            with self._production_scope(root), mock.patch.object(
-                retention,
-                "_creation_evidence_ns",
-                side_effect=lambda file_stat: file_stat.st_mtime_ns,
-            ):
+            root = Path(temporary) / "repo" / "sk_batch" / "logs"
+            now = time.time()
+            at_boundary = self._write(
+                root / "at_boundary.log", age_seconds=DEFAULT_MAX_AGE_SECONDS
+            )
+            older = self._write(
+                root / "older.log", age_seconds=DEFAULT_MAX_AGE_SECONDS + 1
+            )
+            with self._log_scope(root), self._mtime_is_generation_time():
                 plan = plan_retention(
                     root,
-                    scope=PRODUCTION_BACKUP_SCOPE,
-                    policy=RetentionPolicy(keep_count=2, min_age_seconds=0, max_bytes=0),
+                    scope=LOG_SCOPE,
+                    policy=RetentionPolicy(0, DEFAULT_MAX_AGE_SECONDS, HARD_MAX_BYTES),
+                    now=now,
                 )
+            rows = {Path(row["path"]): row for row in plan["entries"]}
+            self.assertEqual(rows[at_boundary.resolve()]["action"], "keep")
+            self.assertEqual(rows[older.resolve()]["action"], "delete")
+            self.assertEqual(
+                rows[older.resolve()]["retention_basis"], "older_than_max_age"
+            )
 
-            delete_rows = [row for row in plan["entries"] if row["action"] == "delete"]
-            self.assertEqual(len(delete_rows), 6)
-            series = {
-                row["series_id"]
+    def test_exact_capacity_boundary_is_forbidden(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "repo" / "sk_batch" / "logs"
+            oldest = self._write(root / "oldest.log", b"a" * 40, age_seconds=30)
+            self._write(root / "middle.log", b"b" * 30, age_seconds=20)
+            self._write(root / "newest.log", b"c" * 30, age_seconds=10)
+            with self._log_scope(root), self._mtime_is_generation_time():
+                plan = plan_retention(
+                    root,
+                    scope=LOG_SCOPE,
+                    policy=RetentionPolicy(0, DEFAULT_MAX_AGE_SECONDS, 100),
+                )
+            self.assertEqual(plan["generated_bytes"], 100)
+            self.assertLess(plan["projected_bytes"], 100)
+            self.assertEqual(
+                next(row for row in plan["entries"] if Path(row["path"]) == oldest.resolve())["action"],
+                "delete",
+            )
+
+    def test_capacity_deletes_oldest_first(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "repo" / "sk_batch" / "logs"
+            paths = [
+                self._write(root / f"{index}.log", bytes([index]) * 30, age_seconds=30 - index)
+                for index in range(4)
+            ]
+            with self._log_scope(root), self._mtime_is_generation_time():
+                plan = plan_retention(
+                    root,
+                    scope=LOG_SCOPE,
+                    policy=RetentionPolicy(0, DEFAULT_MAX_AGE_SECONDS, 61),
+                )
+            deleted = [
+                Path(row["path"])
                 for row in plan["entries"]
-                if row["kind"] in {"backup_sibling", "backup_directory:_spm_backups"}
-            }
-            self.assertEqual(len(series), 3)
+                if row["action"] == "delete"
+            ]
+            self.assertEqual(deleted, [paths[0].resolve(), paths[1].resolve()])
+            self.assertEqual(plan["projected_bytes"], 60)
 
-    def test_scope_roots_are_exact_not_arbitrary_parent_or_similar_name(self):
+    def test_global_capacity_is_shared_across_scopes(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             logs = base / "repo" / "sk_batch" / "logs"
-            logs.mkdir(parents=True)
-            with self._log_scope(logs):
-                plan_retention(logs, scope=LOG_SCOPE)
-                with self.assertRaisesRegex(ValueError, "exact logs root"):
-                    plan_retention(logs.parent, scope=LOG_SCOPE)
-                with self.assertRaisesRegex(ValueError, "exact logs root"):
-                    plan_retention(base / "logs", scope=LOG_SCOPE)
-
-            local = base / "LocalAppData"
-            retry = local / "SpeedTreeBatchTools" / "retry_progress"
-            retry.mkdir(parents=True)
-            with self._retry_environment(local):
-                plan_retention(retry, scope=RETRY_SCOPE)
-                with self.assertRaisesRegex(ValueError, "exact retry_progress root"):
-                    plan_retention(local, scope=RETRY_SCOPE)
-
-    def test_manual_copy_is_backup_inventory_and_needs_explicit_policy(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "Tree"
-            manual_ko = self._write(root / "SK_tree_02 - 복사본.spm")
-            manual_en = self._write(root / "SK_tree_02 - Copy (2).spm")
-            authored = self._write(root / "SK_copy_habitat_01.spm")
-            with self._production_scope(root):
-                plan = plan_retention(
-                    root,
-                    scope=PRODUCTION_BACKUP_SCOPE,
-                    policy=RetentionPolicy(0, 0, 0),
+            reports = base / "repo" / "pcg_st9_texture_batch" / "reports"
+            old = self._write(logs / "old.log", b"a" * 60, age_seconds=20)
+            self._write(reports / "new.json", b"b" * 60, age_seconds=10)
+            with mock.patch.object(retention, "REPOSITORY_LOG_ROOT", logs), mock.patch.object(
+                retention, "PCG_REPORT_ROOT", reports
+            ), mock.patch.dict(
+                os.environ, {"LOCALAPPDATA": str(base / "local")}, clear=False
+            ), self._mtime_is_generation_time():
+                plan = plan_global_retention(
+                    (LOG_SCOPE, PCG_REPORT_SCOPE),
+                    max_bytes=100,
                 )
-
-            self.assertTrue(is_manual_copy_inventory_artifact(manual_ko))
-            self.assertEqual(
-                generated_production_backup_kind(manual_en), "manual_copy_backup"
-            )
-            self.assertFalse(is_manual_copy_inventory_artifact(authored))
-            self.assertEqual(plan["planned_delete_count"], 0)
-            self.assertEqual(
-                {Path(row["path"]) for row in plan["manual_copy_inventory"]},
-                {manual_ko.resolve(), manual_en.resolve()},
-            )
-            self.assertTrue(
-                all(
-                    row["retention_basis"]
-                    == "manual_copy_requires_explicit_backup_policy"
-                    for row in plan["manual_copy_inventory"]
-                )
-            )
-            self.assertNotIn(authored.resolve(), {Path(row["path"]) for row in plan["entries"]})
-
-    def test_explicit_manual_copy_policy_can_plan_but_apply_needs_tree_ack(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "Tree"
-            manual = self._write(root / "SK_tree_02 - Copy.spm")
-            policy = RetentionPolicy(
-                keep_count=0,
-                min_age_seconds=0,
-                max_bytes=0,
-                include_manual_copies=True,
-            )
-            with self._production_scope(root):
-                plan = plan_retention(
-                    root, scope=PRODUCTION_BACKUP_SCOPE, policy=policy
-                )
-                with self.assertRaisesRegex(ValueError, "acknowledgement"):
-                    apply_retention_plan(plan, apply=True)
-                result = apply_retention_plan(
-                    plan,
-                    apply=True,
-                    root_acknowledgement=root,
-                )
-
-            self.assertEqual(result["deleted"], [str(manual.resolve())])
-            self.assertFalse(manual.exists())
-
-    def test_copy2_preserved_mtime_does_not_make_new_backup_old(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "Tree"
-            source = self._write(Path(temporary) / "source.spm", age_seconds=100_000)
-            copy = root / "SK_tree_02 - Copy.spm"
-            copy.parent.mkdir(parents=True)
-            import shutil
-
-            shutil.copy2(source, copy)
-            policy = RetentionPolicy(
-                keep_count=0,
-                min_age_seconds=60,
-                max_bytes=0,
-                include_manual_copies=True,
-            )
-            with self._production_scope(root):
-                plan = plan_retention(
-                    root, scope=PRODUCTION_BACKUP_SCOPE, policy=policy
-                )
-            row = next(row for row in plan["entries"] if Path(row["path"]) == copy.resolve())
-            self.assertEqual(row["retention_basis"], "younger_than_min_age")
-            self.assertEqual(plan["planned_delete_count"], 0)
-
-    def test_zero_min_age_does_not_depend_on_clock_rounding(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "Tree"
-            backup = self._write(
-                root
-                / "_spm_backups"
-                / "SK_tree.skbatch_backup_20260806_010101.spm"
-            )
-            with self._production_scope(root):
-                plan = plan_retention(
-                    root,
-                    scope=PRODUCTION_BACKUP_SCOPE,
-                    policy=RetentionPolicy(0, 0, 0),
-                    now=0,
-                )
-
-            row = next(
+            self.assertEqual(plan["generated_bytes"], 120)
+            self.assertEqual(plan["projected_bytes"], 60)
+            self.assertTrue(plan["target_satisfied"])
+            old_row = next(
                 row
-                for row in plan["entries"]
-                if Path(row["path"]) == backup.resolve()
+                for scope_plan in plan["plans"]
+                for row in scope_plan["entries"]
+                if Path(row["path"]) == old.resolve()
             )
-            self.assertEqual(row["action"], "delete")
-            self.assertNotEqual(
-                row["retention_basis"],
-                "younger_than_min_age",
-            )
+            self.assertEqual(old_row["action"], "delete")
 
-    def test_uncertain_nested_production_bundle_is_never_partially_planned(self):
+    def test_age_pass_precedes_capacity_pass(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "Tree"
-            bundle = root / "tree" / "_spm_backups" / "transaction_20260805"
-            first = self._write(bundle / "SK_tree.spm")
-            second = self._write(bundle / "receipt.json")
-            direct = self._write(
-                root
-                / "tree"
-                / "_spm_backups"
-                / "SK_tree.skbatch_backup_20260805_010101.spm"
+            root = Path(temporary) / "repo" / "sk_batch" / "logs"
+            expired = self._write(
+                root / "expired.log",
+                b"a" * 10,
+                age_seconds=DEFAULT_MAX_AGE_SECONDS + 1,
             )
-            with self._production_scope(root):
-                plan = plan_retention(
-                    root,
-                    scope=PRODUCTION_BACKUP_SCOPE,
-                    policy=RetentionPolicy(0, 0, 0),
-                )
-            rows = {Path(row["path"]): row for row in plan["entries"]}
-
-            self.assertEqual(
-                rows[first.resolve()]["retention_basis"],
-                "uncertain_multi_file_recovery_bundle",
-            )
-            self.assertEqual(
-                rows[second.resolve()]["retention_basis"],
-                "uncertain_multi_file_recovery_bundle",
-            )
-            self.assertEqual(rows[direct.resolve()]["action"], "delete")
-            self.assertGreater(plan["budget_unmet_bytes"], 0)
-
-    def test_production_recovery_receipt_automatically_protects_its_backup(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "Tree"
-            backup_dir = root / "tree" / "_spm_backups"
-            backup = self._write(
-                backup_dir / "SK_tree.skbatch_backup_20260805_010101.spm"
-            )
-            self._write(
-                backup_dir / "calibration_recovery.json",
-                json.dumps({"backup": backup.name}).encode("utf-8"),
-            )
-            with self._production_scope(root):
-                plan = plan_retention(
-                    root,
-                    scope=PRODUCTION_BACKUP_SCOPE,
-                    policy=RetentionPolicy(0, 0, 0),
-                )
-            rows = {Path(row["path"]): row for row in plan["entries"]}
-            self.assertEqual(
-                rows[backup.resolve()]["retention_basis"],
-                "protected_current_active_or_referenced",
-            )
-            self.assertEqual(rows[backup.resolve()]["action"], "keep")
-
-    def test_manifest_sealed_nested_bundle_is_planned_and_removed_as_one_set(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "Tree"
-            bundle = root / "tree" / "_spm_backups" / "generator_sync_tx_01"
-            spm = self._write(bundle / "TreeRoot" / "SK_tree.spm")
-            receipt = self._write(bundle / "receipt.json", payload=b'{"ok": true}')
-            seal_backup_transaction(
-                bundle,
-                (spm, receipt),
-                producer="spm_generator_sync",
-                transaction_id="tx-01",
-            )
-            verified = verify_backup_transaction_manifest(bundle)
-            self.assertTrue(verified["valid"], verified)
-
-            with self._production_scope(root):
-                plan = plan_retention(
-                    root,
-                    scope=PRODUCTION_BACKUP_SCOPE,
-                    policy=RetentionPolicy(0, 0, 0),
-                )
-                bundle_row = next(
-                    row for row in plan["bundles"] if row["seal_valid"]
-                )
-                self.assertEqual(
-                    bundle_row["atomic_mode"],
-                    "sealed_directory_archive_bridge",
-                )
-                self.assertEqual(plan["manifest_sealed_bundle_count"], 1)
-                self.assertEqual(plan["planned_delete_count"], 3)
-                result = apply_retention_plan(
-                    plan,
-                    apply=True,
-                    root_acknowledgement=root,
-                )
-
-            self.assertEqual(result["skipped"], [])
-            self.assertEqual(len(result["deleted"]), 3)
-            self.assertEqual(result["retained_recovery_archives"], [])
-            self.assertFalse(bundle.exists())
-            self.assertEqual(
-                list((root / "tree" / "_spm_backups").glob("*.zip")), []
-            )
-
-    def test_manifest_with_new_undeclared_member_stays_budget_unmet(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "Tree"
-            bundle = root / "tree" / "_spm_backups" / "texture_normalize_tx_01"
-            spm = self._write(bundle / "SK_tree.spm")
-            seal_backup_transaction(
-                bundle,
-                (spm,),
-                producer="texture_normalize",
-            )
-            extra = self._write(bundle / "late_receipt.json")
-            verification = verify_backup_transaction_manifest(bundle)
-            self.assertFalse(verification["valid"])
-
-            with self._production_scope(root):
-                plan = plan_retention(
-                    root,
-                    scope=PRODUCTION_BACKUP_SCOPE,
-                    policy=RetentionPolicy(0, 0, 0),
-                )
-            rows = {Path(row["path"]): row for row in plan["entries"]}
-            self.assertEqual(plan["planned_delete_count"], 0)
-            self.assertEqual(plan["uncertain_backup_bundle_count"], 1)
-            self.assertEqual(
-                rows[extra.resolve()]["retention_basis"],
-                "uncertain_multi_file_recovery_bundle",
-            )
-            self.assertGreater(plan["budget_unmet_bytes"], 0)
-
-    def test_external_recovery_receipt_protects_a_sealed_bundle(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "Tree"
-            backup_dir = root / "tree" / "_spm_backups"
-            bundle = backup_dir / "generator_sync_tx_03"
-            spm = self._write(bundle / "SK_tree.spm")
-            seal_backup_transaction(
-                bundle,
-                (spm,),
-                producer="spm_generator_sync",
-            )
-            self._write(
-                backup_dir / "current_recovery.json",
-                json.dumps({"restore_bundle": str(bundle)}).encode("utf-8"),
-            )
-            with self._production_scope(root):
-                plan = plan_retention(
-                    root,
-                    scope=PRODUCTION_BACKUP_SCOPE,
-                    policy=RetentionPolicy(0, 0, 0),
-                )
-            bundle_row = next(row for row in plan["bundles"] if row["seal_valid"])
-            self.assertEqual(
-                bundle_row["retention_basis"],
-                "protected_current_active_or_referenced",
-            )
-            self.assertEqual(
-                [
-                    row["action"]
-                    for row in plan["entries"]
-                    if Path(row["bundle_root"]) == bundle.resolve()
-                ],
-                ["keep", "keep"],
-            )
-
-    def test_manifest_bundle_change_after_plan_skips_whole_bundle(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "Tree"
-            bundle = root / "tree" / "_spm_backups" / "atlas_tx_01"
-            first = self._write(bundle / "first.spm", payload=b"first")
-            second = self._write(bundle / "second.spm", payload=b"second")
-            seal_backup_transaction(
-                bundle,
-                (first, second),
-                producer="atlas_cluster_normalization",
-            )
-            with self._production_scope(root):
-                plan = plan_retention(
-                    root,
-                    scope=PRODUCTION_BACKUP_SCOPE,
-                    policy=RetentionPolicy(0, 0, 0),
-                )
-                second.write_bytes(b"changed")
-                result = apply_retention_plan(
-                    plan,
-                    apply=True,
-                    root_acknowledgement=root,
-                )
-
-            self.assertTrue(first.exists())
-            self.assertTrue(second.exists())
-            self.assertTrue(
-                all(
-                    row["retention_basis"] == "bundle_manifest_changed"
-                    for row in result["skipped"]
-                )
-            )
-
-    def test_partial_or_tampered_plan_cannot_apply_a_manifest_subset(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "Tree"
-            bundle = root / "tree" / "_spm_backups" / "atlas_tx_02"
-            first = self._write(bundle / "first.spm")
-            second = self._write(bundle / "second.spm")
-            seal_backup_transaction(
-                bundle,
-                (first, second),
-                producer="atlas_cluster_normalization",
-            )
-            with self._production_scope(root):
-                plan = plan_retention(
-                    root,
-                    scope=PRODUCTION_BACKUP_SCOPE,
-                    policy=RetentionPolicy(0, 0, 0),
-                )
-                plan["entries"] = [
-                    row
-                    for row in plan["entries"]
-                    if Path(row["path"]).name != "second.spm"
-                ]
-                result = apply_retention_plan(
-                    plan,
-                    apply=True,
-                    root_acknowledgement=root,
-                )
-
-            self.assertTrue(first.exists())
-            self.assertTrue(second.exists())
-            self.assertTrue(
-                all(
-                    row["retention_basis"] == "bundle_plan_membership_mismatch"
-                    for row in result["skipped"]
-                )
-            )
-
-    def test_manual_copy_named_member_holds_whole_sealed_bundle_without_opt_in(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "Tree"
-            bundle = root / "tree" / "_spm_backups" / "generator_sync_tx_04"
-            ordinary = self._write(bundle / "SK_tree.spm")
-            manual_named = self._write(bundle / "SK_tree - Copy.spm")
-            seal_backup_transaction(
-                bundle,
-                (ordinary, manual_named),
-                producer="spm_generator_sync",
-            )
-            with self._production_scope(root):
-                plan = plan_retention(
-                    root,
-                    scope=PRODUCTION_BACKUP_SCOPE,
-                    policy=RetentionPolicy(0, 0, 0),
-                )
-            bundle_row = next(row for row in plan["bundles"] if row["seal_valid"])
-            self.assertEqual(
-                bundle_row["retention_basis"],
-                "manual_copy_requires_explicit_backup_policy",
-            )
-            self.assertEqual(
-                {row["action"] for row in plan["entries"]}, {"keep"}
-            )
-
-    def test_bundle_root_active_reference_protects_every_sealed_member_at_apply(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "Tree"
-            bundle = root / "tree" / "_spm_backups" / "generator_sync_tx_05"
-            spm = self._write(bundle / "SK_tree.spm")
-            seal_backup_transaction(
-                bundle,
-                (spm,),
-                producer="spm_generator_sync",
-            )
-            with self._production_scope(root):
-                plan = plan_retention(
-                    root,
-                    scope=PRODUCTION_BACKUP_SCOPE,
-                    policy=RetentionPolicy(0, 0, 0),
-                )
-                result = apply_retention_plan(
-                    plan,
-                    apply=True,
-                    root_acknowledgement=root,
-                    active_paths=(bundle,),
-                )
-
-            self.assertTrue(spm.exists())
-            self.assertTrue(
-                all(
-                    row["retention_basis"] == "newly_active_or_referenced"
-                    for row in result["skipped"]
-                )
-            )
-
-    def test_sealed_bundle_partial_unlink_failure_retains_complete_archive(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "Tree"
-            bundle = root / "tree" / "_spm_backups" / "generator_sync_tx_02"
-            first = self._write(bundle / "a.spm", payload=b"first")
-            second = self._write(bundle / "b.spm", payload=b"second")
-            seal_backup_transaction(
-                bundle,
-                (first, second),
-                producer="spm_generator_sync",
-            )
-            real_unlink = retention._unlink_bundle_member
-            calls = {"count": 0}
-
-            def fail_after_one(path):
-                calls["count"] += 1
-                if calls["count"] == 2:
-                    raise PermissionError("fixture locked member")
-                return real_unlink(path)
-
-            with self._production_scope(root):
-                plan = plan_retention(
-                    root,
-                    scope=PRODUCTION_BACKUP_SCOPE,
-                    policy=RetentionPolicy(0, 0, 0),
-                )
-                with mock.patch.object(
-                    retention, "_unlink_bundle_member", side_effect=fail_after_one
-                ):
-                    result = apply_retention_plan(
-                        plan,
-                        apply=True,
-                        root_acknowledgement=root,
-                    )
-
-            self.assertEqual(len(result["retained_recovery_archives"]), 1)
-            archive_path = Path(result["retained_recovery_archives"][0])
-            self.assertTrue(archive_path.is_file())
-            with zipfile.ZipFile(archive_path, "r") as archive:
-                names = set(archive.namelist())
-                self.assertIn("a.spm", names)
-                self.assertIn("b.spm", names)
-                self.assertIn(retention.BACKUP_BUNDLE_MANIFEST_FILENAME, names)
-                self.assertEqual(archive.read("a.spm"), b"first")
-                self.assertEqual(archive.read("b.spm"), b"second")
-            self.assertTrue(result["skipped"])
-
-            with self._production_scope(root):
-                default_plan = plan_retention(
-                    root,
-                    scope=PRODUCTION_BACKUP_SCOPE,
-                    policy=RetentionPolicy(0, 0, 0),
-                )
-                archive_row = next(
-                    row
-                    for row in default_plan["entries"]
-                    if Path(row["path"]) == archive_path.resolve()
-                )
-                self.assertEqual(
-                    archive_row["retention_basis"],
-                    "retained_recovery_archive_requires_explicit_policy",
-                )
-                authorized_plan = plan_retention(
-                    root,
-                    scope=PRODUCTION_BACKUP_SCOPE,
-                    policy=RetentionPolicy(
-                        0,
-                        0,
-                        0,
-                        include_retained_recovery_archives=True,
-                    ),
-                )
-                authorized_result = apply_retention_plan(
-                    authorized_plan,
-                    apply=True,
-                    root_acknowledgement=root,
-                )
-
-            self.assertFalse(archive_path.exists())
-            self.assertFalse(bundle.exists())
-            self.assertIn(str(archive_path), authorized_result["deleted"])
-
-    def test_unregistered_forged_manifest_never_becomes_deletion_authority(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "Tree"
-            bundle = root / "tree" / "_spm_backups" / "foreign_tx_01"
-            spm = self._write(bundle / "SK_tree.spm")
-            seal_backup_transaction(
-                bundle,
-                (spm,),
-                producer="spm_generator_sync",
-            )
-            manifest = bundle / retention.BACKUP_BUNDLE_MANIFEST_FILENAME
-            payload = json.loads(manifest.read_text(encoding="utf-8"))
-            payload["producer"] = "foreign_hand_authored_tool"
-            manifest.write_text(json.dumps(payload), encoding="utf-8")
-
-            verification = verify_backup_transaction_manifest(bundle)
-            self.assertFalse(verification["valid"])
-            self.assertIn(
-                "producer_unregistered", verification["retention_basis"]
-            )
-            with self._production_scope(root):
-                plan = plan_retention(
-                    root,
-                    scope=PRODUCTION_BACKUP_SCOPE,
-                    policy=RetentionPolicy(0, 0, 0),
-                )
-            self.assertEqual(plan["planned_delete_count"], 0)
-            self.assertEqual(plan["uncertain_backup_bundle_count"], 1)
-
-    def test_dotdot_recovery_archive_name_cannot_escape_backup_namespace(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "Tree"
-            namespace = root / "tree" / "_spm_backups"
-            namespace.mkdir(parents=True)
-            outside = self._write(root / "tree" / "must_not_delete.spm")
-            forged = namespace / (
-                "...retention_delete_" + "a" * 32 + ".zip"
-            )
-            payload = {
-                "schema_version": retention.BACKUP_BUNDLE_MANIFEST_SCHEMA_VERSION,
-                "kind": retention.BACKUP_BUNDLE_MANIFEST_KIND,
-                "complete_membership": True,
-                "producer": "spm_generator_sync",
-                "producer_schema_version": (
-                    retention.BACKUP_BUNDLE_PRODUCER_SCHEMA_VERSION
-                ),
-                "transaction_id": "forged-dotdot",
-                "bundle_basename": "..",
-                "directories": [],
-                "members": [],
-            }
-            with zipfile.ZipFile(forged, "w") as archive:
-                archive.writestr(
-                    retention.BACKUP_BUNDLE_MANIFEST_FILENAME,
-                    json.dumps(payload).encode("utf-8"),
-                )
-
-            verification = retention.verify_retained_recovery_archive(forged)
-            self.assertFalse(verification["valid"])
-            self.assertIn(
-                "unsafe recovery archive transaction",
-                verification["retention_basis"],
-            )
-            with self._production_scope(root):
-                plan = plan_retention(
-                    root,
-                    scope=PRODUCTION_BACKUP_SCOPE,
-                    policy=RetentionPolicy(
-                        0,
-                        0,
-                        0,
-                        include_retained_recovery_archives=True,
-                    ),
-                )
-            archive_row = next(
-                row for row in plan["entries"] if Path(row["path"]) == forged.resolve()
-            )
-            self.assertEqual(
-                archive_row["retention_basis"],
-                "retained_recovery_archive_invalid",
-            )
-            self.assertEqual(archive_row["action"], "keep")
-            self.assertTrue(outside.exists())
-
-    def test_budget_respects_age_keep_active_and_receipt_reference(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary)
-            root = base / "repo" / "sk_batch" / "logs"
-            old_delete = self._write(root / "old_delete.log", age_seconds=1_000)
-            referenced = self._write(root / "referenced.fbx", age_seconds=900)
-            active = self._write(root / "active.log", age_seconds=800)
-            recent = self._write(root / "recent.json", age_seconds=1)
-            newest = self._write(root / "newest.log", age_seconds=700)
-            receipt = self._write(
-                base / "receipts" / "current.json",
-                json.dumps({"report": str(referenced.resolve())}).encode("utf-8"),
-            )
-            # This test isolates budget ordering; copy2/creation-time safety is
-            # covered separately above.
-            with self._log_scope(root), mock.patch.object(
-                retention,
-                "_creation_evidence_ns",
-                side_effect=lambda file_stat: file_stat.st_mtime_ns,
-            ):
+            within = self._write(root / "within.log", b"b" * 80, age_seconds=10)
+            with self._log_scope(root), self._mtime_is_generation_time():
                 plan = plan_retention(
                     root,
                     scope=LOG_SCOPE,
-                    policy=RetentionPolicy(keep_count=1, min_age_seconds=100, max_bytes=10),
-                    active_paths=(active,),
-                    receipt_paths=(receipt,),
+                    policy=RetentionPolicy(0, DEFAULT_MAX_AGE_SECONDS, 50),
                 )
             rows = {Path(row["path"]): row for row in plan["entries"]}
+            self.assertEqual(rows[expired.resolve()]["retention_basis"], "older_than_max_age")
+            self.assertEqual(
+                rows[within.resolve()]["retention_basis"],
+                "over_max_bytes_oldest_eligible",
+            )
 
-            self.assertEqual(rows[old_delete.resolve()]["action"], "delete")
-            self.assertEqual(
-                rows[referenced.resolve()]["retention_basis"],
-                "protected_current_active_or_referenced",
-            )
-            self.assertEqual(
-                rows[active.resolve()]["retention_basis"],
-                "protected_current_active_or_referenced",
-            )
-            self.assertEqual(
-                rows[recent.resolve()]["retention_basis"],
-                "younger_than_min_age",
-            )
-            self.assertEqual(
-                rows[newest.resolve()]["retention_basis"],
-                "newest_keep_count",
-            )
-            self.assertGreater(plan["budget_unmet_bytes"], 0)
-            self.assertEqual(apply_retention_plan(plan)["status"], "dry_run")
-            self.assertTrue(old_delete.exists())
+    def test_log_scope_includes_cache_fbx_pre_repair_and_partial_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "logs"
+            paths = [
+                self._write(root / "send2ue_export_cache" / "x" / "mesh.fbx"),
+                self._write(root / "tree_pre_repair_20260810_010101.blend"),
+                self._write(root / "batch_manifest.json"),
+                self._write(root / (".batch.1.2." + "a" * 32 + ".tmp")),
+            ]
+            for path in paths:
+                self.assertIsNotNone(generated_log_kind(path, root))
 
-    def test_relative_latest_receipt_is_protected_at_plan_and_rechecked_at_apply(self):
+    def test_backup_requires_live_original_and_never_inventories_original(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "Forestportfolio"
+            owner = root / "02_nature" / "Tree" / "tree"
+            original = self._write(owner / "SK_tree.spm", b"live")
+            backup = self._write(
+                owner / "_spm_backups" / "SK_tree.skbatch_backup_20260801_010101.spm",
+                b"backup",
+            )
+            with self._production_scope(root):
+                plan = plan_retention(
+                    root,
+                    scope=PRODUCTION_BACKUP_SCOPE,
+                    policy=RetentionPolicy(0, 0, HARD_MAX_BYTES),
+                )
+            rows = {Path(row["path"]): row for row in plan["entries"]}
+            self.assertNotIn(original.resolve(), rows)
+            self.assertTrue(rows[backup.resolve()]["original_verified"])
+            self.assertEqual(rows[backup.resolve()]["action"], "delete")
+
+            original.unlink()
+            with self._production_scope(root):
+                blocked = plan_retention(
+                    root,
+                    scope=PRODUCTION_BACKUP_SCOPE,
+                    policy=RetentionPolicy(0, 0, HARD_MAX_BYTES),
+                )
+            row = next(row for row in blocked["entries"] if Path(row["path"]) == backup.resolve())
+            self.assertEqual(row["action"], "keep")
+            self.assertEqual(row["retention_basis"], "backup_original_unverified")
+
+    def test_sbs_and_named_backup_patterns_require_their_originals(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "Forestportfolio"
+            folder = root / "substance"
+            original = self._write(folder / "material.sbs", b"live")
+            backup = self._write(
+                folder / "material.pcgtex_backup_before_graph_20260801_010101.sbs",
+                b"backup",
+            )
+            self.assertEqual(generated_production_backup_kind(backup), "backup_sibling")
+            with self._production_scope(root):
+                plan = plan_retention(
+                    root,
+                    scope=PRODUCTION_BACKUP_SCOPE,
+                    policy=RetentionPolicy(0, 0, HARD_MAX_BYTES),
+                )
+            row = next(row for row in plan["entries"] if Path(row["path"]) == backup.resolve())
+            self.assertEqual(Path(row["original_path"]), original.resolve())
+
+    def test_apply_rechecks_original_before_unlink(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "Forestportfolio"
+            owner = root / "tree"
+            original = self._write(owner / "SK_tree.spm", b"live")
+            backup = self._write(
+                owner / "_spm_backups" / "SK_tree.codex_backup_20260801_010101.spm",
+                b"backup",
+            )
+            with self._production_scope(root):
+                plan = plan_retention(
+                    root,
+                    scope=PRODUCTION_BACKUP_SCOPE,
+                    policy=RetentionPolicy(0, 0, HARD_MAX_BYTES),
+                )
+                original.unlink()
+                result = apply_retention_plan(
+                    plan, apply=True, root_acknowledgement=root
+                )
+            self.assertTrue(backup.exists())
+            self.assertEqual(
+                result["skipped"][0]["retention_basis"],
+                "backup_original_missing_or_changed",
+            )
+
+    def test_legacy_backup_manifest_maps_only_to_existing_original(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "Forestportfolio"
+            tree = root / "02_nature" / "Tree"
+            original = self._write(tree / "atlas" / "M_leaf.blend", b"live")
+            bundle = tree / "_atlas_cluster_normalization_backups" / "final_20260801_010101"
+            backup = self._write(bundle / "files" / "atlas" / "M_leaf.blend", b"copy")
+            manifest = {
+                "status": "ok",
+                "backup_root": str(bundle.resolve()),
+                "count": 1,
+                "files": [
+                    {
+                        "source": str(original.resolve()),
+                        "backup": str(backup.resolve()),
+                        "size": backup.stat().st_size,
+                        "sha256": "not-trusted-as-identity",
+                    }
+                ],
+            }
+            self._write(
+                bundle / "backup_manifest.json",
+                json.dumps(manifest).encode("utf-8"),
+            )
+            with self._production_scope(root):
+                plan = plan_retention(
+                    root,
+                    scope=PRODUCTION_BACKUP_SCOPE,
+                    policy=RetentionPolicy(0, 0, HARD_MAX_BYTES),
+                )
+                row = next(
+                    row for row in plan["entries"] if Path(row["path"]) == backup.resolve()
+                )
+                self.assertTrue(row["original_verified"])
+                self.assertEqual(Path(row["original_path"]), original.resolve())
+                self.assertEqual(row["atomic_mode"], "single_file")
+                result = apply_retention_plan(
+                    plan, apply=True, root_acknowledgement=root
+                )
+            self.assertIn(str(backup.resolve()), result["deleted"], result)
+            self.assertFalse(backup.exists())
+            self.assertTrue(original.exists())
+
+    def test_verified_multi_file_backup_bundle_applies_as_one_safe_unit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "Forestportfolio"
+            texture = root / "02_nature" / "Tree" / "tree" / "texture"
+            originals = [
+                self._write(texture / "T_leaf_color.tga", b"live-color"),
+                self._write(texture / "T_leaf_normal.tga", b"live-normal"),
+            ]
+            bundle = texture / "_pcgtex_backups" / "T_leaf_20260801_010101_000001"
+            backups = [
+                self._write(bundle / original.name, b"backup")
+                for original in originals
+            ]
+            with self._production_scope(root):
+                plan = plan_retention(
+                    root,
+                    scope=PRODUCTION_BACKUP_SCOPE,
+                    policy=RetentionPolicy(0, 0, HARD_MAX_BYTES),
+                )
+                rows = [
+                    row
+                    for row in plan["entries"]
+                    if Path(row["path"]) in {path.resolve() for path in backups}
+                ]
+                self.assertEqual(len(rows), 2)
+                self.assertTrue(all(row["action"] == "delete" for row in rows))
+                self.assertTrue(
+                    all(
+                        row["atomic_mode"] == "verified_original_bundle"
+                        for row in rows
+                    )
+                )
+                result = apply_retention_plan(
+                    plan, apply=True, root_acknowledgement=root
+                )
+            self.assertEqual(set(result["deleted"]), {str(path.resolve()) for path in backups})
+            self.assertTrue(all(not path.exists() for path in backups))
+            self.assertTrue(all(path.exists() for path in originals))
+
+    def test_live_queue_counts_toward_budget_but_is_never_deleted(self):
         with tempfile.TemporaryDirectory() as temporary:
             local = Path(temporary) / "LocalAppData"
-            root = local / "SpeedTreeBatchTools" / "retry_progress"
-            first = self._write(
-                root / ("retry_19700101T000001_" + "a" * 32 + ".json")
+            root = local / "SpeedTreeBatchTools"
+            queue = self._write(root / "shared_job_queue.json", b"q" * 50)
+            abandoned = self._write(
+                root / (".shared_job_queue.json.1.2." + "a" * 32 + ".tmp"),
+                b"t" * 10,
+                age_seconds=10,
             )
-            second = self._write(
-                root / ("retry_19700101T000002_" + "b" * 32 + ".json")
+            with mock.patch.dict(
+                os.environ, {"LOCALAPPDATA": str(local)}, clear=False
+            ), self._mtime_is_generation_time():
+                plan = plan_retention(
+                    root,
+                    scope=QUEUE_STATE_SCOPE,
+                    policy=RetentionPolicy(0, DEFAULT_MAX_AGE_SECONDS, 55),
+                )
+            rows = {Path(row["path"]): row for row in plan["entries"]}
+            self.assertEqual(rows[queue.resolve()]["action"], "keep")
+            self.assertEqual(
+                rows[queue.resolve()]["retention_basis"],
+                "protected_current_active_or_referenced",
             )
-            latest = self._write(
-                root / "latest.json",
-                json.dumps({"receipt": first.name}).encode("utf-8"),
+            self.assertEqual(rows[abandoned.resolve()]["action"], "delete")
+            self.assertEqual(plan["generated_bytes"], 60)
+
+    def test_pending_unreal_manifest_referenced_by_receipt_is_never_deleted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary) / "repo"
+            root = repo / "sk_batch" / "logs"
+            waiting_fbx = self._write(
+                root / "SK_tree_waiting.fbx",
+                age_seconds=DEFAULT_MAX_AGE_SECONDS + 1,
             )
-            policy = RetentionPolicy(0, 0, 0)
-            with self._retry_environment(local):
-                plan = plan_retention(root, scope=RETRY_SCOPE, policy=policy)
-                rows = {Path(row["path"]): row for row in plan["entries"]}
+            waiting_manifest = self._write(
+                root / "unreal_wait_20260811_120000.json",
+                json.dumps(
+                    {
+                        "kind": "sk_batch_unreal_wait_queue",
+                        "items": [{"files": [str(waiting_fbx)]}],
+                    }
+                ).encode("utf-8"),
+                age_seconds=DEFAULT_MAX_AGE_SECONDS + 1,
+            )
+            completed_manifest = self._write(
+                root / "headless_queue_completed.json",
+                json.dumps({"kind": "completed"}).encode("utf-8"),
+                age_seconds=DEFAULT_MAX_AGE_SECONDS + 1,
+            )
+            wait_references = repo / "sk_batch" / "unreal_wait_references.json"
+            self._write(
+                wait_references,
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "kind": "sk_batch_unreal_wait_references",
+                        "items": [
+                            {
+                                "queue_id": "tree.spm",
+                                "push_status_kind": "exported_pending_unreal",
+                                "push_paths": {
+                                    "waiting_manifest": str(waiting_manifest)
+                                },
+                            },
+                            {
+                                "queue_id": "completed.spm",
+                                "push_status_kind": "imported_ok",
+                                "push_paths": {
+                                    "manifest": str(completed_manifest)
+                                },
+                            },
+                        ],
+                    }
+                ).encode("utf-8"),
+            )
+
+            with mock.patch.object(
+                retention, "REPOSITORY_LOG_ROOT", root
+            ), mock.patch.object(
+                retention,
+                "REPOSITORY_UNREAL_WAIT_REFERENCES",
+                wait_references,
+            ), self._mtime_is_generation_time():
+                plan = plan_retention(
+                    root,
+                    scope=LOG_SCOPE,
+                    policy=RetentionPolicy(0, 0, HARD_MAX_BYTES),
+                )
+
+            rows = {Path(entry["path"]): entry for entry in plan["entries"]}
+            for pending_path in (waiting_manifest, waiting_fbx):
+                self.assertEqual(rows[pending_path.resolve()]["action"], "keep")
                 self.assertEqual(
-                    rows[first.resolve()]["retention_basis"],
+                    rows[pending_path.resolve()]["retention_basis"],
                     "protected_current_active_or_referenced",
                 )
-                self.assertEqual(rows[second.resolve()]["action"], "delete")
+            self.assertEqual(rows[completed_manifest.resolve()]["action"], "delete")
 
-                # The live pointer changes after planning.  Apply must reread
-                # it and retain the newly referenced receipt.
-                latest.write_text(json.dumps({"receipt": second.name}), encoding="utf-8")
-                result = apply_retention_plan(plan, apply=True)
-
-            self.assertTrue(first.exists())
-            self.assertTrue(second.exists())
-            self.assertEqual(
-                result["skipped"],
-                [
-                    {
-                        "path": str(second.resolve()),
-                        "retention_basis": "newly_active_or_referenced",
-                    }
-                ],
-            )
-
-    def test_apply_rechecks_active_and_sha256_not_only_size_and_mtime(self):
+    def test_locked_unlink_is_reported_and_file_remains(self):
         with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary)
-            root = base / "repo" / "sk_batch" / "logs"
-            changed = self._write(root / "changed.log", payload=b"abcdefghij")
-            active = self._write(root / "active.log", payload=b"klmnopqrst")
-            with self._log_scope(root):
+            root = Path(temporary) / "repo" / "sk_batch" / "logs"
+            locked = self._write(root / "locked.log", age_seconds=10)
+            with self._log_scope(root), self._mtime_is_generation_time():
                 plan = plan_retention(
                     root,
                     scope=LOG_SCOPE,
-                    policy=RetentionPolicy(0, 0, 0),
+                    policy=RetentionPolicy(0, 0, HARD_MAX_BYTES),
                 )
-                changed_stat = changed.stat()
+                original_unlink = Path.unlink
+
+                def fail_locked(path, *args, **kwargs):
+                    if Path(path) == locked:
+                        raise PermissionError("locked")
+                    return original_unlink(path, *args, **kwargs)
+
+                with mock.patch.object(Path, "unlink", fail_locked):
+                    result = apply_retention_plan(plan, apply=True)
+            self.assertTrue(locked.exists())
+            self.assertEqual(result["skipped"][0]["retention_basis"], "unlink_failed:PermissionError")
+
+    def test_changed_content_with_same_size_and_mtime_is_not_deleted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "repo" / "sk_batch" / "logs"
+            changed = self._write(root / "changed.log", b"abcdefghij", age_seconds=10)
+            with self._log_scope(root), self._mtime_is_generation_time():
+                plan = plan_retention(
+                    root,
+                    scope=LOG_SCOPE,
+                    policy=RetentionPolicy(0, 0, HARD_MAX_BYTES),
+                )
+                before = changed.stat()
                 changed.write_bytes(b"0123456789")
-                os.utime(
-                    changed,
-                    ns=(changed_stat.st_atime_ns, changed_stat.st_mtime_ns),
-                )
-                result = apply_retention_plan(
-                    plan, apply=True, active_paths=(active,)
-                )
-
-            skipped = {
-                Path(row["path"]): row["retention_basis"]
-                for row in result["skipped"]
-            }
-            self.assertIn(skipped[changed.resolve()], {"identity_changed", "content_hash_changed"})
-            self.assertEqual(skipped[active.resolve()], "newly_active_or_referenced")
-            self.assertTrue(changed.exists())
-            self.assertTrue(active.exists())
-
-    def test_sha256_rejects_changed_content_even_if_plan_identity_is_refreshed(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary)
-            root = base / "repo" / "sk_batch" / "logs"
-            changed = self._write(root / "changed.log", payload=b"abcdefghij")
-            with self._log_scope(root):
-                plan = plan_retention(
-                    root,
-                    scope=LOG_SCOPE,
-                    policy=RetentionPolicy(0, 0, 0),
-                )
-                row = plan["entries"][0]
-                original_sha256 = row["sha256"]
-                old = changed.stat()
-                changed.write_bytes(b"0123456789")
-                os.utime(changed, ns=(old.st_atime_ns, old.st_mtime_ns))
-                # Even if all mutable stat fields in a serialized plan were
-                # refreshed, the planned content identity remains binding.
-                current = changed.stat()
-                row.update(
-                    {
-                        "bytes": current.st_size,
-                        "mtime_ns": current.st_mtime_ns,
-                        "ctime_ns": current.st_ctime_ns,
-                        "device": current.st_dev,
-                        "inode": current.st_ino,
-                    }
-                )
+                os.utime(changed, ns=(before.st_atime_ns, before.st_mtime_ns))
                 result = apply_retention_plan(plan, apply=True)
-
-            self.assertEqual(row["sha256"], original_sha256)
-            self.assertEqual(
-                result["skipped"],
-                [
-                    {
-                        "path": str(changed.resolve()),
-                        "retention_basis": "content_hash_changed",
-                    }
-                ],
-            )
             self.assertTrue(changed.exists())
-
-    def test_apply_refuses_a_forged_multi_file_bundle_without_partial_delete(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary)
-            root = base / "repo" / "sk_batch" / "logs"
-            first = self._write(root / "first.log")
-            second = self._write(root / "second.log")
-            with self._log_scope(root):
-                plan = plan_retention(
-                    root,
-                    scope=LOG_SCOPE,
-                    policy=RetentionPolicy(0, 0, 0),
-                )
-                self.assertEqual(plan["planned_delete_count"], 2)
-                for row in plan["entries"]:
-                    row["bundle_id"] = "forged-shared-bundle"
-                result = apply_retention_plan(plan, apply=True)
-
-            self.assertTrue(first.exists())
-            self.assertTrue(second.exists())
-            self.assertEqual(
-                {row["retention_basis"] for row in result["skipped"]},
-                {"non_atomic_bundle_refused"},
+            self.assertIn(
+                result["skipped"][0]["retention_basis"],
+                {"identity_changed", "content_hash_changed"},
             )
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symlink support unavailable")
-    def test_reparse_candidate_is_not_followed_or_deleted(self):
+    def test_reparse_path_escape_is_not_inventoried(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             root = base / "repo" / "sk_batch" / "logs"
-            outside = self._write(base / "outside" / "outside.log")
+            outside = self._write(base / "outside.log")
             root.mkdir(parents=True)
             link = root / "linked.log"
             try:
@@ -902,122 +510,114 @@ class ArtifactRetentionTests(unittest.TestCase):
             except OSError:
                 self.skipTest("symlink creation is not permitted")
             with self._log_scope(root):
-                plan = plan_retention(
-                    root,
-                    scope=LOG_SCOPE,
-                    policy=RetentionPolicy(0, 0, 0),
-                )
+                plan = plan_retention(root, scope=LOG_SCOPE)
             self.assertNotIn(link, {Path(row["path"]) for row in plan["entries"]})
             self.assertTrue(outside.exists())
 
-    def test_cli_writes_full_dry_run_json_and_never_deletes_by_default(self):
+    def test_reservations_are_concurrent_and_cleaned_after_failure(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             logs = base / "repo" / "sk_batch" / "logs"
-            local = base / "LocalAppData"
-            retry = local / "SpeedTreeBatchTools" / "retry_progress"
-            log_file = self._write(logs / "old.log")
-            retry_file = self._write(
-                retry / ("retry_19700101T000001_" + "a" * 32 + ".json")
+            logs.mkdir(parents=True)
+            barrier = threading.Barrier(2)
+            receipts_seen = []
+            errors = []
+
+            def worker(index):
+                try:
+                    with managed_output_reservation(
+                        logs / f"output_{index}.fbx", 1024
+                    ):
+                        barrier.wait(timeout=10)
+                        receipts_seen.append(
+                            len(list(retention._reservation_directory().glob("*.json")))
+                        )
+                        if index == 0:
+                            raise RuntimeError("producer failed")
+                except RuntimeError as exc:
+                    if str(exc) != "producer failed":
+                        errors.append(exc)
+                except BaseException as exc:  # pragma: no cover - diagnostic
+                    errors.append(exc)
+
+            patches = (
+                mock.patch.object(retention, "REPOSITORY_LOG_ROOT", logs),
+                mock.patch.object(retention, "PCG_REPORT_ROOT", base / "pcg_reports"),
+                mock.patch.object(retention, "SPM_REPORT_ROOT", base / "spm_reports"),
+                mock.patch.object(retention, "SK_CACHE_ROOT", base / "sk_cache"),
+                mock.patch.object(retention, "REPOSITORY_ROOT", base / "repo"),
+                mock.patch.object(retention, "PRODUCTION_TREE_ROOT", base / "Forestportfolio"),
+                mock.patch.dict(os.environ, {"LOCALAPPDATA": str(base / "local")}, clear=False),
             )
-            output = base / "maintenance" / "plan.json"
-            stdout = io.StringIO()
-            with self._log_scope(logs), self._retry_environment(local), contextlib.redirect_stdout(stdout):
-                code = main(
-                    [
-                        "--scope",
-                        LOG_SCOPE,
-                        "--scope",
-                        RETRY_SCOPE,
-                        "--keep-count",
-                        "0",
-                        "--min-age-days",
-                        "0",
-                        "--max-gib",
-                        "0",
-                        "--output",
-                        str(output),
-                    ]
-                )
+            with contextlib.ExitStack() as stack:
+                for patcher in patches:
+                    stack.enter_context(patcher)
+                threads = [threading.Thread(target=worker, args=(index,)) for index in range(2)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=30)
+                remaining = list(retention._reservation_directory().glob("*.json"))
+            self.assertFalse(errors)
+            self.assertEqual(receipts_seen, [2, 2])
+            self.assertEqual(remaining, [])
 
-            payload = json.loads(output.read_text(encoding="utf-8"))
-            console = json.loads(stdout.getvalue())
-            self.assertEqual(code, 0)
-            self.assertEqual(payload["status"], "dry_run")
-            self.assertTrue(payload["push_independent"])
-            self.assertFalse(payload["pipeline_gate"])
-            self.assertEqual(console["output"], str(output.resolve()))
-            self.assertEqual(payload["summary"]["planned_delete_count"], 2)
-            self.assertTrue(log_file.exists())
-            self.assertTrue(retry_file.exists())
-
-    def test_cli_apply_operates_logs_without_production_ack(self):
+    def test_reserved_bytes_participate_in_strict_global_boundary(self):
         with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary)
-            logs = base / "repo" / "sk_batch" / "logs"
-            old = self._write(logs / "old.log")
-            output = base / "applied.json"
-            with self._log_scope(logs), contextlib.redirect_stdout(io.StringIO()):
+            root = Path(temporary) / "logs"
+            self._write(root / "new.log", b"x" * 50)
+            with self._log_scope(root), self._mtime_is_generation_time():
+                plan = plan_global_retention(
+                    (LOG_SCOPE,), max_bytes=100, reserved_bytes=50
+                )
+            self.assertTrue(plan["target_satisfied"])
+            self.assertLess(plan["projected_with_reservations_bytes"], 100)
+            self.assertEqual(plan["planned_delete_bytes"], 50)
+
+    def test_single_reservation_at_hard_limit_is_rejected(self):
+        with self.assertRaises(RetentionCapacityError):
+            retention._begin_output_reservation((Path("x.fbx"),), HARD_MAX_BYTES)
+
+    def test_cli_applies_by_default_and_dry_run_is_explicit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "repo" / "sk_batch" / "logs"
+            old = self._write(root / "old.log", age_seconds=10)
+            output = Path(temporary) / "result.json"
+            with self._log_scope(root), self._mtime_is_generation_time(), contextlib.redirect_stdout(io.StringIO()):
                 code = main(
                     [
                         "--scope",
                         LOG_SCOPE,
-                        "--apply",
-                        "--keep-count",
-                        "0",
-                        "--min-age-days",
+                        "--max-age-days",
                         "0",
                         "--max-gib",
-                        "0",
+                        "1",
                         "--output",
                         str(output),
                     ]
                 )
-
-            payload = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(code, 0)
-            self.assertEqual(payload["status"], "applied")
-            self.assertFalse(payload["plans"][0]["dry_run"])
-            self.assertEqual(payload["summary"]["deleted_count"], 1)
             self.assertFalse(old.exists())
+            self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["status"], "applied")
 
-    def test_cli_manual_copy_apply_requires_exact_tree_ack_before_mutation(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "Tree"
-            manual = self._write(root / "SK_tree_02 - Copy.spm")
-            common = [
-                "--scope",
-                PRODUCTION_BACKUP_SCOPE,
-                "--apply",
-                "--include-manual-copies",
-                "--keep-count",
-                "0",
-                "--min-age-days",
-                "0",
-                "--max-gib",
-                "0",
-                "--output",
-                str(Path(temporary) / "result.json"),
-            ]
-            with self._production_scope(root), contextlib.redirect_stderr(io.StringIO()):
-                with self.assertRaises(SystemExit) as raised:
-                    main(common)
-                self.assertEqual(raised.exception.code, 2)
-                self.assertTrue(manual.exists())
-                with contextlib.redirect_stdout(io.StringIO()):
-                    code = main([*common, "--tree-root-ack", str(root)])
-
+            preview = self._write(root / "preview.log", age_seconds=10)
+            with self._log_scope(root), self._mtime_is_generation_time(), contextlib.redirect_stdout(io.StringIO()):
+                code = main(
+                    [
+                        "--scope",
+                        LOG_SCOPE,
+                        "--dry-run",
+                        "--max-age-days",
+                        "0",
+                        "--max-gib",
+                        "1",
+                        "--output",
+                        str(output),
+                    ]
+                )
             self.assertEqual(code, 0)
-            self.assertFalse(manual.exists())
-
-    def test_bat_launcher_defaults_to_the_non_apply_cli(self):
-        launcher = Path(retention.__file__).with_name(
-            "SpeedTree_Artifact_Maintenance.bat"
-        )
-        text = launcher.read_text(encoding="utf-8")
-        self.assertIn('set "GUARD=%~dp0launch_guard.pyw"', text)
-        self.assertIn('python "%GUARD%" "%MAINTENANCE%" %*', text)
-        self.assertNotIn("--apply", text)
+            self.assertTrue(preview.exists())
+            self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["status"], "dry_run")
 
 
 if __name__ == "__main__":

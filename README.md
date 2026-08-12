@@ -27,8 +27,10 @@ SpeedTree 식생 변환 작업을 위한 독립형 Windows 배치 도구 모음�
 해당 비멱등 작업을 자동 재실행하지 않고 `owner_lost` 실패로 기록한 뒤 다음
 작업을 진행한다. 읽기 전용 검사와 표 갱신은 대기열 밖에서 계속 사용할 수 있다.
 
-완료·실패·취소·abandoned 기록은 `terminal_at`이 가장 최신인 100개만 유지한다
-(`terminal_at`이 없는 기존 행은 상태별 종료 시각과 sequence를 차례로 사용한다).
+완료·실패·취소·abandoned 기록은 3일 이내이면서 `terminal_at`이 가장 최신인
+100개만 유지한다(`terminal_at`이 없는 기존 행은 상태별 종료 시각과 sequence를
+차례로 사용한다). 정확히 3일인 기록은 유지하고 그보다 오래되면 다음 queue
+transaction 또는 도구 시작 정리에서 제거한다.
 따라서 먼저 등록됐지만 늦게 끝난 작업의 새 감사 기록도 보존된다. 대기 또는 실행
 중인 작업은 retention 대상이 아니며 자동으로 제거하지 않는다.
 
@@ -92,6 +94,50 @@ GitHub/
 ```
 
 `sk_batch`는 형제 저장소의 SpeedTree 10.1 프리셋을 자동으로 찾습니다. 다른 위치에 둔 경우 `SPEEDTREE_BWR_ADDON_DIR` 환경 변수에 `speedtree_bone_weight_repair` 패키지 폴더 경로를 지정할 수 있습니다. 기존 `sk_batch_config.json`에 `fbx_ini`와 `xml_ini`가 저장되어 있으면 그 값이 우선 적용됩니다.
+
+## 생성 산출물 보존 및 용량 상한
+
+모든 BAT GUI는 실제 작업을 시작하기 전에 `artifact_retention.py`의 전역 정리를
+자동 적용합니다. `sk_batch/logs`(Send2UE FBX cache, pre-repair Blend, log,
+manifest/queue JSON 포함), PCG/SPM report 폴더, `sk_batch/cache`,
+`%LOCALAPPDATA%\SpeedTreeBatchTools`의 cache/retry/process receipt와 공유 queue,
+회전 오류 로그, `D:\OneDrive\Forestportfolio` 아래 도구 소유 백업이 하나의
+합산 예산을 공유합니다.
+
+- 생성 시각이 **3일을 초과한** 파일을 먼저 지웁니다. 정확히 3일인 파일은 시간
+  단계에서는 유지되지만 용량 단계의 후보가 될 수 있습니다.
+- 남은 전체 logical size가 기본 목표인 **9.75 GiB 미만**이 될 때까지 모든 범위의
+  오래된 생성물부터 지웁니다. 절대 상한은 `total_bytes < 10 * 1024^3`이며 정확히
+  10 GiB도 허용하지 않습니다. 256 MiB 기본 여유는 작은 log/JSON과 예상치 오차가
+  순간 상한을 침범하지 않도록 둡니다.
+- 대형 pre-repair 복사와 Send2UE/Exact Push export는 쓰기 전에 예상 크기를 예약하고,
+  완료 또는 실패 직후 다시 정리합니다. 예약 JSON과 plan/apply는 abandoned-safe
+  process mutex로 직렬화되어 동시 실행이 같은 여유를 중복 사용하지 않습니다.
+- 잠긴 파일, 쓰는 중 변경된 파일, symlink/junction 경로 이탈은 삭제하지 않고
+  실패 근거로 남깁니다. OneDrive cloud placeholder는 내용을 읽어 hydration하지 않고
+  stat identity를 삭제 직전에 다시 확인합니다.
+- OneDrive에서는 `_spm_backups`, `_pcgtex_backups`, `_blend_backups`,
+  `_sbs_backups`, `backups\sbs`, `*.skbatch_backup_*`,
+  `*.pcgtex_backup_before_*`, `*.codex_backup_*`처럼 명확한 백업만 대상으로 삼습니다.
+  각 백업과 대응하는 정상 원본이 현재 존재하고 백업 namespace 밖에 있음을 검증해야
+  삭제할 수 있습니다. 원본 `.spm`/`.sbs` 자체와 출처가 모호한 Explorer 수동 복사본은
+  자동 삭제하지 않습니다. 기존 atlas 정규화 `backup_manifest.json`도 선언된 backup
+  경로·크기와 live source 경로를 다시 검증한 항목에 한해서만 원본 증거로 사용합니다.
+- 공유 queue의 완료/실패/취소 기록은 3일 및 100건 제한으로 원자적으로 축소합니다.
+  현재 `shared_job_queue.json` 크기는 합산 예산에 포함하지만 실행 중/대기 중 작업을
+  보호하기 위해 상태 파일 자체는 retention이 삭제하지 않습니다.
+
+수동 실행도 기본값은 적용 모드입니다. 읽기 전용 확인에는 `--dry-run`을 사용합니다.
+
+```powershell
+.\SpeedTree_Artifact_Maintenance.bat --dry-run
+.\SpeedTree_Artifact_Maintenance.bat
+```
+
+필요하면 `SPEEDTREE_RETENTION_MAX_AGE_DAYS`(0~3)와
+`SPEEDTREE_RETENTION_MAX_GIB`(0~10)로 더 엄격하게 설정할 수 있습니다.
+`--max-age-days`, `--max-gib` 명령행 값이 환경 변수보다 우선합니다. 10 GiB를
+설정해도 비교는 exclusive이므로 정확히 10 GiB인 상태는 정리 대상입니다.
 
 ## 외부 의존성
 
