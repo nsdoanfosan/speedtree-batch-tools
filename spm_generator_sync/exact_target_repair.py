@@ -21,6 +21,7 @@ from connected_run import (
     connected_settings,
     connected_unit_records,
     dependency_identity,
+    rebase_authorized_dependency_identities,
 )
 from exact_target_command import build_exact_target_request, run_exact_target_request
 from atlas_slot_ownership import (
@@ -517,11 +518,28 @@ def execute_exact_generator_request(
                 "completed_units": len(results),
             }
         report.current = index
-        results.append({
+        rebase_updates = rebase_authorized_dependency_identities(
+            unit,
+            units[index:],
+            identities,
+            settings,
+        )
+        rebase_receipts = []
+        for unit_id, update in sorted(rebase_updates.items()):
+            identities[unit_id] = copy.deepcopy(update["identity"])
+            rebase_receipts.append({
+                key: copy.deepcopy(value)
+                for key, value in update.items()
+                if key != "identity"
+            })
+        result_row = {
             "unit_id": unit["unit_id"],
             "stage": unit["stage"],
             "result": module.App._connected_result_summary(attempt["result"]),
-        })
+        }
+        if rebase_receipts:
+            result_row["authorized_dependency_rebases"] = rebase_receipts
+        results.append(result_row)
         progress(
             "Generator/Cluster exact repair",
             completed=index,
