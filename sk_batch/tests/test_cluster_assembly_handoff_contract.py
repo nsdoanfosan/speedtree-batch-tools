@@ -24,9 +24,34 @@ from cluster_assembly_handoff_contract import (  # noqa: E402
     current_assembly_manifest_repair_handoff,
     file_fingerprint,
     normalize_export_name,
+    _normalized_variants_ready,
     resolve_cluster_receipt_path,
     role_identity_aliases_from_contract,
 )
+
+
+class NormalizedVariantBoneIdentityTests(unittest.TestCase):
+    @staticmethod
+    def contract(source_bone):
+        return {
+            "status": "ready",
+            "delivery_mode": "render_connected",
+            "generator_bindings": [{"generator_index": 0}],
+            "variants": [{
+                "ordinal": 1,
+                "source_partition_mode": "PER_CONNECTED_DEFORM_CLUSTER",
+                "source_bone": source_bone,
+                "composite_parts": [],
+            }],
+        }
+
+    def test_requires_exact_source_bone_for_normalized_partition(self):
+        self.assertFalse(_normalized_variants_ready(self.contract("")))
+
+    def test_accepts_exact_source_bone_without_requiring_set_equality(self):
+        self.assertTrue(
+            _normalized_variants_ready(self.contract("Bone_7_Start"))
+        )
 
 
 class CurrentFbxRoleAuthorityTests(unittest.TestCase):
@@ -735,6 +760,7 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                             "skeletal_asset_name": "SK_branch_elm_01_01",
                             "source_prototype_index": 1,
                             "source_partition_mode": "PER_DEFORM_ROOT",
+                            "source_bone": "Bone_1_Start",
                         }],
                     }
                 },
@@ -795,6 +821,7 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                         "variants": [{
                             "ordinal": 1,
                             "source_partition_mode": "PER_DEFORM_ROOT",
+                            "source_bone": "Bone_1_Start",
                         }],
                     },
                 },

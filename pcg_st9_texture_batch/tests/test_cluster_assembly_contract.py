@@ -1324,6 +1324,8 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                             if role == "leaf_side"
                             else "BRANCH_COMPONENTS"
                         ),
+                        "source_bone": f"Bone_{ordinal}_Start",
+                        "endpoint_bone": f"Bone_{ordinal}_End",
                     })
                 payload = {
                     "spm": str(target),
@@ -1491,6 +1493,8 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                         "source_partition_mode": (
                             "PER_CONNECTED_DEFORM_CLUSTER"
                         ),
+                        "source_bone": "Bone_17_Start",
+                        "endpoint_bone": "Bone_17_End",
                         "normalization_workflow_mode": (
                             "PHYSICAL_DIRECT_CAPTURE"
                         ),
@@ -1527,6 +1531,14 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             self.assertEqual(
                 contract["variants"][0]["attachment_vertex_uv"],
                 [0.25, 0.75],
+            )
+            self.assertEqual(
+                contract["variants"][0]["source_bone"],
+                "Bone_17_Start",
+            )
+            self.assertEqual(
+                contract["variants"][0]["endpoint_bone"],
+                "Bone_17_End",
             )
             self.assertEqual(
                 contract["production_normalization"],
@@ -1795,6 +1807,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                     "skeletal_asset_name": "SK_branch_elm_01_01",
                     "source_prototype_index": 1,
                     "source_partition_mode": "WHOLE_MESH",
+                    "source_bone": "Bone_1_Start",
                     "plan_fbx": {"sha256": "plan"},
                     "attachment_vertex_index": 7,
                     "attachment_vertex_uv": [0.25, 0.75],
@@ -1890,6 +1903,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                                 "skeletal_asset_name": "SK_branch_elm_01_01",
                                 "source_prototype_index": 1,
                                 "source_partition_mode": "WHOLE_MESH",
+                                "source_bone": "Bone_1_Start",
                             }],
                         }],
                     }),
@@ -2010,6 +2024,8 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                                     "source_partition_mode": (
                                         "PER_CONNECTED_DEFORM_CLUSTER"
                                     ),
+                                    "source_bone": "Bone_1_Start",
+                                    "endpoint_bone": "Bone_1_End",
                                     "normalization_workflow_mode": (
                                         "PHYSICAL_DIRECT_CAPTURE"
                                     ),
@@ -2077,6 +2093,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                                 "skeletal_asset_name": f"SK_{plan}",
                                 "source_prototype_index": 1,
                                 "source_partition_mode": "WHOLE_MESH",
+                                "source_bone": "Bone_1_Start",
                             }],
                         }],
                     }),
@@ -2130,6 +2147,8 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                     "skeletal_asset_name": "SK_leaf_elm_side_01_01",
                     "source_prototype_index": 1,
                     "source_partition_mode": "COMPOSITE_PER_DEFORM_ROOT",
+                    "source_bone": f"Bone_{ordinal}_Start",
+                    "endpoint_bone": f"Bone_{ordinal}_End",
                     "composite_parts": composite_parts,
                 })
             payload = {
@@ -2158,7 +2177,11 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 "atlas_normalized_plan_composite_skeletal_pair_v2",
             )
             self.assertEqual(len(contract["variants"]), 3)
-            for variant in contract["variants"]:
+            for ordinal, variant in enumerate(contract["variants"], 1):
+                self.assertEqual(
+                    variant["source_bone"],
+                    f"Bone_{ordinal}_Start",
+                )
                 self.assertEqual(len(variant["composite_parts"]), 12)
                 self.assertEqual(
                     [row["subpart_index"] for row in variant["composite_parts"]],

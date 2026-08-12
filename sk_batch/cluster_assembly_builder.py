@@ -60,8 +60,6 @@ MAX_ASSEMBLY_RESIDUAL_RELATIVE_RMS = 1.0e-2
 MAX_ASSEMBLY_PIVOT_ERROR_METERS = 1.0e-8
 MAX_NORMALIZED_PLAN_FACE_LOSS_RATIO = 0.20
 MAX_SPEEDTREE_RENDER_FACE_MULTIPLICITY = 2
-MAX_WEIGHT_BINDING_DISTANCE_SPAN_RATIO = 1.0e-2
-MIN_WEIGHT_BINDING_DISTANCE_METERS = 1.0e-2
 # Blender stores imported FBX coordinates as 32-bit floats.  At the meter-scale
 # positions used by this pipeline, one exporter round-trip can separate an
 # authored coincident vertex by roughly 1e-7 m.  Every topology/correspondence
@@ -4399,85 +4397,27 @@ def _component_influences(obj, component):
     ]
 
 
-def _weighted_vertex_locator(obj):
-    try:
-        from mathutils.kdtree import KDTree
-    except ImportError as exc:  # pragma: no cover - Blender-only dependency.
-        raise ClusterAssemblyBuildError(
-            "Blender KDTree is required for source-role skeleton binding"
-        ) from exc
-    weighted = [
-        vertex for vertex in obj.data.vertices
-        if list(vertex.groups)
-    ]
-    if not weighted:
-        raise ClusterAssemblyBuildError(
-            "final merged mesh has no weighted vertices for Assembly binding"
-        )
-    tree = KDTree(len(weighted))
-    for vertex in weighted:
-        tree.insert(obj.matrix_world @ vertex.co, int(vertex.index))
-    tree.balance()
-    world_points = [
-        tuple(float(value) for value in (obj.matrix_world @ vertex.co))
-        for vertex in weighted
-    ]
-    spans = [
-        max(point[axis] for point in world_points)
-        - min(point[axis] for point in world_points)
-        for axis in range(3)
-    ]
-    return {
-        "tree": tree,
-        "tolerance_meters": _weighted_vertex_attachment_tolerance(spans),
-    }
+def _exact_source_bone_influences(source_bone, skeleton_by_name, context):
+    """Resolve one FBX/normalizer bone reference against the final skeleton.
 
-
-def _weighted_vertex_attachment_tolerance(spans):
-    """Bound nearest-weight inheritance by one percent of the Full-SK span.
-
-    Authored attachment pivots can sit just outside the rendered branch skin.
-    A half-percent gate rejected valid large-tree pivots by only a few
-    millimeters; one percent still keeps the lookup local to the attachment
-    while covering the branch radius and SpeedTree export clipping margin.
+    The source contract is intentionally one-way: every referenced FBX bone
+    must exist in the SPM-derived final skeleton, while extra final-skeleton
+    bones are valid. Geometry position is never an identity fallback.
     """
-    values = [abs(float(value)) for value in spans]
-    if not values:
-        return MIN_WEIGHT_BINDING_DISTANCE_METERS
-    return max(
-        max(values) * MAX_WEIGHT_BINDING_DISTANCE_SPAN_RATIO,
-        MIN_WEIGHT_BINDING_DISTANCE_METERS,
-    )
-
-
-def _nearest_weighted_vertex_influences(obj, locator, world_point):
-    _coordinate, vertex_index, distance = locator["tree"].find(world_point)
-    tolerance = float(locator["tolerance_meters"])
-    if vertex_index is None or float(distance) > tolerance:
+    name = str(source_bone or "").strip()
+    if not name:
         raise ClusterAssemblyBuildError(
-            "Assembly source-role attachment has no nearby weighted Full-SK "
-            f"vertex: distance={float(distance):.9g} tolerance={tolerance:.9g}"
+            f"{context} has no exact source_bone identity"
         )
-    vertex = obj.data.vertices[int(vertex_index)]
-    totals = Counter()
-    for item in vertex.groups:
-        group = obj.vertex_groups[item.group]
-        totals[str(group.name)] += float(item.weight)
-    total = sum(totals.values())
-    if total <= 0.0:
+    if name not in skeleton_by_name:
         raise ClusterAssemblyBuildError(
-            "nearest Full-SK attachment vertex has no skeleton weights"
+            f"{context} source_bone is missing from final skeleton: {name}"
         )
-    influences = [
-        {"bone": name, "weight": value / total}
-        for name, value in totals.most_common()
-        if value > 0.0
-    ]
-    return influences, {
-        "policy": "nearest_weighted_full_sk_vertex_v1",
-        "vertex_index": int(vertex_index),
-        "distance_meters": float(distance),
-        "tolerance_meters": tolerance,
+    return [
+        {"bone": name, "weight": 1.0},
+    ], {
+        "policy": "exact_normalized_source_bone_v1",
+        "source_bone": name,
     }
 
 
@@ -5635,7 +5575,6 @@ def build_blender_assembly_inputs(
     degraded_authored_binding_count = 0
     legacy_fallback_binding_count = 0
     authored_component_cache = {}
-    weighted_vertex_locator = None
     authored_assignment_report = None
     base_obj = None
     base_armature = None
@@ -5870,13 +5809,6 @@ def build_blender_assembly_inputs(
         finally:
             base_armature.name = normalized_armature_name
             final_armature.name = source_armature_name
-        if any(
-            target is not final_merged_mesh
-            for target in role_targets.values()
-        ):
-            weighted_vertex_locator = _weighted_vertex_locator(
-                final_merged_mesh
-            )
         for provider_key in provider_order:
             role_row = roles[provider_key]
             role = role_row["role"]
@@ -5925,6 +5857,9 @@ def build_blender_assembly_inputs(
                             "normalized variant has no target mesh id for "
                             "authored Node matching"
                         ) from exc
+                    composite_parts = list(
+                        variant.get("composite_parts") or []
+                    )
                     bindings = []
                     for instance_index, component in enumerate(instances):
                         component_id = (
@@ -6192,7 +6127,14 @@ def build_blender_assembly_inputs(
                                 not authored_node_table.get("available")
                             ),
                         )
-                        if target_object is final_merged_mesh:
+                        if composite_parts:
+                            influences = []
+                            influence_source = {
+                                "policy": (
+                                    "deferred_exact_composite_source_bone_v1"
+                                ),
+                            }
+                        elif target_object is final_merged_mesh:
                             influences = _component_influences(
                                 target_object,
                                 component,
@@ -6202,10 +6144,13 @@ def build_blender_assembly_inputs(
                             }
                         else:
                             influences, influence_source = (
-                                _nearest_weighted_vertex_influences(
-                                    final_merged_mesh,
-                                    weighted_vertex_locator,
-                                    target_attachment,
+                                _exact_source_bone_influences(
+                                    variant.get("source_bone"),
+                                    skeleton_by_name,
+                                    (
+                                        "normalized Assembly variant "
+                                        f"{part_asset_name}"
+                                    ),
                                 )
                             )
                         binding = {
@@ -6216,14 +6161,14 @@ def build_blender_assembly_inputs(
                             "bone_influences": influences,
                             "bone_influence_source": influence_source,
                         }
-                        hierarchy = validate_binding_hierarchy(
-                            binding,
-                            snapshot,
-                            skeleton_by_name=skeleton_by_name,
-                        )
-                        binding["anchor_bone"] = hierarchy["anchor_bone"]
+                        if not composite_parts:
+                            hierarchy = validate_binding_hierarchy(
+                                binding,
+                                snapshot,
+                                skeleton_by_name=skeleton_by_name,
+                            )
+                            binding["anchor_bone"] = hierarchy["anchor_bone"]
                         bindings.append(binding)
-                    composite_parts = list(variant.get("composite_parts") or [])
                     if composite_parts:
                         if str(variant.get("source_partition_mode") or "") != "COMPOSITE_PER_DEFORM_ROOT":
                             raise ClusterAssemblyBuildError(
@@ -6333,6 +6278,17 @@ def build_blender_assembly_inputs(
                                 )
                                 composite_binding["card_ordinal"] = ordinal
                                 composite_binding["composite_subpart_index"] = subpart_index
+                                (
+                                    composite_binding["bone_influences"],
+                                    composite_binding["bone_influence_source"],
+                                ) = _exact_source_bone_influences(
+                                    subpart.get("source_bone"),
+                                    skeleton_by_name,
+                                    (
+                                        "normalized Assembly composite part "
+                                        f"{subpart_asset}"
+                                    ),
+                                )
                                 composite_binding["transform"] = (
                                     compose_similarity_with_relative_matrix(
                                         base_binding["transform"],
@@ -6367,6 +6323,14 @@ def build_blender_assembly_inputs(
                                         ).get("geometry_residual_blocking")
                                     ),
                                 )
+                                hierarchy = validate_binding_hierarchy(
+                                    composite_binding,
+                                    snapshot,
+                                    skeleton_by_name=skeleton_by_name,
+                                )
+                                composite_binding["anchor_bone"] = hierarchy[
+                                    "anchor_bone"
+                                ]
                                 accumulator["bindings"].append(composite_binding)
                                 all_bindings.append(composite_binding)
                         continue
@@ -6389,6 +6353,12 @@ def build_blender_assembly_inputs(
                         ),
                         "source_partition_mode": str(
                             variant.get("source_partition_mode") or ""
+                        ),
+                        "source_bone": str(
+                            variant.get("source_bone") or ""
+                        ),
+                        "endpoint_bone": str(
+                            variant.get("endpoint_bone") or ""
                         ),
                         "pivot_contract": str(
                             variant.get("pivot_contract") or ""

@@ -43,6 +43,7 @@ from cluster_assembly_builder import (  # noqa: E402
     _component_signature,
     _current_unreal_skeleton_diagnostic,
     _expected_normalized_bounds_for_variant,
+    _exact_source_bone_influences,
     _export_selected_fbx,
     _normalized_prototype_for_component,
     _ordered_cross_object_correspondence,
@@ -52,7 +53,6 @@ from cluster_assembly_builder import (  # noqa: E402
     _validate_capture_receipt,
     _validate_role_component_claims,
     _vertex_descriptors,
-    _weighted_vertex_attachment_tolerance,
     validate_binding_hierarchy,
     validate_generated_assembly_reference_pose_sync,
     validate_manifest_artifacts,
@@ -139,18 +139,48 @@ class GeneratedAssemblyReferencePoseSyncTests(unittest.TestCase):
             })
 
 
-class WeightedVertexAttachmentToleranceTests(unittest.TestCase):
-    def test_large_tree_allows_one_percent_local_weight_lookup(self):
-        self.assertAlmostEqual(
-            _weighted_vertex_attachment_tolerance([1.2, 14.92359162, 0.8]),
-            0.1492359162,
+class ExactSourceBoneInfluenceTests(unittest.TestCase):
+    def test_allows_unused_spm_bones_while_resolving_referenced_fbx_bone(self):
+        influences, source = _exact_source_bone_influences(
+            "Bone_2_Start",
+            {
+                "Bone_1_Start": object(),
+                "Bone_2_Start": object(),
+                "Bone_3_Start": object(),
+            },
+            "test variant",
         )
 
-    def test_small_asset_keeps_one_centimeter_floor(self):
         self.assertEqual(
-            _weighted_vertex_attachment_tolerance([0.2, 0.4, 0.1]),
-            0.01,
+            influences,
+            [{"bone": "Bone_2_Start", "weight": 1.0}],
         )
+        self.assertEqual(source["policy"], "exact_normalized_source_bone_v1")
+
+    def test_rejects_missing_fbx_bone_without_spatial_fallback(self):
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "source_bone is missing from final skeleton: Bone_9_Start",
+        ):
+            _exact_source_bone_influences(
+                "Bone_9_Start",
+                {
+                    "Bone_1_Start": object(),
+                    "Bone_2_Start": object(),
+                },
+                "test variant",
+            )
+
+    def test_rejects_missing_source_bone_identity(self):
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "has no exact source_bone identity",
+        ):
+            _exact_source_bone_influences(
+                "",
+                {"Bone_1_Start": object()},
+                "test variant",
+            )
 
 
 class BaseExportParentChainTests(unittest.TestCase):
