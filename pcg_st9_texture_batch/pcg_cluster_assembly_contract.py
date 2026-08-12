@@ -1871,10 +1871,16 @@ def _normalized_composite_parts(row, source_partition_mode):
             )
         index = int(raw.get("subpart_index") or 0)
         asset_name = str(raw.get("skeletal_asset_name") or "").strip()
+        source_bone = str(raw.get("source_bone") or "").strip()
         matrix = raw.get("subpart_to_card_matrix")
-        if index != expected_index or not asset_name.casefold().startswith("sk_"):
+        if (
+            index != expected_index
+            or not asset_name.casefold().startswith("sk_")
+            or not source_bone
+        ):
             raise ClusterAssemblyReceiptError(
-                "Normalized composite part indices/names must be consecutive SK assets"
+                "Normalized composite part indices/names/source_bones must be "
+                "consecutive exact SK contracts"
             )
         if (
             not isinstance(matrix, list)
@@ -1895,7 +1901,7 @@ def _normalized_composite_parts(row, source_partition_mode):
         checked.append({
             "subpart_index": index,
             "skeletal_asset_name": asset_name,
-            "source_bone": str(raw.get("source_bone") or ""),
+            "source_bone": source_bone,
             "endpoint_bone": str(raw.get("endpoint_bone") or ""),
             "subpart_to_card_matrix": normalized_matrix,
             "pivot_contract": str(
@@ -2018,6 +2024,12 @@ def _normalized_variant_contract(
         source_partition_mode = str(
             row.get("source_partition_mode") or ""
         ).strip() or None
+        source_bone = str(row.get("source_bone") or "").strip()
+        if source_partition_mode and not source_bone:
+            raise ClusterAssemblyReceiptError(
+                "Atlas normalized variant has no exact source_bone identity: "
+                + str(row.get("source_object") or "<unnamed>")
+            )
         composite_parts = _normalized_composite_parts(
             row,
             source_partition_mode,
@@ -2101,6 +2113,8 @@ def _normalized_variant_contract(
             "skeletal_asset_name": skeletal_asset_name,
             "source_prototype_index": source_prototype_index,
             "source_partition_mode": source_partition_mode,
+            "source_bone": source_bone,
+            "endpoint_bone": str(row.get("endpoint_bone") or "").strip(),
             "composite_parts": composite_parts,
             "target_mesh_id": mesh_id,
             "plan_fbx": plan_fbx,

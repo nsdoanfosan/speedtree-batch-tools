@@ -719,7 +719,14 @@ def _normalized_variants_ready(
                 for row in composite_parts
             ):
                 return False
+            if any(
+                not str(row.get("source_bone") or "").strip()
+                for row in composite_parts
+            ):
+                return False
         elif composite_parts:
+            return False
+        elif mode and not str(variant.get("source_bone") or "").strip():
             return False
     return True
 
