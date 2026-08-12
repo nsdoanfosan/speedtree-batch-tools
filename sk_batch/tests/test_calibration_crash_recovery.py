@@ -379,6 +379,103 @@ class CalibrationCrashRecoveryTests(unittest.TestCase):
         self.assertFalse(result["backup_available"])
         self.assertEqual(spm_audit.read_spm(self.spm), PROBE_XML)
 
+    def _write_cluster_normalization_receipt(
+        self,
+        *,
+        source_sha256=None,
+        canonical_spm=None,
+        status="ready",
+    ):
+        receipt = (
+            self.spm.parent
+            / "reports"
+            / f"{self.spm.stem}_cluster_normalization_sync_receipt.json"
+        )
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt.write_text(
+            json.dumps(
+                {
+                    "kind": "speedtree_cluster_sync_normalization",
+                    "version": 3,
+                    "status": status,
+                    "canonical_spm": str(canonical_spm or self.spm),
+                    "source_spm_sha256": source_sha256
+                    or hashlib.sha256(self.spm.read_bytes()).hexdigest(),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return receipt
+
+    def test_newer_cluster_receipt_supersedes_missing_backup_marker(self):
+        self._simulate_kill_during_calibration(backup=False)
+        before_bytes = self.spm.read_bytes()
+        marker = spm_audit.calibration_marker_path(self.spm)
+        marker_mtime_ns = marker.stat().st_mtime_ns
+        receipt = self._write_cluster_normalization_receipt()
+        os.utime(
+            receipt,
+            ns=(marker_mtime_ns + 2_000_000_000,) * 2,
+        )
+
+        result = spm_audit.recover_interrupted_calibration(self.spm)
+
+        self.assertFalse(result["recovered"])
+        self.assertTrue(result["cleared"])
+        self.assertEqual(
+            result["status"],
+            "superseded_by_cluster_normalization_receipt",
+        )
+        self.assertEqual(self.spm.read_bytes(), before_bytes)
+        self.assertFalse(marker.exists())
+        self.assertEqual(
+            result["superseding_receipt"]["source_spm_sha256"],
+            hashlib.sha256(before_bytes).hexdigest(),
+        )
+
+    def test_older_cluster_receipt_cannot_supersede_missing_backup_marker(self):
+        self._simulate_kill_during_calibration(backup=False)
+        marker = spm_audit.calibration_marker_path(self.spm)
+        marker_mtime_ns = marker.stat().st_mtime_ns
+        receipt = self._write_cluster_normalization_receipt()
+        os.utime(
+            receipt,
+            ns=(marker_mtime_ns - 2_000_000_000,) * 2,
+        )
+
+        result = spm_audit.recover_interrupted_calibration(self.spm)
+
+        self.assertFalse(result["recovered"])
+        self.assertFalse(result["cleared"])
+        self.assertEqual(
+            result["diagnostic"]["category"],
+            "calibration_backup_missing",
+        )
+        self.assertTrue(marker.exists())
+
+    def test_cluster_receipt_hash_mismatch_cannot_supersede_marker(self):
+        self._simulate_kill_during_calibration(backup=False)
+        marker = spm_audit.calibration_marker_path(self.spm)
+        marker_mtime_ns = marker.stat().st_mtime_ns
+        receipt = self._write_cluster_normalization_receipt(
+            source_sha256="0" * 64,
+        )
+        os.utime(
+            receipt,
+            ns=(marker_mtime_ns + 2_000_000_000,) * 2,
+        )
+
+        result = spm_audit.recover_interrupted_calibration(self.spm)
+
+        self.assertFalse(result["recovered"])
+        self.assertFalse(result["cleared"])
+        self.assertEqual(
+            result["diagnostic"]["category"],
+            "calibration_backup_missing",
+        )
+        self.assertTrue(marker.exists())
+
     def test_process_spm_repairs_before_reading_the_source(self):
         self._simulate_kill_during_calibration()
         seen = {}
