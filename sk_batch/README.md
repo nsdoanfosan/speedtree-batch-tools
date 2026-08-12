@@ -158,6 +158,15 @@ skin deformer를 완전히 생략한 경우에만, 실제 imported deform bone �
 `--factory-startup`으로 시작하고 BWR만 명시적으로 켜므로 사용자용 애드온의 시작
 오류와 등록 비용을 가져오지 않는다. SpeedTree가 만든 `.stmat`의 실제 Material
 목록은 Blender를 띄우기 전에 가벼운 SpeedTree FBX 사전 export로 먼저 검사한다.
+성공한 라이브 Repair 검사는 상태 파일에 `blend_resume_receipt`를 남긴다. 다음
+비강제 실행은 이 영수증이 묶은 SPM, blend, Repair 보고서, wind JSON, stmat,
+텍스처, 의존 SPM과 출력 설정이 모두 같을 때 완료 행을 worker/progress 대기열에
+넣기 전에 제외한다. 핵심 SPM/blend/report/wind/stmat은 bounded content key까지
+확인하고, 보고서가 열거한 나머지 계약 파일은 파일 ID·크기·mtime·ctime을 묶는다.
+중단 후 다시 실행하면
+미완료·실패·변경된 행만 남으며, 영수증이 없거나 하나라도 달라지면 기존의 엄격한
+라이브 검증 경로로 돌아간다. 기존 상태 파일은 첫 라이브 상태 감사에서 현재 행의
+영수증을 자동 생성한다.
 이 검사를 통과한 항목만 무거운 Blender Repair로 넘어간다. 실제 생성 Node가 쓰는
 재질이 FBX에서 빠졌다면 정확한 Generator 이름/GUID를 보고하고 차단하되 SPM은
 수정하지 않는다.
