@@ -1148,6 +1148,240 @@ def cluster_live_audit_target_block(contract, target_spm):
     return None, None
 
 
+_NORMALIZED_PROVIDER_REFRESH_CODES = frozenset({
+    "NORMALIZED_VARIANTS_REQUIRED",
+})
+
+
+def _cluster_provider_relation_evidence(
+    dependency,
+    target_spm,
+    *,
+    snapshot_cache,
+):
+    """Seal one live provider/target relation for exact repair.
+
+    An external Atlas registry is normally the ON selector.  The Assembly
+    audit can also discover a provider that is already rendered by the exact
+    Tree even while that derived registry row is OFF.  In that case the live
+    SPM and Full FBX pairs are stronger positive placement evidence.  Seal all
+    files that established that result so a queued repair may add only this
+    exact relation, and only while the evidence remains unchanged.
+    """
+
+    target = Path(target_spm).resolve(strict=False)
+    target_key = normalized_folder_key(target)
+    relation = dependency.get("target_relation") or {}
+    status = str(relation.get("status") or "")
+    matched_targets = {
+        normalized_folder_key(value)
+        for value in relation.get("matched_target_spms") or ()
+        if value
+    }
+    explicitly_on = bool(
+        status == "explicit_on"
+        and relation.get("allowed") is True
+        and target_key in matched_targets
+    )
+
+    target_rows = [
+        row for row in dependency.get("targets") or ()
+        if (
+            isinstance(row, dict)
+            and row.get("spm")
+            and normalized_folder_key(row["spm"]) == target_key
+        )
+    ]
+    if len(target_rows) != 1:
+        return None
+    target_row = target_rows[0]
+    spm_pair = target_row.get("spm_material_mesh_pair") or {}
+    fbx_pair = target_row.get("fbx_material_mesh_pair") or {}
+    explicitly_off_but_rendered = bool(
+        status == "explicit_off"
+        and relation.get("allowed") is False
+        and dependency.get("current_live_pair_covered") is True
+        and spm_pair.get("status") == "complete_pair"
+        and fbx_pair.get("status") == "complete_pair"
+        and fbx_pair.get("decision") == "normalize_part"
+    )
+    if not (explicitly_on or explicitly_off_but_rendered):
+        return None
+
+    provider_value = next(
+        (
+            dependency.get(field)
+            for field in ("spm", "output_spm", "authoring_spm", "source_spm")
+            if dependency.get(field)
+        ),
+        None,
+    )
+    if not provider_value:
+        return None
+    provider = Path(provider_value).resolve(strict=False)
+    blend = Path(
+        relation.get("source_blend") or provider.with_suffix(".blend")
+    ).resolve(strict=False)
+    if (
+        not target.is_file()
+        or not provider.is_file()
+        or not blend.is_file()
+        or blend != provider.with_suffix(".blend")
+        or provider.parent.name.casefold() != "cluster"
+        or target.parent != provider.parent.parent
+    ):
+        return None
+
+    fbx_record = copy.deepcopy(
+        ((target_row.get("export_bundle") or {}).get("fbx") or {})
+    )
+    fbx_path = Path(fbx_record.get("path") or "").resolve(strict=False)
+    if (
+        not fbx_path.is_file()
+        or not (
+            fbx_record.get("sha256")
+            or fbx_record.get("fingerprint")
+        )
+    ):
+        return None
+    registry_record = copy.deepcopy(relation.get("registry") or {})
+    registry_path = Path(
+        registry_record.get("path") or blend.with_suffix(
+            ".atlas_leaf_targets.json"
+        )
+    ).resolve(strict=False)
+    if (
+        not registry_path.is_file()
+        or not (
+            registry_record.get("sha256")
+            or registry_record.get("fingerprint")
+        )
+    ):
+        return None
+
+    def exact_snapshot(path):
+        key = ("exact", normalized_folder_key(path))
+        if key not in snapshot_cache:
+            snapshot_cache[key] = {
+                "path": str(path),
+                "fingerprint_algorithm": "blake2b-128-full-v1",
+                **file_content_snapshot(path),
+            }
+        return copy.deepcopy(snapshot_cache[key])
+
+    def sampled_snapshot(path):
+        key = ("sampled", normalized_folder_key(path))
+        if key not in snapshot_cache:
+            snapshot_cache[key] = {
+                "path": str(path),
+                **sampled_file_content_snapshot(path),
+            }
+        return copy.deepcopy(snapshot_cache[key])
+
+    return {
+        "schema_version": 1,
+        "target_spm": str(target),
+        "provider_spm": str(provider),
+        "provider_blend": str(blend),
+        "relation_status": status,
+        "relation_allowed": relation.get("allowed"),
+        "live_pair_proof": {
+            "current_live_pair_covered": bool(
+                dependency.get("current_live_pair_covered")
+            ),
+            "spm_pair_status": str(spm_pair.get("status") or ""),
+            "fbx_pair_status": str(fbx_pair.get("status") or ""),
+            "fbx_pair_decision": str(fbx_pair.get("decision") or ""),
+        },
+        "artifacts": {
+            "target_spm": exact_snapshot(target),
+            "provider_spm": exact_snapshot(provider),
+            "provider_blend": sampled_snapshot(blend),
+            "target_fbx": fbx_record,
+            "target_registry": {
+                **registry_record,
+                "path": str(registry_path),
+            },
+        },
+    }
+
+
+def cluster_live_audit_provider_refresh_block(contract, target_spm, issues):
+    """Admit exact live-provider receipt refreshes from an owner audit.
+
+    Missing normalized metadata has no ``delivery_blocked_targets`` payload, so
+    the ordinary target-delivery admission cannot see it.  An explicit ON row
+    is safe to refresh.  An explicit OFF row is also repairable only when the
+    same live audit proves a complete exact SPM pair and Full-FBX pair; the
+    returned sealed relation lets the executor restore that derived registry
+    row without widening to any sibling target or provider.
+    """
+
+    target = Path(target_spm).resolve(strict=False)
+    provider_paths = {}
+    provider_relations = {}
+    issue_codes = set()
+    snapshot_cache = {}
+    issue_rows = [row for row in issues or () if isinstance(row, dict)]
+    if not issue_rows:
+        return None, None
+
+    for issue in issue_rows:
+        code = str(issue.get("code") or "").strip().upper()
+        if code not in _NORMALIZED_PROVIDER_REFRESH_CODES:
+            return None, None
+        issue_spm = issue.get("spm")
+        dependency = (
+            cluster_contract_dependency_for_spm(contract, issue_spm)
+            if issue_spm
+            else None
+        )
+        if not isinstance(dependency, dict):
+            return None, None
+        try:
+            relation_evidence = _cluster_provider_relation_evidence(
+                dependency,
+                target,
+                snapshot_cache=snapshot_cache,
+            )
+        except (OSError, RuntimeError, ValueError):
+            return None, None
+        if relation_evidence is None:
+            return None, None
+        producer = relation_evidence["provider_spm"]
+        provider_key = normalized_folder_key(producer)
+        provider_paths.setdefault(provider_key, str(producer))
+        provider_relations.setdefault(
+            provider_key,
+            relation_evidence,
+        )
+        issue_codes.add(code)
+
+    ordered_providers = [
+        provider_paths[key] for key in sorted(provider_paths)
+    ]
+    if not ordered_providers:
+        return None, None
+    reason_token = "normalized_variants_required"
+    return Path(ordered_providers[0]), {
+        "reason_token": reason_token,
+        "target_spm": str(target),
+        "target_name": target.name,
+        "delivery_mode": "exact_on_provider_receipt_refresh",
+        "delivery_errors": sorted(issue_codes),
+        "delivery_remedy": (
+            "Refresh the exact registered Cluster relationship and re-audit "
+            "the owner Tree"
+        ),
+        "stale_node_table_target_mesh_ids": [],
+        "live_node_table": {},
+        "provider_spms": ordered_providers,
+        "cluster_provider_relations": [
+            provider_relations[key] for key in sorted(provider_relations)
+        ],
+    }
+
+
 def cluster_contract_issues(contract):
     """Return one stable issue list from the selected owner handoff."""
     handoff = (contract or {}).get("handoff") or {}
@@ -5846,12 +6080,22 @@ class App:
                 artifact.get("report") or ""
             )
         if stage_name in {"generator_sync_and_cluster", "cluster_refresh"}:
-            providers = [
-                Path(path)
-                for path in stage.get("target_spms") or ()
-                if os.path.normcase(os.path.abspath(str(path))).casefold()
-                != os.path.normcase(os.path.abspath(str(exact_spm))).casefold()
-            ]
+            sealed_relations = stage.get("cluster_provider_relations") or ()
+            if sealed_relations:
+                providers = [
+                    Path(row["provider_spm"])
+                    for row in sealed_relations
+                    if isinstance(row, dict) and row.get("provider_spm")
+                ]
+            else:
+                providers = [
+                    Path(path)
+                    for path in stage.get("target_spms") or ()
+                    if os.path.normcase(os.path.abspath(str(path))).casefold()
+                    != os.path.normcase(
+                        os.path.abspath(str(exact_spm))
+                    ).casefold()
+                ]
             observations = []
             for provider in providers:
                 observations.append(
@@ -6003,6 +6247,10 @@ class App:
         if stage.get("repair_action") == ATLAS_PRODUCER_REFRESH:
             provenance["producer_relation"] = copy.deepcopy(
                 stage.get("producer_relation")
+            )
+        if stage.get("cluster_provider_relations"):
+            provenance["cluster_provider_relations"] = copy.deepcopy(
+                stage["cluster_provider_relations"]
             )
         request = build_exact_target_request(
             tool=tool,
@@ -13458,6 +13706,14 @@ class App:
                 selected if isinstance(selected, dict) else {},
                 spm,
             )
+            if not audit_block:
+                audit_producer, audit_block = (
+                    cluster_live_audit_provider_refresh_block(
+                        selected if isinstance(selected, dict) else {},
+                        spm,
+                        live_issues,
+                    )
+                )
             if (
                 audit_block
                 and audit_producer is not None
@@ -13480,6 +13736,12 @@ class App:
                         if isinstance(issue, dict) and issue.get("code")
                     }),
                     "issues": copy.deepcopy(live_issues),
+                    "provider_spms": copy.deepcopy(
+                        audit_block.get("provider_spms") or []
+                    ),
+                    "cluster_provider_relations": copy.deepcopy(
+                        audit_block.get("cluster_provider_relations") or []
+                    ),
                     "gate": "cluster_assembly_live_audit",
                 }
                 raise TargetPlannedExclusionError(
@@ -13923,6 +14185,11 @@ class App:
 
         add_inventory(target)
         add_inventory(producer)
+        for relation in (
+            durable_evidence.get("cluster_provider_relations") or ()
+        ):
+            if isinstance(relation, dict):
+                add_inventory(relation.get("provider_spm"))
         for source_name in ("_active_batch_inventory", "items"):
             source = getattr(self, source_name, None)
             if not isinstance(source, dict):

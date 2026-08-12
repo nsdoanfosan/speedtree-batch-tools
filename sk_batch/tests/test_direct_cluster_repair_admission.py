@@ -10,8 +10,11 @@ These assertions pin the admission rule (the registry decides, not a per-gate
 allowlist), the isolation rule that must survive it (#16), and the display
 invariant that the label is a promise.
 """
+import hashlib
+import json
 import queue
 import sys
+import tempfile
 import threading
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -204,7 +207,7 @@ class DirectClusterRepairAdmissionTests(AppHarness, unittest.TestCase):
 
 
 class LiveAuditGateAdmissionTests(AppHarness, unittest.TestCase):
-    def evaluate(self, app, contract, issues):
+    def evaluate(self, app, contract, issues, *, target=TARGET):
         raw_audit = {
             "selected_contract": contract,
             "audit_report": Path("live_audit.json"),
@@ -214,7 +217,74 @@ class LiveAuditGateAdmissionTests(AppHarness, unittest.TestCase):
                 }],
             },
         }
-        return app._evaluate_cluster_receipt_live_audit(TARGET, raw_audit)
+        return app._evaluate_cluster_receipt_live_audit(target, raw_audit)
+
+    def normalized_contract(self, gui, root, *, rendered=True, count=1):
+        owner = Path(root) / "tree"
+        cluster = owner / "cluster"
+        fbx_dir = owner / "fbx"
+        cluster.mkdir(parents=True)
+        fbx_dir.mkdir()
+        target = owner / "SK_tree.spm"
+        target.write_bytes(b"target-spm")
+        fbx = fbx_dir / "SK_tree.fbx"
+        fbx.write_bytes(b"current-full-fbx")
+        dependencies = []
+        issues = []
+        for index in range(1, count + 1):
+            provider = cluster / f"SK_cluster_{index:02d}.spm"
+            blend = provider.with_suffix(".blend")
+            registry = blend.with_suffix(".atlas_leaf_targets.json")
+            provider.write_bytes(f"provider-{index}".encode())
+            blend.write_bytes(f"blend-{index}".encode())
+            registry.write_text(
+                json.dumps({"target_spms": []}),
+                encoding="utf-8",
+            )
+            registry_bytes = registry.read_bytes()
+            dependencies.append({
+                "spm": str(provider),
+                "output_spm": str(provider),
+                "current_live_pair_covered": rendered,
+                "targets": [{
+                    "spm": str(target),
+                    "spm_material_mesh_pair": {
+                        "status": "complete_pair" if rendered else "missing",
+                    },
+                    "fbx_material_mesh_pair": {
+                        "status": "complete_pair" if rendered else "missing",
+                        "decision": (
+                            "normalize_part" if rendered else "blocked"
+                        ),
+                    },
+                    "export_bundle": {
+                        "fbx": {
+                            "path": str(fbx),
+                            **gui.sampled_file_content_snapshot(fbx),
+                        },
+                    },
+                }],
+                "target_relation": {
+                    "status": "explicit_off",
+                    "allowed": False,
+                    "source_blend": str(blend),
+                    "registry": {
+                        "path": str(registry),
+                        "sha256": hashlib.sha256(
+                            registry_bytes
+                        ).hexdigest(),
+                        "size": len(registry_bytes),
+                    },
+                    "registered_target_spms": [],
+                    "matched_target_spms": [],
+                },
+            })
+            issues.append({
+                "code": "NORMALIZED_VARIANTS_REQUIRED",
+                "role": "cluster",
+                "spm": str(provider),
+            })
+        return target, {"dependencies": dependencies}, issues
 
     def test_live_audit_gate_admits_a_registered_target_block(self):
         gui = load_gui_module()
@@ -265,6 +335,67 @@ class LiveAuditGateAdmissionTests(AppHarness, unittest.TestCase):
             gui.TargetPlannedExclusionError,
         )
         self.assertNotIn("자동 복구 대상", str(caught.exception))
+
+
+    def test_missing_variants_restore_only_rendered_explicit_off_relations(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as folder:
+            target, contract, issues = self.normalized_contract(
+                gui,
+                folder,
+                rendered=True,
+                count=2,
+            )
+
+            with self.assertRaises(
+                gui.TargetPlannedExclusionError
+            ) as caught:
+                self.evaluate(
+                    app,
+                    contract,
+                    issues,
+                    target=target,
+                )
+
+        exclusion = caught.exception
+        relations = exclusion.evidence["cluster_provider_relations"]
+        self.assertEqual(len(relations), 2)
+        self.assertEqual(
+            {row["relation_status"] for row in relations},
+            {"explicit_off"},
+        )
+        self.assertTrue(all(
+            row["live_pair_proof"]["current_live_pair_covered"]
+            for row in relations
+        ))
+        self.assertEqual(
+            exclusion.reason_token,
+            "normalized_variants_required",
+        )
+
+    def test_explicit_off_without_live_pair_proof_remains_terminal(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as folder:
+            target, contract, issues = self.normalized_contract(
+                gui,
+                folder,
+                rendered=False,
+            )
+
+            with self.assertRaises(gui.BatchItemError) as caught:
+                self.evaluate(
+                    app,
+                    contract,
+                    issues,
+                    target=target,
+                )
+
+        self.assertNotIsInstance(
+            caught.exception,
+            gui.TargetPlannedExclusionError,
+        )
 
 
 class DirectRunRecoveryTests(AppHarness, unittest.TestCase):

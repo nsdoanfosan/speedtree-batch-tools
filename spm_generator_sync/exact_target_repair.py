@@ -29,6 +29,11 @@ from atlas_slot_ownership import (
     plan_atlas_slot_ownership_reconciliation,
     validate_atlas_slot_ownership_plan,
 )
+from artifact_content_key import (
+    LEGACY_FINGERPRINT_ALGORITHM,
+    SHA256_ALGORITHM,
+    file_content_key_snapshot,
+)
 from repair_orchestration import (
     ATLAS_SLOT_OWNERSHIP_RECONCILE,
     CLUSTER_REFRESH,
@@ -63,7 +68,142 @@ def _key(value) -> str:
     return os.path.normcase(os.path.abspath(str(value))).casefold()
 
 
-def exact_runtime_scope(target_spms, *, config=None):
+def _validate_sealed_artifact(record, expected_path):
+    if not isinstance(record, Mapping):
+        raise ValueError("sealed Cluster relation artifact is missing")
+    path = Path(record.get("path") or "").expanduser().absolute()
+    expected = Path(expected_path).expanduser().absolute()
+    if _key(path) != _key(expected) or not path.is_file():
+        raise ValueError(f"sealed Cluster relation artifact changed: {expected}")
+    if record.get("sha256"):
+        algorithm = SHA256_ALGORITHM
+        expected_digest = str(record["sha256"]).casefold()
+    elif record.get("fingerprint"):
+        algorithm = str(
+            record.get("fingerprint_algorithm")
+            or LEGACY_FINGERPRINT_ALGORITHM
+        )
+        expected_digest = str(record["fingerprint"]).casefold()
+    else:
+        raise ValueError("sealed Cluster relation artifact has no content key")
+    current = file_content_key_snapshot(path, algorithm)
+    if str(current["digest"]).casefold() != expected_digest:
+        raise ValueError(f"sealed Cluster relation artifact changed: {path}")
+    return path
+
+
+def _sealed_cluster_relation_rows(
+    scope,
+    requested,
+    board_root,
+    relations,
+):
+    """Validate live-pair seals and return only their exact Cluster rows."""
+
+    supplied = list(relations or ())
+    if not supplied:
+        return []
+    requested_keys = {_key(path) for path in requested}
+    existing_by_blend = {
+        _key(row["blend"]): row
+        for row in scope.get("cluster_rows") or ()
+        if isinstance(row, Mapping) and row.get("blend")
+    }
+    rows = {}
+    for relation in supplied:
+        if not isinstance(relation, Mapping) or relation.get(
+            "schema_version"
+        ) != 1:
+            raise ValueError("sealed Cluster provider relation is malformed")
+        target = Path(relation.get("target_spm") or "").expanduser().absolute()
+        provider = Path(
+            relation.get("provider_spm") or ""
+        ).expanduser().absolute()
+        blend = Path(
+            relation.get("provider_blend") or ""
+        ).expanduser().absolute()
+        if (
+            _key(target) not in requested_keys
+            or target.suffix.casefold() != ".spm"
+            or provider.suffix.casefold() != ".spm"
+            or blend.suffix.casefold() != ".blend"
+            or _key(blend) != _key(provider.with_suffix(".blend"))
+            or provider.parent.name.casefold() != "cluster"
+            or _key(target.parent) != _key(provider.parent.parent)
+        ):
+            raise ValueError("sealed Cluster provider relation widened scope")
+        for path in (target, provider, blend):
+            try:
+                path.relative_to(board_root)
+            except ValueError as exc:
+                raise ValueError(
+                    "sealed Cluster provider is outside configured inventory"
+                ) from exc
+
+        status = str(relation.get("relation_status") or "")
+        proof = relation.get("live_pair_proof") or {}
+        if status == "explicit_on":
+            if relation.get("relation_allowed") is not True:
+                raise ValueError("sealed ON Cluster relation lost authority")
+        elif status == "explicit_off":
+            if not (
+                relation.get("relation_allowed") is False
+                and proof.get("current_live_pair_covered") is True
+                and proof.get("spm_pair_status") == "complete_pair"
+                and proof.get("fbx_pair_status") == "complete_pair"
+                and proof.get("fbx_pair_decision") == "normalize_part"
+            ):
+                raise ValueError(
+                    "OFF Cluster relation has no exact live-pair proof"
+                )
+        else:
+            raise ValueError("sealed Cluster relation status is unsupported")
+
+        artifacts = relation.get("artifacts") or {}
+        _validate_sealed_artifact(artifacts.get("target_spm"), target)
+        _validate_sealed_artifact(artifacts.get("provider_spm"), provider)
+        _validate_sealed_artifact(artifacts.get("provider_blend"), blend)
+        expected_fbx = target.parent / "fbx" / f"{target.stem}.fbx"
+        _validate_sealed_artifact(artifacts.get("target_fbx"), expected_fbx)
+        registry = blend.with_suffix(".atlas_leaf_targets.json")
+        _validate_sealed_artifact(
+            artifacts.get("target_registry"),
+            registry,
+        )
+
+        existing = existing_by_blend.get(_key(blend))
+        if status == "explicit_on":
+            if existing is None or _key(target) not in {
+                _key(path) for path in existing.get("on_target_spms") or ()
+            }:
+                raise ValueError("sealed ON Cluster relation is no longer ON")
+            row = copy.deepcopy(existing)
+        else:
+            row = {
+                "kind": "cluster_relation",
+                "blend": blend,
+                "source_spm": provider,
+                "canonical_spm": provider,
+                "registry_path": registry,
+                "refresh_reasons": ["normalized_variants_required"],
+                "refresh_reason_categories": ["derived_relation_registry"],
+            }
+        row["blend"] = blend
+        row["on_target_spms"] = [target]
+        row["target_spms"] = [target]
+        relation_key = (_key(blend), _key(target))
+        if relation_key in rows and rows[relation_key] != row:
+            raise ValueError("conflicting sealed Cluster provider relations")
+        rows[relation_key] = row
+    return [rows[key] for key in sorted(rows)]
+
+
+def exact_runtime_scope(
+    target_spms,
+    *,
+    config=None,
+    cluster_provider_relations=(),
+):
     """Read the current board and retain only exact matching unit selectors."""
 
     module = _load_gui_module()
@@ -84,12 +224,25 @@ def exact_runtime_scope(target_spms, *, config=None):
         verify_physical=False,
     )
     scope = module.App._connected_scope_from_board(board)
+    sealed_cluster_rows = _sealed_cluster_relation_rows(
+        scope,
+        requested,
+        board_root,
+        cluster_provider_relations,
+    )
     inventory = []
+    for sealed_row in sealed_cluster_rows:
+        inventory.extend(sealed_row.get("on_target_spms") or ())
+        for key in ("source_spm", "canonical_spm"):
+            if sealed_row.get(key):
+                inventory.append(Path(sealed_row[key]))
     groups = []
     requested_keys = {_key(path) for path in requested}
     requested_cluster_keys = {
         _key(path)
-        for raw_row in scope["cluster_rows"]
+        for raw_row in (
+            sealed_cluster_rows or scope["cluster_rows"]
+        )
         for path in raw_row.get("on_target_spms") or ()
         if _key(path) in requested_keys
     }
@@ -121,7 +274,7 @@ def exact_runtime_scope(target_spms, *, config=None):
             )
 
     cluster_rows = []
-    for raw_row in scope["cluster_rows"]:
+    for raw_row in (sealed_cluster_rows or scope["cluster_rows"]):
         all_targets = [Path(path) for path in raw_row.get("on_target_spms") or ()]
         inventory.extend(all_targets)
         exact_targets = [path for path in all_targets if _key(path) in requested_keys]
@@ -138,7 +291,13 @@ def exact_runtime_scope(target_spms, *, config=None):
 
 def build_exact_runtime_plan(request: Mapping):
     module, cfg, board_root, groups, cluster_rows, canonical = exact_runtime_scope(
-        request["target_spms"]
+        request["target_spms"],
+        cluster_provider_relations=(
+            (request.get("provenance") or {}).get(
+                "cluster_provider_relations"
+            )
+            or ()
+        ),
     )
     action = request["repair_action"]
     if action == GENERATOR_SYNC:
