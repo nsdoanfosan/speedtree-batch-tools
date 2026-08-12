@@ -104,6 +104,7 @@ def addon_identity(name, runtime_row):
         sealed = dict(entry)
         if entry["kind"] in {"file", "symlink"} and path.is_file():
             sealed.update(stable_file_hash(path))
+        sealed.pop("mtime_ns", None)
         manifest.append(sealed)
     after = inventory(base)
     stable = before == after

@@ -796,6 +796,10 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         INFORMATIONAL, "sk_batch/cluster_assembly_handoff_contract.py",
         "cluster_handoff_diagnostic",
     ),
+    "cluster_role_not_assembled": ReasonRow(
+        INFORMATIONAL, "sk_batch/cluster_assembly_handoff_contract.py",
+        "cluster_handoff_diagnostic",
+    ),
     "cluster_refresh_orchestration_diagnostic": ReasonRow(
         INFORMATIONAL, "sk_batch/sk_batch_gui.pyw",
         "relation_decision_diagnostic",
@@ -850,6 +854,10 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         INFORMATIONAL, "sk_batch/atlas_consumer_integrity.py",
         "current_authority_variant",
     ),
+    "current_receipt_changed_to_pass_through": ReasonRow(
+        INFORMATIONAL, "sk_batch/cluster_assembly_builder.py",
+        "cluster_handoff_diagnostic",
+    ),
     "dependency_root_reason_missing": ReasonRow(
         UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "dependency_provenance",
     ),
@@ -883,6 +891,11 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     ),
     "explicit_target_relation_off": ReasonRow(
         UNCLASSIFIED, "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py", "",
+    ),
+    "explicit_target_relation_off_diagnostic_only": ReasonRow(
+        INFORMATIONAL,
+        "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
+        "relation_decision_diagnostic",
     ),
     "exact_relation_repair_failed": ReasonRow(
         UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "repair_execution",

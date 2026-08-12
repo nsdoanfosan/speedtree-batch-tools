@@ -685,13 +685,12 @@ def _cluster_pair_row(cluster):
 
 
 def _cluster_target_relation(pair_row, target_spms):
-    """Resolve whether one physical Cluster provider is ON for this target.
+    """Record whether one physical Cluster provider is registered for a target.
 
-    Material/mesh names prove that a rendered role exists, but they do not
-    prove that a same-folder Cluster blend owns that role.  When an Atlas
-    target registry exists it is the authoritative ON/OFF relation.  Providers
-    without a registry retain the legacy content-driven behavior so older
-    projects are not silently disconnected.
+    The registry is durable delivery provenance, not rendered-geometry
+    authority.  A stale OFF row cannot erase provider material faces present
+    in the current Full FBX; the later actual-FBX inventory and normalized
+    topology match own that decision.
     """
     source_blend = Path(pair_row["output_spm"]).with_suffix(".blend").absolute()
     try:
@@ -1519,6 +1518,7 @@ def _physical_source_3d_artifacts(
     spm_semantic_reader=None,
     validation_cache=None,
     allow_source_fbx_drift=False,
+    allow_source_spm_drift=False,
 ):
     """Validate the exact SPM/FBX inputs shared by every physical variant."""
     artifacts = None
@@ -1537,6 +1537,7 @@ def _physical_source_3d_artifacts(
         {
             "source_contracts": source_contracts,
             "allow_source_fbx_drift": bool(allow_source_fbx_drift),
+            "allow_source_spm_drift": bool(allow_source_spm_drift),
         },
         sort_keys=True,
         ensure_ascii=False,
@@ -1554,6 +1555,7 @@ def _physical_source_3d_artifacts(
                     spm_semantic_reader=spm_semantic_reader,
                     validation_cache=None,
                     allow_source_fbx_drift=allow_source_fbx_drift,
+                    allow_source_spm_drift=allow_source_spm_drift,
                 ),
             ))
         except ValueError as exc:
@@ -1655,7 +1657,10 @@ def _physical_source_3d_artifacts(
                             "projection is unsupported: "
                             + path
                         )
-                    if current_semantic.casefold() != recorded_semantic:
+                    if (
+                        current_semantic.casefold() != recorded_semantic
+                        and not allow_source_spm_drift
+                    ):
                         raise ClusterAssemblyReceiptStaleError(
                             "Atlas physical source SPM structural semantics "
                             "are stale: "
@@ -1668,7 +1673,7 @@ def _physical_source_3d_artifacts(
                             recorded_hash,
                         )
                     )
-                    if migration is None:
+                    if migration is None and not allow_source_spm_drift:
                         raise ClusterAssemblyReceiptStaleError(
                             "Atlas physical source SPM legacy raw hash drift "
                             "has no exact texture-normalize provenance: "
@@ -1690,6 +1695,13 @@ def _physical_source_3d_artifacts(
                     == "legacy_texture_normalize_migrated"
                 ):
                     source_record["legacy_semantic_migration"] = migration
+                if (
+                    source_record["raw_sha256_drift"]
+                    and allow_source_spm_drift
+                ):
+                    source_record["validation"] = (
+                        "deferred_to_exact_target_geometry_correspondence"
+                    )
                 current[artifact] = source_record
                 identity_rows.append(
                     (
@@ -1744,6 +1756,7 @@ def _physical_normalization_receipt(
     validation_cache=None,
     spm_semantic_reader=None,
     allow_source_fbx_drift=False,
+    allow_source_spm_drift=False,
 ):
     receipt = (payload or {}).get("normalized_prototype_receipt")
     if receipt is None:
@@ -1775,6 +1788,7 @@ def _physical_normalization_receipt(
                 "receipt": receipt,
                 "unit_probe_contract": unit_probe,
                 "allow_source_fbx_drift": bool(allow_source_fbx_drift),
+                "allow_source_spm_drift": bool(allow_source_spm_drift),
             },
             sort_keys=True,
             ensure_ascii=False,
@@ -1793,6 +1807,7 @@ def _physical_normalization_receipt(
                         validation_cache=None,
                         spm_semantic_reader=spm_semantic_reader,
                         allow_source_fbx_drift=allow_source_fbx_drift,
+                        allow_source_spm_drift=allow_source_spm_drift,
                     ),
                 ))
             except ValueError as exc:
@@ -1829,6 +1844,7 @@ def _physical_normalization_receipt(
         spm_semantic_reader=spm_semantic_reader,
         validation_cache=validation_cache,
         allow_source_fbx_drift=allow_source_fbx_drift,
+        allow_source_spm_drift=allow_source_spm_drift,
     )
     if (
         not isinstance(unit_probe, dict)
@@ -1979,6 +1995,7 @@ def _normalized_variant_contract(
     physical_receipt_cache=None,
     spm_semantic_reader=None,
     allow_source_fbx_drift=False,
+    allow_source_spm_drift=False,
 ):
     try:
         physical = _physical_normalization_receipt(
@@ -1986,6 +2003,7 @@ def _normalized_variant_contract(
             validation_cache=physical_receipt_cache,
             spm_semantic_reader=spm_semantic_reader,
             allow_source_fbx_drift=allow_source_fbx_drift,
+            allow_source_spm_drift=allow_source_spm_drift,
         )
     except ClusterAssemblyReceiptError as exc:
         raise type(exc)(f"{exc}: {manifest_path}") from exc
@@ -2197,6 +2215,16 @@ def _normalized_variant_contract(
         result["unit_probe_contract"] = physical["unit_probe_contract"]
         result["source_3d_artifacts"] = physical["source_3d_artifacts"]
         source_fbx = physical["source_3d_artifacts"].get("source_fbx") or {}
+        source_spm = physical["source_3d_artifacts"].get("source_spm") or {}
+        if source_spm.get("raw_sha256_drift"):
+            result["source_spm_drift_validation"] = {
+                "status": "deferred",
+                "policy": (
+                    "exact_target_geometry_correspondence_required_before_"
+                    "assembly_emit"
+                ),
+                "source_spm": copy.deepcopy(source_spm),
+            }
         if source_fbx.get("raw_sha256_drift"):
             result["source_fbx_drift_validation"] = {
                 "status": "deferred",
@@ -3405,6 +3433,22 @@ def _aggregate_target_deliveries(rows):
     return DELIVERY_MODE_ASSET_REGISTRATION_ONLY
 
 
+def _rendered_provider_material_names(audit, spm_path):
+    """Return provider names that own current rendered mesh geometry.
+
+    ``visible_material_names`` can omit a material that has no texture image
+    reference even when its live SPM Material owns CutoutMesh IDs.  Assembly
+    dependency discovery must include both forms of positive evidence or a
+    valid side/secondary provider disappears before role reconciliation.
+    """
+    names = list(audit.visible_material_names(spm_path) or [])
+    for row in audit.extract_material_image_refs(spm_path) or []:
+        name = str(row.get("material_name") or "").strip()
+        if name and list(row.get("cutout_mesh_ids") or []):
+            names.append(name)
+    return list(dict.fromkeys(names))
+
+
 def _physical_target_registry_contract(source_blend):
     """Return the explicit ON-target contract for one physical source blend."""
     blend = Path(source_blend).expanduser().absolute()
@@ -3464,8 +3508,14 @@ def _atlas_normalized_variants(
     audit=None,
     physical_receipt_cache=None,
     atlas_resolution_reader=None,
+    full_fbx_role_present=False,
 ):
-    """Read one current role contract from stable Atlas target/scope receipts."""
+    """Read provider normalization without making its registry geometry authority.
+
+    A target registry is a child delivery record.  When the latest Full FBX
+    already proves that this role rendered, an older missing/OFF registry row
+    must not hide the provider's otherwise-current normalized prototypes.
+    """
     allowed_spms = {
         Path(path).resolve(strict=False): Path(path) for path in target_spms or []
     }
@@ -3617,6 +3667,7 @@ def _atlas_normalized_variants(
                     None,
                 ),
                 allow_source_fbx_drift=True,
+                allow_source_spm_drift=full_fbx_role_present,
             )
         except ClusterAssemblyReceiptStaleError:
             # A normalized receipt is a cache of a previously validated
@@ -3632,8 +3683,14 @@ def _atlas_normalized_variants(
             )
             manifest_key = _normalized_identity_path(manifest_spm)
             if manifest_key not in target_registry["target_keys"]:
-                stale.append(str(manifest_path))
-                continue
+                if not full_fbx_role_present:
+                    stale.append(str(manifest_path))
+                    continue
+                contract["target_registry_diagnostic"] = {
+                    "status": "stale_or_missing_for_rendered_full_fbx_role",
+                    "manifest_spm": str(manifest_spm),
+                    "policy": "latest_full_fbx_geometry_authoritative_v1",
+                }
             contract["target_registry"] = target_registry["fingerprint"]
             contract["registered_target_spms"] = [
                 str(path) for path in target_registry["target_spms"]
@@ -3685,19 +3742,28 @@ def _atlas_normalized_variants(
             sort_keys=True,
             separators=(",", ":"),
         )
-        candidates.append(
-            (
-                str(manifest_path),
-                identity,
-                contract,
-            )
-        )
+        candidates.append((
+            str(manifest_path),
+            identity,
+            contract,
+            manifest_spm in allowed_spms,
+            _normalized_identity_path(manifest_spm),
+        ))
+    # Prefer receipts attached to the targets explicitly requested by this
+    # contract build.  Registered siblings are searched only as a fallback
+    # source of the shared provider plans.  Otherwise one old sibling receipt
+    # can conflict with several mutually consistent current targets and make
+    # the provider vanish from every Assembly role.
+    requested_candidates = [row for row in candidates if row[3]]
+    candidate_pool = requested_candidates or candidates
     distinct = {}
     for (
         _manifest,
         identity,
         contract,
-    ) in sorted(candidates):
+        _requested,
+        _target_key,
+    ) in sorted(candidate_pool):
         selected = distinct.setdefault(
             identity,
             {
@@ -3712,6 +3778,28 @@ def _atlas_normalized_variants(
     if distinct:
         selected = next(iter(distinct.values()))
         contract = selected["contract"]
+        selected_identity = next(iter(distinct))
+        target_contracts = {}
+        for (
+            _manifest,
+            identity,
+            candidate_contract,
+            _requested,
+            target_key,
+        ) in sorted(candidate_pool):
+            if identity == selected_identity:
+                target_contracts.setdefault(
+                    target_key,
+                    candidate_contract,
+                )
+        contract["normalization_receipt_selection"] = {
+            "policy": "requested_targets_before_registered_siblings_v1",
+            "requested_candidate_count": len(requested_candidates),
+            "registered_candidate_count": len(candidates),
+            "ignored_registered_sibling_candidates": max(
+                len(candidates) - len(candidate_pool), 0
+            ),
+        }
         target_deliveries_by_key = {}
         for selected_record, manifest_spm in delivery_records:
             payload = selected_record["payload"]
@@ -3723,15 +3811,21 @@ def _atlas_normalized_variants(
             if len(groups) != 1 or manifest_spm not in allowed_spms:
                 continue
             target_key = _normalized_identity_path(manifest_spm)
-            target_deliveries_by_key[target_key] = (
-                _normalized_generator_delivery(
-                    audit,
-                    allowed_spms[manifest_spm],
-                    payload,
-                    groups[0],
-                    contract["variants"],
-                )
+            target_contract = target_contracts.get(
+                target_key,
+                contract,
             )
+            delivery = _normalized_generator_delivery(
+                audit,
+                allowed_spms[manifest_spm],
+                payload,
+                groups[0],
+                target_contract["variants"],
+            )
+            delivery["normalized_variants"] = copy.deepcopy(
+                target_contract["variants"]
+            )
+            target_deliveries_by_key[target_key] = delivery
         target_deliveries = [
             target_deliveries_by_key[key]
             for key in sorted(target_deliveries_by_key)
@@ -3788,7 +3882,13 @@ def _atlas_normalized_variants(
                 )
             )
             if missing:
-                return None
+                if not full_fbx_role_present:
+                    return None
+                contract["missing_target_deliveries_diagnostic"] = {
+                    "status": "ignored_for_rendered_full_fbx_role",
+                    "target_keys": missing,
+                    "policy": "latest_full_fbx_geometry_authoritative_v1",
+                }
         return contract
     if stale:
         return None
@@ -4551,9 +4651,10 @@ def build_cluster_assembly_contract(
     # relation is positive placement evidence. Recover that evidence here and
     # let the later current-FBX material+mesh gate prove actual geometry.
     visible_material_reader = getattr(audit, "visible_material_names", None)
-    if callable(visible_material_reader):
+    material_ref_reader = getattr(audit, "extract_material_image_refs", None)
+    if callable(visible_material_reader) and callable(material_ref_reader):
         visible_by_spm = {
-            str(spm): list(visible_material_reader(spm) or [])
+            str(spm): _rendered_provider_material_names(audit, spm)
             for spm in assembly_source_spms
         }
         for pair_row in cluster_pairs:
@@ -4618,16 +4719,17 @@ def build_cluster_assembly_contract(
         if _usage_for_cluster(usage, row) is not None
         and row.get("content_role") in ROLE_ORDER
     ]
-    relevant_clusters = [
-        row for row in content_candidates
-        if row["target_relation"]["allowed"]
-    ]
-    excluded_unregistered_clusters = [
+    # A target registry is a child delivery record.  It cannot suppress a
+    # provider whose material/cutout identity is present in the target source
+    # and whose latest Full FBX will be revalidated before any Base polygon is
+    # removed.  Keep OFF rows as diagnostics and let actual FBX topology decide.
+    relevant_clusters = list(content_candidates)
+    registry_diagnostics = [
         {
             "role": row.get("content_role"),
             "name": row["output_spm"].stem,
             "spm": str(row["output_spm"]),
-            "reason": "explicit_target_relation_off",
+            "reason": "explicit_target_relation_off_diagnostic_only",
             "target_relation": copy.deepcopy(row["target_relation"]),
         }
         for row in content_candidates
@@ -4733,6 +4835,7 @@ def build_cluster_assembly_contract(
                     audit=audit,
                     physical_receipt_cache=physical_receipt_cache,
                     atlas_resolution_reader=atlas_resolution_reader,
+                    full_fbx_role_present=current_live_pair_covered,
                 )
                 _validate_normalized_source_dependency(
                     normalized_variants,
@@ -4769,6 +4872,36 @@ def build_cluster_assembly_contract(
                         f"{output_spm.name}, then re-run the audit"
                     ),
                 }
+        provider_material = str(
+            (normalized_variants or {}).get("material") or ""
+        ).strip()
+        if provider_material:
+            # material_names_by_spm is lower relationship provenance and may
+            # be stale enough to name a sibling provider's material.  Once an
+            # exact normalization receipt identifies this provider's own
+            # production material, re-check the latest Full FBX against that
+            # identity.  This prevents two same-role providers from claiming
+            # the same rendered slot while still leaving the Full FBX as the
+            # geometry authority.
+            for target in targets:
+                target["fbx_material_mesh_pair_usage_diagnostic"] = (
+                    target["fbx_material_mesh_pair"]
+                )
+                target["provider_material_names"] = [provider_material]
+                target["fbx_material_mesh_pair"] = classify_fbx_role(
+                    export_bundles[str(target["spm"]).casefold()][
+                        "fbx_contract"
+                    ],
+                    expected_identity,
+                    [provider_material],
+                )
+            decisions = {
+                target["fbx_material_mesh_pair"]["decision"]
+                for target in targets
+            }
+            current_live_pair_covered = bool(
+                _current_live_pair_covered(targets)
+            )
         if not primary_role_source and not current_live_pair_covered:
             decision = "reference_only"
         elif "blocked" in decisions:
@@ -4781,21 +4914,17 @@ def build_cluster_assembly_contract(
             decision = "pass_through"
         else:
             decision = "pass_through"
-        rendered_provider_expansion_covered = bool(
+        spm_only_provider_candidate = bool(
             normalized_variants
             and current_spm_pair_covered
-            and pair_row["target_relation"].get("allowed")
             and not current_live_pair_covered
             and decisions == {"pass_through"}
         )
-        if rendered_provider_expansion_covered:
-            # SpeedTree may render a registered Cluster through the resulting
-            # leaf/branch material instead of preserving the provider material
-            # name in FBX.  The current SPM material+mesh pair proves the
-            # provider is present; the Assembly builder's exact normalized
-            # topology correspondence proves which rendered components belong
-            # to it before any base polygons are removed.
-            decision = "normalize_part"
+        # A lower SPM material/CutoutMesh pair is useful provider provenance,
+        # but it cannot prove that the role is present in the latest Full FBX.
+        # Keep it diagnostic-only; actual FBX material faces decide rendered
+        # role presence.
+        rendered_provider_expansion_covered = False
         normalized_variants_required = decision == "normalize_part"
         normalized_variants_missing = bool(
             normalized_variants_required and not normalized_variants
@@ -4812,10 +4941,6 @@ def build_cluster_assembly_contract(
             decision = "normalize_part"
             normalized_variants_required = True
             normalized_variants_missing = not bool(normalized_variants)
-        elif rendered_provider_expansion_covered:
-            decision = "normalize_part"
-            normalized_variants_required = True
-            normalized_variants_missing = False
         elif (
             normalized_variants
             and normalized_delivery_mode
@@ -4836,8 +4961,6 @@ def build_cluster_assembly_contract(
             not in {DELIVERY_MODE_RENDER_CONNECTED}
         ):
             normalized_delivery_blocked = True
-        if rendered_provider_expansion_covered:
-            normalized_delivery_blocked = False
         capture_texture_refs = _normalized_capture_texture_refs(
             normalized_variants
         )
@@ -4965,6 +5088,7 @@ def build_cluster_assembly_contract(
             "rendered_provider_expansion_covered": (
                 rendered_provider_expansion_covered
             ),
+            "spm_only_provider_candidate": spm_only_provider_candidate,
             "normalized_delivery_mode": normalized_delivery_mode or None,
             "normalized_delivery_blocked": normalized_delivery_blocked,
             "target_relation": copy.deepcopy(pair_row["target_relation"]),
@@ -5206,8 +5330,9 @@ def build_cluster_assembly_contract(
         },
         "roles": role_receipts,
         "relationship_policy": {
-            "mode": "explicit_registry_when_present_else_legacy_content",
-            "excluded_cluster_sources": excluded_unregistered_clusters,
+            "mode": "full_fbx_authoritative_registry_diagnostic_v2",
+            "excluded_cluster_sources": [],
+            "registry_diagnostics": registry_diagnostics,
         },
         "issues": issues,
         "errors": blocking_errors,
@@ -5224,8 +5349,9 @@ def build_cluster_assembly_contract(
         },
         "dependencies": actual_dependencies,
         "relationship_policy": {
-            "mode": "explicit_registry_when_present_else_legacy_content",
-            "excluded_cluster_sources": excluded_unregistered_clusters,
+            "mode": "full_fbx_authoritative_registry_diagnostic_v2",
+            "excluded_cluster_sources": [],
+            "registry_diagnostics": registry_diagnostics,
         },
         "canonical_bark": bark,
         "handoff": handoff,
@@ -5639,6 +5765,9 @@ def validate_cluster_assembly_receipt(payload, requested_spm=None):
                         production,
                         allow_source_fbx_drift=bool(
                             variants.get("source_fbx_drift_validation")
+                        ),
+                        allow_source_spm_drift=bool(
+                            variants.get("source_spm_drift_validation")
                         ),
                     )
                 except ClusterAssemblyReceiptStaleError:

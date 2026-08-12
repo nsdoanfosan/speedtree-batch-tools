@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SK_BATCH = Path(__file__).resolve().parents[1]
@@ -12,14 +15,253 @@ if str(SK_BATCH) not in sys.path:
     sys.path.insert(0, str(SK_BATCH))
 
 from cluster_fleet_push import (  # noqa: E402
+    ExactPushError,
+    PushDependencyError,
+    build_receipt_refresh_command,
     build_repair_command,
+    checkout_headless_manifest_assets,
+    discover_provider_dependencies,
     discover_current_cluster_targets,
+    validate_provider_live_result,
+    validate_provider_repair_result,
     validate_repair_result,
     validate_live_result,
 )
 
 
 class ClusterFleetPushTests(unittest.TestCase):
+    def test_provider_dependencies_are_ordered_before_roots_and_deduplicated(self):
+        root_a = Path("D:/trees/tree_a/SK_tree_a_01.spm")
+        root_b = Path("D:/trees/tree_b/SK_tree_b_01.spm")
+        shared = Path("D:/trees/tree_a/cluster/SK_leaf_shared.spm")
+        branch = Path("D:/trees/tree_a/cluster/SK_branch_a.spm")
+
+        def dependencies(spm):
+            if Path(spm).stem == root_a.stem:
+                return [shared, branch]
+            return [shared]
+
+        with patch(
+            "cluster_fleet_push.cluster_dependency_spms",
+            side_effect=dependencies,
+        ):
+            ordered, by_root, issues, resolution = (
+                discover_provider_dependencies([
+                {"spm": root_a},
+                {"spm": root_b},
+                ])
+            )
+
+        self.assertFalse(issues)
+        self.assertEqual(ordered, [shared.resolve(), branch.resolve()])
+        self.assertEqual(
+            by_root[str(root_a.resolve())],
+            [str(shared.resolve()), str(branch.resolve())],
+        )
+        self.assertEqual(
+            by_root[str(root_b.resolve())],
+            [str(shared.resolve())],
+        )
+        self.assertEqual(
+            resolution[str(root_a.resolve())]["policy"],
+            "current_validated_manifest_or_relation",
+        )
+
+    def test_stale_root_manifest_is_only_a_provider_execution_hint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root_spm = root / "tree" / "SK_tree_01.spm"
+            provider = root / "tree" / "cluster" / "SK_leaf_01.spm"
+            manifest = root / "tree" / "assembly" / "root.json"
+            provider.parent.mkdir(parents=True)
+            manifest.parent.mkdir()
+            root_spm.write_bytes(b"root")
+            provider.write_bytes(b"provider")
+            manifest.write_text(json.dumps({
+                "status": "ready",
+                "content_decision": "build",
+                "parts": [{
+                    "external_source": {
+                        "source_blend": {
+                            "path": str(provider.with_suffix(".blend")),
+                        },
+                    },
+                }],
+            }), encoding="utf-8")
+
+            with patch(
+                "cluster_fleet_push.cluster_dependency_spms",
+                side_effect=PushDependencyError("stale fingerprint"),
+            ):
+                ordered, by_root, issues, resolution = (
+                    discover_provider_dependencies([{
+                        "spm": root_spm,
+                        "manifest": manifest,
+                    }])
+                )
+
+        self.assertFalse(issues)
+        self.assertEqual(ordered, [provider.resolve()])
+        self.assertEqual(
+            by_root[str(root_spm.resolve())], [str(provider.resolve())]
+        )
+        self.assertEqual(
+            resolution[str(root_spm.resolve())]["policy"],
+            "saved_manifest_execution_hint_only",
+        )
+
+    def test_provider_repair_requires_push_ready_blend_and_export_objects(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pipeline = root / "pipeline.json"
+            report = root / "repair.json"
+            pipeline.write_text(json.dumps({
+                "status": "done",
+                "cluster_source_build_contract": {
+                    "status": "ready",
+                    "source_blend_committed": True,
+                    "source_object": "SK_leaf_sample_Merged",
+                },
+                "repair_push_export_postcondition": {
+                    "objects": [{"name": "SK_leaf_sample_01"}],
+                },
+                "import": {"material_consolidation": {
+                    "status": "applied",
+                    "groups": [{
+                        "mode": "production_group_suffix",
+                        "target_material": "M_leaf_sample_atlas_01",
+                        "source_materials": [
+                            "M_leaf_sample_atlas_01_green"
+                        ],
+                    }],
+                }},
+                "steps": [{
+                    "name": "consolidate_speedtree_group_materials",
+                    "status": "skipped",
+                    "groups": [],
+                }],
+            }), encoding="utf-8")
+            report.write_text(json.dumps({
+                "status": "ok",
+                "unreal_push_ready": True,
+                "blend": str(root / "provider.blend"),
+                "pipeline_report": str(pipeline),
+            }), encoding="utf-8")
+            (root / "provider.blend").write_bytes(b"blend")
+
+            result = validate_provider_repair_result(report)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["export_objects"], ["SK_leaf_sample_01"])
+        self.assertEqual(
+            result["material_consolidation"]["status"], "applied"
+        )
+
+    def test_provider_live_result_requires_actual_unreal_import(self):
+        self.assertTrue(validate_provider_live_result({
+            "status": "ok",
+            "unreal_result": {
+                "status": "imported_ok",
+                "asset_paths": ["/Game/Trees/SK_leaf_sample_01"],
+            },
+        })["ok"])
+        self.assertFalse(validate_provider_live_result({
+            "status": "exported_pending_unreal",
+            "unreal_result": {},
+        })["ok"])
+
+    def test_headless_manifest_checkout_uses_exact_existing_read_only_packages(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "MyProject.uproject"
+            package = root / "Content" / "Trees" / "Assembly" / "SK_Tree.uasset"
+            package.parent.mkdir(parents=True)
+            project.write_text("{}", encoding="utf-8")
+            package.write_bytes(b"asset")
+            package.chmod(stat.S_IREAD)
+            calls = []
+
+            class Completed:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            def run_factory(command, **_kwargs):
+                calls.append(command)
+                package.chmod(stat.S_IREAD | stat.S_IWRITE)
+                return Completed()
+
+            result = checkout_headless_manifest_assets(
+                {"items": [{"checkout_asset_paths": [
+                    "/Game/Trees/Assembly/SK_Tree",
+                    "/Game/Trees/Assembly/SK_Tree.SK_Tree",
+                    "/Game/Trees/Assembly/NewPart",
+                    "/Engine/EngineAsset",
+                ]}]},
+                project,
+                p4_client="UnrealProjects",
+                run_factory=run_factory,
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:4], ["p4", "-c", "UnrealProjects", "edit"])
+        self.assertEqual(calls[0][4:], [str(package)])
+        self.assertEqual(result["checked_out"], [str(package)])
+
+    def test_headless_manifest_checkout_fails_if_p4_leaves_file_read_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "MyProject.uproject"
+            package = root / "Content" / "Trees" / "SK_Tree.uasset"
+            package.parent.mkdir(parents=True)
+            project.write_text("{}", encoding="utf-8")
+            package.write_bytes(b"asset")
+            package.chmod(stat.S_IREAD)
+
+            class Completed:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            with self.assertRaisesRegex(
+                ExactPushError, "packages remain read-only"
+            ):
+                checkout_headless_manifest_assets(
+                    {"items": [{"checkout_asset_paths": [
+                        "/Game/Trees/SK_Tree",
+                    ]}]},
+                    project,
+                    run_factory=lambda *_args, **_kwargs: Completed(),
+                )
+
+    def test_receipt_refresh_is_scoped_to_exact_current_spm(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            asset = root / "tree_Weeping_Willow"
+            asset.mkdir()
+            spm = asset / "SK_tree_Weeping_Willow_01.spm"
+            report = root / "receipt.json"
+            spm.write_bytes(b"current")
+
+            command = build_receipt_refresh_command(
+                {"spm": spm},
+                report,
+            )
+
+            self.assertIn("pcg_texture_audit.py", " ".join(command))
+            self.assertEqual(
+                command[command.index("--target") + 1],
+                str(asset.resolve()),
+            )
+            self.assertEqual(
+                command[command.index("--target-mesh") + 1],
+                "SK_tree_Weeping_Willow_01",
+            )
+            self.assertEqual(
+                command[command.index("--json") + 1],
+                str(report.resolve()),
+            )
+
     def test_fleet_repair_command_precedes_push_with_current_inputs(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -42,7 +284,7 @@ class ClusterFleetPushTests(unittest.TestCase):
                 str(contract),
             )
 
-    def test_repair_result_requires_complete_v4_binding_and_plan_free_base(self):
+    def test_repair_result_requires_complete_v4_binding_and_preserves_unmatched_geometry(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             report = root / "repair.json"
@@ -61,7 +303,7 @@ class ClusterFleetPushTests(unittest.TestCase):
                     "degraded_authored_card_binding_count": 0,
                 },
                 "base": {
-                    "unmatched_role_components_removed_from_base": 3,
+                    "unmatched_role_components_removed_from_base": 0,
                 },
                 "preserved_render_components": [{"polygon_count": 3}],
                 "parts": [{"bindings": [{"id": 1}, {"id": 2}]}],
@@ -73,6 +315,7 @@ class ClusterFleetPushTests(unittest.TestCase):
 
             self.assertTrue(result["ok"])
             self.assertEqual(result["bindings"], 2)
+            self.assertEqual(result["preserved_role_polygons_kept"], 3)
 
     def test_repair_result_accepts_current_pass_through_without_stale_manifest(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -94,6 +337,74 @@ class ClusterFleetPushTests(unittest.TestCase):
             self.assertTrue(result["ok"])
             self.assertTrue(result["pass_through"])
             self.assertEqual(result["parts"], 0)
+
+    def test_pass_through_with_preserved_build_is_actionable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report = root / "repair.json"
+            report.write_text(json.dumps({
+                "cluster_assembly_manifest": {
+                    "status": "pass_through",
+                    "content_decision": "pass_through",
+                    "existing_assembly_assets_orphaned": {
+                        "status": "action_required",
+                        "asset_names": ["Base", "Assembly"],
+                    },
+                },
+            }), encoding="utf-8")
+
+            result = validate_repair_result(report, {})
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["problems"], [])
+            self.assertEqual(
+                result["existing_assembly_assets_orphaned"]["asset_names"],
+                ["Base", "Assembly"],
+            )
+
+    def test_repair_result_reports_role_demotion_as_diagnostic(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report = root / "repair.json"
+            manifest = root / "assembly.json"
+            report.write_text(json.dumps({
+                "status": "ok",
+                "cluster_assembly_handoff": {
+                    "role_demotions": [{
+                        "provider_key": "leaf_side:leaf_willow_side_01",
+                        "role": "leaf_side",
+                    }],
+                },
+            }), encoding="utf-8")
+            manifest.write_text(json.dumps({
+                "placement_contract": {
+                    "authored_node_assignment": {
+                        "policy": (
+                            "deterministic_state_mesh_then_global_position_"
+                            "recovery_shared_components_v4"
+                        ),
+                        "assigned_count": 1,
+                        "unmatched_count": 0,
+                    },
+                    "degraded_authored_card_binding_count": 0,
+                },
+                "base": {
+                    "unmatched_role_components_removed_from_base": 0,
+                },
+                "parts": [{"bindings": [{"id": 1}]}],
+            }), encoding="utf-8")
+
+            result = validate_repair_result(
+                report,
+                {"manifest": manifest},
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["problems"], [])
+            self.assertEqual(
+                result["role_demotions"][0]["provider_key"],
+                "leaf_side:leaf_willow_side_01",
+            )
 
     def _manifest(self, root, asset, stem, *, birch=False):
         asset_dir = root / asset
@@ -130,6 +441,76 @@ class ClusterFleetPushTests(unittest.TestCase):
         self.assertEqual(
             [row["stem"] for row in targets],
             ["SK_tree_Weeping_Willow_01", "SK_tree_birch_paper_01"],
+        )
+
+    def test_discovers_current_pass_through_for_live_receipt_revalidation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            asset = root / "tree_blackgum"
+            assembly = asset / "assembly"
+            assembly.mkdir(parents=True)
+            stem = "SK_tree_blackgum_01"
+            spm = asset / f"{stem}.spm"
+            blend = spm.with_suffix(".blend")
+            wind = (
+                asset
+                / "JSON"
+                / f"{stem}_dynamic_wind_import_from_megaplant_groups.json"
+            )
+            wind.parent.mkdir()
+            for path in (spm, blend, wind):
+                path.write_bytes(b"current")
+            manifest = (
+                assembly / f"{stem}_cluster_assembly_bindings.json"
+            )
+            manifest.write_text(json.dumps({
+                "status": "pass_through",
+                "content_decision": "pass_through",
+                "pass_through_provenance": {
+                    "requested_spm": str(spm),
+                },
+            }), encoding="utf-8")
+
+            targets, missing = discover_current_cluster_targets(root)
+
+        self.assertFalse(missing)
+        self.assertEqual([row["stem"] for row in targets], [stem])
+        self.assertEqual(
+            targets[0]["selection_policy"],
+            "current_pass_through_receipt_revalidation",
+        )
+        self.assertEqual(targets[0]["expected_parts"], 0)
+
+    def test_explicit_current_spm_without_manifest_is_revalidated(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            asset = root / "tree_lauraceae"
+            asset.mkdir()
+            stem = "SK_tree_Lauraceae_11"
+            spm = asset / f"{stem}.spm"
+            blend = spm.with_suffix(".blend")
+            wind = (
+                asset
+                / "JSON"
+                / f"{stem}_dynamic_wind_import_from_megaplant_groups.json"
+            )
+            wind.parent.mkdir()
+            for path in (spm, blend, wind):
+                path.write_bytes(b"current")
+
+            targets, missing = discover_current_cluster_targets(
+                root, only=[stem]
+            )
+
+        self.assertFalse(missing)
+        self.assertEqual([row["stem"] for row in targets], [stem])
+        self.assertEqual(
+            targets[0]["selection_policy"],
+            "explicit_current_spm_revalidation",
+        )
+        self.assertEqual(
+            targets[0]["manifest"].name,
+            f"{stem}_cluster_assembly_bindings.json",
         )
 
     def test_live_result_requires_parts_bindings_wind_and_provenance(self):

@@ -46,6 +46,7 @@ from cluster_spm_pair_contract import (
 from cluster_normalization_sync import (
     ClusterNormalizationSyncError,
     ClusterSourceBuildRequiredError,
+    inspect_bwr_material_assignment_freshness,
     inspect_normalization_source_identity,
     resolve_normalization_recipe,
 )
@@ -1732,6 +1733,35 @@ def run_cluster_relation_transaction(
             blend,
             effective_targets,
         )
+        material_freshness = (
+            inspect_bwr_material_assignment_freshness(blend)
+            if auto_normalize
+            else None
+        )
+        if (
+            preflight_state["current"]
+            and material_freshness is not None
+            and not material_freshness["current"]
+        ):
+            preflight_state["current"] = False
+            preflight_state["refresh_reasons"] = list(dict.fromkeys(
+                list(preflight_state.get("refresh_reasons") or [])
+                + list(material_freshness["refresh_reasons"])
+            ))
+            preflight_state["refresh_reason_categories"] = list(
+                dict.fromkeys(
+                    list(
+                        preflight_state.get(
+                            "refresh_reason_categories"
+                        )
+                        or []
+                    )
+                    + ["geometry_ownership"]
+                )
+            )
+            preflight_state["bwr_material_assignment_freshness"] = (
+                material_freshness
+            )
         if preflight_state["current"]:
             report = {
                 "status": "ok",

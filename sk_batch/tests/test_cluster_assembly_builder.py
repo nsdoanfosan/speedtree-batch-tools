@@ -66,7 +66,7 @@ from cluster_assembly_builder import (  # noqa: E402
 
 
 class AssemblyBaseRoleExclusionTests(unittest.TestCase):
-    def test_all_role_polygons_are_removed_even_when_some_are_unmatched(self):
+    def test_only_matched_role_polygons_are_removed(self):
         final_mesh = object()
         external_mesh = object()
         roles = {
@@ -94,7 +94,7 @@ class AssemblyBaseRoleExclusionTests(unittest.TestCase):
 
         self.assertEqual(
             _base_role_polygon_indices(plans, roles, final_mesh),
-            [1, 2, 3, 4, 9],
+            [1],
         )
 
 
@@ -322,6 +322,44 @@ def edge_attachment_test_mesh(*, y_offset=0.0):
     )
 
 
+def clipped_origin_subset_test_mesh(*, scale=1.0, translation=(0.0, 0.0, 0.0)):
+    source_coordinates = [
+        (0.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (1.0, 1.0, 0.0),
+    ]
+    coordinates = [
+        tuple(scale * value + translation[axis] for axis, value in enumerate(row))
+        for row in source_coordinates
+    ]
+    faces = [(0, 1, 2), (1, 3, 2)]
+    uvs = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)]
+    loops = []
+    uv_data = []
+    polygons = []
+    for polygon_index, face in enumerate(faces):
+        loop_indices = []
+        for vertex_index in face:
+            loop_indices.append(len(loops))
+            loops.append(SimpleNamespace(vertex_index=vertex_index))
+            uv = uvs[vertex_index]
+            uv_data.append(SimpleNamespace(
+                uv=SimpleNamespace(x=uv[0], y=uv[1])
+            ))
+        polygons.append(SimpleNamespace(
+            index=polygon_index,
+            vertices=face,
+            loop_indices=loop_indices,
+        ))
+    return SimpleNamespace(
+        vertices=[SimpleNamespace(co=value) for value in coordinates],
+        polygons=polygons,
+        loops=loops,
+        uv_layers=SimpleNamespace(active=SimpleNamespace(data=uv_data)),
+    )
+
+
 class ComponentTopologyTests(unittest.TestCase):
     def test_position_weld_preserves_card_topology_across_seam_split(self):
         source = seam_split_test_mesh(False)
@@ -453,7 +491,7 @@ class ComponentTopologyTests(unittest.TestCase):
         self.assertEqual(len(source_indices), 3)
         self.assertEqual(len(target_indices), 3)
 
-    def test_speedtree_boundary_clipping_accepts_unique_twenty_percent_subset(self):
+    def test_speedtree_boundary_clipping_accepts_unique_final_fbx_subset(self):
         source_component = object()
         target_component = object()
         prototype = {
@@ -479,7 +517,7 @@ class ComponentTopologyTests(unittest.TestCase):
             )
         self.assertIs(selected, prototype)
 
-        def reject_counter(_mesh, component):
+        def larger_clip_counter(_mesh, component):
             if component is source_component:
                 return source_faces
             return Counter({("face", index): 1 for index in range(79)})
@@ -489,12 +527,12 @@ class ComponentTopologyTests(unittest.TestCase):
             return_value="target",
         ), mock.patch(
             "cluster_assembly_builder._component_uv_face_counter",
-            side_effect=reject_counter,
+            side_effect=larger_clip_counter,
         ):
-            rejected = _normalized_prototype_for_component(
+            selected_after_larger_clip = _normalized_prototype_for_component(
                 {"source": prototype}, object(), target_component
             )
-        self.assertIsNone(rejected)
+        self.assertIs(selected_after_larger_clip, prototype)
 
     def test_speedtree_two_sided_render_matches_clipped_normalized_prototype(self):
         source_component = object()
@@ -760,23 +798,106 @@ class ComponentTopologyTests(unittest.TestCase):
             "normalized_origin_uv_edge_interpolation_v1",
         )
 
-    def test_uv_edge_fallback_rejects_a_non_origin_source_point(self):
+    def test_full_fbx_correspondence_overrides_stale_nonorigin_attachment_edge(self):
         source = edge_attachment_test_mesh(y_offset=1.0)
         target = edge_attachment_test_mesh(y_offset=5.0)
         source_component = _component_groups(source, [0])[0]
         target_component = _component_groups(target, [0])[0]
 
-        with self.assertRaisesRegex(
-            ClusterAssemblyBuildError,
-            "does not resolve to the normalized source origin",
+        result = _attachment_point_correspondence(
+            SimpleNamespace(data=source),
+            source_component,
+            SimpleNamespace(data=target),
+            target_component,
+            [0.5, 0.0],
+        )
+
+        self.assertIsNone(result["source_index"])
+        self.assertIsNone(result["target_index"])
+        self.assertEqual(result["source_coordinate"], (0.0, 0.0, 0.0))
+        self.assertEqual(result["target_coordinate"], (0.0, 4.0, 0.0))
+        self.assertEqual(
+            result["evidence"]["policy"],
+            "full_fbx_shared_uv_origin_projection_v1",
+        )
+        self.assertEqual(
+            result["evidence"]["fallback_reason"],
+            "attachment_uv_edge_is_not_normalized_source_origin",
+        )
+
+    def test_full_fbx_correspondence_overrides_ambiguous_attachment_edge(self):
+        source = edge_attachment_test_mesh()
+        target = edge_attachment_test_mesh(y_offset=5.0)
+        source_component = _component_groups(source, [0])[0]
+        target_component = _component_groups(target, [0])[0]
+        source_edge = {
+            "coordinate": (0.0, 0.0, 0.0),
+            "edge_vertices": [0, 1],
+            "parameter": 0.5,
+            "uv_residual": 0.0,
+            "candidate_edge_count": 1,
+        }
+
+        with mock.patch(
+            "cluster_assembly_builder._attachment_uv_edge_point",
+            side_effect=[
+                source_edge,
+                ClusterAssemblyBuildError(
+                    "normalized plan attachment UV crosses multiple geometric edges"
+                ),
+            ],
         ):
-            _attachment_point_correspondence(
+            result = _attachment_point_correspondence(
                 SimpleNamespace(data=source),
                 source_component,
                 SimpleNamespace(data=target),
                 target_component,
                 [0.5, 0.0],
             )
+
+        self.assertEqual(result["source_coordinate"], (0.0, 0.0, 0.0))
+        self.assertEqual(result["target_coordinate"], (0.0, 5.0, 0.0))
+        self.assertEqual(
+            result["evidence"]["fallback_reason"],
+            "attachment_uv_edge_is_geometrically_ambiguous",
+        )
+        self.assertIn(
+            "crosses multiple geometric edges",
+            result["evidence"]["attachment_edge_error"],
+        )
+
+    def test_full_fbx_subset_projects_clipped_plan_origin_from_shared_uvs(self):
+        source = clipped_origin_subset_test_mesh()
+        target = clipped_origin_subset_test_mesh(
+            scale=2.0,
+            translation=(5.0, 7.0, 0.0),
+        )
+        source_component = _component_groups(source, [0, 1])[0]
+        target_component = _component_groups(target, [1])[0]
+
+        result = _attachment_point_correspondence(
+            SimpleNamespace(data=source),
+            source_component,
+            SimpleNamespace(data=target),
+            target_component,
+            [0.0, 0.0],
+        )
+
+        self.assertIsNone(result["source_index"])
+        self.assertIsNone(result["target_index"])
+        self.assertEqual(result["source_coordinate"], (0.0, 0.0, 0.0))
+        for actual, expected in zip(
+            result["target_coordinate"], (5.0, 7.0, 0.0)
+        ):
+            self.assertAlmostEqual(actual, expected)
+        self.assertEqual(
+            result["evidence"]["policy"],
+            "full_fbx_shared_uv_origin_projection_v1",
+        )
+        self.assertEqual(
+            result["evidence"]["correspondence"]["source_only_uv_key_count"],
+            1,
+        )
 
 
 def skeleton_snapshot():
@@ -1235,7 +1356,7 @@ class ContentDecisionTests(unittest.TestCase):
         ):
             _validate_role_component_claims(role_build_plans)
 
-    def test_unmatched_provider_topology_stays_in_base_when_other_part_matches(self):
+    def test_unmatched_provider_topology_fails_even_when_other_part_matches(self):
         preserved = {
             "topology_signature": "rendered-only",
             "instance_count": 3,
@@ -1256,9 +1377,11 @@ class ContentDecisionTests(unittest.TestCase):
             },
         }
 
-        claimed = _validate_role_component_claims(role_build_plans)
-
-        self.assertEqual(set(claimed), {(id(None), 4), (id(None), 5)})
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "matched zero normalized prototype components: leaf:cluster_elm_07",
+        ):
+            _validate_role_component_claims(role_build_plans)
 
     def test_zero_match_without_preserved_geometry_still_fails(self):
         with self.assertRaisesRegex(
@@ -1768,7 +1891,7 @@ class PhysicalProductionContractTests(unittest.TestCase):
         )
         self.assertTrue(first["frame_verified"])
 
-    def test_live_prototype_bounds_preflight_rejects_stale_asset(self):
+    def test_live_prototype_bounds_preflight_reports_stale_asset(self):
         manifest = physical_production_manifest()
         manifest["coordinate_contract"] = {
             "centimeters_per_blender_unit": 100.0,
@@ -1787,21 +1910,20 @@ class PhysicalProductionContractTests(unittest.TestCase):
                     extent_scale=multiplier,
                 )
             )
-        with self.assertRaisesRegex(
-            ClusterAssemblyBuildError,
-            "regular Blender Send to Unreal",
+        with mock.patch(
+            "cluster_assembly_builder._unreal_bone_names",
+            return_value=["part_root"],
         ):
-            with mock.patch(
-                "cluster_assembly_builder._unreal_bone_names",
-                return_value=["part_root"],
-            ):
-                validate_unreal_normalized_prototype_bounds(
-                    SimpleNamespace(),
-                    manifest,
-                    part_assets,
-                )
+            report = validate_unreal_normalized_prototype_bounds(
+                SimpleNamespace(),
+                manifest,
+                part_assets,
+            )
+        self.assertEqual(report["status"], "diagnostic_mismatch")
+        self.assertFalse(report["blocking"])
+        self.assertEqual(report["mismatch_count"], 1)
 
-    def test_live_prototype_bounds_preflight_rejects_shifted_origin(self):
+    def test_live_prototype_bounds_preflight_reports_shifted_origin(self):
         manifest = physical_production_manifest()
         manifest["coordinate_contract"] = {
             "centimeters_per_blender_unit": 100.0,
@@ -1818,19 +1940,18 @@ class PhysicalProductionContractTests(unittest.TestCase):
             )
             for index, part in enumerate(manifest["parts"])
         }
-        with self.assertRaisesRegex(
-            ClusterAssemblyBuildError,
-            "mesh-local bounds frame drifted",
+        with mock.patch(
+            "cluster_assembly_builder._unreal_bone_names",
+            return_value=["part_root"],
         ):
-            with mock.patch(
-                "cluster_assembly_builder._unreal_bone_names",
-                return_value=["part_root"],
-            ):
-                validate_unreal_normalized_prototype_bounds(
-                    SimpleNamespace(),
-                    manifest,
-                    part_assets,
-                )
+            report = validate_unreal_normalized_prototype_bounds(
+                SimpleNamespace(),
+                manifest,
+                part_assets,
+            )
+        self.assertEqual(report["status"], "diagnostic_mismatch")
+        self.assertFalse(report["blocking"])
+        self.assertEqual(report["mismatch_count"], 1)
 
     def test_live_prototype_preflight_requires_only_part_root(self):
         manifest = physical_production_manifest()
@@ -3553,7 +3674,7 @@ class CodexTestMaterialScopeTests(unittest.TestCase):
 
 
 class CurrentPassThroughAndCaptureDiagnosticsTests(unittest.TestCase):
-    def test_missing_target_contract_persists_current_pass_through_manifest(self):
+    def test_pass_through_preserves_current_build_manifest(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             assembly = root / "assembly"
@@ -3565,8 +3686,15 @@ class CurrentPassThroughAndCaptureDiagnosticsTests(unittest.TestCase):
                 "SK_tree_no_assembly_cluster_assembly_bindings.json"
             )
             assembly.mkdir()
+            current_build = {
+                "kind": "sk_batch_cluster_nanite_assembly_inputs",
+                "status": "ready",
+                "content_decision": "build",
+                "full_asset_stem": "SK_tree_no_assembly",
+                "parts": [{"asset_name": "SK_leaf_01"}],
+            }
             stale.write_text(
-                json.dumps({"status": "ready", "content_decision": "build"}),
+                json.dumps(current_build),
                 encoding="utf-8",
             )
             handoff = {
@@ -3589,9 +3717,20 @@ class CurrentPassThroughAndCaptureDiagnosticsTests(unittest.TestCase):
             )
 
             persisted = json.loads(stale.read_text(encoding="utf-8"))
+            sidecar = assembly / (
+                "SK_tree_no_assembly_cluster_assembly_pass_through.json"
+            )
             self.assertEqual(manifest["status"], "pass_through")
-            self.assertEqual(persisted["status"], "pass_through")
-            self.assertEqual(persisted["content_decision"], "pass_through")
+            self.assertEqual(persisted, current_build)
+            self.assertTrue(sidecar.is_file())
+            self.assertEqual(
+                manifest["existing_assembly_assets_orphaned"]["status"],
+                "action_required",
+            )
+            self.assertEqual(
+                manifest["production_build_manifest_preserved"]["path"],
+                str(stale.resolve()),
+            )
 
     def test_current_inspected_pass_through_supersedes_ready_receipt_contract(self):
         with tempfile.TemporaryDirectory() as temporary:

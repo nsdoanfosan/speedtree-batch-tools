@@ -3451,6 +3451,63 @@ def _calibration_recovery_clear_result(state, spm_path, *, recovered):
     }
 
 
+def _superseding_cluster_normalization_receipt(spm_path, state):
+    """Return proof that a newer Cluster rebuild supersedes this marker.
+
+    A killed calibration can leave its marker behind after a later Cluster
+    normalization has already rebuilt and validated the same canonical SPM.
+    The original backup may have been retired by retention in the meantime.
+    In that narrow case restoring the old backup would be wrong: the newer
+    normalization receipt and the live SPM hash are the authoritative proof.
+    """
+    spm_path = Path(spm_path).expanduser().absolute()
+    marker = Path(state.get("marker") or calibration_marker_path(spm_path))
+    receipt_path = (
+        spm_path.parent
+        / "reports"
+        / f"{spm_path.stem}_cluster_normalization_sync_receipt.json"
+    )
+    if not receipt_path.is_file() or not marker.is_file():
+        return None
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt_mtime_ns = receipt_path.stat().st_mtime_ns
+        marker_mtime_ns = marker.stat().st_mtime_ns
+    except (OSError, TypeError, ValueError):
+        return None
+    canonical_spm = str(receipt.get("canonical_spm") or "")
+    try:
+        canonical_matches = (
+            os.path.normcase(os.path.abspath(canonical_spm))
+            == os.path.normcase(os.path.abspath(str(spm_path)))
+        )
+    except (OSError, TypeError, ValueError):
+        canonical_matches = False
+    live_sha256 = str(
+        (state.get("spm_snapshot") or {}).get("sha256") or ""
+    )
+    receipt_sha256 = str(receipt.get("source_spm_sha256") or "")
+    if not (
+        receipt.get("kind") == "speedtree_cluster_sync_normalization"
+        and receipt.get("status") == "ready"
+        and canonical_matches
+        and live_sha256
+        and receipt_sha256 == live_sha256
+        and receipt_mtime_ns > marker_mtime_ns
+    ):
+        return None
+    return {
+        "receipt": str(receipt_path),
+        "receipt_kind": receipt.get("kind"),
+        "receipt_version": receipt.get("version"),
+        "receipt_status": receipt.get("status"),
+        "canonical_spm": canonical_spm,
+        "source_spm_sha256": receipt_sha256,
+        "receipt_mtime_ns": receipt_mtime_ns,
+        "marker_mtime_ns": marker_mtime_ns,
+    }
+
+
 def _restore_legacy_calibration_values(
     spm_path,
     current_text,
@@ -3527,6 +3584,22 @@ def recover_interrupted_calibration(spm_path):
             error=state.get("error") or "calibration marker is unreadable",
         )
     if not state.get("backup_available"):
+        superseding_receipt = _superseding_cluster_normalization_receipt(
+            spm_path,
+            state,
+        )
+        if superseding_receipt:
+            return _calibration_recovery_clear_result(
+                {
+                    **state,
+                    "status": (
+                        "superseded_by_cluster_normalization_receipt"
+                    ),
+                    "superseding_receipt": superseding_receipt,
+                },
+                spm_path,
+                recovered=False,
+            )
         return _calibration_recovery_failure(
             state,
             failure_kind="interrupted_calibration",
