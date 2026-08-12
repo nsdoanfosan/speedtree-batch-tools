@@ -672,17 +672,10 @@ def _normalized_variants_ready(
         spm_path=spm_path,
         contract=contract,
     )
-    if not isinstance(delivery, dict):
+    if not allow_actual_pair and not isinstance(delivery, dict):
         return False
-    delivery_mode = str(delivery.get("delivery_mode") or "")
-    if allow_actual_pair:
-        if delivery_mode not in {
-            "render_connected",
-            "connection_incomplete",
-            "asset_registration_only",
-        }:
-            return False
-    elif (
+    delivery_mode = str((delivery or {}).get("delivery_mode") or "")
+    if not allow_actual_pair and (
         delivery_mode != "render_connected"
         or not list(delivery.get("generator_bindings") or [])
         or list(delivery.get("missing_live_bindings") or [])
@@ -762,12 +755,13 @@ def role_identities_from_contract(contract):
 
 
 def _role_identity_aliases(role, receipt_row, contract, spm_path):
-    """Return receipt-authored names that identify the same rendered role.
+    """Return receipt-authored names used to inventory candidate FBX usage.
 
     Legacy provider names can differ from the authoritative general-tree
-    material name.  The target SPM material/mesh pair is already content
-    audited by PCG, so its complete records are valid aliases; no species or
-    ordinal naming guess is needed.
+    material name.  A complete target SPM pair is retained here as diagnostic
+    inventory evidence; ``build_assembly_handoff`` reclassifies each provider
+    against its exact current normalized material before any Base polygon can
+    become Assembly input.  No species or ordinal naming guess is needed.
     """
     if receipt_row is None:
         # A general-tree FBX can legitimately contain ordinary materials such
@@ -786,11 +780,8 @@ def _role_identity_aliases(role, receipt_row, contract, spm_path):
         material_name = str(record.get("material_name") or "").strip()
         if material_name:
             identities.append(material_name)
-    # The rendered target SPM is authoritative for the material identity used
-    # to cut the base mesh.  Keep a provider/receipt spelling only as an alias;
-    # otherwise a legacy provider identity leaks into every newly generated
-    # assembly binding even when the actual target material has the current
-    # authoritative name.
+    # Keep the exact provider spelling in the candidate inventory as well.
+    # Target aliases are never sufficient on their own to claim this provider.
     identities.append(receipt_identity)
     unique = {}
     for identity in identities:
@@ -1258,12 +1249,55 @@ def _validated_isolated_bark_capture(provider_spm, canonical_material):
     return result
 
 
+def _recover_full_fbx_normalized_variants(contract, receipt_row, spm_path):
+    """Recover provider prototypes after the final Full FBX proves a role.
+
+    Discovery receipts are written before the final BWR FBX exists.  They can
+    therefore carry an older target-registry decision and omit a provider that
+    is visibly present in the final render.  Re-read the provider's current
+    normalization receipt here; the registry remains diagnostic-only and the
+    Assembly builder still requires exact topology correspondence.
+    """
+    provider = str(
+        (receipt_row or {}).get("output_spm")
+        or (receipt_row or {}).get("spm")
+        or (receipt_row or {}).get("authoring_spm")
+        or ""
+    ).strip()
+    identity = str((receipt_row or {}).get("name") or "").strip()
+    if not provider or not identity:
+        return None, "provider_identity_missing"
+    try:
+        from pcg_st9_texture_batch.pcg_cluster_assembly_contract import (
+            _atlas_normalized_variants,
+            _validate_normalized_source_dependency,
+        )
+
+        normalized = _atlas_normalized_variants(
+            Path(str(contract.get("folder") or Path(spm_path).parent)),
+            identity,
+            [Path(spm_path)],
+            audit=None,
+            full_fbx_role_present=True,
+        )
+        if not normalized:
+            return None, "current_provider_normalization_not_found"
+        _validate_normalized_source_dependency(
+            normalized,
+            Path(provider),
+        )
+        return normalized, "recovered_from_current_provider_normalization"
+    except Exception as exc:  # Diagnostic fallback; final FBX stays preserved.
+        return None, f"provider_normalization_recovery_failed: {exc}"
+
+
 def build_assembly_handoff(receipt_path, spm_path, inventory):
     """Reconcile one PCG receipt with the exact imported FBX inventory."""
     _payload, contract = load_cluster_contract(receipt_path, spm_path)
     role_rows = _role_receipt_entries(contract)
     roles = []
     issues = []
+    role_demotions = []
     receipt_roles = {role for role, _row in role_rows}
     work_rows = list(role_rows) + [
         (role, None) for role in ROLE_ORDER if role not in receipt_roles
@@ -1280,41 +1314,95 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
             spm_path,
         )
         identity = identities[0] if identities else ""
-        actual = classify_inventory_role(
+        alias_actual = classify_inventory_role(
             inventory,
             role,
             identity,
             identities[1:],
         )
-        decision, evidence = _reconcile_role(receipt_row, actual)
         normalized_variants = (
             deepcopy(receipt_row.get("normalized_variants"))
             if receipt_row and receipt_row.get("normalized_variants")
             else None
         )
+        normalization_recovery = None
+        if (
+            normalized_variants is None
+            and receipt_row is not None
+            and alias_actual.get("status") == "complete_pair"
+            and alias_actual.get("decision") == "normalize_part"
+        ):
+            normalized_variants, normalization_recovery = (
+                _recover_full_fbx_normalized_variants(
+                    contract,
+                    receipt_row,
+                    spm_path,
+                )
+            )
         delivery = _normalized_delivery_for_target(
             normalized_variants,
             spm_path=spm_path,
             contract=contract,
         )
+        if (
+            normalized_variants
+            and isinstance(delivery, dict)
+            and list(delivery.get("normalized_variants") or [])
+        ):
+            # Provider geometry is shared, while Material/Mesh IDs are local
+            # to each target SPM.  Carry the current target's variant rows into
+            # the Assembly builder instead of reusing the first sibling's IDs.
+            normalized_variants["variants"] = deepcopy(
+                delivery["normalized_variants"]
+            )
+            if delivery.get("target_material_id") is not None:
+                normalized_variants["material_id"] = int(
+                    delivery["target_material_id"]
+                )
         delivery_mode = str(
             (delivery or {}).get("delivery_mode") or ""
         )
         provider_identity = _role_identity(role, receipt_row, contract)
+        provider_material_identity = str(
+            (normalized_variants or {}).get("material")
+            or provider_identity
+            or ""
+        ).strip()
+        # Target SPM pair records are useful diagnostics, but they can name an
+        # ordinary atlas material that is unrelated to this exact provider.
+        # The final Full FBX remains geometry authority while the provider's
+        # current normalized material supplies the provider-specific identity.
+        # This prevents one provider from consuming another provider's (or an
+        # ordinary atlas plane's) polygons through a stale target alias.
+        actual = (
+            classify_inventory_role(
+                inventory,
+                role,
+                provider_material_identity,
+            )
+            if receipt_row is not None and provider_material_identity
+            else alias_actual
+        )
+        decision, evidence = _reconcile_role(receipt_row, actual)
         provider_identity_matches_actual = (
             _actual_assignment_matches_provider_identity(
                 actual,
                 provider_identity,
             )
         )
+        provider_rendered_pair_covered = bool(
+            actual.get("status") == "complete_pair"
+            and actual.get("decision") == "normalize_part"
+        )
         normalized_ready = _normalized_variants_ready(
             normalized_variants,
             spm_path=spm_path,
             contract=contract,
-            allow_actual_pair=(
-                actual.get("status") == "complete_pair"
-                and provider_identity_matches_actual
-            ),
+            # Current Full FBX material faces are the final rendered geometry
+            # authority.  Target registry/delivery metadata is diagnostic once
+            # this pair exists; the builder still requires exact normalized
+            # topology before removing any Base polygon.
+            allow_actual_pair=provider_rendered_pair_covered,
         )
         row = {
             **actual,
@@ -1325,26 +1413,43 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
             ),
             "reconciliation": evidence,
             "normalized_variants": normalized_variants,
+            "normalized_variant_recovery": normalization_recovery,
             "normalized_delivery_mode": delivery_mode or None,
+            "fbx_material_mesh_pair_usage_diagnostic": alias_actual,
             "provider_identity": provider_identity or None,
+            "provider_material_identity": provider_material_identity or None,
             "provider_identity_matches_actual": (
                 provider_identity_matches_actual
             ),
+            "provider_rendered_pair_covered": provider_rendered_pair_covered,
             "rendered_provider_expansion_covered": bool(
                 (receipt_row or {}).get(
                     "rendered_provider_expansion_covered"
                 )
             ),
         }
-        if decision == "normalize_part" and normalized_ready:
+        receipt_rendered_provider_ready = bool(
+            row["receipt_decision"] == "normalize_part"
+            and provider_rendered_pair_covered
+            and normalized_ready
+        )
+        if receipt_rendered_provider_ready:
+            # The final Full FBX contains polygons assigned to this exact
+            # provider material.  Current normalized topology can therefore
+            # override stale child delivery metadata without consulting the
+            # registry for provider presence.
+            decision = "normalize_part"
+            row["decision"] = decision
+            row["reconciliation"] = (
+                "current_full_fbx_pair_and_normalized_topology_override_"
+                + (delivery_mode or "stale_or_missing_delivery_metadata")
+            )
+            evidence = row["reconciliation"]
+        elif decision == "normalize_part" and normalized_ready:
             if delivery_mode != "render_connected":
                 row["reconciliation"] = (
-                    "current_spm_pair_and_normalized_topology_override_"
-                    + delivery_mode
-                    if (receipt_row or {}).get(
-                        "rendered_provider_expansion_covered"
-                    )
-                    else "current_fbx_pair_overrides_" + delivery_mode
+                    "current_full_fbx_pair_and_normalized_topology_override_"
+                    + (delivery_mode or "stale_or_missing_delivery_metadata")
                 )
                 evidence = row["reconciliation"]
         elif delivery_mode == "asset_registration_only":
@@ -1375,6 +1480,30 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
             decision = "pass_through"
             evidence = "normalized_variants_metadata_missing_nonblocking"
         roles.append(row)
+        if (
+            decision != "normalize_part"
+            and row["receipt_decision"] in {
+                "normalize_part",
+                "pending_export",
+            }
+        ):
+            role_demotions.append({
+                "code": "CLUSTER_ROLE_NOT_ASSEMBLED",
+                "role": role,
+                "provider_key": row["provider_key"],
+                "provider_identity": row.get("provider_identity"),
+                "reason": evidence,
+                "actual_status": actual["status"],
+                "receipt_decision": row["receipt_decision"],
+                "dropped_polygon_count": sum(
+                    int(assignment.get("used_polygon_count") or 0)
+                    for assignment in actual.get("assignments") or []
+                ),
+                "remediation": (
+                    "Refresh the target-local Atlas delivery and rebuild "
+                    "this provider before the next Unreal push."
+                ),
+            })
         if decision == "blocked":
             issues.append({
                 "code": "CLUSTER_ROLE_HANDOFF_BLOCKED",
@@ -1533,6 +1662,7 @@ def build_assembly_handoff(receipt_path, spm_path, inventory):
             "validate_part_binding_hierarchy": True,
         },
         "issues": issues,
+        "role_demotions": role_demotions,
     }
 
 

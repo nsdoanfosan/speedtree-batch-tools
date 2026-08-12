@@ -830,7 +830,7 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
         )
         self.assertEqual(scope["skipped"], [])
 
-    def test_connected_board_batch_continues_to_cluster_after_sync_failure(self):
+    def test_connected_board_batch_stops_before_cluster_after_sync_failure(self):
         owner = Path(r"D:\Trees\Tree_elm")
         blend = owner / "Cluster" / "SK_branch_elm_01.blend"
         target = owner / "SK_Tree_elm_01.spm"
@@ -917,63 +917,139 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
         self.assertTrue(
             sync.call_args.kwargs["skip_blocked_scale"]
         )
-        prepare.assert_called_once()
-        refresh.assert_called_once_with(
-            blend,
-            [target],
-            enabled=True,
-            blender_exe=Path(r"C:\Blender\blender.exe"),
-            unit_probe_path=GUI.DEFAULT_CLUSTER_UNIT_PROBE,
-            capture_resolution=1024,
-            repair_runtime_config=app.config,
-            force_refresh=True,
-            progress_callback=mock.ANY,
-        )
-        self.assertEqual(captured["status"], "partial")
+        prepare.assert_not_called()
+        refresh.assert_not_called()
+        self.assertEqual(captured["status"], "failed")
         self.assertEqual(len(captured["failures"]), 1)
-        self.assertEqual(len(captured["cluster_refresh"]), 1)
-        cluster_report = captured["cluster_refresh"][0]
-        self.assertEqual(
-            cluster_report["refresh_reasons"],
-            ["blender_source_content_changed"],
-        )
-        self.assertEqual(
-            cluster_report["refresh_reason_categories"],
-            ["geometry_ownership"],
-        )
-        self.assertEqual(
-            cluster_report["result"]["planned_refresh_reasons"],
-            ["blender_source_content_changed"],
-        )
-        self.assertEqual(
-            cluster_report["result"]["refresh_reasons"],
-            ["blender_source_content_changed"],
-        )
-        self.assertEqual(
-            cluster_report["result"]["source_content_identity"][
-                "status"
-            ],
-            "ok",
-        )
+        self.assertEqual(captured["cluster_refresh"], [])
+        self.assertEqual(captured["summary"]["cluster"]["pending"], 1)
         cluster_unit = next(
             entry
             for entry in captured["unit_results"]
             if entry["stage"] == "cluster_refresh"
         )
-        self.assertEqual(cluster_unit["outcome"], "succeeded")
-        self.assertEqual(
-            cluster_unit["result"]["planned_refresh_reasons"],
-            ["blender_source_content_changed"],
-        )
-        self.assertEqual(
-            cluster_unit["result"]["refresh_reason_categories"],
-            ["geometry_ownership"],
-        )
+        self.assertEqual(cluster_unit["outcome"], "pending")
+        self.assertNotIn("result", cluster_unit)
         app.refresh.assert_called_once()
         self.assertIn(
             "실패 1",
             app.status_var.set.call_args.args[0],
         )
+
+    def test_connected_board_rebases_shared_manifest_before_later_group(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary)
+            manifest = owner / "spm_generator_sync.json"
+            manifest.write_text("before", encoding="utf-8")
+            for name in ("master_a.spm", "a.spm", "master_b.spm", "b.spm"):
+                (owner / name).write_bytes(name.encode("utf-8"))
+            scope = {
+                "groups": [
+                    {
+                        "folder": owner,
+                        "master": "master_a.spm",
+                        "names": ["a.spm"],
+                    },
+                    {
+                        "folder": owner,
+                        "master": "master_b.spm",
+                        "names": ["b.spm"],
+                    },
+                ],
+                "cluster_rows": [],
+                "skipped": [],
+            }
+            app = GUI.App.__new__(GUI.App)
+            app.root = None
+            app.config = {}
+            app.verify_var = mock.Mock()
+            app.verify_var.get.return_value = False
+            app.root_var = mock.Mock()
+            app.root_var.get.return_value = str(owner)
+            app.status_var = mock.Mock()
+            app.refresh = mock.Mock()
+            app._show_job_info = mock.Mock()
+            app.connected_board_scope = mock.Mock(return_value=scope)
+            app._connected_scope_from_board = mock.Mock(return_value=scope)
+            captured = {}
+            execution_digests = []
+
+            def run_now(_label, work, done, **_kwargs):
+                result = work(lambda *_args: None)
+                captured.update(result)
+                done(result)
+
+            def execute(
+                unit,
+                _runtime,
+                _job_config,
+                _verify,
+                settings,
+                expected_identity,
+                _report,
+                _progress,
+                _attempt_event,
+            ):
+                current = GUI.dependency_identity(unit, settings)
+                execution_digests.append((
+                    expected_identity["digest"],
+                    current["digest"],
+                ))
+                if len(execution_digests) == 1:
+                    manifest.write_text("after first group", encoding="utf-8")
+                return {
+                    "ok": True,
+                    "result": {
+                        "status": "up_to_date",
+                        "changed_files": [],
+                        "master_hash": "a" * 64,
+                        "scale_skipped": [],
+                    },
+                    "attempts": [],
+                    "attempt_count": 1,
+                }
+
+            app._start_job = run_now
+            with mock.patch.object(
+                GUI.messagebox,
+                "askyesno",
+                return_value=True,
+            ), mock.patch.object(
+                GUI.engine,
+                "scan_tree_folders",
+                return_value=[],
+            ), mock.patch.object(
+                app,
+                "_execute_connected_runtime_unit",
+                side_effect=execute,
+            ), mock.patch.object(
+                GUI,
+                "write_connected_run_report",
+                return_value=owner / "connected.json",
+            ), mock.patch.object(
+                GUI,
+                "report_file_identity",
+                return_value={
+                    "path": str(owner / "connected.json"),
+                    "sha256": "b" * 64,
+                    "size": 100,
+                },
+            ):
+                app.apply_connected_board()
+
+            self.assertEqual(captured["status"], "ok")
+            self.assertEqual(execution_digests[0][0], execution_digests[0][1])
+            self.assertEqual(execution_digests[1][0], execution_digests[1][1])
+            second = captured["unit_results"][1]
+            receipts = second["authorized_dependency_rebases"]
+            self.assertEqual(len(receipts), 1)
+            self.assertEqual(
+                [
+                    Path(row["path"]).name
+                    for row in receipts[0]["changed_resources"]
+                ],
+                [manifest.name],
+            )
 
     def test_connected_cluster_failure_preserves_planned_refresh_evidence(self):
         owner = Path(r"D:\Trees\Tree_elm")

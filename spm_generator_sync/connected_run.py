@@ -22,7 +22,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 
 CONNECTED_REPORT_SCHEMA_VERSION = 2
-DEPENDENCY_IDENTITY_SCHEMA_VERSION = 2
+DEPENDENCY_IDENTITY_SCHEMA_VERSION = 3
 CONNECTED_PLAN_SCHEMA_VERSION = 2
 PUBLISH_RETRY_DELAYS_SECONDS = (0.2, 0.5)
 ISSUE_ROOT = "https://github.com/nsdoanfosan/speedtree-batch-tools/issues"
@@ -614,6 +614,43 @@ def production_code_identity() -> dict:
     }
 
 
+def _semantic_production_code_identity(identity: Any) -> Any:
+    """Exclude capture-only inventory timestamps from dependency equality."""
+
+    if not isinstance(identity, Mapping):
+        return copy.deepcopy(identity)
+    payload = copy.deepcopy(dict(identity))
+    payload.pop("inventory_before_sha256", None)
+    payload.pop("inventory_after_sha256", None)
+    return payload
+
+
+def _semantic_cluster_producer_identity(identity: Any) -> Any:
+    """Keep producer code identity while dropping per-probe diagnostics."""
+
+    if not isinstance(identity, Mapping):
+        return copy.deepcopy(identity)
+    payload = copy.deepcopy(dict(identity))
+    payload.pop("report_sha256", None)
+    runtime = payload.get("blender_addon_runtime")
+    if isinstance(runtime, Mapping):
+        runtime = copy.deepcopy(dict(runtime))
+        runtime.pop("process_id", None)
+        payload["blender_addon_runtime"] = runtime
+    addons = []
+    for addon in payload.get("addons") or ():
+        if not isinstance(addon, Mapping):
+            addons.append(copy.deepcopy(addon))
+            continue
+        semantic_addon = copy.deepcopy(dict(addon))
+        semantic_addon.pop("inventory_before_sha256", None)
+        semantic_addon.pop("inventory_after_sha256", None)
+        addons.append(semantic_addon)
+    if "addons" in payload:
+        payload["addons"] = addons
+    return payload
+
+
 def probe_cluster_producer_identity(
     blender_exe: str | Path,
     *,
@@ -752,6 +789,18 @@ def dependency_identity(
                 relevant_settings.get("blender_exe") or "."
             )
         )
+    if "production_code_identity" in relevant_settings:
+        relevant_settings["production_code_identity"] = (
+            _semantic_production_code_identity(
+                relevant_settings["production_code_identity"]
+            )
+        )
+    if "cluster_producer_identity" in relevant_settings:
+        relevant_settings["cluster_producer_identity"] = (
+            _semantic_cluster_producer_identity(
+                relevant_settings["cluster_producer_identity"]
+            )
+        )
     cache = file_identity_cache if file_identity_cache is not None else {}
     inventory_specs = _inventory_specs(unit)
     inventory_before = [
@@ -854,6 +903,138 @@ def scope_dependency_identities(
         )
         for unit in units
     }
+
+
+def _identity_rebase_changes(
+    expected: Mapping[str, Any],
+    current: Mapping[str, Any],
+    authorized_writes: Sequence[Mapping[str, Any]],
+) -> Optional[list[dict]]:
+    """Return changed resources when every change is an authorized write.
+
+    ``None`` means the identity also changed outside the predecessor's sealed
+    write ownership and therefore must retain its old fail-closed baseline.
+    """
+
+    if expected.get("stable") is not True or current.get("stable") is not True:
+        return None
+    static_exclusions = {"digest", "inputs", "inventories"}
+    expected_static = {
+        key: copy.deepcopy(value)
+        for key, value in expected.items()
+        if key not in static_exclusions
+    }
+    current_static = {
+        key: copy.deepcopy(value)
+        for key, value in current.items()
+        if key not in static_exclusions
+    }
+    if expected_static != current_static:
+        return None
+
+    def authorized(resource: Mapping[str, Any]) -> bool:
+        return any(
+            _resources_intersect(resource, write)
+            for write in authorized_writes
+        )
+
+    def input_rows(identity: Mapping[str, Any]) -> dict[str, dict]:
+        return {
+            _path_key(entry["path"]): copy.deepcopy(dict(entry))
+            for entry in identity.get("inputs") or ()
+            if isinstance(entry, Mapping) and entry.get("path")
+        }
+
+    def inventory_rows(identity: Mapping[str, Any]) -> dict[tuple, dict]:
+        rows = {}
+        for entry in identity.get("inventories") or ():
+            if not isinstance(entry, Mapping) or not entry.get("path"):
+                continue
+            key = (
+                _path_key(entry["path"]),
+                bool(entry.get("recursive")),
+                tuple(sorted(str(value) for value in entry.get("patterns") or ())),
+            )
+            rows[key] = copy.deepcopy(dict(entry))
+        return rows
+
+    changed: dict[tuple[str, str], dict] = {}
+    expected_inputs = input_rows(expected)
+    current_inputs = input_rows(current)
+    for key in sorted(set(expected_inputs) | set(current_inputs)):
+        before = expected_inputs.get(key)
+        after = current_inputs.get(key)
+        if before == after:
+            continue
+        path = (after or before)["path"]
+        resource = {"kind": "file", "path": _absolute_path(path)}
+        if not authorized(resource):
+            return None
+        changed[("file", _path_key(path))] = resource
+
+    expected_inventories = inventory_rows(expected)
+    current_inventories = inventory_rows(current)
+    for key in sorted(set(expected_inventories) | set(current_inventories)):
+        before = expected_inventories.get(key)
+        after = current_inventories.get(key)
+        if before == after:
+            continue
+        path = (after or before)["path"]
+        resource = {"kind": "tree", "path": _absolute_path(path)}
+        if not authorized(resource):
+            return None
+        changed[("tree", _path_key(path))] = resource
+    return [changed[key] for key in sorted(changed)]
+
+
+def rebase_authorized_dependency_identities(
+    completed_unit: Mapping[str, Any],
+    pending_units: Iterable[Mapping[str, Any]],
+    expected_identities: Mapping[str, Mapping[str, Any]],
+    settings: Optional[Mapping[str, Any]] = None,
+) -> dict[str, dict]:
+    """Refresh pending baselines changed only by a successful predecessor."""
+
+    writes = tuple(
+        (completed_unit.get("resource_sets") or {}).get("write") or ()
+    )
+    if not writes:
+        return {}
+    affected = []
+    for unit in pending_units:
+        resource_sets = unit.get("resource_sets") or _unit_resource_sets(unit)
+        owned = (
+            *(resource_sets.get("read") or ()),
+            *(resource_sets.get("write") or ()),
+        )
+        if any(
+            _resources_intersect(write, resource)
+            for write in writes
+            for resource in owned
+        ):
+            affected.append(unit)
+    if not affected:
+        return {}
+
+    current_identities = scope_dependency_identities(affected, settings)
+    updates = {}
+    for unit in affected:
+        unit_id = unit["unit_id"]
+        expected = expected_identities.get(unit_id)
+        if not isinstance(expected, Mapping):
+            raise ValueError(f"missing expected dependency identity for {unit_id}")
+        current = current_identities[unit_id]
+        changes = _identity_rebase_changes(expected, current, writes)
+        if not changes:
+            continue
+        updates[unit_id] = {
+            "authorized_by_unit_id": completed_unit["unit_id"],
+            "previous_digest": expected.get("digest"),
+            "digest": current.get("digest"),
+            "changed_resources": changes,
+            "identity": current,
+        }
+    return updates
 
 
 def connected_settings(
@@ -1245,16 +1426,19 @@ def summarize_unit_results(unit_results: Iterable[Mapping[str, Any]]) -> dict:
 
 def status_from_unit_results(unit_results, *, cancelled: bool = False) -> str:
     summary = summarize_unit_results(unit_results)
-    succeeded = summary["generator"]["succeeded"] + summary["cluster"]["succeeded"]
     failed = summary["failures"]
     pending = summary["generator"]["pending"] + summary["cluster"]["pending"]
     if cancelled:
         return "cancelled"
+    # A connected run is one pipeline, not a bag of independent jobs.  Once
+    # one unit fails, reporting the earlier mutations as a successful
+    # "partial" terminal outcome hides a broken handoff.  Historical partial
+    # reports remain readable, but newly sealed runs fail as a whole.
+    if failed:
+        return "failed"
     if pending:
         return "incomplete"
-    if not failed:
-        return "ok"
-    return "partial" if succeeded else "failed"
+    return "ok"
 
 
 def update_unit_result(
@@ -1637,6 +1821,7 @@ __all__ = [
     "new_unit_results",
     "probe_cluster_producer_identity",
     "report_file_identity",
+    "rebase_authorized_dependency_identities",
     "scope_dependency_identities",
     "selected_failed_units",
     "shared_queue_result",

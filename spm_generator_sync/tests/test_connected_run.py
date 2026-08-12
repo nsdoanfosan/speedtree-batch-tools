@@ -1,4 +1,6 @@
+import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -19,10 +21,12 @@ from connected_run import (  # noqa: E402
     load_exact_report,
     new_unit_results,
     probe_cluster_producer_identity,
+    rebase_authorized_dependency_identities,
     report_file_identity,
     scope_dependency_identities,
     selected_failed_units,
     shared_queue_result,
+    status_from_unit_results,
     update_unit_result,
     validate_failed_retry_plan,
     validate_preserved_unit_identities,
@@ -50,6 +54,15 @@ def retryable_publish_error(message="Permission denied: registry.json.tmp"):
 
 
 class ConnectedRunContractTests(unittest.TestCase):
+    def test_connected_failure_is_never_reported_as_partial_success(self):
+        unit_results = [
+            {"stage": "generator_sync", "outcome": "succeeded"},
+            {"stage": "cluster_refresh", "outcome": "failed"},
+            {"stage": "cluster_refresh", "outcome": "pending"},
+        ]
+
+        self.assertEqual(status_from_unit_results(unit_results), "failed")
+
     def test_production_shaped_fixture_preserves_partial_counts_and_nine_units(self):
         payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
 
@@ -666,6 +679,370 @@ class ConnectedRunContractTests(unittest.TestCase):
             self.assertEqual(identity["producer_manifest_sha256"], "a" * 64)
             self.assertEqual(identity["blender_exe"], str(blender.absolute()))
             self.assertEqual(len(identity["report_sha256"]), 64)
+
+    def test_addon_manifest_digest_ignores_mtime_only_changes(self):
+        job_path = TOOL_DIR / "jobs" / "connected_producer_identity_job.py"
+        spec = importlib.util.spec_from_file_location(
+            "_connected_producer_identity_job_test",
+            job_path,
+        )
+        self.assertIsNotNone(spec)
+        module = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(
+            sys.modules,
+            {"bpy": SimpleNamespace(app=SimpleNamespace(version=(5, 1, 2)))},
+        ):
+            spec.loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            addon = Path(temporary) / "fixture_addon"
+            addon.mkdir()
+            module_file = addon / "__init__.py"
+            module_file.write_text("VALUE = 1\n", encoding="utf-8")
+            runtime = {"module_file": str(module_file)}
+            first = module.addon_identity("fixture_addon", runtime)
+            stat_result = module_file.stat()
+            os.utime(
+                module_file,
+                ns=(stat_result.st_atime_ns, stat_result.st_mtime_ns + 1_000_000),
+            )
+            second = module.addon_identity("fixture_addon", runtime)
+
+            self.assertEqual(
+                first["manifest_sha256"],
+                second["manifest_sha256"],
+            )
+            self.assertNotEqual(
+                first["inventory_before_sha256"],
+                second["inventory_before_sha256"],
+            )
+
+    def test_production_inventory_diagnostics_do_not_change_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary)
+            master = owner / "master.spm"
+            follower = owner / "follower.spm"
+            manifest = owner / "spm_generator_sync.json"
+            master.write_bytes(b"master")
+            follower.write_bytes(b"follower")
+            manifest.write_text("{}", encoding="utf-8")
+            unit = connected_unit_records([{
+                "folder": owner,
+                "master": master.name,
+                "names": [follower.name],
+            }], [])[0]
+            production = {
+                "stable": True,
+                "manifest_sha256": "a" * 64,
+                "inventory_before_sha256": "b" * 64,
+                "inventory_after_sha256": "b" * 64,
+            }
+            first = scope_dependency_identities(
+                [unit],
+                {"production_code_identity": production},
+            )[unit["unit_id"]]
+            changed_diagnostics = {
+                **production,
+                "inventory_before_sha256": "c" * 64,
+                "inventory_after_sha256": "c" * 64,
+            }
+            second = scope_dependency_identities(
+                [unit],
+                {"production_code_identity": changed_diagnostics},
+            )[unit["unit_id"]]
+
+            self.assertEqual(first["digest"], second["digest"])
+            changed_content = {
+                **changed_diagnostics,
+                "manifest_sha256": "d" * 64,
+            }
+            third = scope_dependency_identities(
+                [unit],
+                {"production_code_identity": changed_content},
+            )[unit["unit_id"]]
+            self.assertNotEqual(first["digest"], third["digest"])
+
+    def test_cluster_producer_probe_diagnostics_do_not_change_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary)
+            blend = owner / "SK_branch_elm_01.blend"
+            target = owner / "SK_Tree_elm_01.spm"
+            blend.write_bytes(b"blend")
+            target.write_bytes(b"target")
+            unit = connected_unit_records(
+                [],
+                [{"blend": blend, "on_target_spms": [target]}],
+            )[0]
+            producer = {
+                "stable": True,
+                "producer_manifest_sha256": "a" * 64,
+                "report_sha256": "b" * 64,
+                "addons": [{
+                    "module": "atlas_leaf_mesh_builder",
+                    "manifest_sha256": "c" * 64,
+                    "inventory_before_sha256": "d" * 64,
+                    "inventory_after_sha256": "d" * 64,
+                }],
+                "blender_addon_runtime": {
+                    "status": "ready",
+                    "process_id": 101,
+                },
+            }
+            first = scope_dependency_identities(
+                [unit],
+                {"cluster_producer_identity": producer},
+            )[unit["unit_id"]]
+            second_producer = json.loads(json.dumps(producer))
+            second_producer["report_sha256"] = "e" * 64
+            second_producer["addons"][0][
+                "inventory_before_sha256"
+            ] = "f" * 64
+            second_producer["addons"][0][
+                "inventory_after_sha256"
+            ] = "f" * 64
+            second_producer["blender_addon_runtime"]["process_id"] = 202
+            second = scope_dependency_identities(
+                [unit],
+                {"cluster_producer_identity": second_producer},
+            )[unit["unit_id"]]
+
+            self.assertEqual(first["digest"], second["digest"])
+            semantic = second["settings"]["cluster_producer_identity"]
+            self.assertNotIn("report_sha256", semantic)
+            self.assertNotIn(
+                "process_id",
+                semantic["blender_addon_runtime"],
+            )
+            self.assertNotIn(
+                "inventory_before_sha256",
+                semantic["addons"][0],
+            )
+
+            second_producer["producer_manifest_sha256"] = "9" * 64
+            changed = scope_dependency_identities(
+                [unit],
+                {"cluster_producer_identity": second_producer},
+            )[unit["unit_id"]]
+            self.assertNotEqual(first["digest"], changed["digest"])
+
+    def test_volatile_cluster_probe_refresh_allows_attempt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary)
+            blend = owner / "SK_branch_elm_01.blend"
+            target = owner / "SK_Tree_elm_01.spm"
+            blend.write_bytes(b"blend")
+            target.write_bytes(b"target")
+            unit = connected_unit_records(
+                [],
+                [{"blend": blend, "on_target_spms": [target]}],
+            )[0]
+            production = {
+                "stable": True,
+                "manifest_sha256": "1" * 64,
+            }
+            planned_producer = {
+                "stable": True,
+                "producer_manifest_sha256": "2" * 64,
+                "report_sha256": "3" * 64,
+                "blender_addon_runtime": {"process_id": 1001},
+            }
+            refreshed_producer = {
+                **planned_producer,
+                "report_sha256": "4" * 64,
+                "blender_addon_runtime": {"process_id": 1002},
+            }
+            settings = {
+                "blender_exe": str(owner / "blender.exe"),
+                "production_code_identity": production,
+                "cluster_producer_identity": planned_producer,
+            }
+            expected = scope_dependency_identities([unit], settings)[
+                unit["unit_id"]
+            ]
+            attempts = []
+            import connected_run as contract
+
+            with mock.patch.object(
+                contract,
+                "production_code_identity",
+                return_value=production,
+            ), mock.patch.object(
+                contract,
+                "probe_cluster_producer_identity",
+                return_value=refreshed_producer,
+            ):
+                outcome = execute_with_bounded_publish_retry(
+                    lambda: attempts.append(1),
+                    capture_identity=lambda: contract.dependency_identity(
+                        unit,
+                        settings,
+                        refresh_execution_identity=True,
+                    ),
+                    ownership_is_current=lambda: True,
+                    expected_identity=expected,
+                )
+
+            self.assertTrue(outcome["ok"])
+            self.assertEqual(attempts, [1])
+
+    def test_authorized_manifest_write_rebases_later_generator_unit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary)
+            manifest = owner / "spm_generator_sync.json"
+            manifest.write_text("before", encoding="utf-8")
+            for name in ("master_a.spm", "a.spm", "master_b.spm", "b.spm"):
+                (owner / name).write_bytes(name.encode("utf-8"))
+            units = connected_unit_records(
+                [
+                    {
+                        "folder": owner,
+                        "master": "master_a.spm",
+                        "names": ["a.spm"],
+                    },
+                    {
+                        "folder": owner,
+                        "master": "master_b.spm",
+                        "names": ["b.spm"],
+                    },
+                ],
+                [],
+            )
+            identities = scope_dependency_identities(units, {})
+            manifest.write_text("after", encoding="utf-8")
+
+            updates = rebase_authorized_dependency_identities(
+                units[0],
+                units[1:],
+                identities,
+                {},
+            )
+
+            update = updates[units[1]["unit_id"]]
+            self.assertNotEqual(
+                update["previous_digest"],
+                update["digest"],
+            )
+            self.assertEqual(
+                [Path(row["path"]).name for row in update["changed_resources"]],
+                [manifest.name],
+            )
+
+    def test_authorized_generator_target_write_rebases_cluster_unit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary)
+            cluster = owner / "Cluster"
+            cluster.mkdir()
+            manifest = owner / "spm_generator_sync.json"
+            master = owner / "master.spm"
+            target = owner / "target.spm"
+            blend = cluster / "SK_branch_elm_01.blend"
+            manifest.write_text("{}", encoding="utf-8")
+            master.write_bytes(b"master")
+            target.write_bytes(b"before")
+            blend.write_bytes(b"blend")
+            units = connected_unit_records(
+                [{
+                    "folder": owner,
+                    "master": master.name,
+                    "names": [target.name],
+                }],
+                [{"blend": blend, "on_target_spms": [target]}],
+            )
+            identities = scope_dependency_identities(units, {})
+            target.write_bytes(b"after")
+
+            updates = rebase_authorized_dependency_identities(
+                units[0],
+                units[1:],
+                identities,
+                {},
+            )
+
+            update = updates[units[1]["unit_id"]]
+            self.assertEqual(
+                [Path(row["path"]).name for row in update["changed_resources"]],
+                [target.name],
+            )
+
+    def test_authorized_cluster_artifact_addition_rebases_later_cluster(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary)
+            cluster = owner / "Cluster"
+            cluster.mkdir()
+            target = owner / "target.spm"
+            first_blend = cluster / "SK_branch_elm_01.blend"
+            second_blend = cluster / "SK_leaf_elm_01.blend"
+            target.write_bytes(b"target")
+            first_blend.write_bytes(b"first")
+            second_blend.write_bytes(b"second")
+            units = connected_unit_records(
+                [],
+                [
+                    {
+                        "blend": first_blend,
+                        "on_target_spms": [target],
+                    },
+                    {
+                        "blend": second_blend,
+                        "on_target_spms": [target],
+                    },
+                ],
+            )
+            identities = scope_dependency_identities(units, {})
+            meshes = owner / "meshes"
+            meshes.mkdir()
+            generated = meshes / "cluster_generated.fbx"
+            generated.write_bytes(b"generated")
+
+            updates = rebase_authorized_dependency_identities(
+                units[0],
+                units[1:],
+                identities,
+                {},
+            )
+
+            update = updates[units[1]["unit_id"]]
+            resources = {
+                (row["kind"], Path(row["path"]).name)
+                for row in update["changed_resources"]
+            }
+            self.assertIn(("file", generated.name), resources)
+            self.assertIn(("tree", meshes.name), resources)
+
+    def test_authorized_rebase_rejects_unrelated_dependency_drift(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary)
+            manifest = owner / "spm_generator_sync.json"
+            manifest.write_text("before", encoding="utf-8")
+            for name in ("master_a.spm", "a.spm", "master_b.spm", "b.spm"):
+                (owner / name).write_bytes(name.encode("utf-8"))
+            units = connected_unit_records(
+                [
+                    {
+                        "folder": owner,
+                        "master": "master_a.spm",
+                        "names": ["a.spm"],
+                    },
+                    {
+                        "folder": owner,
+                        "master": "master_b.spm",
+                        "names": ["b.spm"],
+                    },
+                ],
+                [],
+            )
+            identities = scope_dependency_identities(units, {})
+            manifest.write_text("authorized", encoding="utf-8")
+            (owner / "master_b.spm").write_bytes(b"unrelated drift")
+
+            updates = rebase_authorized_dependency_identities(
+                units[0],
+                units[1:],
+                identities,
+                {},
+            )
+
+            self.assertEqual(updates, {})
 
     def test_blender_addon_manifest_change_invalidates_cluster_retry(self):
         with tempfile.TemporaryDirectory() as temporary:

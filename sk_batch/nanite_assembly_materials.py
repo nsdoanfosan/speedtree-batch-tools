@@ -325,6 +325,7 @@ def normalize_unreal_nanite_assembly_materials(
         "changed": False,
         "before_material_count": len(original_materials),
         "after_material_count": len(plan["global_slots"]),
+        "global_slots": plan["global_slots"],
         "appended_slots": plan["appended_slots"],
         "duplicate_global_keys": plan["duplicate_global_keys"],
         "parts": plan["parts"],

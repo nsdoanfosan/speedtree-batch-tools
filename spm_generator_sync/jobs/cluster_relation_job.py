@@ -397,6 +397,9 @@ def normalize_cluster_blend(recipe):
         "normalization_contract_sha256": recipe[
             "normalization_contract_sha256"
         ],
+        "bwr_material_assignment_sha256": recipe.get(
+            "bwr_material_assignment_sha256"
+        ),
         "recipe_sha256": recipe["recipe_sha256"],
         "capture_manifest": str(capture_manifest),
         "capture_manifest_sha256": sha256_file(capture_manifest),
