@@ -13,12 +13,83 @@ from atlas_target_registry import (
     registry_path_for_blend,
     save_target_registry,
 )
+from artifact_content_key import (
+    LEGACY_FINGERPRINT_ALGORITHM,
+    SAMPLED_FINGERPRINT_ALGORITHM,
+    SHA256_ALGORITHM,
+    file_content_key_snapshot,
+)
 from cluster_spm_pair_contract import bootstrap_cluster_authoring
 from pcg_st9_texture_batch import exact_target_repair as pcg_exact
 from spm_generator_sync import exact_target_repair as generator_exact
 
 
 class ExactTargetBackendTests(unittest.TestCase):
+    @staticmethod
+    def artifact_record(path, algorithm):
+        snapshot = file_content_key_snapshot(path, algorithm)
+        record = {
+            "path": str(Path(path).absolute()),
+            "size": snapshot["size"],
+            "mtime_ns": snapshot["mtime_ns"],
+        }
+        if algorithm == SHA256_ALGORITHM:
+            record["sha256"] = snapshot["digest"]
+        else:
+            record["fingerprint"] = snapshot["digest"]
+            record["fingerprint_algorithm"] = algorithm
+        return record
+
+    def sealed_off_cluster_relation(self, root):
+        root = Path(root)
+        owner = root / "Tree"
+        cluster = owner / "cluster"
+        fbx_dir = owner / "fbx"
+        cluster.mkdir(parents=True)
+        fbx_dir.mkdir()
+        target = owner / "SK_tree.spm"
+        provider = cluster / "SK_cluster.spm"
+        blend = provider.with_suffix(".blend")
+        fbx = fbx_dir / "SK_tree.fbx"
+        target.write_bytes(b"target")
+        provider.write_bytes(b"provider")
+        blend.write_bytes(b"blend")
+        fbx.write_bytes(b"full-fbx")
+        save_target_registry(blend, [])
+        registry = registry_path_for_blend(blend)
+        relation = {
+            "schema_version": 1,
+            "target_spm": str(target),
+            "provider_spm": str(provider),
+            "provider_blend": str(blend),
+            "relation_status": "explicit_off",
+            "relation_allowed": False,
+            "live_pair_proof": {
+                "current_live_pair_covered": True,
+                "spm_pair_status": "complete_pair",
+                "fbx_pair_status": "complete_pair",
+                "fbx_pair_decision": "normalize_part",
+            },
+            "artifacts": {
+                "target_spm": self.artifact_record(
+                    target, LEGACY_FINGERPRINT_ALGORITHM
+                ),
+                "provider_spm": self.artifact_record(
+                    provider, LEGACY_FINGERPRINT_ALGORITHM
+                ),
+                "provider_blend": self.artifact_record(
+                    blend, SAMPLED_FINGERPRINT_ALGORITHM
+                ),
+                "target_fbx": self.artifact_record(
+                    fbx, SAMPLED_FINGERPRINT_ALGORITHM
+                ),
+                "target_registry": self.artifact_record(
+                    registry, SHA256_ALGORITHM
+                ),
+            },
+        }
+        return target, provider, blend, fbx, relation
+
     def ownership_plan(self, root):
         target = Path(root) / "SK_exact.spm"
         target.write_bytes(b"spm")
@@ -255,6 +326,80 @@ class ExactTargetBackendTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(ValueError, "sibling followers"):
                     generator_exact.exact_runtime_scope([master])
+
+    def test_sealed_explicit_off_relation_becomes_one_exact_cluster_row(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target, provider, blend, _fbx, relation = (
+                self.sealed_off_cluster_relation(folder)
+            )
+
+            class Engine:
+                @staticmethod
+                def scan_tree_folders(*_args, **_kwargs):
+                    return []
+
+            class App:
+                @staticmethod
+                def _connected_scope_from_board(_board):
+                    return {"groups": [], "cluster_rows": []}
+
+            module = SimpleNamespace(
+                engine=Engine(),
+                App=App,
+                load_config=lambda: {
+                    "tree_root": str(Path(folder)),
+                    "sk_only": True,
+                },
+            )
+            with mock.patch.object(
+                generator_exact, "_load_gui_module", return_value=module
+            ):
+                _module, _cfg, _root, groups, rows, canonical = (
+                    generator_exact.exact_runtime_scope(
+                        [target],
+                        cluster_provider_relations=[relation],
+                    )
+                )
+
+            self.assertEqual(groups, [])
+            self.assertEqual(canonical, [str(target)])
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(Path(rows[0]["blend"]), blend)
+            self.assertEqual(rows[0]["on_target_spms"], [target])
+            self.assertEqual(Path(rows[0]["source_spm"]), provider)
+
+    def test_sealed_relation_rejects_changed_live_fbx_before_registry_write(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target, _provider, _blend, fbx, relation = (
+                self.sealed_off_cluster_relation(folder)
+            )
+            fbx.write_bytes(b"changed-full-fbx")
+
+            class Engine:
+                @staticmethod
+                def scan_tree_folders(*_args, **_kwargs):
+                    return []
+
+            class App:
+                @staticmethod
+                def _connected_scope_from_board(_board):
+                    return {"groups": [], "cluster_rows": []}
+
+            module = SimpleNamespace(
+                engine=Engine(),
+                App=App,
+                load_config=lambda: {
+                    "tree_root": str(Path(folder)),
+                    "sk_only": True,
+                },
+            )
+            with mock.patch.object(
+                generator_exact, "_load_gui_module", return_value=module
+            ), self.assertRaisesRegex(ValueError, "artifact changed"):
+                generator_exact.exact_runtime_scope(
+                    [target],
+                    cluster_provider_relations=[relation],
+                )
 
     def test_ownership_backend_plan_only_callable_never_applies(self):
         with tempfile.TemporaryDirectory() as folder:

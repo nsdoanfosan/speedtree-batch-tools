@@ -353,6 +353,36 @@ class RepairOrchestrationTests(unittest.TestCase):
         self.assertTrue(plan.supported)
         self.assertEqual(plan.stages[0]["repair_action"], CLUSTER_REFRESH)
 
+    def test_sealed_provider_relations_refresh_the_owner_not_provider_paths(self):
+        second = self.cluster.with_name("SK_cluster_second.spm")
+        second.write_bytes(b"second-cluster")
+        self.inventory.append(second)
+        relations = [
+            {
+                "schema_version": 1,
+                "target_spm": str(self.target),
+                "provider_spm": str(provider),
+                "provider_blend": str(provider.with_suffix(".blend")),
+            }
+            for provider in (self.cluster, second)
+        ]
+        plan = self.plan({
+            "target_spm": str(self.target),
+            "issues": [{
+                "code": "NORMALIZED_VARIANTS_REQUIRED",
+                "spm": str(self.cluster),
+            }],
+            "cluster_provider_relations": relations,
+        })
+
+        self.assertTrue(plan.supported)
+        self.assertEqual(plan.stages[0]["repair_action"], CLUSTER_REFRESH)
+        self.assertEqual(plan.stages[0]["target_spms"], [str(self.target)])
+        self.assertEqual(
+            plan.stages[0]["cluster_provider_relations"],
+            relations,
+        )
+
     def test_lineage_reason_still_routes_cluster_refresh(self):
         evidence = {"reason_code": "lineage_unproven"}
         decision = repair_ui_decision(evidence)

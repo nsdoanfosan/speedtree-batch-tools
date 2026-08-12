@@ -293,6 +293,55 @@ def _cluster_paths_for_exact(
     return tuple(result[key] for key in sorted(result))
 
 
+def _cluster_provider_relations_for_exact(
+    evidence: Mapping[str, Any],
+    exact_spm: str | Path,
+) -> tuple[dict, ...]:
+    """Return deduplicated sealed provider relations for this exact target."""
+
+    exact_key = _path_key(exact_spm)
+    relations: dict[str, dict] = {}
+    for trail, value in _walk(evidence):
+        if (
+            not trail
+            or trail[-1].casefold() != "cluster_provider_relations"
+            or not isinstance(value, (list, tuple))
+        ):
+            continue
+        for row in value:
+            if not isinstance(row, Mapping):
+                continue
+            target = row.get("target_spm")
+            provider = row.get("provider_spm")
+            blend = row.get("provider_blend")
+            if not all(isinstance(item, (str, os.PathLike)) for item in (
+                target,
+                provider,
+                blend,
+            )):
+                continue
+            if _path_key(target) != exact_key:
+                continue
+            provider_path = Path(provider)
+            blend_path = Path(blend)
+            if (
+                not provider_path.is_absolute()
+                or provider_path.suffix.casefold() != ".spm"
+                or not blend_path.is_absolute()
+                or blend_path.suffix.casefold() != ".blend"
+                or _path_key(blend_path)
+                != _path_key(provider_path.with_suffix(".blend"))
+            ):
+                continue
+            key = _path_key(provider_path)
+            candidate = copy.deepcopy(dict(row))
+            existing = relations.get(key)
+            if existing is not None and existing != candidate:
+                return ()
+            relations[key] = candidate
+    return tuple(relations[key] for key in sorted(relations))
+
+
 def canonical_exact_spm(
     value: str | Path,
     inventory_paths: Iterable[str | Path],
@@ -795,6 +844,18 @@ def build_exact_target_repair_plan(
         )
 
     cluster_candidates = list(_cluster_paths_for_exact(evidence, canonical))
+    sealed_cluster_relations = _cluster_provider_relations_for_exact(
+        evidence,
+        canonical,
+    )
+    normalized_provider_refresh = bool(
+        sealed_cluster_relations
+        and cluster_stale
+        and codes.intersection({
+            "normalized_variants_required",
+            "normalized_variants_stale",
+        })
+    )
     if CURRENT_MATERIAL_BINDING_RECIPE in requirements and recipe is not None:
         cluster_candidates.extend(_candidate_paths(recipe, cluster_only=False))
     inventory = list(inventory_paths)
@@ -868,8 +929,10 @@ def build_exact_target_repair_plan(
     needs_cluster = generator_cluster or cluster_stale
     cluster_targets = []
     if needs_cluster:
-        cluster_targets = exact_clusters or (
-            [canonical] if cluster_stale else []
+        cluster_targets = (
+            [canonical]
+            if normalized_provider_refresh
+            else exact_clusters or ([canonical] if cluster_stale else [])
         )
         if not cluster_targets:
             primary = _primary_policy_row(rows)
@@ -893,11 +956,17 @@ def build_exact_target_repair_plan(
     elif generator or generator_cluster:
         add("generator_sync", GENERATOR_SYNC_TOOL, GENERATOR_SYNC, [canonical])
     elif needs_cluster:
+        extra = {}
+        if normalized_provider_refresh:
+            extra["cluster_provider_relations"] = list(
+                sealed_cluster_relations
+            )
         add(
             "cluster_refresh",
             GENERATOR_SYNC_TOOL,
             CLUSTER_REFRESH,
             cluster_targets,
+            **extra,
         )
 
     if not stages:
