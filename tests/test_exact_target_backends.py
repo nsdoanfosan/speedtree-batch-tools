@@ -401,6 +401,116 @@ class ExactTargetBackendTests(unittest.TestCase):
                     cluster_provider_relations=[relation],
                 )
 
+    def test_exact_multi_unit_run_rebases_authorized_successor_identity(self):
+        first = {
+            "unit_id": "cluster:first",
+            "stage": "cluster_refresh",
+            "resource_sets": {"write": [{
+                "kind": "file",
+                "path": "shared.spm",
+            }]},
+        }
+        second = {
+            "unit_id": "cluster:second",
+            "stage": "cluster_refresh",
+            "resource_sets": {"read": [{
+                "kind": "file",
+                "path": "shared.spm",
+            }]},
+        }
+        observed = []
+
+        class App:
+            def _execute_connected_runtime_unit(
+                self,
+                unit,
+                _runtime,
+                _cfg,
+                _verify,
+                _settings,
+                expected_identity,
+                *_reports,
+            ):
+                observed.append((unit["unit_id"], copy.deepcopy(
+                    expected_identity
+                )))
+                return {
+                    "ok": True,
+                    "result": {"status": "ok"},
+                }
+
+            @staticmethod
+            def _connected_result_summary(result):
+                return copy.deepcopy(result)
+
+        module = SimpleNamespace(App=App)
+        identities = {
+            first["unit_id"]: {"digest": "first-before"},
+            second["unit_id"]: {"digest": "second-before"},
+        }
+        rebased = {
+            second["unit_id"]: {
+                "authorized_by_unit_id": first["unit_id"],
+                "previous_digest": "second-before",
+                "digest": "second-after",
+                "changed_resources": [{
+                    "kind": "file",
+                    "path": "shared.spm",
+                }],
+                "identity": {"digest": "second-after"},
+            },
+        }
+        request = {
+            "repair_action": generator_exact.CLUSTER_REFRESH,
+            "target_spms": ["target.spm"],
+        }
+
+        with mock.patch.object(
+            generator_exact,
+            "build_exact_runtime_plan",
+            return_value=(
+                module,
+                {"verify_speedtree": True},
+                [first, second],
+                [{"row": 1}, {"row": 2}],
+                identities,
+                {"settings": True},
+                ["target.spm"],
+            ),
+        ), mock.patch.object(
+            generator_exact,
+            "rebase_authorized_dependency_identities",
+            side_effect=[rebased, {}],
+        ) as rebase:
+            result = generator_exact.execute_exact_generator_request(
+                request,
+                progress=mock.Mock(),
+                cancel_event=SimpleNamespace(is_set=lambda: False),
+                lease=SimpleNamespace(
+                    renew_and_check_current=lambda: True
+                ),
+            )
+
+        self.assertTrue(result["shared_queue_success"])
+        self.assertEqual(
+            observed,
+            [
+                (first["unit_id"], {"digest": "first-before"}),
+                (second["unit_id"], {"digest": "second-after"}),
+            ],
+        )
+        self.assertEqual(rebase.call_count, 2)
+        self.assertEqual(
+            result["units"][0]["authorized_dependency_rebases"][0][
+                "digest"
+            ],
+            "second-after",
+        )
+        self.assertNotIn(
+            "identity",
+            result["units"][0]["authorized_dependency_rebases"][0],
+        )
+
     def test_ownership_backend_plan_only_callable_never_applies(self):
         with tempfile.TemporaryDirectory() as folder:
             target, plan = self.ownership_plan(folder)
