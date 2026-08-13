@@ -276,6 +276,14 @@ def exact_runtime_scope(
 
     cluster_rows = []
     for raw_row in (sealed_cluster_rows or scope["cluster_rows"]):
+        # The Cluster provider is an exact requested repair target too.  Live
+        # board rows previously inventoried only their ON consumers, so a
+        # valid ``[consumer, provider]`` Generator+Cluster plan rejected the
+        # provider with "does not match a canonical inventory" before doing
+        # any work.
+        for key in ("source_spm", "canonical_spm"):
+            if raw_row.get(key):
+                inventory.append(Path(raw_row[key]))
         all_targets = [Path(path) for path in raw_row.get("on_target_spms") or ()]
         inventory.extend(all_targets)
         exact_targets = [path for path in all_targets if _key(path) in requested_keys]
