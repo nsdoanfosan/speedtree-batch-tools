@@ -79,6 +79,23 @@ PUSH_SOURCE_FINGERPRINT_CONTRACT = "content_only_v2"
 DEFAULT_SEND2UE_DIR = Path(
     r"C:\Users\PARK\Documents\GitHub\BlenderTools\src\addons\send2ue"
 )
+DEFAULT_SEND2UE_EXPORT_CACHE_ROOT = Path(
+    r"D:\SpeedTreeBatchTools\send2ue_fbx"
+)
+
+
+def send2ue_export_cache_root():
+    """Return the non-OneDrive D: workspace for large transient FBX exports."""
+    override = os.environ.get("SPEEDTREE_SEND2UE_EXPORT_ROOT")
+    if override:
+        return Path(override).expanduser().resolve()
+    if os.name == "nt":
+        return DEFAULT_SEND2UE_EXPORT_CACHE_ROOT
+    # Keep tests and non-Windows tooling usable without inventing a literal
+    # drive-letter directory. Production Windows runs always use D: above.
+    return LOG_DIR / "send2ue_fbx"
+
+
 
 DEFAULT_CONFIG = {
     "root": r"D:\OneDrive\Forestportfolio\02_nature\Tree",

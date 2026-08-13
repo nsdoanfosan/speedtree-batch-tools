@@ -180,6 +180,7 @@ from sk_common import (
     save_state,
     scan_cluster_spm_sources,
     scan_sk_spms,
+    send2ue_export_cache_root,
     set_manual_bones_marker,
     push_source_snapshot,
     prepare_cluster_spm_pair_for_job,
@@ -16150,6 +16151,8 @@ class App:
         non_error_kinds = {
             "completed",
             "ready",
+            "exporting",
+            "artifact_waiting",
             "exported_pending_unreal",
             "importing",
             "imported_ok",
@@ -16255,6 +16258,14 @@ class App:
                 terminal_reason="operator_cancelled",
                 outcome=RETRY_STAGE_CANCELLED,
             )
+        elif kind in {"exporting", "artifact_waiting"}:
+            self._retry_transition(
+                iid,
+                RETRY_STAGE_SEND2UE,
+                progress_message,
+                progress=True,
+                heartbeat=True,
+            )
         elif kind == "dependency_waiting":
             self._retry_transition(
                 iid,
@@ -16283,6 +16294,58 @@ class App:
                 terminal_reason=str(kind),
                 outcome=terminal_stage,
             )
+
+    def _wait_for_send2ue_disk_space(self, iid, export_root, expected_bytes):
+        """Wait for D: FBX workspace capacity without entering retention."""
+        export_root = Path(export_root)
+        volume = Path(export_root.anchor) if export_root.anchor else export_root
+        workers = max(1, int(self.cfg.get("blender_parallel_jobs", 2)))
+        safety_bytes = 5 * 1024**3
+        required_free = int(expected_bytes) * workers + safety_bytes
+        started = time.monotonic()
+        last_notice_bucket = None
+        while True:
+            if self.stop_flag.is_set():
+                raise BatchItemError(
+                    "D: FBX export 공간 대기 취소",
+                    kind="cancelled",
+                )
+            try:
+                free_bytes = shutil.disk_usage(volume).free
+            except OSError as exc:
+                raise BatchItemError(
+                    f"FBX export 드라이브를 사용할 수 없음: {volume}: {exc}",
+                    kind="data_error",
+                ) from exc
+            if free_bytes >= required_free:
+                return
+            elapsed = max(0.0, time.monotonic() - started)
+            notice_bucket = int(elapsed // 15)
+            if notice_bucket != last_notice_bucket:
+                last_notice_bucket = notice_bucket
+                status = (
+                    "D: FBX export 공간 대기 중... "
+                    f"(여유 {free_bytes / 1024**3:.1f} GiB, "
+                    f"필요 {required_free / 1024**3:.1f} GiB)"
+                )
+                self._set_push_state(
+                    iid,
+                    "artifact_waiting",
+                    status,
+                    message=status,
+                )
+                self.ui_queue.put(
+                    ("progress", f"{Path(iid).name}: {status}")
+                )
+                self.log(
+                    f"[D: FBX capacity wait] {Path(iid).name}: "
+                    f"free={free_bytes}, required={required_free}"
+                )
+            if self.stop_flag.wait(1.0):
+                raise BatchItemError(
+                    "D: FBX export 공간 대기 취소",
+                    kind="cancelled",
+                )
 
     def _push_dependency_paths(self):
         planning = self._failed_retry_planning_context()
@@ -16515,6 +16578,24 @@ class App:
             return None
         if str(item.get("queue_id")) != iid or not manifest_item_files_match(item):
             return None
+        exported_files = item.get("exported_files") or []
+        if exported_files:
+            d_export_root = send2ue_export_cache_root().resolve()
+            uses_d_export_root = False
+            for identity in exported_files:
+                path = str((identity or {}).get("path") or "").strip()
+                if not path:
+                    continue
+                try:
+                    Path(path).resolve().relative_to(d_export_root)
+                    uses_d_export_root = True
+                    break
+                except (OSError, ValueError):
+                    continue
+            if not uses_d_export_root:
+                # Do not copy or migrate old C: payloads. A current source
+                # simply exports once into the new D: FBX workspace.
+                return None
         return item
 
     def _export_manifest_item(self, iid, spm, batch_stamp):
@@ -16541,7 +16622,12 @@ class App:
             self.log(f"[export cache] {spm.name}: {cached['fingerprint']}")
             return cached
 
-        cache_root = LOG_DIR / "send2ue_export_cache" / source_fingerprint / spm.stem
+        cache_root = (
+            send2ue_export_cache_root()
+            / "headless"
+            / source_fingerprint
+            / spm.stem
+        )
         manifest_path = LOG_DIR / f"{spm.stem}_manifest_{source_fingerprint}.json"
         export_report = LOG_DIR / f"{spm.stem}_export_{source_fingerprint}.json"
         export_log_name = f"{spm.stem}_export_{batch_stamp}.log"
@@ -16611,29 +16697,28 @@ class App:
             self.cfg.get("push_job_timeout", 1800)
         ))
         self._assert_active_production_source_manifest()
+        expected_export_bytes = estimate_output_reservation_bytes(
+            blend, minimum_bytes=1024**3, multiplier=4
+        )
         try:
-            with managed_output_reservation(
-                (
-                    cache_root,
-                    manifest_path,
-                    export_report,
-                    checkpoint_path,
-                    batch_report,
+            self._wait_for_send2ue_disk_space(
+                iid, cache_root, expected_export_bytes
+            )
+            self._set_push_state(
+                iid,
+                "exporting",
+                "Send2UE export 중...",
+            )
+            code, log_file = self._run_limited(
+                cmd,
+                export_log_name,
+                None,
+                affinity=self.cfg.get("blender_parallel_jobs", 2) <= 1,
+                inactivity_timeout=disk_export_timeout,
+                inactivity_timeout_by_marker=send2ue_inactivity_rules(
+                    stage_timeout, disk_export_timeout
                 ),
-                estimate_output_reservation_bytes(
-                    blend, minimum_bytes=1024**3, multiplier=4
-                ),
-            ):
-                code, log_file = self._run_limited(
-                    cmd,
-                    export_log_name,
-                    None,
-                    affinity=self.cfg.get("blender_parallel_jobs", 2) <= 1,
-                    inactivity_timeout=disk_export_timeout,
-                    inactivity_timeout_by_marker=send2ue_inactivity_rules(
-                        stage_timeout, disk_export_timeout
-                    ),
-                )
+            )
         finally:
             # Send2UE output produced across two code revisions is discarded by
             # the parent restart fence and must not create an asset failure.
@@ -17818,7 +17903,12 @@ class App:
         checkpoint_path = LOG_DIR / f"{spm.stem}_rpc_checkpoint_{stamp}.json"
         batch_report = LOG_DIR / f"{spm.stem}_rpc_batch_{stamp}.json"
         import_report = LOG_DIR / f"{spm.stem}_rpc_unreal_{stamp}.json"
-        export_root = LOG_DIR / "send2ue_rpc_export" / stamp / spm.stem
+        export_root = (
+            send2ue_export_cache_root()
+            / "rpc"
+            / stamp
+            / spm.stem
+        )
         send2ue_unreal_py = (
             Path(self.cfg["send2ue_dir"]) / "dependencies" / "unreal.py"
         )
@@ -17865,28 +17955,26 @@ class App:
         disk_export_timeout = max(1, int(
             self.cfg.get("push_job_timeout", 1800)
         ))
-        with managed_output_reservation(
-            (
-                export_root,
-                manifest_path,
-                checkpoint_path,
-                batch_report,
-                import_report,
-                job_report,
+        expected_export_bytes = estimate_output_reservation_bytes(
+            blend, minimum_bytes=1024**3, multiplier=4
+        )
+        self._wait_for_send2ue_disk_space(
+            iid, export_root, expected_export_bytes
+        )
+        self._set_push_state(
+            iid,
+            "exporting",
+            "Send2UE export 중...",
+        )
+        code, log_file = self._run_limited(
+            cmd,
+            f"{spm.stem}_push_{stamp}.log",
+            None,
+            inactivity_timeout=disk_export_timeout,
+            inactivity_timeout_by_marker=send2ue_inactivity_rules(
+                stage_timeout, disk_export_timeout
             ),
-            estimate_output_reservation_bytes(
-                blend, minimum_bytes=1024**3, multiplier=4
-            ),
-        ):
-            code, log_file = self._run_limited(
-                cmd,
-                f"{spm.stem}_push_{stamp}.log",
-                None,
-                inactivity_timeout=disk_export_timeout,
-                inactivity_timeout_by_marker=send2ue_inactivity_rules(
-                    stage_timeout, disk_export_timeout
-                ),
-            )
+        )
         result = load_job_report(job_report)
         if code != 0 or result.get("status") != "ok":
             reason = summarize_job_failure(result, log_file)
