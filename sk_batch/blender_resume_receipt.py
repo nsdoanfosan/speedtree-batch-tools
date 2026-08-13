@@ -1,9 +1,9 @@
-"""Durable, cheap identity receipts for completed Blender Repair rows.
+"""Non-blocking resume hints for completed Blender Repair rows.
 
-The full live Repair audit remains the authority that creates a receipt.  A
-later queue run may reuse that decision only while every file identity and
-output-affecting setting bound by the audit is unchanged.  This keeps restart
-planning cheap without turning a saved UI label into completion authority.
+A receipt may remove an unchanged row from a restarted queue.  A missing or
+changed receipt never fails an item: orchestration either runs relationship
+maintenance before deciding whether BWR is still reusable, or rebuilds the
+row when an output-affecting input changed.
 """
 
 from __future__ import annotations
@@ -14,15 +14,16 @@ import json
 import os
 from pathlib import Path
 
-from artifact_content_key import sampled_file_content_snapshot
-
-
 BLENDER_RESUME_RECEIPT_KIND = "sk_batch_blender_resume_receipt"
 BLENDER_RESUME_RECEIPT_VERSION = 1
 
 
 class BlenderResumeReceiptError(ValueError):
-    """The saved receipt is malformed, stale, or belongs to another row."""
+    """A resume hint cannot authorize a queue-level skip."""
+
+    def __init__(self, message, *, resume_action="invalid"):
+        super().__init__(message)
+        self.resume_action = str(resume_action)
 
 
 def _canonical_json_sha256(payload):
@@ -43,7 +44,7 @@ def _path_key(path):
     return os.path.normcase(_canonical_path(path)).casefold()
 
 
-def _file_identity(path, *, include_content_key=False):
+def _file_identity(path):
     candidate = Path(path).expanduser().absolute()
     try:
         stat = candidate.stat()
@@ -64,10 +65,6 @@ def _file_identity(path, *, include_content_key=False):
         "device": int(stat.st_dev),
         "file_id": int(stat.st_ino),
     }
-    if include_content_key:
-        # Core source/output files also carry a bounded content key so a
-        # same-size replacement with restored timestamps still fails closed.
-        identity["content_key"] = sampled_file_content_snapshot(candidate)
     return identity
 
 
@@ -83,7 +80,8 @@ def build_blender_resume_receipt(
     queue_spm,
     *,
     tracked_paths,
-    content_key_paths=(),
+    relation_paths=(),
+    relation_signature=None,
     settings,
     repair_state,
 ):
@@ -98,22 +96,25 @@ def build_blender_resume_receipt(
         raise BlenderResumeReceiptError(
             f"queue SPM is missing: {queue_spm}"
         )
-    paths = {_path_key(queue_spm): queue_spm}
+    paths = {_path_key(queue_spm): (queue_spm, "core")}
     for path in tracked_paths or ():
         if path:
             canonical = _canonical_path(path)
-            paths[_path_key(canonical)] = canonical
-    content_keys = {
-        _path_key(path)
-        for path in content_key_paths or ()
-        if path
-    }
-    content_keys.add(_path_key(queue_spm))
+            paths[_path_key(canonical)] = (canonical, "core")
+    for path in relation_paths or ():
+        if path:
+            canonical = _canonical_path(path)
+            # A core output/input must stay core even if a dependency report
+            # redundantly lists the same path as relationship metadata.
+            paths.setdefault(
+                _path_key(canonical),
+                (canonical, "relation"),
+            )
     files = [
-        _file_identity(
-            paths[key],
-            include_content_key=key in content_keys,
-        )
+        {
+            **_file_identity(paths[key][0]),
+            "role": paths[key][1],
+        }
         for key in sorted(paths)
     ]
     result = {
@@ -133,6 +134,7 @@ def build_blender_resume_receipt(
         "schema_version": BLENDER_RESUME_RECEIPT_VERSION,
         "queue_spm": queue_spm,
         "settings_sha256": settings_signature(settings),
+        "relation_signature": copy.deepcopy(relation_signature),
         "files": files,
         "repair_state": result,
     }
@@ -140,11 +142,20 @@ def build_blender_resume_receipt(
     return payload
 
 
-def validate_blender_resume_receipt(receipt, queue_spm, *, settings):
-    """Return the saved current decision after cheap fail-closed validation."""
+def validate_blender_resume_receipt(
+    receipt,
+    queue_spm,
+    *,
+    settings,
+    relation_signature=None,
+):
+    """Return the saved decision only when a queue-level skip is safe."""
 
     if not isinstance(receipt, dict):
-        raise BlenderResumeReceiptError("Blender resume receipt is missing")
+        raise BlenderResumeReceiptError(
+            "Blender resume receipt is missing",
+            resume_action="missing",
+        )
     recorded_hash = str(receipt.get("receipt_sha256") or "").casefold()
     unsigned = copy.deepcopy(receipt)
     unsigned.pop("receipt_sha256", None)
@@ -155,50 +166,71 @@ def validate_blender_resume_receipt(receipt, queue_spm, *, settings):
         or _canonical_json_sha256(unsigned) != recorded_hash
     ):
         raise BlenderResumeReceiptError(
-            "Blender resume receipt envelope is invalid"
+            "Blender resume receipt envelope is invalid",
+            resume_action="invalid",
         )
     if _path_key(receipt.get("queue_spm") or "") != _path_key(queue_spm):
         raise BlenderResumeReceiptError(
-            "Blender resume receipt belongs to another SPM"
+            "Blender resume receipt belongs to another SPM",
+            resume_action="wrong_target",
         )
     if receipt.get("settings_sha256") != settings_signature(settings):
         raise BlenderResumeReceiptError(
-            "Blender Repair output settings changed"
+            "Blender Repair output settings changed",
+            resume_action="rebuild_required",
+        )
+    if receipt.get("relation_signature") != relation_signature:
+        raise BlenderResumeReceiptError(
+            "Blender Repair relationship signal changed",
+            resume_action="relation_changed",
         )
     files = receipt.get("files")
     if not isinstance(files, list) or not files:
         raise BlenderResumeReceiptError(
-            "Blender resume receipt has no bound files"
+            "Blender resume receipt has no bound files",
+            resume_action="invalid",
         )
     queue_key = _path_key(queue_spm)
     seen = set()
     for recorded in files:
         if not isinstance(recorded, dict) or not recorded.get("path"):
             raise BlenderResumeReceiptError(
-                "Blender resume receipt contains a malformed file identity"
+                "Blender resume receipt contains a malformed file identity",
+                resume_action="invalid",
             )
         key = _path_key(recorded["path"])
         if key in seen:
             raise BlenderResumeReceiptError(
-                "Blender resume receipt contains duplicate file identities"
+                "Blender resume receipt contains duplicate file identities",
+                resume_action="invalid",
             )
         seen.add(key)
-        current = _file_identity(
-            recorded["path"],
-            include_content_key="content_key" in recorded,
-        )
-        if current != recorded:
+        current = _file_identity(recorded["path"])
+        expected = dict(recorded)
+        role = str(expected.pop("role", "core") or "core")
+        # Receipts from the pre-merge prototype may contain a sampled content
+        # key. Drop it instead of reading SPM/Blend bytes again; current stat
+        # identity is the resume contract.
+        expected.pop("content_key", None)
+        if current != expected:
             raise BlenderResumeReceiptError(
-                f"bound Repair artifact changed: {recorded['path']}"
+                f"bound Repair artifact changed: {recorded['path']}",
+                resume_action=(
+                    "relation_changed"
+                    if role == "relation"
+                    else "rebuild_required"
+                ),
             )
     if queue_key not in seen:
         raise BlenderResumeReceiptError(
-            "Blender resume receipt does not bind its queue SPM"
+            "Blender resume receipt does not bind its queue SPM",
+            resume_action="invalid",
         )
     result = copy.deepcopy(receipt.get("repair_state"))
     if not isinstance(result, dict) or result.get("current") is not True:
         raise BlenderResumeReceiptError(
-            "Blender resume receipt has no current Repair result"
+            "Blender resume receipt has no current Repair result",
+            resume_action="invalid",
         )
     return result
 
