@@ -327,6 +327,63 @@ class ExactTargetBackendTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "sibling followers"):
                     generator_exact.exact_runtime_scope([master])
 
+    def test_generator_cluster_plan_accepts_live_row_source_spm(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            asset = root / "asset"
+            cluster = asset / "cluster"
+            cluster.mkdir(parents=True)
+            master = asset / "SK_tree_master.spm"
+            target = asset / "SK_tree_exact.spm"
+            provider = cluster / "SK_cluster_exact.spm"
+            for path in (master, target, provider):
+                path.write_bytes(path.name.encode())
+
+            scope = {
+                "groups": [{
+                    "folder": asset,
+                    "master": master.name,
+                    "names": [target.name],
+                }],
+                "cluster_rows": [{
+                    "blend": provider.with_suffix(".blend"),
+                    "source_spm": provider,
+                    "canonical_spm": provider,
+                    "on_target_spms": [target],
+                }],
+                "skipped": [],
+            }
+
+            class Engine:
+                @staticmethod
+                def scan_tree_folders(*_args, **_kwargs):
+                    return ["board"]
+
+            class App:
+                @staticmethod
+                def _connected_scope_from_board(_board):
+                    return scope
+
+            module = SimpleNamespace(
+                engine=Engine(),
+                App=App,
+                load_config=lambda: {
+                    "tree_root": str(root),
+                    "sk_only": True,
+                },
+            )
+
+            with mock.patch.object(
+                generator_exact, "_load_gui_module", return_value=module
+            ):
+                _module, _cfg, _root, groups, rows, canonical = (
+                    generator_exact.exact_runtime_scope([target, provider])
+                )
+
+            self.assertEqual(groups[0]["names"], [target.name])
+            self.assertEqual(rows[0]["on_target_spms"], [target])
+            self.assertEqual(canonical, [str(target), str(provider)])
+
     def test_sealed_explicit_off_relation_becomes_one_exact_cluster_row(self):
         with tempfile.TemporaryDirectory() as folder:
             target, provider, blend, _fbx, relation = (
