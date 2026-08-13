@@ -259,7 +259,7 @@ def test_multi_target_receipt_never_projects_the_other_target(tmp_path):
     )
 
 
-def test_real_pass_through_to_actionable_transition_stays_blocked(tmp_path):
+def test_live_transition_does_not_invalidate_saved_pass_through(tmp_path):
     gui = load_gui_module()
     app = make_app(gui)
     scenario = make_scenario(tmp_path)
@@ -277,12 +277,11 @@ def test_real_pass_through_to_actionable_transition_stays_blocked(tmp_path):
         scenario["target_spm"]
     )
 
-    assert not ready
-    assert "target_contract.handoff.status" in reason
-    assert "expected=pass_through actual=ready" in reason
+    assert ready, reason
+    assert reason == ""
 
 
-def test_changed_pass_through_artifact_stays_blocked_with_exact_path(
+def test_changed_upstream_pass_through_artifact_is_diagnostic(
     tmp_path,
 ):
     gui = load_gui_module()
@@ -294,17 +293,8 @@ def test_changed_pass_through_artifact_stays_blocked_with_exact_path(
         scenario["target_spm"]
     )
 
-    assert not ready
-    assert (
-        "target_contract.dependencies[0].spm_fingerprint.sha256"
-        in reason
-        or (
-            "target_contract.handoff.cluster_dependencies[0]."
-            "spm_fingerprint.sha256"
-        ) in reason
-    )
-    assert str(scenario["dependency_spm"]) in reason
-    assert len(reason) > 100
+    assert ready, reason
+    assert reason == ""
 
 
 def test_sampled_pass_through_artifact_mtime_only_rewrite_stays_current(
@@ -328,7 +318,7 @@ def test_sampled_pass_through_artifact_mtime_only_rewrite_stays_current(
     assert reason == ""
 
 
-def test_sampled_pass_through_artifact_same_size_content_change_stays_blocked(
+def test_sampled_upstream_content_change_is_diagnostic(
     tmp_path,
 ):
     gui = load_gui_module()
@@ -340,12 +330,11 @@ def test_sampled_pass_through_artifact_same_size_content_change_stays_blocked(
         scenario["target_spm"]
     )
 
-    assert not ready
-    assert ".fingerprint" in reason
-    assert str(scenario["dependency_spm"]) in reason
+    assert ready, reason
+    assert reason == ""
 
 
-def test_operator_state_keeps_full_mismatch_before_display_truncation(
+def test_operator_state_accepts_dependency_drift_as_diagnostic(
     tmp_path,
 ):
     gui = load_gui_module()
@@ -355,36 +344,5 @@ def test_operator_state_keeps_full_mismatch_before_display_truncation(
     ready, full_reason = app._cluster_assembly_inputs_current(
         scenario["target_spm"]
     )
-    assert not ready
-    assert len(full_reason) > 100
-
-    target = {"spm": scenario["target_spm"]}
-    app.stop_flag = threading.Event()
-    app.cfg = {"blender_parallel_jobs": 1}
-    app.log = mock.Mock()
-    app._job_blender = mock.Mock(
-        side_effect=gui.BatchItemError(
-            full_reason,
-            kind="data_error",
-        )
-    )
-    app._publish_repair_stage_contract = mock.Mock()
-    app._batch_job_inventory = mock.Mock(return_value={})
-
-    with mock.patch.object(
-        gui,
-        "expand_blender_repair_targets",
-        return_value=([target], {}, set()),
-    ), mock.patch.object(gui, "save_state"):
-        app._run_batch("blender", [target], emit_done=False)
-
-    state = app.state[str(scenario["target_spm"])]
-    assert state["blend_status"].endswith("…")
-    assert len(state["blend_status"]) <= 104
-    assert state["blend_status_error"]["message"] == full_reason
-    app._publish_repair_stage_contract.assert_called_once_with(
-        scenario["target_spm"],
-        ready=False,
-        reason=full_reason,
-        kind="data_error",
-    )
+    assert ready, full_reason
+    assert full_reason == ""

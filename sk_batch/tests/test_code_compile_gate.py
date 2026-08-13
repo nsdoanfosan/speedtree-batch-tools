@@ -459,10 +459,12 @@ class CodeCompileGateTests(unittest.TestCase):
     def test_push_contract_values_must_be_consumed(self):
         source = gui_source()
         source = source.replace(
-            '                    ok = bool(repair_contract["ready"])\n'
-            '                    why = str(repair_contract["reason"])\n',
-            '                    ok = False\n'
-            '                    why = "ignored"\n',
+            'ok = bool(repair_contract["ready"])',
+            "ok = False",
+            1,
+        ).replace(
+            'why = str(repair_contract["reason"])',
+            'why = "ignored"',
             1,
         )
         with self.assertRaisesRegex(
@@ -471,28 +473,30 @@ class CodeCompileGateTests(unittest.TestCase):
         ):
             validate_gui_contracts(source)
 
-    def test_same_generation_evidence_validation_is_a_compile_contract(self):
-        module = ast.parse(gui_source())
-        changed = RenameMethodCall(
-            "_validate_repair_stage_contract",
-            "_validate_repair_stage_contract_disabled",
-        ).visit(module)
-        ast.fix_missing_locations(changed)
-        with self.assertRaisesRegex(
-            CompileGateError,
-            "does not validate same-generation evidence",
-        ):
-            validate_gui_contracts(ast.unparse(changed))
-
-    def test_push_worker_evidence_cli_is_static_compile_contract(self):
-        source = PUSH_JOB_PATH.read_text(encoding="utf-8").replace(
-            'parser.add_argument("--repair-evidence")',
-            'parser.add_argument("--repair-evidence-disabled")',
+    def test_obsolete_same_generation_evidence_guard_fails_compile_gate(self):
+        changed = gui_source().replace(
+            "class App:",
+            "class App:\n"
+            "    def _validate_repair_stage_contract(self):\n"
+            "        return None\n",
             1,
         )
         with self.assertRaisesRegex(
             CompileGateError,
-            "no --repair-evidence contract",
+            "Obsolete Repair-to-Push evidence guard returned",
+        ):
+            validate_gui_contracts(changed)
+
+    def test_push_worker_rejects_obsolete_evidence_cli(self):
+        source = PUSH_JOB_PATH.read_text(encoding="utf-8").replace(
+            "    return parser.parse_args(argv)",
+            '    parser.add_argument("--repair-evidence")\n'
+            "    return parser.parse_args(argv)",
+            1,
+        )
+        with self.assertRaisesRegex(
+            CompileGateError,
+            "obsolete Repair evidence CLI",
         ):
             validate_push_job_contracts(source)
 

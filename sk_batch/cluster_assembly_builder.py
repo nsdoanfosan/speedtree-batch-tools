@@ -38,7 +38,6 @@ if str(REPO_DIR) not in sys.path:
 from process_lifecycle import owned_run
 from artifact_content_key import (
     artifact_record_content_key,
-    file_content_key_snapshot,
 )
 
 from nanite_assembly_materials import (
@@ -505,92 +504,6 @@ def _first_contract_difference(expected, actual, path):
     return ""
 
 
-def _iter_contract_artifact_records(value, path="target_contract"):
-    if isinstance(value, dict):
-        is_fingerprint = bool(
-            value.get("path")
-            and "exists" in value
-            and any(
-                key in value
-                for key in ("size", "mtime_ns", "sha256")
-            )
-        )
-        if is_fingerprint:
-            yield path, value
-        for key, child in value.items():
-            yield from _iter_contract_artifact_records(
-                child, f"{path}.{key}"
-            )
-    elif isinstance(value, list):
-        for index, child in enumerate(value):
-            yield from _iter_contract_artifact_records(
-                child, f"{path}[{index}]"
-            )
-
-
-def _validate_contract_artifact_record(path, expected):
-    artifact_path = Path(str(expected.get("path") or ""))
-    expected_exists = expected.get("exists") is True
-    actual_exists = artifact_path.is_file()
-    if actual_exists != expected_exists:
-        raise ClusterAssemblyBuildError(
-            "Cluster pass-through artifact mismatch at "
-            f"{path}.exists: expected={expected_exists} "
-            f"actual={actual_exists}; artifact={artifact_path}"
-        )
-    if not expected_exists:
-        return
-    try:
-        stat = artifact_path.stat()
-    except OSError as exc:
-        raise ClusterAssemblyBuildError(
-            "Cluster pass-through artifact could not be read at "
-            f"{path}: {artifact_path}: {exc}"
-        ) from exc
-    if expected.get("size") is not None and int(expected["size"]) != stat.st_size:
-        raise ClusterAssemblyBuildError(
-            "Cluster pass-through artifact mismatch at "
-            f"{path}.size: expected={expected['size']} "
-            f"actual={stat.st_size}; artifact={artifact_path}"
-        )
-    try:
-        expected_content_key = artifact_record_content_key(expected)
-    except (TypeError, ValueError) as exc:
-        raise ClusterAssemblyBuildError(
-            "Cluster pass-through artifact fingerprint is invalid at "
-            f"{path}: {exc}; artifact={artifact_path}"
-        ) from exc
-    if expected_content_key:
-        try:
-            actual_snapshot = file_content_key_snapshot(
-                artifact_path,
-                expected_content_key["algorithm"],
-            )
-        except (OSError, ValueError) as exc:
-            raise ClusterAssemblyBuildError(
-                "Cluster pass-through artifact could not be fingerprinted at "
-                f"{path}: {artifact_path}: {exc}"
-            ) from exc
-        actual_digest = str(actual_snapshot.get("digest") or "").casefold()
-        expected_digest = str(
-            expected_content_key.get("digest") or ""
-        ).casefold()
-        if actual_digest != expected_digest:
-            field = str(expected_content_key.get("field") or "content")
-            raise ClusterAssemblyBuildError(
-                "Cluster pass-through artifact mismatch at "
-                f"{path}.{field}: expected={expected_digest} "
-                f"actual={actual_digest}; artifact={artifact_path}"
-            )
-    elif expected.get("mtime_ns") is not None:
-        if int(expected["mtime_ns"]) != stat.st_mtime_ns:
-            raise ClusterAssemblyBuildError(
-                "Cluster pass-through artifact mismatch at "
-                f"{path}.mtime_ns: expected={expected['mtime_ns']} "
-                f"actual={stat.st_mtime_ns}; artifact={artifact_path}"
-            )
-
-
 def build_receipt_pass_through_manifest(
     handoff,
     *,
@@ -663,168 +576,6 @@ def build_receipt_pass_through_manifest(
         "pass_through_provenance": provenance,
         "target_contract_disposition": target_contract_disposition,
     }
-
-
-def validate_receipt_pass_through_manifest(
-    manifest,
-    *,
-    receipt_path,
-    target_contract,
-    target_spm,
-):
-    """Validate the same target contract and every immutable artifact."""
-    if not isinstance(manifest, dict):
-        raise ClusterAssemblyBuildError(
-            "Cluster pass-through manifest is missing"
-        )
-    if manifest.get("kind") != MANIFEST_KIND:
-        raise ClusterAssemblyBuildError(
-            "Cluster pass-through provenance mismatch at manifest.kind: "
-            f"expected={MANIFEST_KIND} actual={manifest.get('kind')}"
-        )
-    if manifest.get("schema_version") != SCHEMA_VERSION:
-        raise ClusterAssemblyBuildError(
-            "Cluster pass-through provenance mismatch at "
-            "manifest.schema_version: "
-            f"expected={SCHEMA_VERSION} "
-            f"actual={manifest.get('schema_version')}"
-        )
-    if manifest.get("status") != "pass_through":
-        raise ClusterAssemblyBuildError(
-            "Cluster pass-through provenance mismatch at manifest.status"
-        )
-    provenance = manifest.get("pass_through_provenance")
-    if not isinstance(provenance, dict):
-        raise ClusterAssemblyBuildError(
-            "Cluster pass-through provenance is missing"
-        )
-    if (
-        provenance.get("schema_version")
-        != PASS_THROUGH_PROVENANCE_SCHEMA_VERSION
-    ):
-        raise ClusterAssemblyBuildError(
-            "Cluster pass-through provenance schema_version changed: "
-            f"expected={PASS_THROUGH_PROVENANCE_SCHEMA_VERSION} "
-            f"actual={provenance.get('schema_version')}"
-        )
-    if manifest.get("content_decision") != "pass_through":
-        raise ClusterAssemblyBuildError(
-            "Cluster pass-through provenance mismatch at "
-            "manifest.content_decision"
-        )
-    if manifest.get("reason") != PASS_THROUGH_PROVENANCE_REASON:
-        raise ClusterAssemblyBuildError(
-            "Cluster pass-through provenance mismatch at manifest.reason"
-        )
-    try:
-        rendered_role_count = int(manifest.get("rendered_role_count", -1))
-    except (TypeError, ValueError):
-        rendered_role_count = -1
-    if rendered_role_count != 0:
-        raise ClusterAssemblyBuildError(
-            "Cluster pass-through provenance mismatch at "
-            "manifest.rendered_role_count: expected=0 "
-            f"actual={manifest.get('rendered_role_count')}"
-        )
-    expected_target = _normalized_contract_path(
-        provenance.get("requested_spm") or ""
-    )
-    actual_target = _normalized_contract_path(target_spm)
-    if expected_target != actual_target:
-        raise ClusterAssemblyBuildError(
-            "Cluster pass-through provenance mismatch at "
-            "pass_through_provenance.requested_spm: "
-            f"expected={expected_target} actual={actual_target}"
-        )
-
-    saved_contract = provenance.get("target_contract")
-    if not isinstance(saved_contract, dict):
-        raise ClusterAssemblyBuildError(
-            "Cluster pass-through provenance target_contract is missing"
-        )
-    saved_contract_sha256 = _sha256_bytes(
-        _canonical_json(saved_contract).encode("utf-8")
-    )
-    if saved_contract_sha256 != provenance.get("target_contract_sha256"):
-        raise ClusterAssemblyBuildError(
-            "Cluster pass-through provenance mismatch at "
-            "pass_through_provenance.target_contract_sha256"
-        )
-    handoff_evidence = manifest.get("handoff_evidence") or {}
-    evidence_sha256 = handoff_evidence.get(
-        "selected_target_contract_sha256"
-    )
-    if evidence_sha256 != saved_contract_sha256:
-        raise ClusterAssemblyBuildError(
-            "Cluster pass-through provenance mismatch at "
-            "manifest.handoff_evidence.selected_target_contract_sha256"
-        )
-    current_handoff = (
-        target_contract.get("handoff")
-        if isinstance(target_contract, dict)
-        else None
-    ) or {}
-    if current_handoff.get("status") != "pass_through":
-        raise ClusterAssemblyBuildError(
-            "Cluster pass-through target became actionable at "
-            "target_contract.handoff.status: expected=pass_through "
-            f"actual={current_handoff.get('status') or '<missing>'}"
-        )
-    difference = _first_contract_difference(
-        saved_contract,
-        target_contract,
-        "target_contract",
-    )
-    if difference:
-        raise ClusterAssemblyBuildError(
-            "Cluster pass-through target contract changed at " + difference
-        )
-    difference = _first_contract_difference(
-        saved_contract.get("handoff") or {},
-        manifest.get("handoff") or {},
-        "manifest.handoff",
-    )
-    if difference:
-        raise ClusterAssemblyBuildError(
-            "Cluster pass-through saved handoff changed at " + difference
-        )
-
-    # Compare the selected target before the enclosing receipt fingerprint.
-    # A multi-target receipt can change because another target changed; when
-    # this target changed, name its exact semantic field instead of reporting
-    # only the outer JSON digest.
-    recorded_receipt = provenance.get("receipt") or {}
-    difference = _first_contract_difference(
-        recorded_receipt,
-        handoff_evidence.get("pcg_receipt") or {},
-        "manifest.handoff_evidence.pcg_receipt",
-    )
-    if difference:
-        raise ClusterAssemblyBuildError(
-            "Cluster pass-through saved receipt evidence changed at "
-            + difference
-        )
-    current_receipt = file_fingerprint(receipt_path)
-    for field in ("path", "exists", "size", "sha256"):
-        expected = recorded_receipt.get(field)
-        actual = current_receipt.get(field)
-        if field == "path":
-            expected = _normalized_contract_path(expected or "")
-            actual = _normalized_contract_path(actual or "")
-        elif field == "sha256":
-            expected = str(expected or "").casefold()
-            actual = str(actual or "").casefold()
-        if expected != actual:
-            raise ClusterAssemblyBuildError(
-                "Cluster pass-through receipt mismatch at "
-                f"pass_through_provenance.receipt.{field}: "
-                f"expected={expected} actual={actual}"
-            )
-    for artifact_path, artifact in _iter_contract_artifact_records(
-        saved_contract
-    ):
-        _validate_contract_artifact_record(artifact_path, artifact)
-    return True
 
 
 _PHYSICAL_CAPTURE_KIND = "speedtree_cluster_physical_capture_fit"
@@ -1917,7 +1668,13 @@ def validate_normalized_prototype_unit_contract(manifest):
 
 
 def validate_manifest_artifacts(manifest):
-    """Revalidate every Blender/FBX/wind artifact at each consumer boundary."""
+    """Validate only materialized files consumed by export or Unreal import.
+
+    Authoring SPMs, source blends, and PCG receipts are provenance.  They may
+    legitimately change or disappear after Repair has produced the assembly,
+    especially while a durable Unreal-wait item is queued.  Revalidating those
+    upstream files here used to reject otherwise complete import payloads.
+    """
     if (manifest or {}).get("status") != "ready":
         raise ClusterAssemblyBuildError("Assembly manifest is not ready")
     if not list((manifest or {}).get("parts") or []):
@@ -1941,18 +1698,6 @@ def validate_manifest_artifacts(manifest):
         ),
         "parts": {},
     }
-    placement_contract = manifest.get("placement_contract")
-    if placement_contract is not None:
-        checked["authored_placement_spm"] = validate_file_fingerprint(
-            placement_contract.get("source_spm"),
-            "Assembly authored placement SPM",
-        )
-    source_blend = manifest.get("assembly_source_blend")
-    if source_blend is not None:
-        checked["assembly_source_blend"] = validate_file_fingerprint(
-            source_blend,
-            "Assembly Blender source",
-        )
     for part in manifest.get("parts") or []:
         prototype_id = str(part.get("prototype_id") or "")
         if not prototype_id or prototype_id in checked["parts"]:
@@ -1962,10 +1707,6 @@ def validate_manifest_artifacts(manifest):
         external = part.get("external_source") or {}
         if external:
             checked["parts"][prototype_id] = {
-                "source_blend": validate_file_fingerprint(
-                    external.get("source_blend"),
-                    f"Send to Unreal source blend {prototype_id}",
-                ),
                 "plan_fbx": validate_file_fingerprint(
                     external.get("plan_fbx"),
                     f"normalized plan FBX {prototype_id}",

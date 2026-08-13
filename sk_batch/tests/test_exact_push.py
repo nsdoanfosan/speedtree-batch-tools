@@ -71,31 +71,6 @@ class ExactPushCommandTests(unittest.TestCase):
             self.assertNotIn("repair_evidence", outputs)
             self.assertTrue(str(outputs["report"]).endswith("_exact_push_test.json"))
 
-    def test_uses_only_explicit_repair_evidence(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            spm = root / "SK_tree_sample_01.spm"
-            blend = spm.with_suffix(".blend")
-            blender = root / "blender.exe"
-            evidence = root / "current_evidence.json"
-            logs = root / "logs"
-            logs.mkdir()
-            material = logs / "SK_tree_sample_01_push_material_contract_current.json"
-            for path in (spm, blend, blender, evidence, material):
-                path.write_bytes(b"current")
-
-            command, outputs = build_exact_push_command(
-                spm,
-                blender=blender,
-                log_dir=logs,
-                run_id="test",
-                repair_evidence=evidence,
-                material_contract=material,
-            )
-
-            self.assertIn("--repair-evidence", command)
-            self.assertEqual(outputs["repair_evidence"], evidence.resolve())
-
     def test_missing_repaired_blend_fails_before_launch(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
