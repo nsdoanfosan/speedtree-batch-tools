@@ -4297,7 +4297,7 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(job["targets"], [{"spm": Path(iid)}])
         self.assertIn(iid, job["inventory"])
 
-    def test_waiting_import_revalidates_manifest_then_runs_one_headless_batch(self):
+    def test_waiting_import_uses_finalized_manifest_without_rehashing_assets(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         spm = Path("SK_wait.spm")
@@ -4331,17 +4331,27 @@ class PushQueueFlowTests(unittest.TestCase):
                 },
             }
             app._unreal_running = mock.Mock(side_effect=[False, False])
-            app._source_push_fingerprint = mock.Mock(return_value="source-v1")
+            app._source_push_fingerprint = mock.Mock(
+                side_effect=AssertionError(
+                    "waiting import must not hash the source again"
+                )
+            )
             app._run_headless_import_items = mock.Mock(return_value=True)
 
             with mock.patch.object(
-                gui, "manifest_item_files_match", return_value=True
-            ):
+                gui,
+                "manifest_item_files_match",
+                side_effect=AssertionError(
+                    "waiting import must not hash exported files again"
+                ),
+            ) as files_match:
                 result = app._run_waiting_asset_import_batch(
                     [target], emit_done=False
                 )
 
         self.assertTrue(result)
+        app._source_push_fingerprint.assert_not_called()
+        files_match.assert_not_called()
         app._run_headless_import_items.assert_called_once()
         queued = app._run_headless_import_items.call_args.args[0]
         self.assertEqual([item["queue_id"] for item in queued], [iid])

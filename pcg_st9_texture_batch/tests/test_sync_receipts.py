@@ -1031,6 +1031,7 @@ class GuiSyncStateTests(unittest.TestCase):
                 sync_files=[],
                 allowed_step3_row_keys=allowed,
                 exact_mutation_baseline=baseline,
+                normalization_plan=plan,
             )
 
         exact_plan = build_jobs.call_args.args[0]
@@ -1238,7 +1239,16 @@ class GuiSyncStateTests(unittest.TestCase):
         app.root = Root()
         app.status_var = Value()
         app._busy = False
-        app.items = {}
+        app.items = {
+            r"D:\Trees\selected": {
+                "item": {
+                    "folder": r"D:\Trees\selected",
+                    "name": "selected",
+                },
+                "checked": True,
+            }
+        }
+        app._display_only_snapshot = True
         app._set_busy = mock.Mock()
         app._run_step3_planning = mock.Mock()
         app._step3_jobs = mock.Mock()

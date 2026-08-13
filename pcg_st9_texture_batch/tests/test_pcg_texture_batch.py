@@ -3814,7 +3814,10 @@ class GuiLabelTests(unittest.TestCase):
         }
 
         with mock.patch.object(
-                self.gui, "make_report", return_value={}
+                self.gui, "make_report",
+                side_effect=AssertionError(
+                    "Step 3 normalization must not re-audit folders"
+                ),
         ) as make_report, mock.patch.object(
                 self.gui, "save_spm_analysis_cache"
         ), mock.patch.object(
@@ -3837,13 +3840,10 @@ class GuiLabelTests(unittest.TestCase):
             app._run_step3(
                 [], [selected], sync_files=[],
                 exact_mutation_baseline=baseline,
+                normalization_plan=plan,
             )
 
-        make_report.assert_called_once_with(
-            app.cfg,
-            targets=[r"D:\Trees\ladyfern"],
-            mutation_authority=True,
-        )
+        make_report.assert_not_called()
         exact_plan = build_jobs.call_args.args[0]
         self.assertEqual(
             [row["spm"] for row in exact_plan["preserved_cluster_materials"]],
@@ -3917,7 +3917,9 @@ class GuiLabelTests(unittest.TestCase):
         ), mock.patch.object(
                 self.gui,
                 "make_report",
-                return_value={},
+                side_effect=AssertionError(
+                    "Step 3 normalization must not re-audit folders"
+                ),
         ) as make_report, mock.patch.object(
                 self.gui,
                 "persist_cluster_assembly_receipts_safely",
@@ -3952,13 +3954,10 @@ class GuiLabelTests(unittest.TestCase):
             app._run_step3(
                 jobs, [target], sync_files=[],
                 exact_mutation_baseline=baseline,
+                normalization_plan=plan,
             )
 
-        make_report.assert_called_once_with(
-            app.cfg,
-            targets=[folder],
-            mutation_authority=True,
-        )
+        make_report.assert_not_called()
         exact_plan = build_jobs.call_args.args[0]
         self.assertEqual(
             [row["atlas_base"] for row in exact_plan["items"]],

@@ -64,6 +64,7 @@ from pcg_texture_common import (
 from pcg_texture_audit import (
     _unsafe_provisional_source,
     atlas_provisional_source_declarations,
+    candidate_folders,
     make_report,
     persist_cluster_assembly_receipts_safely,
     prepare_sk,
@@ -2417,6 +2418,9 @@ def step3_exact_plan_payload(plan):
         "exact_step3_spms": [
             str(path) for path in (plan or {}).get("exact_step3_spms") or ()
         ],
+        "normalization_plan": startup_json_safe(
+            (plan or {}).get("normalization_plan") or {}
+        ),
         "force_unreal_verify": bool(
             (plan or {}).get("force_unreal_verify")
         ),
@@ -2747,7 +2751,7 @@ class App:
         self.shared_queue_runtime = SharedQueueRuntime(
             "pcg_st9_texture_batch"
         )
-        self._initial_refreshing = True
+        self._initial_refreshing = False
         self._manual_refreshing = False
         self._target_refresh_active = False
         self._pending_refresh = False
@@ -2787,8 +2791,14 @@ class App:
             },
         )
         if not snapshot_painted:
-            self.status_var.set("초기 검사 중...")
-        self.root.after(0, self._start_initial_refresh)
+            self._load_initial_folder_inventory()
+        try:
+            self.sync_state = load_sync_state(migrate=False)
+        except Exception as exc:
+            self.log(f"[Unreal 동기화 기록 경고] {exc}")
+            self.sync_state = {"entries": {}}
+        self._set_busy(False)
+        self._update_step3_button()
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -3635,10 +3645,72 @@ class App:
         stale = snapshot.get("cache_state") != "matching_inputs"
         suffix = " · 입력 변경 감지" if stale else ""
         self.status_var.set(
-            "저장된 표 표시 중 · live 검증 중"
-            f"{suffix} · 변경 작업 잠김"
+            "저장된 표 즉시 표시"
+            f"{suffix} · ①② 변경 작업 잠김 · "
+            "③ 실행 시 선택 범위만 최신화"
         )
         return True
+
+    def _load_initial_folder_inventory(self):
+        """Open a cold board from cheap folder discovery only.
+
+        Detailed SPM/SBS/Blender inspection is intentionally user-triggered.
+        """
+        try:
+            folders = candidate_folders(
+                self.cfg,
+                pcg_targets=self._initial_pcg_targets(),
+            )
+        except Exception as exc:
+            self.log(f"[초기 폴더 목록 경고] {exc}")
+            folders = []
+        items = [self._initial_inventory_item(folder) for folder in folders]
+        self.report = {
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "pcg_targets": {"mesh_count": 0},
+            "summary": {
+                "total": len(items),
+                "by_status": {"startup_pending": len(items)},
+            },
+            "items": items,
+            "inventory_pending": bool(items),
+            "partial_live_audit": True,
+        }
+        self._display_only_snapshot = True
+        self.populate()
+        self._update_summary()
+        self.status_var.set(
+            f"생산 폴더 {len(items)}개 즉시 표시 · "
+            "상세 검사는 검사 버튼 또는 선택 실행 시 수행"
+        )
+
+    @staticmethod
+    def _initial_inventory_item(folder):
+        """Return a display-only row for a discovered production folder."""
+        folder = Path(folder)
+        return {
+            "folder": str(folder),
+            "name": folder.name,
+            "status": "startup_pending",
+            "actions": ["선택 실행 시 상세 검사"],
+            "source_spms": [],
+            "sk_spms": [],
+            "cluster_items": [],
+            "target_spm_statuses": [],
+            "target_mesh_names": [],
+            "pcg_target_mesh_names": [],
+            "pcg_target_meshes": [],
+            "pcg_mesh_names": [],
+            "pcg_data_assets": [],
+            "level_mesh_names": [],
+            "level_placements": [],
+            "leaf_mesh_sources": [],
+            "leaf_atlas_inventory": [],
+            "cluster_source_rows": [],
+            "cluster_assembly": {},
+            "_gui_blender_connection_pending": True,
+            "audit_complete": False,
+        }
 
     def _initial_partial_live_item(
         self,
@@ -3664,7 +3736,10 @@ class App:
         self.report = {
             "generated_at": datetime.now().isoformat(timespec="seconds"),
             "pcg_targets": {"mesh_count": 0},
-            "summary": {"total": 1, "by_status": {item.get("status", "unknown"): 1}},
+            "summary": {
+                "total": 1,
+                "by_status": {item.get("status", "unknown"): 1},
+            },
             "items": [item],
             "partial_live_audit": True,
         }
@@ -4134,7 +4209,6 @@ class App:
         for name in (
             "btn_prepare",
             "btn_step2",
-            "btn_step3",
             "btn_step3_force",
             "btn_add_target",
             "btn_remove_target",
@@ -4464,7 +4538,7 @@ class App:
             self._pending_refresh = False
             self.refresh()
 
-    def _start_completion_refresh(self, final_status):
+    def _start_completion_refresh(self, final_status, targets=None):
         """Refresh the table off the Tk thread after a batch completes.
 
         The completed operation's summary remains the authoritative status;
@@ -4472,7 +4546,12 @@ class App:
         """
         if not getattr(self, "_busy", False):
             self._set_busy(True)
-        self.status_var.set(f"{final_status} · 표 재검사 중...")
+        scoped_targets = sorted(
+            {str(path) for path in targets or ()},
+            key=os.path.normcase,
+        )
+        refresh_label = "선택 범위 갱신" if scoped_targets else "표 재검사"
+        self.status_var.set(f"{final_status} · {refresh_label} 중...")
         self.cfg["tree_root"] = self.root_var.get()
         save_config(self.cfg)
         cfg = dict(self.cfg)
@@ -4485,11 +4564,13 @@ class App:
             session_evidence = {}
             try:
                 pcg_targets = load_pcg_targets() if use_pcg_targets else None
-                report = make_report(
-                    cfg,
-                    pcg_targets=pcg_targets,
-                    session_evidence=session_evidence,
-                )
+                report_kwargs = {
+                    "pcg_targets": pcg_targets,
+                    "session_evidence": session_evidence,
+                }
+                if scoped_targets:
+                    report_kwargs["targets"] = scoped_targets
+                report = make_report(cfg, **report_kwargs)
                 cache_blender_connection_rows(
                     report,
                     session_evidence=session_evidence,
@@ -4501,16 +4582,19 @@ class App:
                 error = exc
             self.root.after(
                 0,
-                lambda result=report, state=sync_state, failure=error:
+                lambda result=report, state=sync_state, failure=error,
+                scoped=bool(scoped_targets):
                     self._completion_refresh_done(
-                        result, state, final_status, failure),
+                        result, state, final_status, failure,
+                        scoped=scoped),
             )
 
         self.worker = threading.Thread(target=worker, daemon=True)
         self.worker.start()
 
-    def _completion_refresh_done(self, report, sync_state, final_status,
-                                 error=None):
+    def _completion_refresh_done(
+            self, report, sync_state, final_status, error=None, *,
+            scoped=False):
         """Apply a completed background audit and restore its final summary."""
         self.worker = None
         if error is not None:
@@ -4518,7 +4602,11 @@ class App:
             self._set_busy(False)
             self.status_var.set(f"{final_status} · 표 재검사 실패")
             return
-        self.report = report
+        if scoped:
+            self._apply_step3_scope_report(report)
+        else:
+            self.report = report
+            self._display_only_snapshot = False
         self.sync_state = sync_state
         self.texplan_cache.clear()
         if not hasattr(self, "texplan_errors"):
@@ -4532,6 +4620,17 @@ class App:
     def _update_summary(self):
         items = self.report["items"]
         n = len(items)
+        if self.report.get("inventory_pending"):
+            pending = sum(
+                item.get("status") == "startup_pending" for item in items
+            )
+            complete = n - pending
+            self.targets_info_var.set("")
+            self.status_var.set(
+                f"생산 폴더 {n}개 표시 · 상세 검사 {complete}/{n} · "
+                "변경 작업 잠김"
+            )
+            return
         done = sum(1 for i in items if i["status"] == "ready")
         need1 = sum(1 for i in items if i["status"] in ("needs_sk", "needs_m_prefix"))
         need23 = sum(1 for i in items if i["status"] == "needs_texture_work")
@@ -4615,7 +4714,12 @@ class App:
         for item in self.report["items"]:
             self._annotate_unreal_sync(item)
             iid = item["folder"]
-            folder_default = old_checked.get(iid, True)
+            # The board is an inventory, not an implicit batch selection.
+            # Selecting every new row turned one-folder Sync into fleet work.
+            folder_default = old_checked.get(
+                iid,
+                not getattr(self, "_display_only_snapshot", False),
+            )
             target_rows = []
             for target_index, target in enumerate(spm_display_rows(item)):
                 selection_key = (
@@ -4869,6 +4973,8 @@ class App:
 
     # ---------------------------------------------------------- column texts
     def step1_text(self, item):
+        if item.get("status") == "startup_pending":
+            return "상세 검사 대기"
         if item.get("duplicate_target_mesh_names") or item.get("duplicate_pcg_target_mesh_names"):
             return "⚠ 중복 매칭 확인"
         statuses = item.get("target_spm_statuses") or []
@@ -4897,6 +5003,8 @@ class App:
         return "완료 ✓"
 
     def step2_text(self, item):
+        if item.get("status") == "startup_pending":
+            return "상세 검사 대기"
         sources = item.get("leaf_mesh_sources") or []
         if not sources:
             inventory = item.get("leaf_atlas_inventory") or []
@@ -4973,6 +5081,8 @@ class App:
         return " · ".join(parts)
 
     def step3_text(self, item):
+        if item.get("status") == "startup_pending":
+            return "상세 검사 대기"
         state = step3_item_state(item)
         if not state["sets"]:
             if state["connection_sets"]:
@@ -5996,6 +6106,22 @@ class App:
     def _update_step3_button(self):
         """Keep the action truthful after scans and checkbox changes."""
         if not hasattr(self, "btn_step3"):
+            return
+        if getattr(self, "_display_only_snapshot", False):
+            checked = any(
+                entry.get("checked")
+                for entry in getattr(self, "items", {}).values()
+            )
+            self.btn_step3.configure(
+                text="③ 선택 항목만 검사 후 실행",
+                state=(
+                    "normal"
+                    if checked and not getattr(self, "_busy", False)
+                    else "disabled"
+                ),
+            )
+            if hasattr(self, "btn_step3_force"):
+                self.btn_step3_force.configure(state="disabled")
             return
         if getattr(self, "_sync_state_migrating", False):
             self.btn_step3.configure(
@@ -7119,6 +7245,15 @@ class App:
             "eligible_row_keys": eligible_row_keys,
             "exact_step3_spms": exact_step3_spms,
             "selected_rows": selected_rows,
+            "normalization_plan": build_texture_plan_from_report(
+                self.report or {"items": []},
+                "<step3-force-current-board>",
+            ),
+            "scope_folders": sorted({
+                str(item.get("folder"))
+                for item, _row in selected_rows
+                if str(item.get("folder") or "").strip()
+            }, key=os.path.normcase),
             "require_all_renders_for_sync": True,
             "operation_label": "PCG ③ 전체 재추출",
         }
@@ -7248,6 +7383,106 @@ class App:
         plan["_exact_mutation_baseline"] = baseline
         return baseline
 
+    def _step3_scope_folders(self):
+        """Return checked folders plus only their explicitly shared owners."""
+        selected = [
+            entry.get("item")
+            for entry in getattr(self, "items", {}).values()
+            if entry.get("checked") and isinstance(entry.get("item"), dict)
+        ]
+        if not selected:
+            raise RuntimeError("③ 실행할 폴더를 하나 이상 체크하세요")
+
+        by_name = {
+            str((entry.get("item") or {}).get("name") or "").casefold():
+            entry.get("item")
+            for entry in getattr(self, "items", {}).values()
+            if isinstance(entry.get("item"), dict)
+        }
+        scoped = list(selected)
+        seen_ids = {id(item) for item in scoped}
+        for item in list(selected):
+            for row in item.get("cluster_items") or ():
+                owner_name = str(row.get("shared_from") or "").casefold()
+                owner = by_name.get(owner_name)
+                if owner is not None and id(owner) not in seen_ids:
+                    seen_ids.add(id(owner))
+                    scoped.append(owner)
+        return sorted(
+            {
+                str(item.get("folder"))
+                for item in scoped
+                if str(item.get("folder") or "").strip()
+            },
+            key=os.path.normcase,
+        )
+
+    def _apply_step3_scope_report(self, report):
+        """Replace only audited rows while preserving the rest of the board."""
+        if not hasattr(self, "texplan_cache"):
+            self.texplan_cache = {}
+        if not hasattr(self, "texplan_errors"):
+            self.texplan_errors = {}
+        live_by_key = {
+            startup_path_key(item.get("folder") or ""): item
+            for item in (report or {}).get("items") or ()
+        }
+        for iid, entry in getattr(self, "items", {}).items():
+            live = live_by_key.get(startup_path_key(iid))
+            if live is not None:
+                entry["item"] = live
+                self.texplan_cache.pop(iid, None)
+                self.texplan_errors.pop(iid, None)
+
+        current = dict(getattr(self, "report", {}) or {})
+        current_items = list(current.get("items") or ())
+        replaced = set()
+        for index, item in enumerate(current_items):
+            key = startup_path_key(item.get("folder") or "")
+            live = live_by_key.get(key)
+            if live is not None:
+                current_items[index] = live
+                replaced.add(key)
+        current_items.extend(
+            item for key, item in live_by_key.items() if key not in replaced
+        )
+        current["items"] = current_items
+        current["generated_at"] = (report or {}).get(
+            "generated_at", current.get("generated_at")
+        )
+        current["inventory_pending"] = any(
+            item.get("status") == "startup_pending" for item in current_items
+        )
+        self.report = current
+        self._step3_live_scope_report = report
+        return report
+
+    def _refresh_step3_execution_scope(self):
+        """Audit only the checked Step 3 scope after its queue turn arrives."""
+        scope_folders = self._step3_scope_folders()
+        pcg_targets = (
+            load_pcg_targets()
+            if bool(getattr(
+                self, "_active_step3_use_pcg_targets", False
+            )) else None
+        )
+        session_evidence = {}
+        report = make_report(
+            self.cfg,
+            targets=scope_folders,
+            pcg_targets=pcg_targets,
+            mutation_authority=True,
+            session_evidence=session_evidence,
+        )
+        cache_blender_connection_rows(
+            report,
+            verify_physical=True,
+            read_cache=False,
+            session_evidence=session_evidence,
+        )
+        self._apply_step3_scope_report(report)
+        return scope_folders
+
     def _validate_step3_plan_live_evidence(self, plan):
         plan["pending_manifest_rows"] = list(
             (plan or {}).get("pending_manifest_rows")
@@ -7268,7 +7503,11 @@ class App:
                 for item in job.get("items") or [job.get("item")]
                 if isinstance(item, dict)
             ]
-        baseline = self._reaudit_and_seal_mutation_items(
+        # The exact selected scope was audited immediately before this plan was
+        # built.  Seal those rows directly; calling make_report again here was
+        # a redundant second audit of the same folders.
+        self._validate_live_mutation_items(items)
+        baseline = seal_exact_mutation_baseline(
             items,
             action="step3_texture",
             plan_payload=step3_exact_plan_payload(plan),
@@ -7368,6 +7607,14 @@ class App:
             ),
             selected_texture_rows=normalization_rows,
         )
+        live_scope_report = getattr(self, "_step3_live_scope_report", None)
+        normalization_plan = (
+            build_texture_plan_from_report(
+                live_scope_report,
+                "<step3-selected-scope>",
+            )
+            if live_scope_report is not None else {}
+        )
         return {
             "jobs": jobs,
             "skipped": skipped,
@@ -7376,6 +7623,10 @@ class App:
             "eligible_row_keys": eligible_row_keys,
             "exact_step3_spms": exact_step3_spms,
             "selected_rows": selected_rows,
+            "normalization_plan": normalization_plan,
+            "scope_folders": list(
+                getattr(self, "_active_step3_scope_folders", ())
+            ),
         }
 
     def _run_step3_planning(self, shared_record=None):
@@ -7390,6 +7641,9 @@ class App:
                         "③ 실행 차례 도착 · 최신 대상 계획 계산 중..."
                     )
                 )
+            self._active_step3_scope_folders = (
+                self._refresh_step3_execution_scope()
+            )
             plan = self._build_step3_execution_plan()
             self._validate_step3_plan_live_evidence(plan)
         except Exception as exc:
@@ -7407,8 +7661,23 @@ class App:
         if getattr(self, "_busy", False):
             self.status_var.set("현재 작업이 끝난 뒤 ③ 실행을 다시 누르세요.")
             return
-        if not self._require_live_mutation_items():
+        if not any(
+            entry.get("checked")
+            for entry in getattr(self, "items", {}).values()
+        ):
+            self.status_var.set("③ 실행할 폴더를 하나 이상 체크하세요")
             return
+        if (
+            not getattr(self, "_display_only_snapshot", False)
+            and not self._require_live_mutation_items()
+        ):
+            return
+        # Tk variables must only be read on the UI thread.  The queue worker
+        # consumes this immutable snapshot when its execution turn arrives.
+        use_pcg_targets_var = getattr(self, "use_pcg_targets_var", None)
+        self._active_step3_use_pcg_targets = bool(
+            use_pcg_targets_var.get()
+        ) if use_pcg_targets_var is not None else False
         try:
             shared = self._enqueue_shared_execution(
                 "PCG ③ 텍스처 생성/정규화/Unreal 동기화",
@@ -7474,6 +7743,12 @@ class App:
         eligible_row_keys = plan["eligible_row_keys"]
         exact_step3_spms = plan["exact_step3_spms"]
         selected_rows = plan["selected_rows"]
+        normalization_plan = copy.deepcopy(
+            plan.get("normalization_plan") or {}
+        )
+        self._active_step3_refresh_folders = list(
+            plan.get("scope_folders") or ()
+        )
         require_all_renders_for_sync = bool(
             plan.get("require_all_renders_for_sync", False)
         )
@@ -7546,6 +7821,8 @@ class App:
             )
             self.root.update_idletasks()
             worker_kwargs = {}
+            if normalization_plan:
+                worker_kwargs["normalization_plan"] = normalization_plan
             if exact_mutation_baseline is not None:
                 worker_kwargs["exact_mutation_baseline"] = (
                     exact_mutation_baseline
@@ -7615,6 +7892,8 @@ class App:
         # but only the exact checked/PCG-target SK paths may be normalized.
         # A folder can contain sibling variants that were not selected.
         worker_kwargs = {}
+        if normalization_plan:
+            worker_kwargs["normalization_plan"] = normalization_plan
         if exact_mutation_baseline is not None:
             worker_kwargs["exact_mutation_baseline"] = (
                 exact_mutation_baseline
@@ -7670,7 +7949,8 @@ class App:
             force_unreal_verify=False, require_all_renders_for_sync=False,
             planned_skipped=0, allowed_step3_row_keys=None,
             step3_run_report_path=None, step3_run_report=None,
-            exact_mutation_baseline=None, pending_manifest_rows=None):
+            exact_mutation_baseline=None, pending_manifest_rows=None,
+            normalization_plan=None):
         done = failed = 0
         sync_summary = {"latest": 0, "changed": 0, "failed": 0}
         sync_report_path = None
@@ -7933,16 +8213,12 @@ class App:
                     os.path.normcase(os.path.abspath(str(path)))
                     for path in affected_spms
                 }
-                affected_folders = sorted({
-                    str(step3_audit_folder_for_spm(path))
-                    for path in affected_spms
-                }, key=os.path.normcase)
-                report = make_report(
-                    self.cfg,
-                    targets=affected_folders,
-                    mutation_authority=True,
-                )
-                plan = build_texture_plan_from_report(report, "<step3-normalize>")
+                plan = copy.deepcopy(normalization_plan or {})
+                if not plan:
+                    raise RuntimeError(
+                        "선택 범위 normalization plan이 없습니다; "
+                        "전체 폴더를 다시 검사하지 않고 중단합니다"
+                    )
                 exact_plan = dict(plan)
                 allowed_rows = (
                     {
@@ -8023,7 +8299,6 @@ class App:
                             mutation_source_path(
                                 normalize_spms_transactionally
                             ),
-                            mutation_source_path(make_report),
                         ],
                     )
                 )
@@ -8035,8 +8310,6 @@ class App:
                         self.cfg, ("tree_root",)
                     ),
                 )
-                persist_cluster_assembly_receipts_safely(report)
-                save_spm_analysis_cache()
                 normalized = normalize_spms_transactionally(
                     spm_jobs,
                     backup_root=Path(self.cfg["tree_root"]) / "_spm_backups",
@@ -8443,7 +8716,17 @@ class App:
             self.log(f"③ Unreal 보류 사유: {deferred}")
         final_status = (
             summary + (f" · 리포트 {report_path}" if report_path else ""))
-        self._start_completion_refresh(final_status)
+        refresh_folders = list(
+            getattr(self, "_active_step3_refresh_folders", ())
+        )
+        self._active_step3_refresh_folders = []
+        if refresh_folders:
+            self._start_completion_refresh(
+                final_status,
+                targets=refresh_folders,
+            )
+        else:
+            self._start_completion_refresh(final_status)
 
     def _batch_finished(self, label, done, failed):
         summary = f"{label} 완료: 성공 {done}개, 실패 {failed}개"
