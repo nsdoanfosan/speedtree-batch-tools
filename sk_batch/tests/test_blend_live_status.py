@@ -5201,6 +5201,7 @@ class BlendLiveStatusTests(unittest.TestCase):
         ):
             root = Path(temporary) / "Tree_elm"
             root.mkdir()
+            (root / "Cluster").mkdir()
             spm = root / "SK_Tree_elm_01.spm"
             write_empty_spm(spm)
             app.force_rerun = True
@@ -6075,7 +6076,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 [],
             )
 
-    def test_current_cluster_bwr_skips_relation_rediscovery(self):
+    def test_valid_cluster_resume_receipt_skips_relation_rediscovery(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as temporary:
@@ -6088,15 +6089,21 @@ class BlendLiveStatusTests(unittest.TestCase):
             for path in (spm, target, blend):
                 path.touch()
             app.force_rerun = False
-            app._repair_output_state = mock.Mock(return_value={
+            app.log = mock.Mock()
+            repair_state = {
                 "current": True,
                 "push_ready": True,
                 "kind": "ready",
                 "reason": "준비됨 ✓",
                 "push_dependency_contract": {"status": "current"},
-            })
-            app._record_live_blend_status = mock.Mock()
-            app._publish_repair_stage_contract = mock.Mock()
+            }
+            app.state[str(spm)] = {
+                "blend_resume_receipt": {"receipt_sha256": "saved"},
+            }
+            app._validated_blender_resume_state = mock.Mock(
+                return_value=repair_state
+            )
+            app._publish_current_repair_skip = mock.Mock(return_value=True)
             app._refresh_canonical_atlas_manifests = mock.Mock()
             app._cluster_relation_input_plan = mock.Mock(
                 side_effect=AssertionError(
@@ -6122,33 +6129,19 @@ class BlendLiveStatusTests(unittest.TestCase):
                 "referenced_by_spms": (target,),
             }
 
-            with mock.patch.object(
-                gui,
-                "cluster_relation_refresh_state",
-                side_effect=AssertionError(
-                    "current Cluster BWR must not inspect relation metadata"
-                ),
-            ) as refresh_state, mock.patch(
-                "cluster_blend_sync.run_cluster_relation_transaction",
-                side_effect=AssertionError(
-                    "current Cluster BWR must not run relation transaction"
-                ),
-            ) as relation:
-                app._job_blender(str(spm), spm, item)
+            runnable, skipped = app._prefilter_blender_resume_targets([item])
 
-            refresh_state.assert_not_called()
-            relation.assert_not_called()
+            self.assertEqual(runnable, [])
+            self.assertEqual(skipped, [item])
             app._cluster_relation_input_plan.assert_not_called()
             app._refresh_cluster_source_relations.assert_not_called()
             app._cluster_normalization_stage_with_recovery.assert_not_called()
-            app._repair_output_state.assert_called_once_with(spm)
             app._run_limited.assert_not_called()
-            app._publish_repair_stage_contract.assert_called_once_with(
+            app._publish_current_repair_skip.assert_called_once_with(
+                str(spm),
                 spm,
-                ready=True,
-                reason="준비됨 ✓",
-                kind="ready",
-                push_dependency_contract={"status": "current"},
+                repair_state,
+                validated_resume_receipt={"receipt_sha256": "saved"},
             )
 
     def test_current_owner_bwr_skips_atlas_refresh_and_material_preflight(self):
@@ -6202,6 +6195,124 @@ class BlendLiveStatusTests(unittest.TestCase):
             app._cluster_receipt_with_recovery.assert_not_called()
             app._execute_material_preflight.assert_not_called()
             app._run_limited.assert_not_called()
+
+    def test_relation_receipt_drift_refreshes_before_current_owner_skip(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_chestnut"
+            owner.mkdir(parents=True)
+            (owner / "Cluster").mkdir()
+            spm = owner / "SK_tree_chestnut_01.spm"
+            blend = spm.with_suffix(".blend")
+            live_report = owner / "cluster_live_audit.json"
+            for path in (spm, blend, live_report):
+                path.touch()
+            app.force_rerun = False
+            app.log = mock.Mock()
+            app._refresh_canonical_atlas_manifests = mock.Mock()
+            app._leaf_reference_ready = mock.Mock(return_value=(True, "ok"))
+            events = []
+            live_resolution = {
+                "policy": "live_audit_authoritative",
+                "live_audit_report": str(live_report),
+                "selected_contract": {
+                    "handoff": {"status": "pass_through"},
+                },
+            }
+
+            def refresh_relations(_spm, _stamp):
+                events.append("relation_refresh")
+                return live_resolution
+
+            def current_state(_spm, pipeline_projection_out=None):
+                events.append("output_state")
+                return {
+                    "current": True,
+                    "push_ready": True,
+                    "kind": "ready",
+                    "reason": "준비됨 ✓",
+                }
+
+            app._cluster_receipt_with_recovery = mock.Mock(
+                side_effect=refresh_relations
+            )
+            app._repair_output_state = mock.Mock(side_effect=current_state)
+            app._publish_current_repair_skip = mock.Mock(return_value=True)
+            app._execute_material_preflight = mock.Mock(
+                side_effect=AssertionError("BWR must not run")
+            )
+            item = {
+                "spm": spm,
+                "wind_override": "auto",
+                "referenced_by_spms": (),
+                "_blender_resume_policy": "live_validation",
+            }
+
+            with mock.patch.object(
+                gui,
+                "material_preflight_mesh_reference_block",
+                return_value=None,
+            ):
+                app._job_blender(str(spm), spm, item)
+
+            self.assertEqual(events, ["relation_refresh", "output_state"])
+            app._refresh_canonical_atlas_manifests.assert_called_once_with(spm)
+            app._publish_current_repair_skip.assert_called_once()
+            app._execute_material_preflight.assert_not_called()
+
+    def test_core_receipt_drift_forces_bwr_despite_old_current_state(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            owner = Path(temporary) / "Tree_chestnut"
+            owner.mkdir(parents=True)
+            spm = owner / "SK_tree_chestnut_01.spm"
+            blend = spm.with_suffix(".blend")
+            for path in (spm, blend):
+                path.touch()
+            app.force_rerun = False
+            app.log = mock.Mock()
+            app.cfg = {}
+            app._refresh_canonical_atlas_manifests = mock.Mock()
+            app._leaf_reference_ready = mock.Mock(return_value=(True, "ok"))
+            app._repair_output_state = mock.Mock(return_value={
+                "current": True,
+                "push_ready": True,
+                "kind": "ready",
+                "reason": "준비됨 ✓",
+            })
+            app._publish_current_repair_skip = mock.Mock(return_value=True)
+            app._execute_material_preflight = mock.Mock(
+                side_effect=RuntimeError("entered material preflight")
+            )
+            item = {
+                "spm": spm,
+                "wind_override": "auto",
+                "referenced_by_spms": (),
+                "_blender_resume_policy": "rebuild",
+            }
+
+            with mock.patch.object(
+                gui,
+                "material_preflight_mesh_reference_block",
+                return_value=None,
+            ), mock.patch.object(
+                gui,
+                "blender_open_file_window_titles",
+                return_value=[],
+            ), self.assertRaisesRegex(
+                RuntimeError,
+                "entered material preflight",
+            ):
+                app._job_blender(str(spm), spm, item)
+
+            app._repair_output_state.assert_called_once_with(
+                spm,
+                pipeline_projection_out=None,
+            )
+            app._publish_current_repair_skip.assert_not_called()
+            app._execute_material_preflight.assert_called_once()
 
     def test_provider_metadata_disagreement_is_not_relation_refresh_gate(self):
         gui = load_gui_module()

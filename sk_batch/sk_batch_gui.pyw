@@ -258,6 +258,11 @@ from repair_runtime_contract import (
     repair_runtime_receipt_path,
     write_repair_runtime_receipt,
 )
+from blender_resume_receipt import (
+    BlenderResumeReceiptError,
+    build_blender_resume_receipt,
+    validate_blender_resume_receipt,
+)
 from spm_audit import (
     cluster_root_logical_postcondition,
     current_bone_semantic_fingerprint,
@@ -286,6 +291,13 @@ _REGISTERED_RELATION_REPAIR_LOCK = threading.RLock()
 CHECK_ON = "☑"
 CHECK_OFF = "☐"
 STATUS_COLUMNS = ("spm_status", "blend_status", "push_status")
+BLENDER_RESUME_CONFIG_KEYS = (
+    "fbx_ini",
+    "rename_materials",
+    "tree_leaf_parent_red_gradient",
+    "cluster_unit_probe",
+    "cluster_capture_resolution",
+)
 CLUSTER_RELATION_LOCKS_GUARD = threading.Lock()
 _REPAIR_REPORT_READ_LOCAL = threading.local()
 CLUSTER_RELATION_LOCKS = {}
@@ -3855,6 +3867,9 @@ class App:
                 "spm_snapshot": snapshots.get(iid),
                 "live_texture_paths": cached_texture_paths,
                 "live_status_signature": cached_live_signature,
+                "blend_resume_receipt": copy.deepcopy(
+                    entry.get("blend_resume_receipt")
+                ),
             }
             spm_status = (
                 f"Output 규격 · {cluster_source['pair_status']}"
@@ -3973,6 +3988,433 @@ class App:
             texture_stats,
         )
 
+    def _blender_resume_settings(self, iid, item=None):
+        """Return only settings that can change durable Repair output."""
+
+        if item is None:
+            item = self._batch_job_item(iid)
+        return {
+            "wind_override": normalize_wind_override(
+                item.get("wind_override", "auto")
+            ),
+            "manual_bones_locked": bool(
+                item.get("manual_bones_locked", False)
+            ),
+            "config": {
+                key: self.cfg.get(key)
+                for key in BLENDER_RESUME_CONFIG_KEYS
+            },
+        }
+
+    def _blender_resume_tracked_paths(
+        self,
+        spm,
+        repair_state,
+        texture_paths=None,
+    ):
+        """Bind the files consulted by the successful live Repair audit."""
+
+        spm = Path(spm)
+        speedtree_spm = speedtree_output_spm_for(spm)
+        report_path = repair_pipeline_report_path(spm)
+        wind_path = (
+            blend_path_for(spm).parent
+            / "JSON"
+            / f"{spm.stem}_dynamic_wind_import_from_megaplant_groups.json"
+        )
+        required = [
+            spm,
+            speedtree_spm,
+            blend_path_for(spm),
+            report_path,
+            wind_path,
+        ]
+        for path in required:
+            if not Path(path).is_file():
+                raise BlenderResumeReceiptError(
+                    f"current Repair result is missing a required file: {path}"
+                )
+
+        optional = []
+        optional.append(speedtree_stmat_path(speedtree_spm))
+        if texture_paths is None:
+            texture_paths = self._reported_texture_paths(spm)
+        optional.extend(
+            Path(path) for path in texture_paths
+        )
+        return required + optional
+
+    def _blender_resume_relation_inventory(self, spm, item=None):
+        """Describe registered relations from the already-scanned table.
+
+        This path deliberately reads no SPM/Blend contents and resolves no
+        global receipt cache.  The scan has already discovered provider use;
+        only small target registries are consulted here.
+        """
+
+        spm = Path(spm).expanduser().absolute()
+        cluster_source = is_cluster_source_spm(spm)
+        owner = spm.parent.parent if cluster_source else spm.parent
+        owner_has_cluster = (owner / "Cluster").is_dir()
+        if cluster_source:
+            candidates = [dict(item or {}, spm=spm)]
+            requested_target = None
+        elif owner_has_cluster:
+            table = getattr(self, "items", None)
+            if not isinstance(table, dict):
+                return None
+            candidates = list(table.values())
+            requested_target = normalized_folder_key(spm)
+        else:
+            return []
+
+        rows = []
+        for candidate in candidates:
+            if not isinstance(candidate, dict) or not candidate.get("spm"):
+                continue
+            provider = Path(candidate["spm"]).expanduser().absolute()
+            if (
+                not is_cluster_source_spm(provider)
+                or normalized_folder_key(provider.parent.parent)
+                != normalized_folder_key(owner)
+            ):
+                continue
+            try:
+                targets = cluster_relation_output_targets(
+                    provider,
+                    candidate.get("referenced_by_spms") or (),
+                )
+            except (OSError, RuntimeError, TypeError, ValueError):
+                return None
+            target_keys = sorted(
+                normalized_folder_key(target) for target in targets
+            )
+            if requested_target and requested_target not in target_keys:
+                continue
+            authoring = candidate.get("authoring_spm")
+            rows.append({
+                "provider_spm": str(provider),
+                "provider_authoring_spm": (
+                    str(Path(authoring).expanduser().absolute())
+                    if authoring
+                    else ""
+                ),
+                "provider_blend": str(blend_path_for(provider)),
+                "target_registry": str(
+                    blend_path_for(provider).with_suffix(
+                        ".atlas_leaf_targets.json"
+                    )
+                ),
+                "registered_targets": target_keys,
+            })
+        rows.sort(key=lambda row: normalized_folder_key(row["provider_spm"]))
+        return rows
+
+    def _blender_resume_relation_signature(
+        self,
+        spm,
+        item=None,
+        *,
+        relation_inventory=None,
+    ):
+        """Return the stat-backed relation index for fast skip eligibility."""
+
+        spm = Path(spm).expanduser().absolute()
+        if relation_inventory is None:
+            relation_inventory = self._blender_resume_relation_inventory(
+                spm,
+                item=item,
+            )
+        if relation_inventory is None:
+            return {"status": "unresolved"}
+        return {
+            "status": (
+                "tracked"
+                if (
+                    is_cluster_source_spm(spm)
+                    or (spm.parent / "Cluster").is_dir()
+                )
+                else "not_applicable"
+            ),
+            "relations": copy.deepcopy(relation_inventory),
+        }
+
+    @staticmethod
+    def _blender_resume_relation_paths(
+        spm,
+        repair_state,
+        *,
+        relation_inventory=(),
+    ):
+        """Files whose drift requires relation maintenance, not a failure."""
+
+        paths = []
+        for row in relation_inventory or ():
+            if not isinstance(row, dict):
+                continue
+            paths.extend(
+                Path(row[key])
+                for key in (
+                    "provider_spm",
+                    "provider_authoring_spm",
+                    "provider_blend",
+                    "target_registry",
+                )
+                if row.get(key)
+            )
+        dependency_contract = repair_state.get("push_dependency_contract")
+        if isinstance(dependency_contract, dict):
+            paths.extend(
+                Path(path)
+                for path in dependency_contract.get("dependency_spms") or ()
+            )
+        return paths
+
+    def _build_blender_resume_receipt(
+        self,
+        iid,
+        spm,
+        repair_state,
+        *,
+        texture_paths=None,
+        item=None,
+        relation_validated=False,
+    ):
+        spm = Path(spm)
+        if item is None:
+            try:
+                item = self._batch_job_item(iid)
+            except (KeyError, TypeError):
+                # Detached status probes may not have a current table row.
+                # They may omit the optimization; they must not turn receipt
+                # creation into a status failure.
+                item = {}
+        speedtree_spm = speedtree_output_spm_for(spm)
+        relation_inventory = self._blender_resume_relation_inventory(
+            spm,
+            item=item,
+        )
+        relation_signature = self._blender_resume_relation_signature(
+            spm,
+            item=item,
+            relation_inventory=relation_inventory,
+        )
+        relation_sensitive = bool(
+            is_cluster_source_spm(spm)
+            or (speedtree_spm.parent / "Cluster").is_dir()
+        )
+        if (
+            relation_signature.get("status") == "unresolved"
+            or (relation_sensitive and not relation_validated)
+        ):
+            raise BlenderResumeReceiptError(
+                "Cluster relationship has not been live-validated",
+                resume_action="relation_changed",
+            )
+        return build_blender_resume_receipt(
+            spm,
+            tracked_paths=self._blender_resume_tracked_paths(
+                spm,
+                repair_state,
+                texture_paths=texture_paths,
+            ),
+            relation_paths=self._blender_resume_relation_paths(
+                spm,
+                repair_state,
+                relation_inventory=relation_inventory,
+            ),
+            relation_signature=relation_signature,
+            settings=self._blender_resume_settings(iid, item=item),
+            repair_state=repair_state,
+        )
+
+    def _validated_blender_resume_state(self, iid, spm, item, receipt):
+        relation_inventory = self._blender_resume_relation_inventory(
+            spm,
+            item=item,
+        )
+        return validate_blender_resume_receipt(
+            receipt,
+            spm,
+            settings=self._blender_resume_settings(iid, item=item),
+            relation_signature=self._blender_resume_relation_signature(
+                spm,
+                item=item,
+                relation_inventory=relation_inventory,
+            ),
+        )
+
+    def _migrate_blender_resume_from_stat_state(self, iid, spm, item):
+        """Seal an existing current row without opening SPM/Blend contents."""
+
+        with self.state_lock:
+            entry = copy.deepcopy(self.state.get(iid) or {})
+        status_text = str(entry.get("blend_status") or "")
+        status_kind = str(entry.get("blend_status_kind") or "")
+        if (
+            status_kind not in {"", "ok"}
+            or not (
+                status_text.startswith("최신")
+                or status_text.startswith("Blend 완료")
+            )
+        ):
+            return {"policy": "live_validation"}
+
+        spm = Path(spm).expanduser().absolute()
+        speedtree_spm = speedtree_output_spm_for(spm)
+        blend = blend_path_for(spm)
+        report = repair_pipeline_report_path(spm)
+        wind = (
+            blend.parent
+            / "JSON"
+            / f"{spm.stem}_dynamic_wind_import_from_megaplant_groups.json"
+        )
+        required = (spm, speedtree_spm, blend, report, wind)
+        try:
+            stats = {path: Path(path).stat() for path in required}
+        except OSError:
+            return {"policy": "rebuild"}
+        newest_source_mtime = max(
+            stats[spm].st_mtime_ns,
+            stats[speedtree_spm].st_mtime_ns,
+        )
+        if newest_source_mtime > stats[blend].st_mtime_ns:
+            return {"policy": "rebuild"}
+
+        relation_inventory = self._blender_resume_relation_inventory(
+            spm,
+            item=item,
+        )
+        if relation_inventory is None:
+            return {"policy": "live_validation"}
+        relation_paths = self._blender_resume_relation_paths(
+            spm,
+            {},
+            relation_inventory=relation_inventory,
+        )
+        for path in relation_paths:
+            try:
+                if Path(path).stat().st_mtime_ns > stats[blend].st_mtime_ns:
+                    return {"policy": "live_validation"}
+            except FileNotFoundError:
+                # Missing registry sidecars are an explicit OFF/pass-through
+                # state and are sealed as missing in the receipt.
+                if str(path).casefold().endswith(
+                    ".atlas_leaf_targets.json"
+                ):
+                    continue
+                return {"policy": "live_validation"}
+            except OSError:
+                return {"policy": "live_validation"}
+
+        push_ready = "Push 차단" not in status_text
+        repair_state = {
+            "current": True,
+            "push_ready": push_ready,
+            "kind": "ready" if push_ready else "source_review",
+            "reason": (
+                "준비됨 ✓"
+                if push_ready
+                else "원본/재질 검토 필요 — Unreal Push 차단"
+            ),
+        }
+        try:
+            receipt = self._build_blender_resume_receipt(
+                iid,
+                spm,
+                repair_state,
+                texture_paths=tuple(entry.get("live_texture_paths") or ()),
+                item=item,
+                relation_validated=True,
+            )
+        except (
+            BlenderResumeReceiptError,
+            OSError,
+            TypeError,
+            ValueError,
+        ):
+            return {"policy": "live_validation"}
+        return {
+            "policy": "skip",
+            "repair_state": repair_state,
+            "receipt": receipt,
+        }
+
+    def _prefilter_blender_resume_targets(self, targets):
+        """Exclude unchanged completed rows before workers and waves exist."""
+
+        targets = list(targets)
+        if getattr(self, "force_rerun", False):
+            return targets, []
+        runnable = []
+        skipped = []
+        for item in targets:
+            item.pop("_blender_resume_policy", None)
+            spm = Path(item["spm"])
+            iid = str(spm)
+            with self.state_lock:
+                receipt = copy.deepcopy(
+                    (self.state.get(iid) or {}).get(
+                        "blend_resume_receipt"
+                    )
+                )
+            try:
+                repair_state = self._validated_blender_resume_state(
+                    iid,
+                    spm,
+                    item,
+                    receipt,
+                )
+            except BlenderResumeReceiptError as exc:
+                if exc.resume_action == "missing":
+                    migration = self._migrate_blender_resume_from_stat_state(
+                        iid,
+                        spm,
+                        item,
+                    )
+                    if migration.get("policy") == "skip":
+                        if self._publish_current_repair_skip(
+                            iid,
+                            spm,
+                            migration["repair_state"],
+                            validated_resume_receipt=migration["receipt"],
+                        ):
+                            skipped.append(item)
+                            continue
+                    elif migration.get("policy") == "rebuild":
+                        item["_blender_resume_policy"] = "rebuild"
+                        runnable.append(item)
+                        continue
+                item["_blender_resume_policy"] = (
+                    "rebuild"
+                    if exc.resume_action in {
+                        "rebuild_required",
+                        "wrong_target",
+                    }
+                    else "live_validation"
+                )
+                runnable.append(item)
+                continue
+            except (OSError, TypeError, ValueError):
+                item["_blender_resume_policy"] = "live_validation"
+                runnable.append(item)
+                continue
+            if not self._publish_current_repair_skip(
+                iid,
+                spm,
+                repair_state,
+                validated_resume_receipt=receipt,
+            ):
+                runnable.append(item)
+                continue
+            skipped.append(item)
+        if skipped:
+            self.log(
+                "Blender Repair 재개 영수증: 완료 항목 "
+                f"{len(skipped)}개를 실행 대기열 전에 건너뜀"
+            )
+        return runnable, skipped
+
     def _schedule_live_status_poll(self, delay_ms=10000):
         try:
             pending = getattr(self, "_live_poll_after_id", None)
@@ -3997,6 +4439,13 @@ class App:
                     item["spm"],
                     tuple(item.get("live_texture_paths") or ()),
                     item.get("live_status_signature"),
+                    copy.deepcopy(item.get("blend_resume_receipt")),
+                    {
+                        "wind_override": item.get("wind_override", "auto"),
+                        "manual_bones_locked": item.get(
+                            "manual_bones_locked", False
+                        ),
+                    },
                 )
                 for iid, item in list(self.items.items())
             ]
@@ -4015,10 +4464,26 @@ class App:
         error_count = 0
         try:
             def inspect_row(row):
-                iid, spm, texture_paths, previous_signature = row
+                legacy_snapshot = len(row) == 4
+                if legacy_snapshot:
+                    iid, spm, texture_paths, previous_signature = row
+                    resume_receipt = None
+                    resume_item = {}
+                else:
+                    (
+                        iid,
+                        spm,
+                        texture_paths,
+                        previous_signature,
+                        resume_receipt,
+                        resume_item,
+                ) = row
                 try:
                     signature = self._live_status_signature(spm, texture_paths)
                     if signature == previous_signature:
+                        # Unchanged rows need no SPM/material audit. A missing
+                        # fast receipt is migrated from this saved status and
+                        # current stat identity only when Blender is run.
                         return None
                     # A changed report can point at a new set of
                     # T_/Cluster files.
@@ -4026,10 +4491,48 @@ class App:
                     signature = self._live_status_signature(
                         spm, texture_paths
                     )
-                    status = self._blend_status_text(spm)
+                    repair_state = None
+                    if legacy_snapshot:
+                        status = self._blend_status_text(spm)
+                    else:
+                        repair_state = self._repair_output_state(spm)
+                        status = self._blend_status_from_repair_state(
+                            repair_state
+                        )
                     push_status = self._current_push_status_text(iid, spm)
+                    resume_receipt = None
+                    if (
+                        isinstance(repair_state, dict)
+                        and repair_state.get("current") is True
+                    ):
+                        try:
+                            resume_receipt = (
+                                self._build_blender_resume_receipt(
+                                    iid,
+                                    spm,
+                                    repair_state,
+                                    texture_paths=texture_paths,
+                                    item=resume_item,
+                                )
+                            )
+                        except (
+                            BlenderResumeReceiptError,
+                            OSError,
+                            TypeError,
+                            ValueError,
+                        ):
+                            # A receipt is an optimization. Keep the live
+                            # status authoritative and let the queue fall
+                            # back to its ordinary validation path.
+                            resume_receipt = None
                     return (
-                        iid, texture_paths, signature, status, push_status, ""
+                        iid,
+                        texture_paths,
+                        signature,
+                        status,
+                        push_status,
+                        resume_receipt,
+                        "",
                     )
                 except Exception as exc:
                     # One damaged row must not terminate the whole audit.  A
@@ -4042,6 +4545,7 @@ class App:
                         None,
                         f"확인 실패 · {message}",
                         "-",
+                        None,
                         message,
                     )
 
@@ -4052,7 +4556,13 @@ class App:
                 with ThreadPoolExecutor(max_workers=min(4, len(snapshot))) as pool:
                     rows = [row for row in pool.map(inspect_row, snapshot) if row]
             for (
-                iid, texture_paths, signature, status, push_status, row_error
+                iid,
+                texture_paths,
+                signature,
+                status,
+                push_status,
+                resume_receipt,
+                row_error,
             ) in rows:
                 with self.state_lock:
                     if generation != self._scan_generation or iid not in self.items:
@@ -4060,10 +4570,22 @@ class App:
                     item = self.items[iid]
                     item["live_texture_paths"] = texture_paths
                     item["live_status_signature"] = signature
+                    item["blend_resume_receipt"] = copy.deepcopy(
+                        resume_receipt
+                    )
                     state_entry = self.state.setdefault(iid, {})
                     state_entry["blend_status"] = status
                     state_entry["live_texture_paths"] = list(texture_paths)
                     state_entry["live_status_signature"] = signature
+                    if resume_receipt is not None:
+                        state_entry["blend_resume_receipt"] = copy.deepcopy(
+                            resume_receipt
+                        )
+                        state_entry["blend_status_kind"] = "ok"
+                        state_entry.pop("blend_status_error", None)
+                        state_entry.pop("blend_status_result", None)
+                    else:
+                        state_entry.pop("blend_resume_receipt", None)
                     if row_error:
                         state_entry["live_status_error"] = row_error
                     else:
@@ -9731,6 +10253,11 @@ class App:
             state_entry = self.state.setdefault(iid, {})
             state_entry[column] = status_text
             state_entry[f"{column}_kind"] = kind
+            if column == "blend_status":
+                state_entry.pop("blend_resume_receipt", None)
+                item = getattr(self, "items", {}).get(iid)
+                if isinstance(item, dict):
+                    item["blend_resume_receipt"] = None
             durable_entry = {
                 "time": datetime.now().isoformat(timespec="seconds"),
                 "kind": kind,
@@ -10153,6 +10680,20 @@ class App:
                 )
                 if emit_done:
                     self.ui_queue.put(("progress", reason))
+                    self.ui_queue.put(("done", None))
+                return True
+        if phase == "blender":
+            targets, resume_skipped = self._prefilter_blender_resume_targets(
+                targets
+            )
+            if not targets:
+                self.ui_queue.put(("batch_progress", (0, 0)))
+                self.log(
+                    "Blender Repair 실행 항목 없음 — 재개 영수증으로 "
+                    f"{len(resume_skipped)}개 완료 상태 확인"
+                )
+                if emit_done:
+                    self.ui_queue.put(("progress", "대기"))
                     self.ui_queue.put(("done", None))
                 return True
         titles = {"check": "검사", "spm": "SPM 본 세팅", "blender": "Blender Repair", "push": "Unreal Push"}
@@ -11267,12 +11808,57 @@ class App:
         spm,
         persist=True,
         repair_state=None,
+        validated_resume_receipt=None,
+        relation_validated=False,
     ):
         text = (
             self._blend_status_from_repair_state(repair_state)
             if isinstance(repair_state, dict)
             else self._blend_status_text(spm)
         )
+        resume_receipt = None
+        texture_paths = ()
+        live_signature = None
+        if (
+            isinstance(repair_state, dict)
+            and repair_state.get("current") is True
+        ):
+            if isinstance(validated_resume_receipt, dict):
+                resume_receipt = copy.deepcopy(validated_resume_receipt)
+                texture_paths = tuple(
+                    (self.state.get(iid) or {}).get(
+                        "live_texture_paths"
+                    )
+                    or ()
+                )
+                live_signature = self._live_status_signature(
+                    spm,
+                    texture_paths,
+                )
+            else:
+                try:
+                    texture_paths = self._reported_texture_paths(spm)
+                    live_signature = self._live_status_signature(
+                        spm,
+                        texture_paths,
+                    )
+                    resume_receipt = self._build_blender_resume_receipt(
+                        iid,
+                        spm,
+                        repair_state,
+                        texture_paths=texture_paths,
+                        relation_validated=relation_validated,
+                    )
+                except (
+                    BlenderResumeReceiptError,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                ) as exc:
+                    self.log(
+                        "  [② 재개 영수증 경고] "
+                        f"{Path(spm).name}: {compact_error_message(exc)}"
+                    )
         self.ui_queue.put(("cell", (iid, "blend_status", text)))
         if persist:
             with self.state_lock:
@@ -11288,6 +11874,22 @@ class App:
                     entry["blend_status_kind"] = "ok"
                     entry.pop("blend_status_error", None)
                     entry.pop("blend_status_result", None)
+                    if resume_receipt is not None:
+                        entry["blend_resume_receipt"] = resume_receipt
+                        entry["live_texture_paths"] = list(texture_paths)
+                        entry["live_status_signature"] = live_signature
+                    else:
+                        entry.pop("blend_resume_receipt", None)
+                    item = getattr(self, "items", {}).get(iid)
+                    if isinstance(item, dict):
+                        item["blend_resume_receipt"] = copy.deepcopy(
+                            resume_receipt
+                        )
+                        if resume_receipt is not None:
+                            item["live_texture_paths"] = texture_paths
+                            item["live_status_signature"] = live_signature
+                elif isinstance(repair_state, dict):
+                    entry.pop("blend_resume_receipt", None)
                 self._save_state_after_phase_update()
         return text
 
@@ -13137,9 +13739,6 @@ class App:
                     return cached_resolution
                 self.log(f"Cluster Assembly live contract 확인: {spm.name}")
             except FileNotFoundError:
-                # Only an owner Tree with a real Cluster child can be missing
-                # an actionable receipt. Ordinary vegetation and the Cluster
-                # source rows themselves remain pass-through.
                 if not owner_has_cluster:
                     return None
                 self.log(
@@ -14608,7 +15207,15 @@ class App:
         )
         return live_resolution
 
-    def _publish_current_repair_skip(self, iid, spm, repair_state):
+    def _publish_current_repair_skip(
+        self,
+        iid,
+        spm,
+        repair_state,
+        *,
+        validated_resume_receipt=None,
+        relation_validated=False,
+    ):
         """Publish one exact current Repair result without rediscovering work."""
         if not isinstance(repair_state, dict) or not repair_state.get("current"):
             return False
@@ -14616,6 +15223,8 @@ class App:
             iid,
             spm,
             repair_state=repair_state,
+            validated_resume_receipt=validated_resume_receipt,
+            relation_validated=relation_validated,
         )
         suffix = (
             " · Unreal Push 차단 상태 유지"
@@ -14639,11 +15248,24 @@ class App:
 
         spm = self._prepare_pair_for_job(spm)
         cluster_source = is_cluster_source_spm(spm)
-        if not self.force_rerun:
+        relation_sensitive = bool(
+            cluster_source
+            or (speedtree_output_spm_for(spm).parent / "Cluster").is_dir()
+        )
+        resume_policy = str(
+            item.get("_blender_resume_policy") or ""
+        )
+        if (
+            not self.force_rerun
+            and not resume_policy
+            and not relation_sensitive
+        ):
             # The shared Repair decision already validates the exact SPM,
             # blend, BWR report, material/wind output and exact dependency
             # artifacts.  Consult it before Atlas refresh, consumer audits or
-            # material preflight for both owner Trees and Cluster providers.
+            # material preflight for ordinary non-Cluster rows. Relation rows
+            # reach this worker only when their fast receipt was unavailable
+            # or changed, so they must refresh the relation once here.
             # Explicit force rebuild deliberately bypasses this fast path.
             repair_state = self._repair_output_state(spm)
             if self._publish_current_repair_skip(
@@ -14808,13 +15430,28 @@ class App:
         def resolve_cluster_receipt_once():
             nonlocal cluster_receipt_resolution, cluster_receipt_resolved
             if not cluster_receipt_resolved:
-                cluster_receipt_resolution = (
-                    self._cluster_receipt_with_recovery(speedtree_spm, stamp)
-                )
+                if (speedtree_spm.parent / "Cluster").is_dir():
+                    cluster_receipt_resolution = (
+                        self._cluster_receipt_with_recovery(
+                            speedtree_spm,
+                            stamp,
+                        )
+                    )
+                else:
+                    # Ordinary vegetation and provider rows have no owner
+                    # Assembly audit. Do not scan/hash the global receipt
+                    # directory merely to prove that absence.
+                    cluster_receipt_resolution = None
                 cluster_receipt_resolved = True
             return cluster_receipt_resolution
 
         if not self.force_rerun:
+            if resume_policy == "live_validation" or relation_sensitive:
+                # Receipt drift schedules work; it is never an item failure by
+                # itself.  Run the existing registered relationship recovery
+                # before deciding whether the materialized Blend still needs
+                # to be rebuilt.
+                resolve_cluster_receipt_once()
             live_contract = cluster_receipt_resolution_uses_live_audit(
                 cluster_receipt_resolution
             )
@@ -14845,35 +15482,41 @@ class App:
                     "Cluster canonical bark capture 필요: "
                     f"{spm.name} · 기존 blend 최신 판정 무효화"
                 )
-            if repair_state["current"]:
+            if repair_state["current"] and resume_policy != "rebuild":
                 if live_contract:
-                    # A clean live contract with no persisted receipt may skip
-                    # only when a prior Repair actually captured an Assembly
-                    # manifest.  Otherwise run BWR once and embed the live
-                    # contract instead of treating the receipt warning as an
-                    # error or silently degrading to non-Assembly.
+                    # An actionable live Assembly contract needs a matching
+                    # materialized manifest before the old Blend may be
+                    # reused.  Pass-through has no Assembly output to embed,
+                    # so missing metadata alone must not manufacture a BWR
+                    # rerun.
                     saved_manifest = saved_pipeline.get(
                         "cluster_assembly_manifest"
                     )
-                    if not isinstance(saved_manifest, dict):
-                        repair_state["current"] = False
-                    else:
-                        try:
-                            live_contract = copy.deepcopy(
-                                cluster_receipt_resolution.get(
-                                    "selected_contract"
-                                )
+                    try:
+                        live_contract = copy.deepcopy(
+                            cluster_receipt_resolution.get(
+                                "selected_contract"
                             )
-                            if not isinstance(live_contract, dict):
-                                raise ValueError(
-                                    "selected live contract is unavailable"
-                                )
-                            live_status = str(
-                                (
-                                    live_contract.get("handoff") or {}
-                                ).get("status")
-                                or ""
+                        )
+                        if not isinstance(live_contract, dict):
+                            raise ValueError(
+                                "selected live contract is unavailable"
                             )
+                        live_status = str(
+                            (
+                                live_contract.get("handoff") or {}
+                            ).get("status")
+                            or ""
+                        )
+                        if not isinstance(saved_manifest, dict):
+                            # A first resume audit may establish that an
+                            # ordinary asset still has no Assembly work.  That
+                            # is enough to create the skip receipt; it must not
+                            # force a ceremonial BWR rebuild just to persist a
+                            # pass-through manifest.
+                            if live_status != "pass_through":
+                                repair_state["current"] = False
+                        else:
                             saved_status = str(
                                 saved_manifest.get("status") or ""
                             )
@@ -14892,16 +15535,16 @@ class App:
                                 )
                             ):
                                 repair_state["current"] = False
-                        except (
-                            OSError,
-                            RuntimeError,
-                            TypeError,
-                            ValueError,
-                        ):
-                            # A live-audit result that cannot be reconciled
-                            # with the saved manifest must never authorize an
-                            # early Repair skip.
-                            repair_state["current"] = False
+                    except (
+                        OSError,
+                        RuntimeError,
+                        TypeError,
+                        ValueError,
+                    ):
+                        # This is a skip decision only.  Continue through BWR
+                        # instead of turning relationship metadata into a
+                        # separate terminal failure.
+                        repair_state["current"] = False
                 if repair_state["current"]:
                     if cluster_source:
                         relation_refresh = (
@@ -14926,6 +15569,7 @@ class App:
                         iid,
                         spm,
                         repair_state,
+                        relation_validated=cluster_receipt_resolved,
                     ):
                         return
                     self.log(
@@ -15304,6 +15948,7 @@ class App:
             iid,
             spm,
             repair_state=handoff_state or None,
+            relation_validated=cluster_receipt_resolved,
         )
         source_review = bool(
             result.get("source_review_required")
