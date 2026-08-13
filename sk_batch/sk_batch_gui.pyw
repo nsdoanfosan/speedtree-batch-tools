@@ -17439,7 +17439,7 @@ class App:
         return not failed_items
 
     def _load_waiting_import_item(self, target, batch_stamp):
-        """Load one durable waiting item after revalidating its exact source."""
+        """Load one finalized durable manifest item without re-auditing it."""
         spm = Path(target["spm"])
         iid = str(spm)
         with self.state_lock:
@@ -17451,23 +17451,6 @@ class App:
             )
 
         export_cache = entry.get("push_export_cache") or {}
-        expected_source = str(export_cache.get("source_fingerprint") or "")
-        if not expected_source:
-            raise BatchItemError(
-                "대기 export source fingerprint 없음",
-                kind="data_error",
-            )
-        current_source = self._source_push_fingerprint(
-            blend_path_for(spm),
-            iid,
-        )
-        if current_source != expected_source:
-            raise BatchItemError(
-                "대기 export 이후 Blender/콘텐츠 계약이 변경됨; "
-                "unreal_wait export를 다시 실행하세요",
-                kind="data_error",
-            )
-
         paths = entry.get("push_paths") or {}
         manifest_value = (
             paths.get("waiting_manifest")
@@ -17491,16 +17474,6 @@ class App:
                 f"대기 manifest 항목을 읽을 수 없음: {exc}",
                 kind="data_error",
             ) from exc
-        if item.get("fingerprint") != export_cache.get("fingerprint"):
-            raise BatchItemError(
-                "대기 manifest와 export 영수증 fingerprint 불일치",
-                kind="data_error",
-            )
-        if not manifest_item_files_match(item):
-            raise BatchItemError(
-                "대기 export 파일 fingerprint 검증 실패",
-                kind="data_error",
-            )
         item["report_path"] = str(
             LOG_DIR / f"{spm.stem}_waiting_unreal_{batch_stamp}.json"
         )
@@ -17575,19 +17548,19 @@ class App:
                     details = copy.deepcopy(
                         self.state.get(iid, {}).get("push_paths") or {}
                     )
-                details["waiting_validation_error"] = reason
+                details["waiting_import_error"] = reason
                 self._set_push_state(
                     iid,
                     "exported_pending_unreal",
-                    "Unreal 대기 유지 · export 재검증 필요",
+                    "Unreal 대기 유지 · import manifest 확인 필요",
                     details=details,
                 )
-                self.log(f"[대기 import 검증 실패] {Path(iid).name}: {reason}")
+                self.log(f"[대기 import 준비 실패] {Path(iid).name}: {reason}")
                 invalid_ids.add(iid)
             self.ui_queue.put(("batch_progress", (index, total)))
             self.ui_queue.put((
                 "progress",
-                f"대기 에셋 검증 {index}/{total}",
+                f"대기 에셋 준비 {index}/{total}",
             ))
 
         if not pending:
@@ -17608,11 +17581,11 @@ class App:
                     details = copy.deepcopy(
                         self.state.get(iid, {}).get("push_paths") or {}
                     )
-                details["waiting_validation_error"] = reason
+                details["waiting_import_error"] = reason
                 self._set_push_state(
                     iid,
                     "exported_pending_unreal",
-                    "Unreal 대기 유지 · dependency 재검증 필요",
+                    "Unreal 대기 유지 · dependency 확인 필요",
                     details=details,
                 )
                 invalid_ids.add(iid)

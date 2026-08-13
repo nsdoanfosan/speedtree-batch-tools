@@ -7719,13 +7719,17 @@ def write_csv(report, csv_path):
         writer.writerows(rows)
 
 
-def global_m_graph_names(items, cfg, metrics=None):
+def global_m_graph_names(items, cfg, metrics=None, discovery_roots=None):
     """Find material graphs through a bounded content-validated inventory."""
     paths = []
     for item in items:
         paths.extend(Path(path) for path in item.get("sbs_files") or [])
-    roots = [Path(cfg.get("tree_root", ""))]
-    roots.extend(Path(path) for path in cfg.get("source_texture_roots", []))
+    roots = (
+        [Path(path) for path in discovery_roots]
+        if discovery_roots is not None
+        else [Path(cfg.get("tree_root", ""))]
+        + [Path(path) for path in cfg.get("source_texture_roots", [])]
+    )
     discovered, discovery = bounded_recursive_files(
         roots,
         suffix=".sbs",
@@ -7746,7 +7750,8 @@ def global_m_graph_names(items, cfg, metrics=None):
     )
 
 
-def attach_global_m_graphs(items, cfg, metrics=None):
+def attach_global_m_graphs(
+        items, cfg, metrics=None, discovery_roots=None):
     """Attach canonical shared SBS graphs without treating old M_ outputs as inputs."""
     needs_global = any(
         not entry.get("m_graph") or entry.get("legacy_m_graph")
@@ -7762,7 +7767,12 @@ def attach_global_m_graphs(items, cfg, metrics=None):
                 "strategy": "skipped_all_rows_have_canonical_graphs",
             })
         return {}
-    graphs = global_m_graph_names(items, cfg, metrics=metrics)
+    graphs = global_m_graph_names(
+        items,
+        cfg,
+        metrics=metrics,
+        discovery_roots=discovery_roots,
+    )
     if metrics is not None:
         metrics.setdefault("strategy", "bounded_content_identity_inventory")
     changed = set()
@@ -8432,7 +8442,16 @@ def make_report(
         for args in buffered_progress:
             progress_callback(*args)
     sbs_metrics = {"cache_hits": 0, "cache_misses": 0}
-    attach_global_m_graphs(items, cfg, metrics=sbs_metrics)
+    attach_global_m_graphs(
+        items,
+        cfg,
+        metrics=sbs_metrics,
+        # An explicit target is an exact audit boundary.  Do not recurse the
+        # entire tree merely to resolve SBS graphs for one selected folder;
+        # the selected folder(s) and their already-discovered SBS files are
+        # sufficient for this scoped execution plan.
+        discovery_roots=folders if targets else None,
+    )
     finish_phase("global_sbs_discovery", **sbs_metrics)
     resolve_shared_atlas_entries(items, cfg)
     refresh_texture_output_contract_states(items, cfg)

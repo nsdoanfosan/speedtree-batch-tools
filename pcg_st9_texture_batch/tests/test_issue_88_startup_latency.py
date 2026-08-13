@@ -5,6 +5,7 @@ import importlib.machinery
 import importlib.util
 import copy
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -2826,6 +2827,142 @@ class ProductionShapedLatencyFixtureTests(unittest.TestCase):
                 limitation_receipt["workload_equivalence"],
                 "cardinality_only",
             )
+
+
+class Issue290RedundantAuditTests(unittest.TestCase):
+    class Value:
+        def __init__(self, value=None):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value):
+            self.value = value
+
+    def test_constructor_does_not_schedule_automatic_full_audit(self):
+        source = inspect.getsource(GUI.App.__init__)
+        self.assertNotIn("_start_initial_refresh", source)
+        self.assertIn("_load_initial_folder_inventory", source)
+
+    def test_cold_inventory_uses_folder_discovery_without_make_report(self):
+        app = GUI.App.__new__(GUI.App)
+        app.cfg = {"tree_root": r"D:\Trees"}
+        app.use_pcg_targets_var = self.Value(False)
+        app.populate = mock.Mock()
+        app._update_summary = mock.Mock()
+        app.status_var = self.Value()
+        app.log = mock.Mock()
+        folders = [Path(r"D:\Trees\one"), Path(r"D:\Trees\two")]
+
+        with mock.patch.object(
+            GUI, "candidate_folders", return_value=folders
+        ), mock.patch.object(
+            GUI,
+            "make_report",
+            side_effect=AssertionError("startup must not run a detailed audit"),
+        ) as make_report:
+            app._load_initial_folder_inventory()
+
+        make_report.assert_not_called()
+        self.assertEqual(
+            [item["folder"] for item in app.report["items"]],
+            [str(path) for path in folders],
+        )
+        self.assertTrue(app._display_only_snapshot)
+
+    def test_explicit_audit_targets_do_not_recurse_the_tree_root_for_sbs(self):
+        selected = Path(r"D:\Trees\selected")
+        captured = {}
+
+        def discover(roots, **_kwargs):
+            captured["roots"] = list(roots)
+            return [], {"directory_count": 1, "file_count": 0}
+
+        with mock.patch.object(
+            audit, "bounded_recursive_files", side_effect=discover
+        ), mock.patch.object(
+            audit, "folder_m_graph_names", return_value={}
+        ):
+            audit.global_m_graph_names(
+                [{"sbs_files": []}],
+                {
+                    "tree_root": r"D:\Trees",
+                    "source_texture_roots": [r"D:\AllTextures"],
+                },
+                discovery_roots=[selected],
+            )
+
+        self.assertEqual(captured["roots"], [selected])
+
+    def test_step3_scope_audits_checked_row_and_shared_owner_only(self):
+        selected = {
+            "folder": r"D:\Trees\selected",
+            "name": "selected",
+            "cluster_items": [{"shared_from": "owner"}],
+        }
+        owner = {
+            "folder": r"D:\Trees\owner",
+            "name": "owner",
+            "cluster_items": [],
+        }
+        unrelated = {
+            "folder": r"D:\Trees\unrelated",
+            "name": "unrelated",
+            "cluster_items": [],
+        }
+        app = GUI.App.__new__(GUI.App)
+        app.cfg = {"tree_root": r"D:\Trees"}
+        app.use_pcg_targets_var = self.Value(False)
+        app.items = {
+            row["folder"]: {"item": row, "checked": row is selected}
+            for row in (selected, owner, unrelated)
+        }
+        app.report = {"items": [selected, owner, unrelated]}
+        app.texplan_cache = {}
+        app.texplan_errors = {}
+        scoped_report = {
+            "items": [dict(selected), dict(owner)],
+            "generated_at": "now",
+        }
+
+        with mock.patch.object(
+            GUI, "make_report", return_value=scoped_report
+        ) as make_report, mock.patch.object(
+            GUI, "cache_blender_connection_rows"
+        ):
+            folders = app._refresh_step3_execution_scope()
+
+        expected = sorted(
+            [selected["folder"], owner["folder"]],
+            key=os.path.normcase,
+        )
+        self.assertEqual(folders, expected)
+        make_report.assert_called_once_with(
+            app.cfg,
+            targets=expected,
+            pcg_targets=None,
+            mutation_authority=True,
+            session_evidence={},
+        )
+        self.assertNotIn(unrelated["folder"], folders)
+
+    def test_step3_completion_refresh_keeps_exact_scope(self):
+        app = GUI.App.__new__(GUI.App)
+        app._active_step3_refresh_folders = [r"D:\Trees\selected"]
+        app.log = mock.Mock()
+        app._start_completion_refresh = mock.Mock()
+
+        app._step3_finished(
+            0,
+            0,
+            {"latest": 1, "changed": 0, "failed": 0},
+        )
+
+        app._start_completion_refresh.assert_called_once_with(
+            mock.ANY,
+            targets=[r"D:\Trees\selected"],
+        )
 
 
 if __name__ == "__main__":
