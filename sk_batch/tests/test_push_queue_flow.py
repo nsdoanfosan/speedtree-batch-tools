@@ -2846,9 +2846,6 @@ class PushQueueFlowTests(unittest.TestCase):
                 "same-pipeline Push must not repeat the ② handoff audit"
             )
         )
-        app._validate_repair_stage_contract = mock.Mock(
-            return_value=True
-        )
         app._publish_repair_stage_contract(
             spm,
             ready=True,
@@ -2865,10 +2862,6 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(ready, [target])
         self.assertIsNone(fatal)
         app._handoff_ready.assert_not_called()
-        app._validate_repair_stage_contract.assert_called_once_with(
-            spm,
-            mock.ANY,
-        )
         self.assertIn("② 결과 재사용 1개", app.log.call_args.args[0])
 
     def test_standalone_push_still_runs_full_handoff_preflight(self):
@@ -2893,7 +2886,7 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertIsNone(fatal)
         app._handoff_ready.assert_called_once_with(spm)
 
-    def test_stale_same_pipeline_contract_freezes_without_standalone_fallback(
+    def test_same_pipeline_upstream_evidence_does_not_freeze_push(
         self,
     ):
         gui = load_gui_module()
@@ -2912,6 +2905,17 @@ class PushQueueFlowTests(unittest.TestCase):
             spm,
             ready=True,
             reason="ready",
+            evidence_bundle={
+                "assembly": {
+                    "files": [{
+                        "role": (
+                            "assembly.manifest.handoff_evidence.pcg_receipt"
+                        ),
+                        "path": "D:/deleted/pcg_receipt.json",
+                        "sha256": "0" * 64,
+                    }],
+                },
+            },
         )
 
         with mock.patch.object(
@@ -2921,18 +2925,9 @@ class PushQueueFlowTests(unittest.TestCase):
         ), mock.patch.object(gui, "save_state"):
             ready, fatal = app._push_preflight([target])
 
-        self.assertEqual(ready, [])
+        self.assertEqual(ready, [target])
         self.assertIsNone(fatal)
         app._handoff_ready.assert_not_called()
-        state = app.state[str(spm)]
-        self.assertEqual(
-            state["push_status_kind"],
-            "stale_execution_freeze",
-        )
-        self.assertIn(
-            "STALE_EXECUTION_FREEZE",
-            state["push_status_error"]["message"],
-        )
 
     def test_same_pipeline_source_review_contract_blocks_without_reaudit(self):
         gui = load_gui_module()
@@ -3215,7 +3210,7 @@ class PushQueueFlowTests(unittest.TestCase):
             }
             self.assertIn("--spm", strings)
             self.assertIn("--material-contract", strings)
-            self.assertIn("--repair-evidence", strings)
+            self.assertNotIn("--repair-evidence", strings)
             self.assertIn("--dependency-orchestrated", strings)
 
         blender_job_strings = set()
@@ -3302,20 +3297,13 @@ class PushQueueFlowTests(unittest.TestCase):
             '"dependency_orchestrated": bool(args.dependency_orchestrated)',
             push_source,
         )
-        self.assertIn(
-            'parser.add_argument("--repair-evidence")',
-            push_source,
-        )
-        self.assertIn(
+        self.assertNotIn("--repair-evidence", push_source)
+        self.assertNotIn(
             "validate_repair_push_evidence_bundle(",
             push_source,
         )
-        self.assertIn(
+        self.assertNotIn(
             "validate_export_object_postcondition(",
-            push_source,
-        )
-        self.assertIn(
-            '"push_mutators_skipped": True',
             push_source,
         )
         sync_call = push_source.index("sync_unreal_mesh_folder_path()")

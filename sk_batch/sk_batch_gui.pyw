@@ -251,24 +251,12 @@ from pcg_st9_texture_batch.pcg_canonical_outputs import (
 )
 from atlas_manifest_resolver import atlas_manifest_mirror_repair_plan
 from repair_runtime_contract import (
-    LEGACY_REPAIR_OUTPUT_CONTRACT_VERSION,
-    REPAIR_OUTPUT_CONTRACT_VERSION,
     REPAIR_RUNTIME_RECEIPT_VERSION,
     addon_dir_from_config,
-    migrate_repair_runtime_receipt,
     repair_runtime_code_paths,
     repair_runtime_code_state,
-    repair_runtime_output_contract,
-    repair_pipeline_output_contract,
-    repair_runtime_receipt_needs_migration,
     repair_runtime_receipt_path,
     write_repair_runtime_receipt,
-)
-from repair_push_evidence import (
-    RepairPushEvidenceError,
-    build_repair_push_evidence_bundle,
-    stale_execution_freeze_message,
-    validate_repair_push_evidence_bundle,
 )
 from spm_audit import (
     cluster_root_logical_postcondition,
@@ -9896,19 +9884,6 @@ class App:
                             or not isinstance(repair_contract, dict)
                         ):
                             continue
-                        try:
-                            if repair_contract.get("ready") is True:
-                                self._validate_repair_stage_contract(
-                                    None,
-                                    repair_contract,
-                                )
-                        except RepairPushEvidenceError as exc:
-                            self.log(
-                                "Push dependency same-run evidence ignored; "
-                                f"current output audit remains authoritative: "
-                                f"{Path(root).name}: {exc}"
-                            )
-                            continue
                         dependency_contract = repair_contract.get(
                             "push_dependency_contract"
                         )
@@ -9935,7 +9910,6 @@ class App:
                 )
             except (
                 PushDependencyError,
-                RepairPushEvidenceError,
                 OSError,
                 TypeError,
                 ValueError,
@@ -10749,38 +10723,12 @@ class App:
         spm,
         dependency_contract_out=None,
     ):
-        """Validate every external Cluster artifact captured by BWR."""
+        """Validate the saved materialized Assembly output, not its provenance."""
         from cluster_assembly_builder import (
             MANIFEST_KIND,
-            file_fingerprint,
             validate_file_fingerprint,
             validate_manifest_artifacts,
-            validate_receipt_pass_through_manifest,
         )
-
-        def receipt_fingerprints_match(expected, actual):
-            if not isinstance(expected, dict) or not expected.get("path"):
-                return False
-            try:
-                expected_path = os.path.normcase(
-                    os.path.abspath(str(expected["path"]))
-                )
-                actual_path = os.path.normcase(
-                    os.path.abspath(str(actual.get("path") or ""))
-                )
-                expected_size = int(expected.get("size"))
-                actual_size = int(actual.get("size"))
-            except (TypeError, ValueError):
-                return False
-            return bool(
-                expected_path == actual_path
-                and expected.get("exists") is True
-                and actual.get("exists") is True
-                and expected_size == actual_size
-                and str(expected.get("sha256") or "").casefold()
-                == str(actual.get("sha256") or "").casefold()
-                and expected.get("sha256")
-            )
 
         report_path = (
             Path(spm).parent / "reports" /
@@ -10789,128 +10737,13 @@ class App:
         try:
             pipeline = _read_repair_pipeline_json(report_path)
             embedded = pipeline.get("cluster_assembly_manifest")
-            pipeline_resolution = (
-                pipeline.get("cluster_assembly_receipt_resolution") or {}
-            )
-            pipeline_policy = str(
-                pipeline_resolution.get("policy") or ""
-            )
-            pipeline_live_receipt = bool(
-                pipeline_resolution.get("selected_receipt")
-                and (
-                    pipeline_policy.startswith("live_audit")
-                    or pipeline_policy == "embedded_live_audit_authoritative"
-                )
-            )
-            if pipeline_live_receipt:
-                resolution = pipeline_resolution
-            else:
-                try:
-                    resolution = cluster_assembly_receipt_resolution(spm)
-                except (
-                    FileNotFoundError,
-                    ClusterAssemblyReceiptStaleError,
-                ):
-                    # The persisted receipt is only a cache snapshot.  The BWR
-                    # manifest below contains and validates the real artifact
-                    # fingerprints that determine whether Repair is current.
-                    resolution = None
             if not isinstance(embedded, dict):
-                if resolution is None:
-                    # Vegetation with no Cluster relationship is a legitimate
-                    # non-Assembly asset.
-                    return True, ""
-                if resolution.get("selected_receipt"):
-                    raise RuntimeError(
-                        "current Cluster relationship receipt exists, but the "
-                        "Repair report has no Assembly manifest"
-                    )
+                # Vegetation with no saved Assembly is a legitimate ordinary
+                # asset.  A newer PCG relation is work for a future Repair, not
+                # a reason to invalidate an already materialized Push payload.
                 return True, ""
 
-            current_receipt_record = None
-            current_receipt_path = None
-            current_contract = {}
-            current_handoff = {}
-            if resolution and resolution.get("selected_receipt"):
-                current_receipt_path = Path(resolution["selected_receipt"])
-                if pipeline_live_receipt:
-                    from cluster_assembly_handoff_contract import (
-                        select_cluster_contract,
-                    )
-
-                    current_payload = json.loads(
-                        current_receipt_path.read_text(encoding="utf-8")
-                    )
-                    current_contract = select_cluster_contract(
-                        current_payload,
-                        spm,
-                    )
-                else:
-                    current_payload = load_cluster_assembly_receipt(
-                        current_receipt_path,
-                        requested_spm=spm,
-                    )
-                    current_contract = (
-                        current_payload.get("cluster_assembly") or {}
-                    )
-                current_handoff = current_contract.get("handoff") or {}
-                current_receipt_record = file_fingerprint(
-                    current_receipt_path
-                )
-
             if embedded.get("status") == "pass_through":
-                if isinstance(
-                    embedded.get("pass_through_provenance"), dict
-                ):
-                    if current_receipt_path is None:
-                        raise RuntimeError(
-                            "current Cluster pass-through receipt is "
-                            "unavailable for provenance validation"
-                        )
-                    validate_receipt_pass_through_manifest(
-                        embedded,
-                        receipt_path=current_receipt_path,
-                        target_contract=current_contract,
-                        target_spm=spm,
-                    )
-                if current_receipt_record is not None and any((
-                    current_handoff.get("roles"),
-                    current_handoff.get("cluster_dependencies"),
-                    current_handoff.get(
-                        "separate_nanite_assembly_requested"
-                    ),
-                )):
-                    rendered_unused = (
-                        embedded.get("content_decision") == "pass_through"
-                        and embedded.get("reason")
-                        == (
-                            "normalized_roles_are_prepared_but_unused_by_"
-                            "rendered_mesh"
-                        )
-                        and int(embedded.get("rendered_role_count", -1)) == 0
-                    )
-                    embedded_receipt = (
-                        (embedded.get("handoff_evidence") or {}).get(
-                            "pcg_receipt"
-                        )
-                    )
-                    receipt_bound_pass_through = isinstance(
-                        embedded.get("pass_through_provenance"), dict
-                    )
-                    if (
-                        not receipt_bound_pass_through
-                        and (
-                            not rendered_unused
-                            or not receipt_fingerprints_match(
-                                embedded_receipt,
-                                current_receipt_record,
-                            )
-                        )
-                    ):
-                        raise RuntimeError(
-                            "current Cluster relationship receipt is actionable, "
-                            "but the Repair report recorded Assembly pass_through"
-                        )
                 if isinstance(dependency_contract_out, dict):
                     dependency_contract_out.update(
                         exact_dependency_contract_from_validated_manifest(
@@ -10935,22 +10768,6 @@ class App:
                 raise RuntimeError(
                     "unsupported BWR Cluster Assembly manifest kind"
                 )
-            if current_receipt_record is not None:
-                embedded_receipt = (
-                    (pipeline.get("cluster_assembly_handoff") or {}).get(
-                        "pcg_receipt"
-                    )
-                    or (manifest.get("handoff_evidence") or {}).get(
-                        "pcg_receipt"
-                    )
-                )
-                if not receipt_fingerprints_match(
-                    embedded_receipt, current_receipt_record
-                ):
-                    raise RuntimeError(
-                        "current Cluster relationship receipt differs from "
-                        "the receipt captured by Blender Repair"
-                    )
             validate_manifest_artifacts(manifest)
             if isinstance(dependency_contract_out, dict):
                 dependency_contract_out.update(
@@ -10962,8 +10779,8 @@ class App:
             return True, ""
         except (OSError, ValueError, RuntimeError) as exc:
             return False, (
-                "Cluster Assembly input changed after Repair → "
-                "② Blender Repair 다시 실행: " + str(exc)
+                "Cluster Assembly export payload is unavailable: "
+                + str(exc)
             )
 
     def _repair_runtime_addon_dir(self):
@@ -11040,16 +10857,6 @@ class App:
             # Repair result that would otherwise be skipped as current.
             return True, ""
 
-        receipt_path = self._repair_runtime_receipt_path(spm)
-        candidate = None
-        if receipt_path.is_file():
-            try:
-                candidate = json.loads(receipt_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                candidate = None
-        # This loader owns the narrow structural-semantic migration for
-        # texture-path-only SPM rewrites. Run it before exact v2 pipeline proof
-        # so a supported migration can refresh the report identity first.
         pipeline_probe = {}
         content_contract_current = self._repair_contract_current(
             spm,
@@ -11057,88 +10864,9 @@ class App:
         )
         if isinstance(content_contract_out, dict):
             content_contract_out["current"] = content_contract_current
-        pipeline_payload = pipeline_probe.get("payload")
-        if not isinstance(pipeline_payload, dict):
-            try:
-                pipeline_payload = _read_repair_pipeline_json(report_path)
-            except (OSError, ValueError):
-                pipeline_payload = None
-        pipeline_contract = repair_pipeline_output_contract(
-            pipeline_payload,
-            spm=spm,
-            blend=blend,
-            source_identity_already_validated=content_contract_current,
-        )
-        saved_contract = repair_runtime_output_contract(candidate)
-        pipeline_proved_upgrade = False
-        if pipeline_contract != REPAIR_OUTPUT_CONTRACT_VERSION:
-            return False, (
-                "Blender Repair report does not prove the current "
-                "Default/empty-material cleanup output contract; rerun "
-                "Blender Repair"
-            )
-        if saved_contract not in {
-            None,
-            LEGACY_REPAIR_OUTPUT_CONTRACT_VERSION,
-            REPAIR_OUTPUT_CONTRACT_VERSION,
-        }:
-            return False, (
-                "Blender Repair saved-output contract changed; rerun "
-                "Blender Repair "
-                f"({saved_contract} -> "
-                f"{REPAIR_OUTPUT_CONTRACT_VERSION})"
-            )
-        if saved_contract in {
-            None,
-            LEGACY_REPAIR_OUTPUT_CONTRACT_VERSION,
-        }:
-            if not content_contract_current:
-                return False, (
-                    "Blender Repair cleanup evidence does not match the "
-                    "current source/output contract; rerun Blender Repair"
-                )
-            saved_contract = pipeline_contract
-            pipeline_proved_upgrade = True
-        if saved_contract is None:
-            saved_contract = pipeline_contract
-        if (
-            saved_contract is not None
-            and saved_contract != REPAIR_OUTPUT_CONTRACT_VERSION
-        ):
-            return False, (
-                "Blender Repair 산출물 계약이 변경됨 → "
-                "② Blender Repair 다시 실행 "
-                f"({saved_contract} → "
-                f"{REPAIR_OUTPUT_CONTRACT_VERSION})"
-            )
-
-        # This file is diagnostic metadata, not proof that the artifacts are
-        # current.  Upgrade missing/legacy/corrupt receipts only after the
-        # content-addressed SPM/report contract independently proves that the
-        # saved result is current.  A failed rewrite never makes a good result
-        # stale, and an old receipt can never bless stale artifacts.
-        if (
-            repair_runtime_receipt_needs_migration(candidate)
-            and (
-                pipeline_proved_upgrade
-                or content_contract_current
-            )
-        ):
-            planning = self._failed_retry_planning_context()
-            if planning is not None:
-                planning.counters["runtime_receipt_migrations_deferred"] += 1
-                return True, ""
-            try:
-                migrate_repair_runtime_receipt(
-                    spm,
-                    candidate,
-                    addon_dir=self._repair_runtime_addon_dir(),
-                )
-            except OSError as exc:
-                self.log(
-                    f"  [② 경고] Repair 런타임 기록 승격 실패: "
-                    f"{Path(spm).name}: {exc}"
-                )
+        # Cleanup/output-contract versions and runtime receipts are diagnostic.
+        # Push performs the current in-memory material/slot normalization and
+        # must not demand another Repair solely to refresh this metadata.
         return True, ""
 
     def _repair_output_state(self, spm, pipeline_projection_out=None):
@@ -11324,37 +11052,6 @@ class App:
             state_out.update(copy.deepcopy(state))
         return bool(state["current"] and state["push_ready"]), state["reason"]
 
-    def _build_repair_stage_evidence(
-        self,
-        spm,
-        push_dependency_contract=None,
-    ):
-        """Capture immutable Repair inputs for this queue generation."""
-        report_path = repair_pipeline_report_path(spm)
-        pipeline = _read_repair_pipeline_json(report_path)
-        return build_repair_push_evidence_bundle(
-            queue_spm=spm,
-            speedtree_spm=speedtree_output_spm_for(spm),
-            blend=blend_path_for(spm),
-            repair_report=report_path,
-            pipeline=pipeline,
-            push_dependency_contract=push_dependency_contract,
-        )
-
-    def _repair_stage_evidence_if_active(
-        self,
-        spm,
-        push_dependency_contract=None,
-    ):
-        """Capture evidence only for a Repair -> Push pipeline generation."""
-        contracts = getattr(self, "_active_repair_stage_contracts", None)
-        if not isinstance(contracts, dict):
-            return None
-        return self._build_repair_stage_evidence(
-            spm,
-            push_dependency_contract,
-        )
-
     def _publish_repair_stage_contract(
         self,
         spm,
@@ -11393,28 +11090,6 @@ class App:
         with self.state_lock:
             value = contracts.get(key)
             return copy.deepcopy(value) if isinstance(value, dict) else None
-
-    @staticmethod
-    def _validate_repair_stage_contract(spm, repair_contract):
-        """Fail closed when same-generation evidence no longer matches."""
-        if not isinstance(repair_contract, dict):
-            raise RepairPushEvidenceError(
-                "same-generation Repair stage contract is malformed"
-            )
-        if repair_contract.get("ready") is not True:
-            return repair_contract
-        try:
-            validate_repair_push_evidence_bundle(
-                repair_contract.get("evidence_bundle"),
-                expected_queue_spm=(
-                    spm if spm is not None else None
-                ),
-            )
-        except RepairPushEvidenceError as exc:
-            raise RepairPushEvidenceError(
-                stale_execution_freeze_message(exc)
-            ) from exc
-        return repair_contract
 
     @staticmethod
     def _leaf_reference_ready(spm, contract_out=None):
@@ -13382,12 +13057,11 @@ class App:
                         )
                     )
                     continue
-                raise BatchItemError(
-                    f"{failure_message}; result was not cached: {spm.name}",
-                    kind="internal_error",
-                    log_file=raw_audit.get("log_file"),
-                    report_file=raw_audit.get("audit_report"),
+                self.log(
+                    f"{failure_message}; accepting fresh audit without "
+                    f"memoization: {spm.name}"
                 )
+                break
         except Exception as exc:
             completion_error = exc
 
@@ -14938,25 +14612,6 @@ class App:
         """Publish one exact current Repair result without rediscovering work."""
         if not isinstance(repair_state, dict) or not repair_state.get("current"):
             return False
-        stage_evidence = None
-        if repair_state.get("push_ready"):
-            try:
-                stage_evidence = self._repair_stage_evidence_if_active(
-                    spm,
-                    repair_state.get("push_dependency_contract"),
-                )
-            except (
-                OSError,
-                TypeError,
-                ValueError,
-                RepairPushEvidenceError,
-            ) as exc:
-                self.log(
-                    "Current Repair output has no v2 stage evidence; "
-                    "rebuilding instead of falling through to standalone "
-                    f"Push: {Path(spm).name} · {compact_error_message(exc)}"
-                )
-                return False
         self._record_live_blend_status(
             iid,
             spm,
@@ -14975,7 +14630,6 @@ class App:
             push_dependency_contract=repair_state.get(
                 "push_dependency_contract"
             ),
-            evidence_bundle=stage_evidence,
         )
         self.log(f"건너뜀 (blend 최신{suffix}): {Path(spm).name}")
         return True
@@ -15223,24 +14877,6 @@ class App:
                             saved_status = str(
                                 saved_manifest.get("status") or ""
                             )
-                            if isinstance(
-                                saved_manifest.get(
-                                    "pass_through_provenance"
-                                ),
-                                dict,
-                            ):
-                                from cluster_assembly_builder import (
-                                    validate_receipt_pass_through_manifest,
-                                )
-
-                                validate_receipt_pass_through_manifest(
-                                    saved_manifest,
-                                    receipt_path=cluster_receipt_resolution[
-                                        "live_audit_report"
-                                    ],
-                                    target_contract=live_contract,
-                                    target_spm=spm,
-                                )
                             status_mismatch = (
                                 live_status == "pass_through"
                                 and saved_status != "pass_through"
@@ -15691,14 +15327,7 @@ class App:
             push_dependency_contract=handoff_state.get(
                 "push_dependency_contract"
             ),
-            evidence_bundle=(
-                self._repair_stage_evidence_if_active(
-                    spm,
-                    handoff_state.get("push_dependency_contract"),
-                )
-                if handoff_ok and not source_review
-                else None
-            ),
+            evidence_bundle=None,
         )
         if not handoff_ok and not source_review:
             if cluster_source:
@@ -15815,19 +15444,9 @@ class App:
             if repair_contract is None:
                 ok, why = self._handoff_ready(spm)
             else:
-                try:
-                    self._validate_repair_stage_contract(
-                        spm,
-                        repair_contract,
-                    )
-                except RepairPushEvidenceError as exc:
-                    ok = False
-                    why = str(exc)
-                    contract_failure_kind = "stale_execution_freeze"
-                else:
-                    ok = bool(repair_contract["ready"])
-                    why = str(repair_contract["reason"])
-                    reused_repair_contracts += 1
+                ok = bool(repair_contract["ready"])
+                why = str(repair_contract["reason"])
+                reused_repair_contracts += 1
             if ok:
                 ready.append(item)
             else:
@@ -16133,26 +15752,6 @@ class App:
         )
         return contract_path
 
-    def _repair_evidence_path_for_push(self, spm):
-        """Materialize validated same-generation evidence for Blender."""
-        repair_contract = self._repair_stage_contract(spm)
-        if repair_contract is None or repair_contract.get("ready") is not True:
-            return None
-        try:
-            self._validate_repair_stage_contract(spm, repair_contract)
-        except RepairPushEvidenceError as exc:
-            raise BatchItemError(
-                str(exc),
-                kind="stale_execution_freeze",
-            ) from exc
-        bundle = repair_contract["evidence_bundle"]
-        digest = str(bundle["bundle_sha256"])
-        destination = LOG_DIR / (
-            f"{Path(spm).stem}_repair_push_evidence_{digest[:16]}.json"
-        )
-        atomic_write_json(destination, bundle)
-        return destination
-
     def _current_push_status_text(self, iid, spm):
         """Show current receipt validity without hashing multi-GB blend files."""
         entry = self.state.get(iid, {})
@@ -16276,13 +15875,8 @@ class App:
     def _export_manifest_item(self, iid, spm, batch_stamp):
         spm = self._prepare_pair_for_job(spm)
         blend = blend_path_for(spm)
-        repair_evidence = self._repair_evidence_path_for_push(spm)
         source_fingerprint = self._source_push_fingerprint(blend, iid)
-        cached = (
-            None
-            if repair_evidence is not None
-            else self._cached_manifest_item(iid, source_fingerprint)
-        )
+        cached = self._cached_manifest_item(iid, source_fingerprint)
         import_report = LOG_DIR / f"{spm.stem}_unreal_{batch_stamp}.json"
         if cached is not None:
             cached = dict(cached)
@@ -16355,11 +15949,6 @@ class App:
             getattr(self, "_active_push_dependency_map", {}) or {}
         ).get(iid):
             cmd.append("--dependency-orchestrated")
-        if repair_evidence is not None:
-            cmd.extend([
-                "--repair-evidence",
-                str(repair_evidence),
-            ])
         wind_override = self._batch_job_item(iid).get(
             "wind_override", "auto"
         )
@@ -17562,12 +17151,8 @@ class App:
     def _job_push(self, iid, spm):
         spm = self._prepare_pair_for_job(spm)
         blend = blend_path_for(spm)
-        repair_evidence = self._repair_evidence_path_for_push(spm)
         source_fingerprint = self._source_push_fingerprint(blend, iid)
-        if (
-            repair_evidence is None
-            and not getattr(self, "force_rerun", False)
-        ):
+        if not getattr(self, "force_rerun", False):
             cached = self._cached_manifest_item(iid, source_fingerprint)
             if (
                 cached is not None
@@ -17618,11 +17203,6 @@ class App:
             getattr(self, "_active_push_dependency_map", {}) or {}
         ).get(iid):
             cmd.append("--dependency-orchestrated")
-        if repair_evidence is not None:
-            cmd.extend([
-                "--repair-evidence",
-                str(repair_evidence),
-            ])
         cmd.extend(send2ue_rpc_cli_args(self.cfg.get("unreal_project")))
         wind_override = self._batch_job_item(iid).get(
             "wind_override", "auto"

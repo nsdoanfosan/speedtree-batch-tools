@@ -746,12 +746,8 @@ def _reads_mapping_key(node: ast.AST, variable: str, key: str) -> bool:
 def _require_repair_push_reuse(methods) -> None:
     required = {
         "_run_full_pipeline",
-        "_build_repair_stage_evidence",
-        "_repair_stage_evidence_if_active",
         "_publish_repair_stage_contract",
         "_repair_stage_contract",
-        "_validate_repair_stage_contract",
-        "_repair_evidence_path_for_push",
         "_job_blender",
         "_push_preflight",
         "_export_manifest_item",
@@ -761,6 +757,17 @@ def _require_repair_push_reuse(methods) -> None:
     if missing:
         raise CompileGateError(
             "Repair-to-Push reuse contract failed: missing " + ", ".join(missing)
+        )
+    obsolete_guards = sorted({
+        "_build_repair_stage_evidence",
+        "_repair_stage_evidence_if_active",
+        "_validate_repair_stage_contract",
+        "_repair_evidence_path_for_push",
+    }.intersection(methods))
+    if obsolete_guards:
+        raise CompileGateError(
+            "Obsolete Repair-to-Push evidence guard returned: "
+            + ", ".join(obsolete_guards)
         )
 
     pipeline = methods["_run_full_pipeline"]
@@ -806,17 +813,6 @@ def _require_repair_push_reuse(methods) -> None:
             "Repair-to-Push reuse contract failed: Blender Repair does not "
             "publish its final result"
         )
-    if not _calls(
-        methods["_job_blender"],
-        "_repair_stage_evidence_if_active",
-    ) or not _calls(
-        methods["_repair_stage_evidence_if_active"],
-        "_build_repair_stage_evidence",
-    ):
-        raise CompileGateError(
-            "Repair-to-Push evidence contract failed: Blender Repair does not "
-            "capture the content-addressed evidence bundle"
-        )
     handoff_calls = _calls(methods["_job_blender"], "_handoff_ready")
     if not any(
         any(keyword.arg == "state_out" for keyword in call.keywords)
@@ -837,11 +833,6 @@ def _require_repair_push_reuse(methods) -> None:
         raise CompileGateError(
             "Repair-to-Push reuse contract failed: Push does not read the "
             "job-scoped Repair result"
-        )
-    if not _calls(push_preflight, "_validate_repair_stage_contract"):
-        raise CompileGateError(
-            "Repair-to-Push evidence contract failed: Push does not validate "
-            "same-generation evidence before reuse"
         )
     reuse_branch = None
     for node in ast.walk(push_preflight):
@@ -896,20 +887,15 @@ def _require_repair_push_reuse(methods) -> None:
             "report must use the scoped JSON reader"
         )
     for name in ("_export_manifest_item", "_job_push"):
-        method = methods[name]
         strings = {
             node.value
-            for node in ast.walk(method)
+            for node in ast.walk(methods[name])
             if isinstance(node, ast.Constant)
             and isinstance(node.value, str)
         }
-        if (
-            "--repair-evidence" not in strings
-            or not _calls(method, "_repair_evidence_path_for_push")
-        ):
+        if "--repair-evidence" in strings:
             raise CompileGateError(
-                "Repair-to-Push evidence contract failed: "
-                f"{name} does not forward the verified bundle"
+                "Obsolete Repair evidence forwarding returned: " + name
             )
 
 
@@ -940,7 +926,7 @@ def validate_push_job_contracts(
     source: str,
     filename=str(PUSH_JOB_PATH),
 ) -> int:
-    """Validate only the Push worker's static CLI/API evidence surface."""
+    """Prevent mutable Repair evidence from becoming a Push gate again."""
     try:
         module = ast.parse(source, filename=filename)
     except SyntaxError as exc:
@@ -955,17 +941,28 @@ def validate_push_job_contracts(
         if isinstance(node, ast.Constant)
         and isinstance(node.value, str)
     }
-    if "--repair-evidence" not in strings:
+    if "--repair-evidence" in strings:
         raise CompileGateError(
-            "Push worker CLI has no --repair-evidence contract"
+            "Push worker exposes obsolete Repair evidence CLI"
         )
     for function_name in (
         "validate_repair_push_evidence_bundle",
         "validate_export_object_postcondition",
     ):
+        if _calls(main, function_name):
+            raise CompileGateError(
+                "Push worker calls obsolete evidence API: "
+                + function_name
+            )
+    for function_name in (
+        "consolidate_speedtree_group_materials",
+        "normalize_speedtree_material_textures",
+        "remove_unused_empty_material_slots",
+        "pack_speedtree_vertex_payload",
+    ):
         if not _calls(main, function_name):
             raise CompileGateError(
-                "Push worker does not enforce evidence API: "
+                "Push worker does not run current export normalization: "
                 + function_name
             )
     return 1

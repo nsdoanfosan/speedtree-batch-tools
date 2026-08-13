@@ -70,7 +70,6 @@ def build_exact_push_command(
     blender: Path = DEFAULT_BLENDER,
     log_dir: Path = LOG_DIR,
     run_id: str | None = None,
-    repair_evidence: Path | None = None,
     material_contract: Path | None = None,
     unreal_project: Path | None = DEFAULT_UNREAL_PROJECT,
 ) -> tuple[list[str], dict]:
@@ -95,12 +94,6 @@ def build_exact_push_command(
         if not material_contract.is_file():
             raise ExactPushError(
                 f"explicit Push material contract is missing: {material_contract}"
-            )
-    if repair_evidence is not None:
-        repair_evidence = repair_evidence.expanduser().resolve()
-        if not repair_evidence.is_file():
-            raise ExactPushError(
-                f"explicit Repair/Push evidence is missing: {repair_evidence}"
             )
     run_id = run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
     prefix = log_dir / f"{stem}_exact_push_{run_id}"
@@ -146,9 +139,6 @@ def build_exact_push_command(
         "--unreal-ingest",
         str(UNREAL_INGEST),
     ]
-    if repair_evidence is not None:
-        command.extend(["--repair-evidence", str(repair_evidence)])
-        outputs["repair_evidence"] = repair_evidence
     outputs["unreal_project"] = (
         Path(unreal_project).expanduser().resolve()
         if unreal_project
@@ -265,7 +255,6 @@ def parse_args(argv=None):
     parser.add_argument("--spm", required=True, type=Path)
     parser.add_argument("--blender", type=Path, default=DEFAULT_BLENDER)
     parser.add_argument("--log-dir", type=Path, default=LOG_DIR)
-    parser.add_argument("--repair-evidence", type=Path)
     parser.add_argument("--material-contract", type=Path)
     parser.add_argument("--unreal-project", type=Path, default=DEFAULT_UNREAL_PROJECT)
     parser.add_argument(
@@ -284,7 +273,6 @@ def main(argv=None):
             args.spm,
             blender=args.blender,
             log_dir=args.log_dir,
-            repair_evidence=args.repair_evidence,
             material_contract=args.material_contract,
             unreal_project=args.unreal_project,
         )

@@ -16,6 +16,7 @@ from unittest import mock
 
 from atlas_target_registry import TargetRegistryError
 from sk_batch.repair_runtime_contract import (
+    REPAIR_OUTPUT_CONTRACT_VERSION,
     RepairPipelineEvidenceError,
     repair_pipeline_output_contract,
     repair_runtime_receipt_path,
@@ -1194,7 +1195,7 @@ class BlendLiveStatusTests(unittest.TestCase):
         )
         return payload
 
-    def test_missing_runtime_receipt_for_legacy_output_forces_rerun(self):
+    def test_missing_runtime_receipt_is_diagnostic(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as temporary:
@@ -1205,11 +1206,11 @@ class BlendLiveStatusTests(unittest.TestCase):
             app.log = mock.Mock()
 
             fresh, reason = app._repair_runtime_fresh(spm)
-            self.assertFalse(fresh)
-            self.assertIn("Blender Repair", reason)
+            self.assertTrue(fresh, reason)
+            self.assertEqual(reason, "")
             self.assertFalse(app._repair_runtime_receipt_path(spm).is_file())
 
-    def test_missing_runtime_receipt_migrates_only_with_cleanup_evidence(self):
+    def test_cleanup_evidence_does_not_require_runtime_receipt_migration(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as temporary:
@@ -1223,15 +1224,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             fresh, reason = app._repair_runtime_fresh(spm)
 
             self.assertTrue(fresh, reason)
-            receipt = json.loads(
-                app._repair_runtime_receipt_path(spm).read_text(
-                    encoding="utf-8"
-                )
-            )
-            self.assertEqual(
-                receipt["output_contract_version"],
-                gui.REPAIR_OUTPUT_CONTRACT_VERSION,
-            )
+            self.assertFalse(app._repair_runtime_receipt_path(spm).exists())
 
     def test_runtime_receipt_stays_current_when_addon_code_changes(self):
         gui = load_gui_module()
@@ -1274,7 +1267,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.assertTrue(fresh, reason)
             self.assertEqual(reason, "")
 
-    def test_runtime_receipt_gates_on_explicit_output_contract_change(self):
+    def test_runtime_receipt_output_contract_change_is_diagnostic(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as temporary:
@@ -1287,20 +1280,20 @@ class BlendLiveStatusTests(unittest.TestCase):
             receipt_path = app._repair_runtime_receipt_path(spm)
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
             receipt["output_contract_version"] = (
-                gui.REPAIR_OUTPUT_CONTRACT_VERSION + 1
+                REPAIR_OUTPUT_CONTRACT_VERSION + 1
             )
             receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
 
             fresh, reason = app._repair_runtime_fresh(spm)
 
-            self.assertFalse(fresh)
+            self.assertTrue(fresh, reason)
+            self.assertEqual(reason, "")
             self.assertEqual(
                 json.loads(receipt_path.read_text(encoding="utf-8")),
                 receipt,
             )
-            self.assertIn("saved-output contract changed", reason)
 
-    def test_version_one_runtime_receipt_migrates_with_current_v2_pipeline(self):
+    def test_version_one_runtime_receipt_is_left_as_diagnostic(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as temporary:
@@ -1328,15 +1321,11 @@ class BlendLiveStatusTests(unittest.TestCase):
             fresh, reason = app._repair_runtime_fresh(spm)
 
             self.assertTrue(fresh, reason)
-            migrated = json.loads(receipt_path.read_text(encoding="utf-8"))
-            self.assertEqual(migrated["version"], 2)
-            self.assertEqual(
-                migrated["output_contract_version"],
-                gui.REPAIR_OUTPUT_CONTRACT_VERSION,
-            )
+            diagnostic = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(diagnostic["version"], 1)
             app._repair_runtime_code_state.assert_not_called()
 
-    def test_version_one_runtime_receipt_reruns_when_artifact_is_not_current(
+    def test_version_one_runtime_receipt_never_blocks_current_export(
         self,
     ):
         gui = load_gui_module()
@@ -1358,14 +1347,14 @@ class BlendLiveStatusTests(unittest.TestCase):
 
             fresh, reason = app._repair_runtime_fresh(spm)
 
-            self.assertFalse(fresh)
-            self.assertIn("current source/output contract", reason)
+            self.assertTrue(fresh, reason)
+            self.assertEqual(reason, "")
             self.assertEqual(
                 json.loads(receipt_path.read_text(encoding="utf-8")),
                 legacy,
             )
 
-    def test_current_receipt_cannot_bless_legacy_pipeline_evidence(self):
+    def test_legacy_cleanup_pipeline_evidence_is_diagnostic(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as temporary:
@@ -1393,11 +1382,11 @@ class BlendLiveStatusTests(unittest.TestCase):
 
             fresh, reason = app._repair_runtime_fresh(spm)
 
-            self.assertFalse(fresh)
-            self.assertIn("does not prove", reason)
+            self.assertTrue(fresh, reason)
+            self.assertEqual(reason, "")
             self.assertEqual(receipt_path.read_bytes(), current_receipt)
 
-    def test_invalid_runtime_receipt_is_rewritten_only_for_current_artifacts(
+    def test_invalid_runtime_receipt_is_ignored_and_not_rewritten(
         self,
     ):
         gui = load_gui_module()
@@ -1413,7 +1402,8 @@ class BlendLiveStatusTests(unittest.TestCase):
 
             fresh, reason = app._repair_runtime_fresh(spm)
 
-            self.assertFalse(fresh)
+            self.assertTrue(fresh, reason)
+            self.assertEqual(reason, "")
             self.assertEqual(receipt_path.read_text(encoding="utf-8"), "{broken")
 
             self._write_cleanup_contract_evidence(spm)
@@ -1421,11 +1411,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             fresh, reason = app._repair_runtime_fresh(spm)
 
             self.assertTrue(fresh, reason)
-            migrated = json.loads(receipt_path.read_text(encoding="utf-8"))
-            self.assertEqual(
-                migrated["output_contract_version"],
-                gui.REPAIR_OUTPUT_CONTRACT_VERSION,
-            )
+            self.assertEqual(receipt_path.read_text(encoding="utf-8"), "{broken")
 
     def test_runtime_receipt_writer_rejects_missing_or_partial_pipeline(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1808,7 +1794,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 ready, reason = app._cluster_assembly_inputs_current(spm)
 
         self.assertFalse(ready)
-        self.assertIn("Cluster Assembly input changed", reason)
+        self.assertIn("Cluster Assembly export payload is unavailable", reason)
         self.assertIn("branch_normalized_01", reason)
 
     def test_handoff_readiness_checks_cluster_assembly_inputs(self):
@@ -1893,7 +1879,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             str(spm.resolve()),
         )
 
-    def test_current_cluster_receipt_requires_embedded_assembly_manifest(self):
+    def test_current_cluster_receipt_does_not_create_a_new_push_requirement(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as temporary:
@@ -1916,10 +1902,10 @@ class BlendLiveStatusTests(unittest.TestCase):
             ):
                 ready, reason = app._cluster_assembly_inputs_current(spm)
 
-        self.assertFalse(ready)
-        self.assertIn("Assembly manifest", reason)
+        self.assertTrue(ready, reason)
+        self.assertEqual(reason, "")
 
-    def test_actionable_current_receipt_invalidates_old_pass_through_report(self):
+    def test_actionable_current_receipt_does_not_invalidate_saved_pass_through(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         from cluster_assembly_builder import file_fingerprint
@@ -1978,12 +1964,9 @@ class BlendLiveStatusTests(unittest.TestCase):
             ) as load_receipt:
                 ready, reason = app._cluster_assembly_inputs_current(spm)
 
-        self.assertFalse(ready)
-        self.assertIn("receipt is actionable", reason)
-        load_receipt.assert_called_once_with(
-            current_receipt,
-            requested_spm=spm,
-        )
+        self.assertTrue(ready, reason)
+        self.assertEqual(reason, "")
+        load_receipt.assert_not_called()
 
     def test_run_specific_live_pass_through_ignores_old_persisted_relation(self):
         gui = load_gui_module()
@@ -2191,7 +2174,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             )
         )
 
-    def test_current_receipt_must_match_ready_report_receipt_evidence(self):
+    def test_current_receipt_drift_does_not_block_ready_manifest(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         from cluster_assembly_builder import MANIFEST_KIND, file_fingerprint
@@ -2257,9 +2240,9 @@ class BlendLiveStatusTests(unittest.TestCase):
             ) as validate_artifacts:
                 ready, reason = app._cluster_assembly_inputs_current(spm)
 
-        self.assertFalse(ready)
-        self.assertIn("receipt differs", reason)
-        validate_artifacts.assert_not_called()
+        self.assertTrue(ready, reason)
+        self.assertEqual(reason, "")
+        validate_artifacts.assert_called_once()
 
     def test_live_status_explains_unconnected_managed_atlas(self):
         gui = load_gui_module()
@@ -3519,7 +3502,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             for call in app.log.call_args_list
         ))
 
-    def test_cluster_live_audit_reports_artifact_mismatch_without_input_churn(
+    def test_cluster_live_audit_artifact_mismatch_is_diagnostic(
         self,
     ):
         gui = load_gui_module()
@@ -3546,44 +3529,21 @@ class BlendLiveStatusTests(unittest.TestCase):
                 return_value=(False, (artifact_error,)),
             )
 
-            with self.assertRaises(gui.BatchItemError) as caught:
-                app._refresh_stale_cluster_receipt(
-                    spm,
-                    "20260731_230101",
-                )
-
-            message = str(caught.exception)
-            compact = gui.compact_error_message(message)
-            iid = str(spm)
-            app._record_phase_status(
-                iid,
-                "blend_status",
-                f"failed: {compact}",
-                caught.exception.kind,
-                compact,
-                persist=False,
+            app._refresh_stale_cluster_receipt(
+                spm,
+                "20260731_230101",
             )
-            app._phase_failed_items = {iid}
-            job_summary = app._summarize_phase_targets([{"spm": spm}])
 
         self.assertEqual(
             app._refresh_stale_cluster_receipt_uncached.call_count,
             2,
         )
-        self.assertIn("Live artifact mismatch", message)
-        self.assertIn(str(artifact), message)
-        self.assertNotIn("inputs kept changing", message)
-        self.assertIn("Live artifact mismatch", compact)
-        self.assertIn(
-            "Live artifact mismatch",
-            app.state[iid]["blend_status_error"]["message"],
-        )
-        self.assertIn(
-            "Live artifact mismatch",
-            job_summary["target_outcomes"][0]["evidence"]["message"],
-        )
+        messages = [call.args[0] for call in app.log.call_args_list]
+        self.assertTrue(any("Live artifact mismatch" in row for row in messages))
+        self.assertTrue(any(str(artifact) in row for row in messages))
+        self.assertTrue(any("accepting fresh audit" in row for row in messages))
 
-    def test_cluster_live_audit_reports_changed_input_path_separately(self):
+    def test_cluster_live_audit_changed_input_path_is_diagnostic(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         app.log = mock.Mock()
@@ -3616,39 +3576,22 @@ class BlendLiveStatusTests(unittest.TestCase):
                 return_value=(True, ()),
             )
 
-            with self.assertRaises(gui.BatchItemError) as caught:
-                app._refresh_stale_cluster_receipt(
-                    spm,
-                    "20260731_230201",
-                )
-
-            message = str(caught.exception)
-            compact = gui.compact_error_message(message)
-            iid = str(spm)
-            app._record_phase_status(
-                iid,
-                "blend_status",
-                f"failed: {compact}",
-                caught.exception.kind,
-                compact,
-                persist=False,
+            app._refresh_stale_cluster_receipt(
+                spm,
+                "20260731_230201",
             )
-            app._phase_failed_items = {iid}
-            job_summary = app._summarize_phase_targets([{"spm": spm}])
 
         self.assertEqual(audit_calls["count"], 2)
-        self.assertIn("Input fingerprint changed during audit", message)
-        self.assertIn(str(manifest).casefold(), message.casefold())
-        self.assertNotIn("Live artifact mismatch", message)
-        self.assertIn("Input fingerprint changed during audit", compact)
-        self.assertIn(
-            "Input fingerprint changed during audit",
-            app.state[iid]["blend_status_error"]["message"],
-        )
-        self.assertIn(
-            "Input fingerprint changed during audit",
-            job_summary["target_outcomes"][0]["evidence"]["message"],
-        )
+        messages = [call.args[0] for call in app.log.call_args_list]
+        self.assertTrue(any(
+            "Input fingerprint changed during audit" in row
+            for row in messages
+        ))
+        self.assertTrue(any(
+            str(manifest).casefold() in row.casefold()
+            for row in messages
+        ))
+        self.assertTrue(any("accepting fresh audit" in row for row in messages))
 
     def test_cluster_live_audit_fingerprint_contains_assets_not_runtime_code(
         self,
@@ -6206,7 +6149,6 @@ class BlendLiveStatusTests(unittest.TestCase):
                 reason="준비됨 ✓",
                 kind="ready",
                 push_dependency_contract={"status": "current"},
-                evidence_bundle=None,
             )
 
     def test_current_owner_bwr_skips_atlas_refresh_and_material_preflight(self):

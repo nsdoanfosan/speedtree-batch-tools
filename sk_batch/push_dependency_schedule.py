@@ -113,7 +113,7 @@ def load_current_cluster_assembly_manifest(spm):
 
 
 def _dependency_spms_from_manifest(manifest):
-    """Resolve exact Cluster SPM inputs from a validated Assembly manifest."""
+    """Return available scheduling hints without gating materialized output."""
     status = str(manifest.get("status") or "")
     if status == "pass_through":
         return []
@@ -128,22 +128,12 @@ def _dependency_spms_from_manifest(manifest):
             continue
         source_blend = external.get("source_blend")
         if not isinstance(source_blend, dict) or not source_blend.get("path"):
-            raise PushDependencyError(
-                "external Cluster part has no source_blend contract: "
-                + str(part.get("prototype_id") or part.get("asset_name") or "?")
-            )
+            continue
         dependency = Path(str(source_blend["path"])).with_suffix(".spm")
         if not is_cluster_source_spm(dependency):
-            raise PushDependencyError(
-                "Cluster dependency source is outside a Cluster folder: "
-                + str(dependency)
-            )
+            continue
         if not dependency.is_file():
-            raise PushDependencyError(
-                "Cluster dependency SPM is missing: " + str(dependency),
-                concrete_missing=True,
-                dependency_path=dependency,
-            )
+            continue
         key = normalized_path_key(dependency)
         if key not in seen:
             seen.add(key)
