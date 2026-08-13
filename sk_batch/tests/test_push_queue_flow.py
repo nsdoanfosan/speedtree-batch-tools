@@ -4430,6 +4430,32 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertIn("실패/준비 제외 1개", progress)
         self.assertNotIn("완료 (cache)", progress)
 
+    def test_d_drive_fbx_capacity_wait_is_visible_and_cancellable(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.cfg = {"blender_parallel_jobs": 2}
+        app._retry_transition = mock.Mock()
+        iid = "SK_wait_for_d_space.spm"
+        app.stop_flag.wait = mock.Mock(return_value=True)
+        disk_usage = mock.Mock(free=1024**3)
+
+        with mock.patch.object(
+            gui.shutil, "disk_usage", return_value=disk_usage
+        ), mock.patch.object(gui, "save_state"), self.assertRaises(
+            gui.BatchItemError
+        ) as caught:
+            app._wait_for_send2ue_disk_space(
+                iid,
+                Path(r"D:\SpeedTreeBatchTools\send2ue_fbx\headless"),
+                3 * 1024**3,
+            )
+
+        self.assertEqual(caught.exception.kind, "cancelled")
+        self.assertEqual(
+            app.state[iid]["push_status_kind"], "artifact_waiting"
+        )
+        self.assertIn("D: FBX export", app.state[iid]["push_status"])
+
     def test_rpc_push_skips_when_source_export_and_import_receipts_match(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -5144,6 +5170,45 @@ class PushQueueFlowTests(unittest.TestCase):
                 item = app._cached_manifest_item("tree", "source-v2")
 
         self.assertEqual(item["queue_id"], "tree")
+
+    def test_cached_manifest_on_old_c_export_root_is_rebuilt_on_d(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.force_rerun = False
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifest_path = Path(temp_dir) / "old_c_cache.json"
+            manifest_path.write_text(
+                json.dumps({
+                    "items": [{
+                        "queue_id": "tree",
+                        "fingerprint": "tree-v2",
+                        "exported_files": [{
+                            "path": (
+                                r"C:\repo\sk_batch\logs\send2ue_export_cache"
+                                r"\tree.fbx"
+                            )
+                        }],
+                    }]
+                }),
+                encoding="utf-8",
+            )
+            app.state["tree"] = {
+                "push_export_cache": {
+                    "source_fingerprint": "source-v2",
+                    "manifest": str(manifest_path),
+                    "fingerprint": "tree-v2",
+                }
+            }
+            with mock.patch.object(
+                gui, "manifest_item_files_match", return_value=True
+            ), mock.patch.object(
+                gui,
+                "send2ue_export_cache_root",
+                return_value=Path(r"D:\SpeedTreeBatchTools\send2ue_fbx"),
+            ):
+                item = app._cached_manifest_item("tree", "source-v2")
+
+        self.assertIsNone(item)
 
     def test_retry_planning_validates_the_record_computed_with_fingerprint(self):
         gui = load_gui_module()

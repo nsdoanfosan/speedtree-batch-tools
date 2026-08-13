@@ -98,8 +98,8 @@ GitHub/
 ## 생성 산출물 보존 및 용량 상한
 
 모든 BAT GUI는 실제 작업을 시작하기 전에 `artifact_retention.py`의 전역 정리를
-자동 적용합니다. `sk_batch/logs`(Send2UE FBX cache, pre-repair Blend, log,
-manifest/queue JSON 포함), PCG/SPM report 폴더, `sk_batch/cache`,
+자동 적용합니다. `sk_batch/logs`(pre-repair Blend, log, manifest/queue JSON 포함),
+PCG/SPM report 폴더, `sk_batch/cache`,
 `%LOCALAPPDATA%\SpeedTreeBatchTools`의 cache/retry/process receipt와 공유 queue,
 회전 오류 로그, `D:\OneDrive\Forestportfolio` 아래 도구 소유 백업이 하나의
 합산 예산을 공유합니다.
@@ -110,9 +110,11 @@ manifest/queue JSON 포함), PCG/SPM report 폴더, `sk_batch/cache`,
   오래된 생성물부터 지웁니다. 절대 상한은 `total_bytes < 10 * 1024^3`이며 정확히
   10 GiB도 허용하지 않습니다. 256 MiB 기본 여유는 작은 log/JSON과 예상치 오차가
   순간 상한을 침범하지 않도록 둡니다.
-- 대형 pre-repair 복사와 Send2UE/Exact Push export는 쓰기 전에 예상 크기를 예약하고,
-  완료 또는 실패 직후 다시 정리합니다. 예약 JSON과 plan/apply는 abandoned-safe
-  process mutex로 직렬화되어 동시 실행이 같은 여유를 중복 사용하지 않습니다.
+- 대형 pre-repair 복사는 쓰기 전에 예상 크기를 예약하고 완료 또는 실패 직후 다시
+  정리합니다. 예약 JSON과 plan/apply는 abandoned-safe process mutex로 직렬화됩니다.
+- Send2UE Headless/RPC/Exact Push의 대형 FBX export payload만 OneDrive 밖의
+  `D:\SpeedTreeBatchTools\send2ue_fbx`에 씁니다. 이 payload는 백업을 만들지 않으며,
+  D: 여유 공간이 부족하면 실패 대신 취소 가능한 대기 상태로 전환합니다.
 - 잠긴 파일, 쓰는 중 변경된 파일, symlink/junction 경로 이탈은 삭제하지 않고
   실패 근거로 남깁니다. OneDrive cloud placeholder는 내용을 읽어 hydration하지 않고
   stat identity를 삭제 직전에 다시 확인합니다.

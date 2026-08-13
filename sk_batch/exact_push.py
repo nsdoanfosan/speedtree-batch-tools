@@ -11,8 +11,10 @@ import argparse
 import json
 import os
 import runpy
+import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -22,10 +24,8 @@ if str(REPO_DIR) not in sys.path:
     sys.path.insert(0, str(REPO_DIR))
 
 from process_lifecycle import owned_run  # noqa: E402
-from artifact_retention import (  # noqa: E402
-    estimate_output_reservation_bytes,
-    managed_output_reservation,
-)
+from artifact_retention import estimate_output_reservation_bytes  # noqa: E402
+from sk_common import send2ue_export_cache_root  # noqa: E402
 
 LOG_DIR = SK_BATCH_DIR / "logs"
 PUSH_JOB = SK_BATCH_DIR / "jobs" / "send2ue_push_job.py"
@@ -44,6 +44,26 @@ DEFAULT_UNREAL_EDITOR_CMD = Path(
 
 class ExactPushError(RuntimeError):
     pass
+
+
+def _wait_for_export_disk_space(export_root: Path, expected_bytes: int) -> None:
+    volume = Path(export_root.anchor) if export_root.anchor else export_root
+    required_free = int(expected_bytes) + 5 * 1024**3
+    last_notice = 0.0
+    while True:
+        free_bytes = shutil.disk_usage(volume).free
+        if free_bytes >= required_free:
+            return
+        now = time.monotonic()
+        if now - last_notice >= 15.0:
+            last_notice = now
+            print(
+                "Waiting for D: FBX export space: "
+                f"free={free_bytes / 1024**3:.1f} GiB, "
+                f"required={required_free / 1024**3:.1f} GiB",
+                file=sys.stderr,
+            )
+        time.sleep(1.0)
 
 
 def _write_current_material_contract(spm: Path) -> Path:
@@ -97,13 +117,19 @@ def build_exact_push_command(
             )
     run_id = run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
     prefix = log_dir / f"{stem}_exact_push_{run_id}"
+    export_root = (
+        send2ue_export_cache_root()
+        / "exact"
+        / stem
+        / str(run_id)
+    )
     outputs = {
         "report": prefix.with_suffix(".json"),
         "manifest": prefix.with_name(prefix.name + "_manifest.json"),
         "checkpoint": prefix.with_name(prefix.name + "_checkpoint.json"),
         "batch_report": prefix.with_name(prefix.name + "_batch.json"),
         "item_import_report": prefix.with_name(prefix.name + "_unreal.json"),
-        "export_root": prefix.with_name(prefix.name + "_export"),
+        "export_root": export_root,
         "material_contract": material_contract,
         "queue_id": str(spm),
     }
@@ -294,28 +320,16 @@ def main(argv=None):
         return 0
 
     blend = args.spm.expanduser().resolve().with_suffix(".blend")
-    with managed_output_reservation(
-        tuple(
-            outputs[key]
-            for key in (
-                "report",
-                "manifest",
-                "checkpoint",
-                "batch_report",
-                "item_import_report",
-                "export_root",
-            )
-        ),
-        estimate_output_reservation_bytes(
-            blend, minimum_bytes=1024**3, multiplier=4
-        ),
-    ):
-        completed = owned_run(
-            command,
-            source="sk_batch.exact_push.blender_export",
-            run_factory=subprocess.run,
-            check=False,
-        )
+    expected_export_bytes = estimate_output_reservation_bytes(
+        blend, minimum_bytes=1024**3, multiplier=4
+    )
+    _wait_for_export_disk_space(outputs["export_root"], expected_export_bytes)
+    completed = owned_run(
+        command,
+        source="sk_batch.exact_push.blender_export",
+        run_factory=subprocess.run,
+        check=False,
+    )
     if completed.returncode != 0:
         print(
             "SK Exact Push failed; production report: "
