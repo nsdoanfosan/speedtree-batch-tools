@@ -417,7 +417,12 @@ int wmain(int argc, wchar_t** argv) {
         STARTUPINFOW startup{};
         startup.cb = sizeof(startup);
         startup.dwFlags = STARTF_USESHOWWINDOW;
-        startup.wShowWindow = SW_SHOWMINNOACTIVE;
+        // SpeedTree suspends the MainWindow OnIdle/OnIdleDraw path while its
+        // window is minimized.  The collision bake hook is intentionally
+        // driven by that real GUI event path, so keep the window visible while
+        // avoiding focus/activation.  Minimizing here makes the export wait
+        // until a user manually restores the window.
+        startup.wShowWindow = SW_SHOWNOACTIVATE;
         PROCESS_INFORMATION process{};
         const BOOL created = CreateProcessW(
             modeler.c_str(),

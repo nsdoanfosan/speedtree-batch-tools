@@ -2,12 +2,12 @@
 
 SpeedTree Modeler 10.1.0의 기본 `-export` 명령이 잎 충돌 계산보다 먼저 실행되는 문제를 보완하는 Windows x64 전용 호출기입니다.
 
-화면 좌표 클릭이나 고정식 UI 자동화는 사용하지 않습니다. 모델러를 최소화된 정상 GUI 모드로 초기화한 뒤, 설치 바이너리 내부의 모델 계산 경로와 `CCollisionThread` 완료 상태를 확인하고 `ExportCommandLineTree(...)`를 Qt 메인 스레드에서 직접 호출합니다.
+화면 좌표 클릭이나 고정식 UI 자동화는 사용하지 않습니다. 모델러를 포커스를 가져오지 않는 정상 GUI 모드로 초기화한 뒤, 설치 바이너리 내부의 모델 계산 경로와 `CCollisionThread` 완료 상태를 확인하고 `ExportCommandLineTree(...)`를 Qt 메인 스레드에서 직접 호출합니다. 최소화 상태에서는 SpeedTree의 `OnIdle/OnIdleDraw` 갱신이 정지하므로 작업 중 창을 최소화하지 않습니다.
 
 ## 동작 순서
 
 1. 설치된 SpeedTree Modeler와 Qt DLL의 SHA-256을 검증합니다.
-2. 모델러를 최소화된 GUI 모드로 시작하고 helper DLL을 주입합니다.
+2. 모델러를 활성화하지 않는 표시 상태로 시작하고 helper DLL을 주입합니다.
 3. SPM의 충돌 품질을 3으로 맞추고 정상 GUI 컨트롤러에 베이크를 요청합니다.
 4. 실제 `CCollisionThread` 시작과 완료, 생성된 충돌 입력을 확인합니다.
 5. 완료된 모델 상태에서 내부 `ExportCommandLineTree(output, preset, game)`를 호출합니다.
