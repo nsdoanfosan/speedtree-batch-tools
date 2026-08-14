@@ -24,6 +24,7 @@ from pathlib import Path
 from process_lifecycle import (
     ProcessLifecycleError,
     owned_popen,
+    owned_run,
     shutdown_process_supervisor,
     start_process_supervisor,
 )
@@ -210,8 +211,9 @@ def start_speedtree_session_host(target):
     try:
         deadline = time.monotonic() + 45.0
         while time.monotonic() < deadline:
-            ping = subprocess.run(
+            ping = owned_run(
                 [str(cli), "--ping-session"],
+                source="launch_guard:speedtree_persistent_session_ping",
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=3,
@@ -246,8 +248,9 @@ def stop_speedtree_session_host(host):
     log_handle = host["log_handle"]
     cli = host["cli"]
     try:
-        subprocess.run(
+        owned_run(
             [str(cli), "--shutdown-session"],
+            source="launch_guard:speedtree_persistent_session_shutdown",
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=10,
