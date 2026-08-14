@@ -423,11 +423,11 @@ void RemovePersistentSessionHooks() {
 }
 
 void __fastcall HookedMainWindowRecoveryCheck(void* mainWindow) {
-    if (gSessionServerMode) {
-        Log("persistent session skipped SpeedTree's startup recovery-file prompt");
-        return;
-    }
-    gOriginalMainWindowRecoveryCheck(mainWindow);
+    (void)mainWindow;
+    // Every GUI-bake process is wrapper-owned and must be non-interactive. Keep
+    // SpeedTree's autosave/backup file intact, but do not let an existing .sbk
+    // stop either a one-shot export or a persistent document load.
+    Log("wrapper GUI bake skipped SpeedTree's recovery-file question");
 }
 
 bool BuildSessionTargetPathList(void* result) {
@@ -2072,7 +2072,7 @@ bool InstallHooks() {
             RemoveHook(gQThreadStartHook);
             return false;
         }
-        if (gSessionServerMode && !InstallHook(
+        if (!InstallHook(
                 gMainWindowRecoveryCheckHook,
                 reinterpret_cast<void*>(gSpeedTreeBase + kMainWindowRecoveryCheckRva),
                 HookedMainWindowRecoveryCheck,

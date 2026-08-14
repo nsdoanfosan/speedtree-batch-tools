@@ -20,7 +20,9 @@ SpeedTree Modeler 10.1.0의 기본 `-export` 명령이 잎 충돌 계산보다 �
 
 여러 SPM을 연속 처리할 때는 하나의 SpeedTree 프로세스를 재사용할 수 있습니다. 시작 시 `blank.spm` 하나를 anchor 문서로 열어 두고, 각 작업마다 내부 Open 경로에 대상 SPM을 직접 전달한 뒤 `load → quality 3 bake → export → 대상 탭 닫기`를 수행합니다. 파일 선택창, 화면 좌표 클릭, 드래그 앤 드롭은 사용하지 않습니다.
 
-시작 복구 파일 질문은 wrapper가 만든 persistent 프로세스 안에서만 건너뜁니다. 복구 파일을 삭제하지 않으며 `ShowNewOnStart` 레지스트리 값도 프로세스 초기화 직후 원래 값으로 복구합니다. 대상이 정상 로드되어도 SpeedTree 탭 이름이 잠시 `blank.spm`으로 남을 수 있지만 내부 모델과 FBX 출력에는 영향을 주지 않습니다.
+`SK_Batch.bat`와 통합 `SpeedTree_Batch_Tools.bat`는 GUI 수명 동안 `--serve-session` 호스트를 하나 소유합니다. 병렬 Blender 작업이 동시에 export를 요청해도 named pipe가 요청을 직렬화하므로 모두 같은 SpeedTree PID를 사용합니다. GUI가 닫히면 launch guard가 `--shutdown-session`을 전송하고, 응답하지 않는 경우에도 정확히 소유한 host 프로세스 트리만 정리합니다.
+
+복구 파일 질문은 wrapper가 만든 모든 GUI bake 프로세스에서 건너뜁니다. SpeedTree 자동저장 설정과 `.sbk` 복구 파일은 변경하거나 삭제하지 않으므로, 수동으로 연 Modeler의 복구 기능은 그대로 유지됩니다. `ShowNewOnStart` 레지스트리 값도 persistent 프로세스 초기화 직후 원래 값으로 복구합니다. 대상이 정상 로드되어도 SpeedTree 탭 이름이 잠시 `blank.spm`으로 남을 수 있지만 내부 모델과 FBX 출력에는 영향을 주지 않습니다.
 
 ```powershell
 .\speedtree_collision_cli\bin\speedtree_collision_cli.exe `
@@ -31,6 +33,12 @@ SpeedTree Modeler 10.1.0의 기본 `-export` 명령이 잎 충돌 계산보다 �
   -export "D:\path\tree.fbx"
 
 .\speedtree_collision_cli\bin\speedtree_collision_cli.exe --shutdown-session
+```
+
+세션 상태만 확인하려면 다음 명령을 사용합니다.
+
+```powershell
+.\speedtree_collision_cli\bin\speedtree_collision_cli.exe --ping-session
 ```
 
 `SK_tree_black_locast_03/04/05.spm`을 한 PID에서 연속 처리한 회귀 테스트에서도 세 작업의 FBX 생성과 대상 탭 닫기가 모두 완료됐습니다.

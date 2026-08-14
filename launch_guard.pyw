@@ -13,14 +13,18 @@ Usage:
 import ctypes
 import os
 import runpy
+import subprocess
 import sys
 import threading
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
 
 from process_lifecycle import (
     ProcessLifecycleError,
+    owned_popen,
+    owned_run,
     shutdown_process_supervisor,
     start_process_supervisor,
 )
@@ -41,6 +45,10 @@ _ERROR_LOG_LOCK = threading.RLock()
 MB_ICONERROR = 0x10
 CODE_COMPILE_GATE = REPO_DIR / "sk_batch" / "code_compile_gate.py"
 CODE_COMPILE_GATE_TARGETS = {
+    (REPO_DIR / "speedtree_batch_tools_gui.pyw").resolve(),
+    (REPO_DIR / "sk_batch" / "sk_batch_gui.pyw").resolve(),
+}
+SPEEDTREE_SESSION_TARGETS = {
     (REPO_DIR / "speedtree_batch_tools_gui.pyw").resolve(),
     (REPO_DIR / "sk_batch" / "sk_batch_gui.pyw").resolve(),
 }
@@ -156,6 +164,108 @@ def run_startup_retention():
     return enforce_retention(phase="startup")
 
 
+def start_speedtree_session_host(target):
+    """Own one blank-anchored Modeler for every export in this GUI run."""
+
+    if (
+        target.resolve() not in SPEEDTREE_SESSION_TARGETS
+        or os.environ.get("SPEEDTREE_COLLISION_PERSISTENT") != "1"
+    ):
+        return None
+    cli = Path(os.environ.get("SPEEDTREE_COLLISION_CLI_EXE", "")).expanduser()
+    anchor = Path(
+        os.environ.get("SPEEDTREE_COLLISION_SESSION_ANCHOR", "")
+    ).expanduser()
+    if not cli.is_file():
+        raise RuntimeError(f"SpeedTree collision CLI was not found: {cli}")
+    if not anchor.is_file():
+        raise RuntimeError(f"SpeedTree persistent anchor was not found: {anchor}")
+
+    log_path = Path(
+        os.environ.get(
+            "SPEEDTREE_COLLISION_SESSION_HOST_LOG",
+            str(Path(os.environ.get("TEMP", REPO_DIR)) / "speedtree_collision_session_host.log"),
+        )
+    ).expanduser()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_handle = log_path.open("a", encoding="utf-8", newline="\n")
+    command = [
+        str(cli),
+        "--serve-session",
+        "--session-anchor",
+        str(anchor),
+        "--log",
+        str(log_path.with_suffix(".hook.log")),
+    ]
+    try:
+        process = owned_popen(
+            command,
+            source="launch_guard:speedtree_persistent_session_host",
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+        )
+    except BaseException:
+        log_handle.close()
+        raise
+
+    try:
+        deadline = time.monotonic() + 45.0
+        while time.monotonic() < deadline:
+            ping = owned_run(
+                [str(cli), "--ping-session"],
+                source="launch_guard:speedtree_persistent_session_ping",
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+                check=False,
+            )
+            if ping.returncode == 0:
+                return {
+                    "process": process,
+                    "log_handle": log_handle,
+                    "cli": cli,
+                }
+            if process.poll() is not None:
+                log_handle.flush()
+                raise RuntimeError(
+                    "SpeedTree persistent session host exited before it became ready; "
+                    f"see {log_path}"
+                )
+            time.sleep(0.1)
+        raise RuntimeError(
+            "SpeedTree persistent session host did not become ready within 45 seconds; "
+            f"see {log_path}"
+        )
+    except BaseException:
+        log_handle.close()
+        raise
+
+
+def stop_speedtree_session_host(host):
+    if not host:
+        return
+    process = host["process"]
+    log_handle = host["log_handle"]
+    cli = host["cli"]
+    try:
+        owned_run(
+            [str(cli), "--shutdown-session"],
+            source="launch_guard:speedtree_persistent_session_shutdown",
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            # The process supervisor owns this exact host tree and performs the
+            # final fail-closed cleanup immediately after this function.
+            pass
+    finally:
+        log_handle.close()
+
+
 def _run_main(argv):
     if len(argv) < 2:
         report(
@@ -252,7 +362,9 @@ def main(argv):
         return 1
 
     result = 1
+    session_host = None
     try:
+        session_host = start_speedtree_session_host(target)
         result = _run_main(argv)
     except BaseException as exc:  # noqa: BLE001 - guard its own last boundary
         report(
@@ -262,6 +374,14 @@ def main(argv):
         )
         result = 1
     finally:
+        try:
+            stop_speedtree_session_host(session_host)
+        except (OSError, subprocess.SubprocessError) as exc:
+            record_error(
+                f"{target.name}:speedtree_session_shutdown",
+                "".join(traceback.format_exception(exc)),
+            )
+            result = 1
         try:
             shutdown_process_supervisor(
                 "gui_normal_exit" if result == 0 else "gui_error_exit"
