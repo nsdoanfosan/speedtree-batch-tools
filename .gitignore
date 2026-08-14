@@ -20,6 +20,7 @@ spm_generator_sync/spm_generator_sync_cache.json.tmp
 
 # Generated logs, audits, queues, and work reports
 work/
+speedtree_collision_cli/bin/
 pcg_st9_texture_batch/reports/
 sk_batch/cache/
 sk_batch/logs/

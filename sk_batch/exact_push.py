@@ -25,10 +25,16 @@ if str(REPO_DIR) not in sys.path:
 
 from process_lifecycle import owned_run  # noqa: E402
 from artifact_retention import estimate_output_reservation_bytes  # noqa: E402
-from sk_common import send2ue_export_cache_root  # noqa: E402
+from sk_common import (  # noqa: E402
+    DEFAULT_SEND2UE_DIR,
+    send2ue_export_cache_root,
+    unreal_remote_execution_settings,
+    wind_preset_for_spm,
+)
 
 LOG_DIR = SK_BATCH_DIR / "logs"
 PUSH_JOB = SK_BATCH_DIR / "jobs" / "send2ue_push_job.py"
+BWR_JOB = SK_BATCH_DIR / "jobs" / "bwr_headless_job.py"
 UNREAL_INGEST = SK_BATCH_DIR / "unreal_ingest.py"
 GUI_ENTRY = SK_BATCH_DIR / "sk_batch_gui.pyw"
 DEFAULT_BLENDER = Path(
@@ -40,10 +46,33 @@ DEFAULT_UNREAL_PROJECT = Path(
 DEFAULT_UNREAL_EDITOR_CMD = Path(
     r"C:\Program Files\Epic Games\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe"
 )
+DEFAULT_MAX_PUSH_POLYGONS = 2_000_000
+DEFAULT_MAX_PUSH_BONES = 1_500
+DEFAULT_RPC_TIMEOUT_MIN = 180
+DEFAULT_RPC_TIMEOUT_MAX = 900
 
 
 class ExactPushError(RuntimeError):
     pass
+
+
+def _rpc_cli_args(unreal_project: Path | None) -> list[str]:
+    """Build the same project-scoped Send2UE RPC overrides as the GUI."""
+    settings = unreal_remote_execution_settings(unreal_project)
+    arguments = []
+    bind_address = settings.get("multicast_bind_address")
+    if bind_address:
+        arguments.extend(["--rpc-multicast-bind-address", str(bind_address)])
+    group_endpoint = settings.get("multicast_group_endpoint")
+    if group_endpoint:
+        arguments.extend(
+            ["--rpc-multicast-group-endpoint", str(group_endpoint)]
+        )
+    if "multicast_ttl" in settings:
+        arguments.extend(
+            ["--rpc-multicast-ttl", str(settings["multicast_ttl"])]
+        )
+    return arguments
 
 
 def _wait_for_export_disk_space(export_root: Path, expected_bytes: int) -> None:
@@ -84,6 +113,36 @@ def _write_current_material_contract(spm: Path) -> Path:
     return path
 
 
+def build_repair_refresh_command(
+    spm: Path,
+    *,
+    blender: Path,
+    material_contract: Path,
+    report_path: Path,
+) -> list[str]:
+    """Refresh the repaired Blend from the current post-collision SPM export."""
+    return [
+        str(blender),
+        "--factory-startup",
+        "--background",
+        "--python",
+        str(BWR_JOB),
+        "--",
+        "--spm",
+        str(spm),
+        "--speedtree-spm",
+        str(spm),
+        "--blend",
+        str(spm.with_suffix(".blend")),
+        "--wind",
+        wind_preset_for_spm(spm),
+        "--material-contract",
+        str(material_contract),
+        "--report",
+        str(report_path),
+    ]
+
+
 def build_exact_push_command(
     spm: Path,
     *,
@@ -92,6 +151,12 @@ def build_exact_push_command(
     run_id: str | None = None,
     material_contract: Path | None = None,
     unreal_project: Path | None = DEFAULT_UNREAL_PROJECT,
+    transport: str = "headless",
+    send2ue_dir: Path = DEFAULT_SEND2UE_DIR,
+    max_push_polygons: int = DEFAULT_MAX_PUSH_POLYGONS,
+    max_push_bones: int = DEFAULT_MAX_PUSH_BONES,
+    rpc_timeout_min: int = DEFAULT_RPC_TIMEOUT_MIN,
+    rpc_timeout_max: int = DEFAULT_RPC_TIMEOUT_MAX,
 ) -> tuple[list[str], dict]:
     spm = spm.expanduser().resolve()
     blender = blender.expanduser().resolve()
@@ -105,6 +170,11 @@ def build_exact_push_command(
         raise ExactPushError(f"Blender executable is missing: {blender}")
     if not PUSH_JOB.is_file():
         raise ExactPushError(f"production Push job is missing: {PUSH_JOB}")
+    if not BWR_JOB.is_file():
+        raise ExactPushError(f"production Repair job is missing: {BWR_JOB}")
+    transport = str(transport).strip().casefold()
+    if transport not in {"headless", "rpc"}:
+        raise ExactPushError(f"unsupported exact Push transport: {transport}")
 
     stem = spm.stem
     if material_contract is None:
@@ -119,12 +189,13 @@ def build_exact_push_command(
     prefix = log_dir / f"{stem}_exact_push_{run_id}"
     export_root = (
         send2ue_export_cache_root()
-        / "exact"
+        / ("rpc" if transport == "rpc" else "exact")
         / stem
         / str(run_id)
     )
     outputs = {
         "report": prefix.with_suffix(".json"),
+        "repair_report": prefix.with_name(prefix.name + "_repair.json"),
         "manifest": prefix.with_name(prefix.name + "_manifest.json"),
         "checkpoint": prefix.with_name(prefix.name + "_checkpoint.json"),
         "batch_report": prefix.with_name(prefix.name + "_batch.json"),
@@ -148,7 +219,7 @@ def build_exact_push_command(
         "--material-contract",
         str(material_contract),
         "--transport",
-        "headless_export",
+        "rpc" if transport == "rpc" else "headless_export",
         "--dependency-orchestrated",
         "--manifest",
         str(outputs["manifest"]),
@@ -170,6 +241,26 @@ def build_exact_push_command(
         if unreal_project
         else None
     )
+    outputs["transport"] = transport
+    if transport == "rpc":
+        send2ue_unreal_py = (
+            Path(send2ue_dir).expanduser().resolve()
+            / "dependencies"
+            / "unreal.py"
+        )
+        command.extend([
+            "--send2ue-unreal-py",
+            str(send2ue_unreal_py),
+            "--max-push-polygons",
+            str(max(1, int(max_push_polygons))),
+            "--max-push-bones",
+            str(max(1, int(max_push_bones))),
+            "--rpc-timeout-min",
+            str(max(1, int(rpc_timeout_min))),
+            "--rpc-timeout-max",
+            str(max(1, int(rpc_timeout_max))),
+        ])
+        command.extend(_rpc_cli_args(outputs["unreal_project"]))
     return command, outputs
 
 
@@ -276,7 +367,10 @@ def merge_unreal_result(outputs: dict, batch_result: dict) -> dict:
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Push one exact repaired SK target through UnrealEditor-Cmd",
+        description=(
+            "Push one exact repaired SK target through headless Unreal or the "
+            "currently open Unreal Editor RPC endpoint"
+        ),
     )
     parser.add_argument("--spm", required=True, type=Path)
     parser.add_argument("--blender", type=Path, default=DEFAULT_BLENDER)
@@ -287,6 +381,11 @@ def parse_args(argv=None):
         "--unreal-editor-cmd",
         type=Path,
         default=DEFAULT_UNREAL_EDITOR_CMD,
+    )
+    parser.add_argument(
+        "--transport",
+        choices=("headless", "rpc"),
+        default="headless",
     )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
@@ -301,6 +400,7 @@ def main(argv=None):
             log_dir=args.log_dir,
             material_contract=args.material_contract,
             unreal_project=args.unreal_project,
+            transport=args.transport,
         )
     except ExactPushError as exc:
         print(f"SK Exact Push failed: {exc}", file=sys.stderr)
@@ -324,6 +424,44 @@ def main(argv=None):
         blend, minimum_bytes=1024**3, multiplier=4
     )
     _wait_for_export_disk_space(outputs["export_root"], expected_export_bytes)
+    repair_command = build_repair_refresh_command(
+        args.spm.expanduser().resolve(),
+        blender=args.blender.expanduser().resolve(),
+        material_contract=outputs["material_contract"],
+        report_path=outputs["repair_report"],
+    )
+    print("Refreshing repaired Blend from post-collision SpeedTree export", flush=True)
+    repair_completed = owned_run(
+        repair_command,
+        source="sk_batch.exact_push.blender_repair_refresh",
+        run_factory=subprocess.run,
+        check=False,
+    )
+    if repair_completed.returncode != 0:
+        print(
+            "SK Exact Push repair refresh failed; production report: "
+            + str(outputs["repair_report"]),
+            file=sys.stderr,
+        )
+        return repair_completed.returncode or 1
+    try:
+        repair_report = json.loads(
+            outputs["repair_report"].read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError) as exc:
+        print(f"SK Exact Push repair report is unreadable: {exc}", file=sys.stderr)
+        return 1
+    collision_cli = repair_report.get("speedtree_collision_cli") or {}
+    if (
+        repair_report.get("status") != "ok"
+        or collision_cli.get("status") != "required"
+    ):
+        print(
+            "SK Exact Push repair did not prove the collision CLI contract: "
+            + str(outputs["repair_report"]),
+            file=sys.stderr,
+        )
+        return 1
     completed = owned_run(
         command,
         source="sk_batch.exact_push.blender_export",
@@ -339,21 +477,29 @@ def main(argv=None):
         return completed.returncode or 1
     try:
         export_report = json.loads(outputs["report"].read_text(encoding="utf-8"))
-        if export_report.get("status") != "exported_pending_unreal":
-            raise ExactPushError(
-                "Blender export did not reach exported_pending_unreal: "
-                + str(export_report)
+        if args.transport == "rpc":
+            if export_report.get("status") != "ok":
+                raise ExactPushError(
+                    "Blender RPC Push did not reach status=ok: "
+                    + str(export_report)
+                )
+            report = export_report
+        else:
+            if export_report.get("status") != "exported_pending_unreal":
+                raise ExactPushError(
+                    "Blender export did not reach exported_pending_unreal: "
+                    + str(export_report)
+                )
+            batch_result = run_headless_manifest(
+                outputs["manifest"],
+                outputs["checkpoint"],
+                outputs["batch_report"],
+                unreal_project=args.unreal_project,
+                unreal_editor_cmd=args.unreal_editor_cmd,
             )
-        batch_result = run_headless_manifest(
-            outputs["manifest"],
-            outputs["checkpoint"],
-            outputs["batch_report"],
-            unreal_project=args.unreal_project,
-            unreal_editor_cmd=args.unreal_editor_cmd,
-        )
-        report = merge_unreal_result(outputs, batch_result)
+            report = merge_unreal_result(outputs, batch_result)
     except (OSError, ValueError, ExactPushError) as exc:
-        print(f"SK Exact Push headless ingest failed: {exc}", file=sys.stderr)
+        print(f"SK Exact Push finalization failed: {exc}", file=sys.stderr)
         return 1
     if report.get("status") != "ok":
         print(
