@@ -17,6 +17,7 @@ import shutil
 import sys
 import traceback
 from pathlib import Path
+from time import perf_counter
 
 import bpy
 
@@ -144,6 +145,14 @@ def parse_args():
 def write_report(path, data):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def record_stage_duration(report, name, started):
+    """Attach one monotonic stage duration without changing job control flow."""
+    report.setdefault("stage_timings_seconds", {})[name] = round(
+        perf_counter() - started,
+        6,
+    )
 
 
 def save_cluster_source_mainfile(bpy_module, filepath, report):
@@ -423,6 +432,7 @@ def cluster_assembly_contract_from_material_contract(receipt_path, spm_path):
 
 
 def main():
+    job_started = perf_counter()
     args = parse_args()
     canonical_spm = Path(args.spm).resolve()
     speedtree_spm = Path(args.speedtree_spm or args.spm).resolve()
@@ -463,6 +473,7 @@ def main():
             "the GUID receipt does not relax source validation."
         )
     try:
+        preflight_started = perf_counter()
         bark_normalization_manifest = None
         if args.bark_normalization_manifest:
             manifest_path = Path(
@@ -506,6 +517,8 @@ def main():
                 "speedtree_pipeline_contract"
             ]
             report["speedtree_pipeline_contract_required"] = True
+        record_stage_duration(report, "input_preflight", preflight_started)
+        addon_runtime_started = perf_counter()
         addon_runtime = prepare_runtime(
             "sk_batch.jobs.bwr_headless_job",
             {
@@ -518,6 +531,11 @@ def main():
             },
         )
         report["blender_addon_runtime"] = addon_runtime.receipt
+        record_stage_duration(
+            report,
+            "addon_runtime_prepare",
+            addon_runtime_started,
+        )
         require_spm_sk_ready = addon_runtime.operation(
             "speedtree_bone_weight_repair",
             "require_spm_sk_ready",
@@ -534,15 +552,23 @@ def main():
         # Reject authored-but-disabled Branch skeletons before creating an
         # empty .blend. BranchMesh-only assets remain valid and use the rigid
         # one-bone fallback inside the add-on.
+        spm_readiness_started = perf_counter()
         if not args.manual_bones_locked:
             require_spm_sk_ready(str(speedtree_spm))
+        record_stage_duration(
+            report,
+            "spm_skeleton_readiness",
+            spm_readiness_started,
+        )
 
         blend_path = os.path.abspath(args.blend)
         blend_exists = os.path.exists(blend_path)
+        blend_open_started = perf_counter()
         if blend_exists:
             bpy.ops.wm.open_mainfile(filepath=blend_path)
         else:
             bpy.ops.wm.read_homefile(use_empty=True)
+        record_stage_duration(report, "blend_open", blend_open_started)
 
         cluster_assembly_handoff = None
         cluster_assembly_source_resolution = None
@@ -634,6 +660,7 @@ def main():
         )
 
         export_settings = settings.as_dict()
+        speedtree_export_started = perf_counter()
         speedtree_export = run_speedtree_cli_export(
             str(speedtree_spm),
             speedtree_exe_path=export_settings["speedtree_exe_path"],
@@ -652,6 +679,11 @@ def main():
             # contract. Keep the normal FBX preset (including authored bones)
             # while bypassing only the automatic Branch-generator gate.
             allow_manual_bones=bool(args.manual_bones_locked),
+        )
+        record_stage_duration(
+            report,
+            "speedtree_export_bundle",
+            speedtree_export_started,
         )
         fbx_export = speedtree_export["exports"].get("fbx", {})
         xml_export = speedtree_export["exports"].get("xml", {})
@@ -855,7 +887,13 @@ def main():
                 bpy.data,
                 canonical_spm.stem,
             )
+        blender_repair_started = perf_counter()
         result = run_import_and_repair(repair_settings)
+        record_stage_duration(
+            report,
+            "blender_import_and_repair",
+            blender_repair_started,
+        )
         try:
             unassigned_geometry_cleanup = (
                 validate_unassigned_geometry_cleanup_evidence(
@@ -1333,6 +1371,7 @@ def main():
             report["error"] = "② Blender Repair 사전검사 차단 — " + " | ".join(reasons)
     except Exception as exc:
         mark_job_failed(report, exc, traceback.format_exc())
+    record_stage_duration(report, "total_job", job_started)
     write_report(args.report, report)
     if report["status"] != "ok":
         sys.exit(1)
