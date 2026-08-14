@@ -84,6 +84,48 @@ class ExactPushCommandTests(unittest.TestCase):
             )
             self.assertNotIn("backup", str(outputs["export_root"]).casefold())
 
+            with mock.patch.object(
+                exact_push,
+                "send2ue_export_cache_root",
+                return_value=d_export,
+            ):
+                rpc_command, rpc_outputs = build_exact_push_command(
+                    spm,
+                    blender=blender,
+                    log_dir=logs,
+                    run_id="rpc_test",
+                    material_contract=material,
+                    unreal_project=project,
+                    transport="rpc",
+                )
+
+            self.assertEqual(
+                rpc_command[rpc_command.index("--transport") + 1],
+                "rpc",
+            )
+            self.assertEqual(
+                rpc_command[
+                    rpc_command.index("--rpc-multicast-bind-address") + 1
+                ],
+                "192.168.0.4",
+            )
+            self.assertEqual(
+                rpc_command[
+                    rpc_command.index("--rpc-multicast-group-endpoint") + 1
+                ],
+                "239.0.0.1:6766",
+            )
+            self.assertEqual(
+                rpc_command[rpc_command.index("--rpc-multicast-ttl") + 1],
+                "1",
+            )
+            self.assertIn("--send2ue-unreal-py", rpc_command)
+            self.assertEqual(rpc_outputs["transport"], "rpc")
+            self.assertEqual(
+                rpc_outputs["export_root"],
+                d_export / "rpc" / spm.stem / "rpc_test",
+            )
+
     def test_missing_repaired_blend_fails_before_launch(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

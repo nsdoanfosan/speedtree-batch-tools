@@ -30,6 +30,31 @@ BATCH_TOOLS_DIR = str(Path(__file__).resolve().parent.parent.parent)
 if BATCH_TOOLS_DIR not in sys.path:
     sys.path.insert(0, BATCH_TOOLS_DIR)
 
+DEFAULT_SPEEDTREE_COLLISION_CLI = (
+    Path(BATCH_TOOLS_DIR)
+    / "speedtree_collision_cli"
+    / "bin"
+    / "speedtree_collision_cli.exe"
+)
+
+
+def resolve_speedtree_collision_cli():
+    """Return the version-locked post-collision exporter used by batch repair."""
+    configured = os.environ.get("SPEEDTREE_COLLISION_CLI_EXE")
+    executable = (
+        Path(configured).expanduser()
+        if configured
+        else DEFAULT_SPEEDTREE_COLLISION_CLI
+    ).resolve()
+    hook = executable.with_name("speedtree_collision_hook.dll")
+    if not executable.is_file() or not hook.is_file():
+        raise RuntimeError(
+            "SpeedTree collision CLI is not built. Run "
+            "speedtree_collision_cli\\build.ps1 before SK Batch: "
+            f"{executable}"
+        )
+    return executable, hook
+
 from vertex_color_contract import (
     inspect_object_vertex_colors,
     pack_speedtree_vertex_payload,
@@ -550,6 +575,16 @@ def main():
 
         settings = bpy.context.scene.speedtree_bwr_settings
         settings.spm_path = str(speedtree_spm)
+        collision_cli, collision_hook = resolve_speedtree_collision_cli()
+        settings.speedtree_exe_path = str(collision_cli)
+        report["speedtree_collision_cli"] = {
+            "status": "required",
+            "executable": file_fingerprint(collision_cli),
+            "hook": file_fingerprint(collision_hook),
+            "policy": (
+                "quality_3_gui_bake_then_synchronous_export_collision_refresh"
+            ),
+        }
         settings.texture_contract_path = (
             os.path.abspath(args.material_contract)
             if args.material_contract

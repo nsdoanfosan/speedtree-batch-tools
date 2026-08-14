@@ -222,6 +222,21 @@ Cluster Assembly가 있는 Tree만 선택해도 BWR manifest의 실제
 그 원본 리그용 JSON은 적용하지 않고 최종 Assembly 스켈레톤 재바인딩 단계까지
 DynamicWind 적용을 유예한다. 일반 나무와 최종 Assembly의 wind JSON은 계속 필수다.
 
+### 단일 SPM Exact Push (충돌 베이크 + RPC)
+
+열려 있는 Unreal Editor로 한 자산을 끝까지 다시 넣을 때는 다음 BAT를 사용한다.
+
+```powershell
+.\sk_batch\SK_Exact_Push.bat --transport rpc --spm "D:\path\SK_tree_01.spm"
+```
+
+BAT는 먼저 `speedtree_collision_cli`를 빌드·진단하고, SpeedTree 충돌 품질 3 베이크가
+완료된 FBX/XML로 Blender Repair와 Cluster Assembly manifest를 갱신한 다음 Send2UE
+RPC를 실행한다. 보정 호출기나 hook DLL이 없거나 설치된 SpeedTree 빌드가 검증된
+버전과 다르면 일반 SpeedTree export로 우회하지 않고 중단한다. 성공은 최종 보고서의
+`status=ok`, Unreal import의 `imported_ok`, Cluster Assembly build/runtime probe의
+`ok/passed`가 모두 확인된 경우에만 `SK_EXACT_PUSH_OK=...json`으로 출력한다.
+
 ②/③ 실패 시 표와 저장 상태에는 `Unreal 연결 실패`, `메시를 찾지 못함`,
 `add-on 로드 실패`, `FBX 메시 지오메트리 없음`, `시간 초과`처럼 짧은 원인을
 남긴다. 전체 traceback과 상세 경로는 `sk_batch/logs/`의 JSON/log에 보존한다.
