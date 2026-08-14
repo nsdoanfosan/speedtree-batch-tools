@@ -4,7 +4,23 @@ setlocal
 rem Launch the integrated tabbed GUI without a console window.
 set "GUARD=%~dp0launch_guard.pyw"
 set "LAUNCHER=%~dp0speedtree_batch_tools_gui.pyw"
+set "COLLISION_DIR=%~dp0speedtree_collision_cli"
+set "COLLISION_CLI=%COLLISION_DIR%\bin\speedtree_collision_cli.exe"
+set "COLLISION_HOOK=%COLLISION_DIR%\bin\speedtree_collision_hook.dll"
 set "SPEEDTREE_BATCH_LAUNCH_SOURCE=bat:SpeedTree_Batch_Tools.bat"
+
+if exist "%COLLISION_CLI%" if exist "%COLLISION_HOOK%" goto collision_ready
+echo [INFO] Building the SpeedTree post-collision CLI...
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%COLLISION_DIR%\build.ps1"
+if errorlevel 1 goto collision_build_failed
+
+:collision_ready
+"%COLLISION_CLI%" --diagnose >nul
+if errorlevel 1 goto collision_diagnose_failed
+set "SPEEDTREE_COLLISION_CLI_EXE=%COLLISION_CLI%"
+set "SPEEDTREE_COLLISION_PERSISTENT=1"
+if not defined SPEEDTREE_COLLISION_SESSION_ANCHOR set "SPEEDTREE_COLLISION_SESSION_ANCHOR=%USERPROFILE%\Downloads\blank.spm"
+if not exist "%SPEEDTREE_COLLISION_SESSION_ANCHOR%" goto collision_anchor_missing
 
 where.exe pythonw >nul 2>&1
 if errorlevel 1 goto python_missing
@@ -38,6 +54,19 @@ goto show_error
 echo [ERROR] The pythonw found in PATH cannot import tkinter.
 echo         Install Python with the tcl/tk option, or fix the PATH order.
 pythonw -c "import sys; print(sys.executable)"
+goto show_error
+
+:collision_build_failed
+echo [ERROR] Failed to build the SpeedTree post-collision CLI.
+goto show_error
+
+:collision_diagnose_failed
+echo [ERROR] The installed SpeedTree version is not supported by the collision CLI.
+goto show_error
+
+:collision_anchor_missing
+echo [ERROR] Persistent SpeedTree anchor was not found: "%SPEEDTREE_COLLISION_SESSION_ANCHOR%"
+goto show_error
 
 :show_error
 echo.

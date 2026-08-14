@@ -434,6 +434,8 @@ void PrintUsage() {
         << L"  --log <path>          Hook diagnostic log path\n"
         << L"  --persistent          Reuse one blank-anchored SpeedTree process\n"
         << L"  --no-persistent       Force the legacy one-process-per-export path\n"
+        << L"  --serve-session       Keep one blank-anchored session alive for batch clients\n"
+        << L"  --ping-session        Check whether the persistent session is ready\n"
         << L"  --shutdown-session    Stop the persistent SpeedTree process and exit\n"
         << L"  --session-anchor <spm>  Blank SPM kept open by the persistent process\n"
         << L"  --diagnose            Verify installed binary hashes and exit\n\n"
@@ -470,6 +472,8 @@ int wmain(int argc, wchar_t** argv) {
         std::filesystem::path logPath;
         std::filesystem::path sessionAnchor;
         bool diagnose = false;
+        bool serveSession = false;
+        bool pingSession = false;
         bool shutdownSession = false;
         bool persistent = GetEnvironment(L"SPEEDTREE_COLLISION_PERSISTENT") ==
             std::optional<std::wstring>(L"1");
@@ -495,6 +499,11 @@ int wmain(int argc, wchar_t** argv) {
                 persistent = true;
             } else if (value == L"--no-persistent") {
                 persistent = false;
+            } else if (value == L"--serve-session") {
+                persistent = true;
+                serveSession = true;
+            } else if (value == L"--ping-session") {
+                pingSession = true;
             } else if (value == L"--shutdown-session") {
                 shutdownSession = true;
             } else if (value == L"--session-anchor" && index + 1 < argc) {
@@ -531,6 +540,20 @@ int wmain(int argc, wchar_t** argv) {
             std::wcout << L"Supported installation verified.\n";
             return 0;
         }
+        if (pingSession) {
+            auto request = std::make_unique<speedtree_collision_cli::SessionRequest>();
+            speedtree_collision_cli::SessionResponse response{};
+            request->command = speedtree_collision_cli::SessionCommand::Ping;
+            DWORD pipeError = ERROR_SUCCESS;
+            if (!SendSessionRequest(*request, response, 1000, pipeError)) {
+                std::wcerr << L"Persistent SpeedTree session is not ready (error "
+                           << pipeError << L").\n";
+                return 12;
+            }
+            std::wcout << response.message << L" PID "
+                       << response.speedTreeProcessId << L".\n";
+            return response.status == ERROR_SUCCESS ? 0 : 12;
+        }
         if (shutdownSession) {
             auto request = std::make_unique<speedtree_collision_cli::SessionRequest>();
             speedtree_collision_cli::SessionResponse response{};
@@ -548,47 +571,52 @@ int wmain(int argc, wchar_t** argv) {
             std::wcout << response.message << L"\n";
             return response.status == ERROR_SUCCESS ? 0 : 12;
         }
-        if (modelerArguments.empty()) {
+        if (!serveSession && modelerArguments.empty()) {
             PrintUsage();
             return 2;
         }
-        const bool hasExport = std::find(modelerArguments.begin(), modelerArguments.end(), L"-export") !=
-            modelerArguments.end();
-        if (!hasExport) {
-            std::wcerr << L"The wrapper requires the native -export argument.\n";
-            return 2;
-        }
 
-        const std::filesystem::path inputModel = modelerArguments.front();
+        std::filesystem::path inputModel;
         std::filesystem::path outputFbx;
         std::filesystem::path exportOptions;
         bool gameExport = false;
-        for (std::size_t index = 1; index < modelerArguments.size(); ++index) {
-            if (modelerArguments[index] == L"-export" && index + 1 < modelerArguments.size()) {
-                outputFbx = modelerArguments[++index];
-            } else if (
-                modelerArguments[index] == L"-export_options" &&
-                index + 1 < modelerArguments.size()) {
-                exportOptions = modelerArguments[++index];
-            } else if (modelerArguments[index] == L"-export_game") {
-                gameExport = true;
+        if (!serveSession) {
+            const bool hasExport = std::find(
+                modelerArguments.begin(), modelerArguments.end(), L"-export") !=
+                modelerArguments.end();
+            if (!hasExport) {
+                std::wcerr << L"The wrapper requires the native -export argument.\n";
+                return 2;
             }
-        }
-        if (!std::filesystem::is_regular_file(inputModel)) {
-            std::wcerr << L"Input SPM was not found: " << inputModel << L"\n";
-            return 2;
+            inputModel = modelerArguments.front();
+            for (std::size_t index = 1; index < modelerArguments.size(); ++index) {
+                if (modelerArguments[index] == L"-export" && index + 1 < modelerArguments.size()) {
+                    outputFbx = modelerArguments[++index];
+                } else if (
+                    modelerArguments[index] == L"-export_options" &&
+                    index + 1 < modelerArguments.size()) {
+                    exportOptions = modelerArguments[++index];
+                } else if (modelerArguments[index] == L"-export_game") {
+                    gameExport = true;
+                }
+            }
+            if (!std::filesystem::is_regular_file(inputModel)) {
+                std::wcerr << L"Input SPM was not found: " << inputModel << L"\n";
+                return 2;
+            }
         }
         if (persistent && !std::filesystem::is_regular_file(sessionAnchor)) {
             std::wcerr << L"Persistent mode requires a valid --session-anchor SPM.\n";
             return 2;
         }
-        if (outputFbx.empty() || exportOptions.empty() ||
-            !std::filesystem::is_regular_file(exportOptions)) {
+        if (!serveSession &&
+            (outputFbx.empty() || exportOptions.empty() ||
+             !std::filesystem::is_regular_file(exportOptions))) {
             std::wcerr << L"Both a valid -export_options file and an -export output path are required.\n";
             return 2;
         }
         std::optional<std::filesystem::file_time_type> outputWriteTimeBefore;
-        if (std::filesystem::is_regular_file(outputFbx)) {
+        if (!serveSession && std::filesystem::is_regular_file(outputFbx)) {
             outputWriteTimeBefore = std::filesystem::last_write_time(outputFbx);
         }
 
@@ -601,7 +629,7 @@ int wmain(int argc, wchar_t** argv) {
         }
 
         auto sessionRequest = std::unique_ptr<speedtree_collision_cli::SessionRequest>();
-        if (persistent) {
+        if (persistent && !serveSession) {
             sessionRequest = std::make_unique<speedtree_collision_cli::SessionRequest>();
             sessionRequest->command = speedtree_collision_cli::SessionCommand::Export;
             sessionRequest->timeoutMs = timeoutMs;
@@ -615,7 +643,16 @@ int wmain(int argc, wchar_t** argv) {
 
             speedtree_collision_cli::SessionResponse existingResponse{};
             DWORD pipeError = ERROR_SUCCESS;
-            if (SendSessionRequest(*sessionRequest, existingResponse, 0, pipeError)) {
+            bool existingRequestCompleted =
+                SendSessionRequest(*sessionRequest, existingResponse, 0, pipeError);
+            if (!existingRequestCompleted && pipeError == ERROR_PIPE_BUSY) {
+                existingRequestCompleted = SendSessionRequest(
+                    *sessionRequest,
+                    existingResponse,
+                    timeoutMs + 5 * 60 * 1000,
+                    pipeError);
+            }
+            if (existingRequestCompleted) {
                 if (existingResponse.status != ERROR_SUCCESS) {
                     std::wcerr << existingResponse.message << L" (error "
                                << existingResponse.status << L").\n";
@@ -633,6 +670,23 @@ int wmain(int argc, wchar_t** argv) {
             }
             if (pipeError != ERROR_FILE_NOT_FOUND && pipeError != ERROR_PIPE_BUSY) {
                 std::wcerr << L"Could not contact the persistent SpeedTree session (error "
+                           << pipeError << L").\n";
+                return 12;
+            }
+        }
+
+        if (serveSession) {
+            auto pingRequest = std::make_unique<speedtree_collision_cli::SessionRequest>();
+            speedtree_collision_cli::SessionResponse existingResponse{};
+            pingRequest->command = speedtree_collision_cli::SessionCommand::Ping;
+            DWORD pipeError = ERROR_SUCCESS;
+            if (SendSessionRequest(*pingRequest, existingResponse, 1000, pipeError)) {
+                std::wcout << L"Persistent SpeedTree session is already ready in PID "
+                           << existingResponse.speedTreeProcessId << L".\n";
+                return existingResponse.status == ERROR_SUCCESS ? 0 : 12;
+            }
+            if (pipeError != ERROR_FILE_NOT_FOUND && pipeError != ERROR_PIPE_BUSY) {
+                std::wcerr << L"Could not inspect the persistent SpeedTree session (error "
                            << pipeError << L").\n";
                 return 12;
             }
@@ -659,10 +713,10 @@ int wmain(int argc, wchar_t** argv) {
             L"1");
         const auto restoreOutput = SetTemporaryEnvironment(
             L"SPEEDTREE_COLLISION_CLI_OUTPUT",
-            std::filesystem::absolute(outputFbx).wstring());
+            serveSession ? L"" : std::filesystem::absolute(outputFbx).wstring());
         const auto restoreExportOptions = SetTemporaryEnvironment(
             L"SPEEDTREE_COLLISION_CLI_EXPORT_OPTIONS",
-            std::filesystem::absolute(exportOptions).wstring());
+            serveSession ? L"" : std::filesystem::absolute(exportOptions).wstring());
         const auto restoreGameExport = SetTemporaryEnvironment(
             L"SPEEDTREE_COLLISION_CLI_GAME_EXPORT",
             gameExport ? L"1" : L"0");
@@ -745,6 +799,32 @@ int wmain(int argc, wchar_t** argv) {
                 CloseHandle(process.hProcess);
                 return 13;
             }
+        }
+
+        if (serveSession) {
+            auto pingRequest = std::make_unique<speedtree_collision_cli::SessionRequest>();
+            speedtree_collision_cli::SessionResponse response{};
+            pingRequest->command = speedtree_collision_cli::SessionCommand::Ping;
+            DWORD pipeError = ERROR_SUCCESS;
+            const bool ready = SendSessionRequest(*pingRequest, response, 30000, pipeError);
+            RestoreRegistryValue(HKEY_CURRENT_USER, showNewOnStartRestore);
+            if (!ready || response.status != ERROR_SUCCESS) {
+                TerminateProcess(process.hProcess, 12);
+                CloseHandle(process.hProcess);
+                std::wcerr << L"The persistent SpeedTree session host did not become ready "
+                           << L"(pipe error " << pipeError << L").\n";
+                return 12;
+            }
+            std::wcout << L"Persistent SpeedTree session ready in PID "
+                       << response.speedTreeProcessId << L".\n";
+            std::wcout << L"Hook log: " << std::filesystem::absolute(logPath) << L"\n";
+            const DWORD waitResult = WaitForSingleObject(process.hProcess, INFINITE);
+            DWORD exitCode = 12;
+            if (waitResult == WAIT_OBJECT_0) {
+                GetExitCodeProcess(process.hProcess, &exitCode);
+            }
+            CloseHandle(process.hProcess);
+            return waitResult == WAIT_OBJECT_0 ? static_cast<int>(exitCode) : 12;
         }
 
         if (persistent) {
