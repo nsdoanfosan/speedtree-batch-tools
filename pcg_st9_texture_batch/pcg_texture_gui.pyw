@@ -7246,7 +7246,7 @@ class App:
             "exact_step3_spms": exact_step3_spms,
             "selected_rows": selected_rows,
             "normalization_plan": build_texture_plan_from_report(
-                self.report or {"items": []},
+                getattr(self, "report", None) or {"items": []},
                 "<step3-force-current-board>",
             ),
             "scope_folders": sorted({
