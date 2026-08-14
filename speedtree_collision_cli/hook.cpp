@@ -1,19 +1,28 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
 #include <iterator>
+#include <memory>
+#include <new>
 #include <string>
+#include <vector>
+
+#include "session_protocol.h"
 
 namespace {
 
 constexpr std::uintptr_t kSpeedTreeExportRva = 0x135A20;
 constexpr std::uintptr_t kMainWindowOnIdleRva = 0x13B7F0;
 constexpr std::uintptr_t kMainWindowOnIdleDrawRva = 0x13C390;
+constexpr std::uintptr_t kMainWindowOpenFileListRva = 0x137750;
+constexpr std::uintptr_t kMainWindowConfirmDiscardRva = 0x131880;
+constexpr std::uintptr_t kMainWindowRecoveryCheckRva = 0x1325E0;
 constexpr std::uintptr_t kMarkCollisionDirtyRva = 0x3D90B0;
 constexpr std::uintptr_t kCollisionDoneRva = 0x3D25D0;
 constexpr std::uintptr_t kCollisionComputeRva = 0x3EE760;
@@ -27,6 +36,7 @@ constexpr DWORD kCollisionTimeoutExitCode = 0xC0111002;
 constexpr DWORD kHookRuntimeFailureExitCode = 0xC0111003;
 constexpr DWORD kNoGeneratedCollisionInputsExitCode = 0xC0111004;
 constexpr DWORD kDefaultTimeoutMs = 10 * 60 * 1000;
+constexpr DWORD kPersistentDocumentLoadTimeoutMs = 10 * 60 * 1000;
 
 constexpr unsigned char kSpeedTreeExportPrologue[12] = {
     0x48, 0x89, 0x5c, 0x24, 0x20, 0x55,
@@ -49,6 +59,24 @@ constexpr unsigned char kMainWindowOnIdleDrawPrologue[15] = {
     0x48, 0x89, 0x74, 0x24, 0x18,
 };
 
+constexpr unsigned char kMainWindowConfirmDiscardPrologue[15] = {
+    0x48, 0x89, 0x5c, 0x24, 0x10,
+    0x48, 0x89, 0x74, 0x24, 0x18,
+    0x48, 0x89, 0x7c, 0x24, 0x20,
+};
+
+constexpr unsigned char kMainWindowOpenFileListPrologue[13] = {
+    0x40, 0x55, 0x53, 0x56, 0x57,
+    0x41, 0x54, 0x41, 0x55, 0x41,
+    0x56, 0x41, 0x57,
+};
+
+constexpr unsigned char kMainWindowRecoveryCheckPrologue[15] = {
+    0x48, 0x89, 0x5c, 0x24, 0x10,
+    0x48, 0x89, 0x74, 0x24, 0x18,
+    0x48, 0x89, 0x7c, 0x24, 0x20,
+};
+
 constexpr char kCollisionThreadRttiName[] = ".?AVCCollisionThread@@";
 
 using QThreadStartFn = void(__fastcall*)(void* thread, int priority);
@@ -60,12 +88,72 @@ using SpeedTreeExportFn = void(__fastcall*)(void* arg1, void* arg2, void* arg3, 
 using QWidgetFindFn = void*(__cdecl*)(std::uintptr_t windowId);
 using QObjectChildrenFn = const void*(__fastcall*)(const void* object);
 using QObjectInheritsFn = bool(__fastcall*)(const void* object, const char* className);
+using QObjectParentFn = void*(__fastcall*)(const void* object);
 using MarkCollisionDirtyFn = void(__fastcall*)(void* treeModel);
 using ApplicationUpdateFn = void(__fastcall*)(void* controller);
 using MainWindowIdleFn = void(__fastcall*)(void* mainWindow);
+using MainWindowConfirmDiscardFn = bool(__fastcall*)(void* mainWindow);
+using MainWindowRecoveryCheckFn = void(__fastcall*)(void* mainWindow);
+using MainWindowOpenFileListFn = void*(__fastcall*)(
+    void* mainWindow,
+    void* result,
+    void* parent,
+    const void* caption,
+    const void* directory,
+    const void* filter,
+    int options);
 using CollisionDoneFn = void(__fastcall*)(void* model);
 using CollisionComputeFn = void(__fastcall*)(void* model);
 using QCoreApplicationInstanceFn = void*(__cdecl*)();
+
+struct QGenericArgumentCompat {
+    const void* data;
+    const char* name;
+};
+
+constexpr unsigned char kQCoreNotifyInternalPrologue[12] = {
+    0x48, 0x89, 0x5c, 0x24, 0x18,
+    0x55, 0x56, 0x57,
+    0x48, 0x83, 0xec, 0x50,
+};
+
+struct QStringStorage {
+    alignas(void*) unsigned char bytes[24];
+};
+
+struct QEventStorage {
+    alignas(16) unsigned char bytes[64];
+};
+
+using QStringCtorFn = void*(__fastcall*)(
+    void* storage,
+    const std::uint16_t* characters,
+    std::ptrdiff_t length);
+using QEventCtorFn = void*(__fastcall*)(void* storage, int eventType);
+using PostEventFn = void(__cdecl*)(void* receiver, void* event, int priority);
+using NotifyInternalFn = bool(__cdecl*)(void* receiver, void* event);
+using QArrayDataAllocateFn = void*(__cdecl*)(
+    void** allocationHeader,
+    std::ptrdiff_t objectSize,
+    std::ptrdiff_t alignment,
+    std::ptrdiff_t capacity,
+    int option);
+using QMdiAreaSetActiveSubWindowFn = void(__fastcall*)(void* mdiArea, void* subWindow);
+using QMdiAreaActiveSubWindowFn = void*(__fastcall*)(const void* mdiArea);
+using QMetaInvokeFn = bool(__cdecl*)(
+    void* object,
+    const char* member,
+    int connectionType,
+    QGenericArgumentCompat arg0,
+    QGenericArgumentCompat arg1,
+    QGenericArgumentCompat arg2,
+    QGenericArgumentCompat arg3,
+    QGenericArgumentCompat arg4,
+    QGenericArgumentCompat arg5,
+    QGenericArgumentCompat arg6,
+    QGenericArgumentCompat arg7,
+    QGenericArgumentCompat arg8,
+    QGenericArgumentCompat arg9);
 
 struct QtPointerListView {
     void* allocationHeader;
@@ -74,11 +162,15 @@ struct QtPointerListView {
 };
 
 using QApplicationAllWidgetsFn = QtPointerListView(__cdecl*)();
+using QMdiAreaSubWindowListFn = void*(__fastcall*)(
+    const void* mdiArea,
+    QtPointerListView* result,
+    int order);
 
 struct HookRecord {
     void* target = nullptr;
     void* trampoline = nullptr;
-    unsigned char original[16]{};
+    unsigned char original[32]{};
     std::size_t originalBytes = 0;
     bool installed = false;
 };
@@ -107,11 +199,15 @@ SendPostedEventsFn gSendPostedEvents = nullptr;
 QWidgetFindFn gQWidgetFind = nullptr;
 QObjectChildrenFn gQObjectChildren = nullptr;
 QObjectInheritsFn gQObjectInherits = nullptr;
+QObjectParentFn gQObjectParent = nullptr;
 MarkCollisionDirtyFn gMarkCollisionDirty = nullptr;
 CollisionDoneFn gCollisionDone = nullptr;
 CollisionComputeFn gCollisionCompute = nullptr;
 MainWindowIdleFn gMainWindowOnIdle = nullptr;
 MainWindowIdleFn gMainWindowOnIdleDraw = nullptr;
+MainWindowConfirmDiscardFn gOriginalMainWindowConfirmDiscard = nullptr;
+MainWindowRecoveryCheckFn gOriginalMainWindowRecoveryCheck = nullptr;
+MainWindowOpenFileListFn gOriginalMainWindowOpenFileList = nullptr;
 std::atomic<void*> gCollisionModel{nullptr};
 std::atomic<bool> gSynchronousCollisionCompleted{false};
 std::atomic<unsigned int> gCollisionStartCount{0};
@@ -119,20 +215,57 @@ std::atomic<bool> gGuiExportStarted{false};
 std::atomic<bool> gGuiBakeRequested{false};
 QCoreApplicationInstanceFn gQCoreApplicationInstance = nullptr;
 QApplicationAllWidgetsFn gQApplicationAllWidgets = nullptr;
+QStringCtorFn gQStringCtor = nullptr;
+QEventCtorFn gQEventCtor = nullptr;
+PostEventFn gPostEvent = nullptr;
+QMetaInvokeFn gQMetaInvoke = nullptr;
+NotifyInternalFn gOriginalNotifyInternal = nullptr;
+QArrayDataAllocateFn gQArrayDataAllocate = nullptr;
+QMdiAreaSetActiveSubWindowFn gQMdiAreaSetActiveSubWindow = nullptr;
+QMdiAreaActiveSubWindowFn gQMdiAreaActiveSubWindow = nullptr;
+QMdiAreaSubWindowListFn gQMdiAreaSubWindowList = nullptr;
 HookRecord gQThreadStartHook;
 HookRecord gSpeedTreeExportHook;
 HookRecord gMainWindowOnIdleHook;
 HookRecord gMainWindowOnIdleDrawHook;
+HookRecord gNotifyInternalHook;
+HookRecord gMainWindowConfirmDiscardHook;
+HookRecord gMainWindowRecoveryCheckHook;
+HookRecord gMainWindowOpenFileListHook;
 HMODULE gSpeedTreeModule = nullptr;
 std::uintptr_t gSpeedTreeBase = 0;
 std::size_t gSpeedTreeImageSize = 0;
 wchar_t gLogPath[32768]{};
 wchar_t gGuiExportPath[32768]{};
 wchar_t gGuiExportOptionsPath[32768]{};
+wchar_t gPersistentInputPath[32768]{};
 DWORD gTimeoutMs = kDefaultTimeoutMs;
 ULONGLONG gHookStartTick = 0;
 bool gGuiBakeMode = false;
 bool gGuiGameExport = false;
+bool gSessionServerMode = false;
+std::atomic<bool> gSessionJobActive{false};
+std::atomic<bool> gSessionJobComplete{false};
+std::atomic<DWORD> gSessionJobStatus{ERROR_SUCCESS};
+std::atomic<void*> gSessionMainWindow{nullptr};
+std::atomic<bool> gSessionOpenPathArmed{false};
+std::atomic<bool> gSessionForceDiscardClose{false};
+std::atomic<bool> gSessionClosingTarget{false};
+std::atomic<bool> gSessionOpenCallActive{false};
+void* gSessionAnchorMdiSubWindow = nullptr;
+void* gSessionTargetTreeWindow = nullptr;
+void* gSessionTargetMdiSubWindow = nullptr;
+bool gSessionTargetStateLogged = false;
+
+enum class PersistentJobPhase {
+    WaitForAnchor,
+    OpenTarget,
+    WaitForTarget,
+    Ready,
+    Complete,
+};
+
+PersistentJobPhase gPersistentJobPhase = PersistentJobPhase::Complete;
 
 void Log(const char* message) {
     if (gLogPath[0] == L'\0') {
@@ -220,7 +353,7 @@ bool InstallHook(
     const void* replacement,
     const unsigned char (&expectedPrologue)[PrologueBytes],
     void** originalFunction) {
-    static_assert(PrologueBytes >= 12 && PrologueBytes <= 16);
+    static_assert(PrologueBytes >= 12 && PrologueBytes <= 32);
     if (std::memcmp(target, expectedPrologue, PrologueBytes) != 0) {
         Log("hook rejected: target prologue does not match the supported build");
         return false;
@@ -284,6 +417,78 @@ void RemoveHook(HookRecord& record) {
     }
 }
 
+void RemovePersistentSessionHooks() {
+    RemoveHook(gMainWindowRecoveryCheckHook);
+    RemoveHook(gMainWindowOpenFileListHook);
+}
+
+void __fastcall HookedMainWindowRecoveryCheck(void* mainWindow) {
+    if (gSessionServerMode) {
+        Log("persistent session skipped SpeedTree's startup recovery-file prompt");
+        return;
+    }
+    gOriginalMainWindowRecoveryCheck(mainWindow);
+}
+
+bool BuildSessionTargetPathList(void* result) {
+    auto* list = static_cast<QtPointerListView*>(result);
+    std::memset(list, 0, sizeof(*list));
+    void* allocationHeader = nullptr;
+    void* itemStorage = gQArrayDataAllocate(
+        &allocationHeader,
+        static_cast<std::ptrdiff_t>(sizeof(QStringStorage)),
+        static_cast<std::ptrdiff_t>(alignof(QStringStorage)),
+        1,
+        0);
+    if (allocationHeader == nullptr || itemStorage == nullptr) {
+        Log("persistent session could not allocate the target path list");
+        return false;
+    }
+    gQStringCtor(
+        itemStorage,
+        reinterpret_cast<const std::uint16_t*>(gPersistentInputPath),
+        static_cast<std::ptrdiff_t>(std::wcslen(gPersistentInputPath)));
+    list->allocationHeader = allocationHeader;
+    list->items = static_cast<void**>(itemStorage);
+    list->size = 1;
+    return true;
+}
+
+void* __fastcall HookedMainWindowOpenFileList(
+    void* mainWindow,
+    void* result,
+    void* parent,
+    const void* caption,
+    const void* directory,
+    const void* filter,
+    int options) {
+    if (!gSessionOpenPathArmed.exchange(false, std::memory_order_acq_rel)) {
+        return gOriginalMainWindowOpenFileList(
+            mainWindow,
+            result,
+            parent,
+            caption,
+            directory,
+            filter,
+            options);
+    }
+    Log("persistent session intercepted SpeedTree's internal Open file-list helper");
+    if (!BuildSessionTargetPathList(result)) {
+        return result;
+    }
+    Log("persistent session supplied the target SPM without opening a file dialog");
+    return result;
+}
+
+bool __fastcall HookedMainWindowConfirmDiscard(void* mainWindow) {
+    if (gSessionForceDiscardClose.load(std::memory_order_acquire) ||
+        gSessionOpenCallActive.load(std::memory_order_acquire)) {
+        Log("persistent session bypassed the document prompt with discard semantics");
+        return true;
+    }
+    return gOriginalMainWindowConfirmDiscard(mainWindow);
+}
+
 void __fastcall HookedQThreadStart(void* thread, int priority) {
     if (IsCollisionThread(thread)) {
         gCollisionThread.store(thread, std::memory_order_release);
@@ -299,7 +504,9 @@ void __fastcall HookedQThreadStart(void* thread, int priority) {
             "CCollisionThread start count is %u",
             startCount);
         Log(countMessage);
-        if (gGuiBakeMode && gGuiExportStarted.load(std::memory_order_acquire)) {
+        if (gGuiBakeMode &&
+            gGuiExportStarted.load(std::memory_order_acquire) &&
+            !gSessionClosingTarget.load(std::memory_order_acquire)) {
             void* collisionModel = gCollisionModel.load(std::memory_order_acquire);
             if (collisionModel != nullptr) {
                 // ExportCommandLineTree rebuilds geometry, starts this refresh, and
@@ -333,14 +540,18 @@ void PumpMainThreadEvents() {
     }
 }
 
-void* FindTreeWindowRecursive(void* object, int depth, std::size_t& inspected) {
+void* FindQObjectRecursiveByClass(
+    void* object,
+    const char* className,
+    int depth,
+    std::size_t& inspected) {
     if (object == nullptr || depth > 64 || inspected >= 100000) {
         return nullptr;
     }
     ++inspected;
 
     __try {
-        if (gQObjectInherits(object, "CTreeWindow")) {
+        if (gQObjectInherits(object, className)) {
             return object;
         }
         const auto* children = static_cast<const QtPointerListView*>(gQObjectChildren(object));
@@ -349,7 +560,11 @@ void* FindTreeWindowRecursive(void* object, int depth, std::size_t& inspected) {
             return nullptr;
         }
         for (std::ptrdiff_t index = 0; index < children->size; ++index) {
-            if (void* found = FindTreeWindowRecursive(children->items[index], depth + 1, inspected)) {
+            if (void* found = FindQObjectRecursiveByClass(
+                    children->items[index],
+                    className,
+                    depth + 1,
+                    inspected)) {
                 return found;
             }
         }
@@ -357,6 +572,10 @@ void* FindTreeWindowRecursive(void* object, int depth, std::size_t& inspected) {
         return nullptr;
     }
     return nullptr;
+}
+
+void* FindTreeWindowRecursive(void* object, int depth, std::size_t& inspected) {
+    return FindQObjectRecursiveByClass(object, "CTreeWindow", depth, inspected);
 }
 
 struct WindowSearchContext {
@@ -424,6 +643,105 @@ void* FindTreeWindow() {
         Log(message);
     }
     return context.treeWindow;
+}
+
+bool ContainsPointer(const std::vector<void*>& values, void* value) {
+    return std::find(values.begin(), values.end(), value) != values.end();
+}
+
+void* FindQObjectParentByClass(void* object, const char* className) {
+    void* current = object;
+    for (int depth = 0; depth < 16 && current != nullptr; ++depth) {
+        if (gQObjectInherits(current, className)) {
+            return current;
+        }
+        current = gQObjectParent(current);
+    }
+    return nullptr;
+}
+
+bool InvokeQtNoArgumentWithConnection(void* object, const char* method, int connectionType) {
+    if (object == nullptr || gQMetaInvoke == nullptr) {
+        return false;
+    }
+    const QGenericArgumentCompat empty{nullptr, nullptr};
+    return gQMetaInvoke(
+        object,
+        method,
+        connectionType,
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        empty);
+}
+
+bool InvokeQtNoArgument(void* object, const char* method) {
+    return InvokeQtNoArgumentWithConnection(object, method, 1);
+}
+
+bool InvokeQtInt(void* object, const char* method, int value) {
+    if (object == nullptr || gQMetaInvoke == nullptr) {
+        return false;
+    }
+    const QGenericArgumentCompat argument{&value, "int"};
+    const QGenericArgumentCompat empty{nullptr, nullptr};
+    return gQMetaInvoke(
+        object,
+        method,
+        1,
+        argument,
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        empty);
+}
+
+bool CollectMdiSubWindows(void* mdiArea, std::vector<void*>& result) {
+    result.clear();
+    if (mdiArea == nullptr || gQMdiAreaSubWindowList == nullptr) {
+        return false;
+    }
+    __try {
+        QtPointerListView list{};
+        gQMdiAreaSubWindowList(mdiArea, &list, 0);
+        if (list.size < 0 || list.size > 4096 ||
+            (list.size > 0 && list.items == nullptr)) {
+            return false;
+        }
+        result.assign(list.items, list.items + list.size);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool PostQtWakeEvent(void* receiver) {
+    if (receiver == nullptr || gQEventCtor == nullptr || gPostEvent == nullptr) {
+        return false;
+    }
+    void* eventStorage = ::operator new(sizeof(QEventStorage), std::nothrow);
+    if (eventStorage == nullptr) {
+        return false;
+    }
+    constexpr int kQEventUser = 1000;
+    void* event = gQEventCtor(eventStorage, kQEventUser);
+    if (event == nullptr) {
+        ::operator delete(eventStorage);
+        return false;
+    }
+    gPostEvent(receiver, event, 0);
+    return true;
 }
 
 bool IsReadableWritablePage(DWORD protection) {
@@ -774,8 +1092,492 @@ std::string WideToUtf8(const wchar_t* text) {
     return result;
 }
 
+void* ReadMainWindowMdiArea(void* mainWindow) {
+    __try {
+        return *reinterpret_cast<void**>(
+            static_cast<unsigned char*>(mainWindow) + 0x298);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+bool ReadPipeExact(HANDLE pipe, void* destination, std::size_t byteCount) {
+    auto* bytes = static_cast<unsigned char*>(destination);
+    std::size_t completed = 0;
+    while (completed < byteCount) {
+        const DWORD chunk = static_cast<DWORD>((std::min)(
+            byteCount - completed,
+            static_cast<std::size_t>(0x7ffff000)));
+        DWORD transferred = 0;
+        if (!ReadFile(pipe, bytes + completed, chunk, &transferred, nullptr) ||
+            transferred == 0) {
+            return false;
+        }
+        completed += transferred;
+    }
+    return true;
+}
+
+bool WritePipeExact(HANDLE pipe, const void* source, std::size_t byteCount) {
+    const auto* bytes = static_cast<const unsigned char*>(source);
+    std::size_t completed = 0;
+    while (completed < byteCount) {
+        const DWORD chunk = static_cast<DWORD>((std::min)(
+            byteCount - completed,
+            static_cast<std::size_t>(0x7ffff000)));
+        DWORD transferred = 0;
+        if (!WriteFile(pipe, bytes + completed, chunk, &transferred, nullptr) ||
+            transferred == 0) {
+            return false;
+        }
+        completed += transferred;
+    }
+    return true;
+}
+
+bool SessionRequestPathsAreTerminated(
+    const speedtree_collision_cli::SessionRequest& request) {
+    return std::wmemchr(
+               request.input,
+               L'\0',
+               speedtree_collision_cli::kSessionPathCapacity) != nullptr &&
+        std::wmemchr(
+               request.output,
+               L'\0',
+               speedtree_collision_cli::kSessionPathCapacity) != nullptr &&
+        std::wmemchr(
+               request.exportOptions,
+               L'\0',
+               speedtree_collision_cli::kSessionPathCapacity) != nullptr;
+}
+
+bool StartPersistentSessionJob(
+    const speedtree_collision_cli::SessionRequest& request,
+    speedtree_collision_cli::SessionResponse& response) {
+    if (!SessionRequestPathsAreTerminated(request) ||
+        request.input[0] == L'\0' || request.output[0] == L'\0' ||
+        request.exportOptions[0] == L'\0') {
+        response.status = ERROR_INVALID_DATA;
+        wcscpy_s(response.message, L"The persistent export request contains an invalid path.");
+        return false;
+    }
+    if (GetFileAttributesW(request.input) == INVALID_FILE_ATTRIBUTES ||
+        GetFileAttributesW(request.exportOptions) == INVALID_FILE_ATTRIBUTES) {
+        response.status = ERROR_FILE_NOT_FOUND;
+        wcscpy_s(response.message, L"The input SPM or export-options file was not found.");
+        return false;
+    }
+    if (gSessionJobActive.load(std::memory_order_acquire)) {
+        response.status = ERROR_BUSY;
+        wcscpy_s(response.message, L"The persistent SpeedTree session is already exporting.");
+        return false;
+    }
+
+    wcsncpy_s(gPersistentInputPath, request.input, _TRUNCATE);
+    wcsncpy_s(gGuiExportPath, request.output, _TRUNCATE);
+    wcsncpy_s(gGuiExportOptionsPath, request.exportOptions, _TRUNCATE);
+    gGuiGameExport = request.gameExport != 0;
+    gTimeoutMs = request.timeoutMs >= 1000 ? request.timeoutMs : kDefaultTimeoutMs;
+    gHookStartTick = GetTickCount64();
+    gSessionAnchorMdiSubWindow = nullptr;
+    gSessionTargetTreeWindow = nullptr;
+    gSessionTargetMdiSubWindow = nullptr;
+    gSessionTargetStateLogged = false;
+    gSessionClosingTarget.store(false, std::memory_order_release);
+    gSessionOpenCallActive.store(false, std::memory_order_release);
+    gSessionForceDiscardClose.store(false, std::memory_order_release);
+    gCollisionModel.store(nullptr, std::memory_order_release);
+    gCollisionThread.store(nullptr, std::memory_order_release);
+    gCollisionStartCount.store(0, std::memory_order_release);
+    gSynchronousCollisionCompleted.store(false, std::memory_order_release);
+    gGuiBakeRequested.store(false, std::memory_order_release);
+    gGuiExportStarted.store(false, std::memory_order_release);
+    gSessionJobStatus.store(ERROR_IO_PENDING, std::memory_order_release);
+    gSessionJobComplete.store(false, std::memory_order_release);
+    gPersistentJobPhase = PersistentJobPhase::WaitForAnchor;
+    // Publish the active state only after every per-job field is initialized.
+    // The GUI driver uses this release/acquire edge before reading those fields.
+    gSessionJobActive.store(true, std::memory_order_release);
+
+    const std::string input = WideToUtf8(request.input);
+    char message[1024]{};
+    _snprintf_s(
+        message,
+        sizeof(message),
+        _TRUNCATE,
+        "persistent session accepted export job: %s",
+        input.c_str());
+    Log(message);
+    return true;
+}
+
+void CompletePersistentSessionJob(DWORD status) {
+    gSessionJobStatus.store(status, std::memory_order_release);
+    gSessionJobComplete.store(true, std::memory_order_release);
+}
+
+DWORD WINAPI RunPersistentSessionPipeServer(void*) {
+    Log("persistent session named-pipe server started");
+    for (;;) {
+        HANDLE pipe = CreateNamedPipeW(
+            speedtree_collision_cli::kSessionPipeName,
+            PIPE_ACCESS_DUPLEX,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1,
+            4096,
+            4096,
+            0,
+            nullptr);
+        if (pipe == INVALID_HANDLE_VALUE) {
+            Log("persistent session could not create its named pipe");
+            return GetLastError();
+        }
+        const bool connected = ConnectNamedPipe(pipe, nullptr) != FALSE ||
+            GetLastError() == ERROR_PIPE_CONNECTED;
+        auto request = std::unique_ptr<speedtree_collision_cli::SessionRequest>(
+            new (std::nothrow) speedtree_collision_cli::SessionRequest{});
+        speedtree_collision_cli::SessionResponse response{};
+        response.speedTreeProcessId = GetCurrentProcessId();
+        bool terminateAfterResponse = false;
+        if (!connected || request == nullptr ||
+            !ReadPipeExact(pipe, request.get(), sizeof(*request))) {
+            response.status = ERROR_BROKEN_PIPE;
+            wcscpy_s(response.message, L"The persistent session request could not be read.");
+        } else if (request->magic != speedtree_collision_cli::kSessionProtocolMagic ||
+                   request->version != speedtree_collision_cli::kSessionProtocolVersion) {
+            response.status = ERROR_REVISION_MISMATCH;
+            wcscpy_s(response.message, L"The persistent session protocol version does not match.");
+        } else if (request->command == speedtree_collision_cli::SessionCommand::Ping) {
+            response.status = ERROR_SUCCESS;
+            wcscpy_s(response.message, L"The persistent SpeedTree session is ready.");
+        } else if (request->command == speedtree_collision_cli::SessionCommand::Shutdown) {
+            response.status = ERROR_SUCCESS;
+            wcscpy_s(response.message, L"The persistent SpeedTree session is shutting down.");
+            terminateAfterResponse = true;
+        } else if (request->command != speedtree_collision_cli::SessionCommand::Export) {
+            response.status = ERROR_INVALID_FUNCTION;
+            wcscpy_s(response.message, L"The persistent session command is not supported.");
+        } else if (StartPersistentSessionJob(*request, response)) {
+            const ULONGLONG deadline = GetTickCount64() + gTimeoutMs +
+                kPersistentDocumentLoadTimeoutMs;
+            while (!gSessionJobComplete.load(std::memory_order_acquire) &&
+                   GetTickCount64() < deadline) {
+                Sleep(25);
+            }
+            if (gSessionJobComplete.load(std::memory_order_acquire)) {
+                response.status = gSessionJobStatus.load(std::memory_order_acquire);
+                wcscpy_s(
+                    response.message,
+                    response.status == ERROR_SUCCESS
+                        ? L"Post-collision export completed in the persistent SpeedTree session."
+                        : L"The persistent SpeedTree export failed.");
+            } else {
+                response.status = WAIT_TIMEOUT;
+                wcscpy_s(response.message, L"The persistent SpeedTree export timed out.");
+                terminateAfterResponse = true;
+            }
+            gSessionJobActive.store(false, std::memory_order_release);
+        }
+
+        if (connected) {
+            WritePipeExact(pipe, &response, sizeof(response));
+            FlushFileBuffers(pipe);
+            DisconnectNamedPipe(pipe);
+        }
+        CloseHandle(pipe);
+        if (terminateAfterResponse) {
+            TerminateProcess(GetCurrentProcess(), response.status);
+            return response.status;
+        }
+    }
+}
+
+bool TargetCollisionInitializationComplete(void* model, void* collisionThread) {
+    if (model == nullptr || collisionThread == nullptr ||
+        gQThreadIsRunning(collisionThread)) {
+        return false;
+    }
+    __try {
+        if (*(static_cast<unsigned char*>(model) + 0x9C89) != 0) {
+            return false;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return GeneratedCollisionInputCount(model) > 0;
+}
+
+bool CollisionThreadBelongsToModel(void* collisionThread, void* model) {
+    if (collisionThread == nullptr || model == nullptr) {
+        return false;
+    }
+    __try {
+        return *reinterpret_cast<void**>(
+            static_cast<unsigned char*>(collisionThread) + 0x10) == model;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool PreparePersistentJob(void* mainWindow) {
+    if (!gSessionServerMode) {
+        return true;
+    }
+    switch (gPersistentJobPhase) {
+        case PersistentJobPhase::WaitForAnchor: {
+            void* mdiArea = ReadMainWindowMdiArea(mainWindow);
+            std::vector<void*> anchorSubWindows;
+            if (mdiArea == nullptr ||
+                !CollectMdiSubWindows(mdiArea, anchorSubWindows) ||
+                anchorSubWindows.empty()) {
+                return false;
+            }
+            if (anchorSubWindows.size() != 1) {
+                AbortExport(
+                    kHookRuntimeFailureExitCode,
+                    "persistent session expected exactly one blank anchor document");
+            }
+            gSessionAnchorMdiSubWindow = anchorSubWindows.front();
+            LogPointer(
+                "persistent session blank anchor QMdiSubWindow is ",
+                gSessionAnchorMdiSubWindow);
+            gCollisionThread.store(nullptr, std::memory_order_release);
+            gCollisionStartCount.store(0, std::memory_order_release);
+            gPersistentJobPhase = PersistentJobPhase::OpenTarget;
+            return false;
+        }
+
+        case PersistentJobPhase::OpenTarget: {
+            Log("persistent session invoking MainWindow::fileOpen with an in-memory target path");
+            gSessionOpenPathArmed.store(true, std::memory_order_release);
+            gSessionOpenCallActive.store(true, std::memory_order_release);
+            gPersistentJobPhase = PersistentJobPhase::WaitForTarget;
+            if (!InvokeQtNoArgument(mainWindow, "fileOpen")) {
+                gSessionOpenCallActive.store(false, std::memory_order_release);
+                gSessionOpenPathArmed.store(false, std::memory_order_release);
+                AbortExport(
+                    kHookRuntimeFailureExitCode,
+                    "persistent session could not invoke MainWindow::fileOpen");
+            }
+            gSessionOpenCallActive.store(false, std::memory_order_release);
+            if (gSessionOpenPathArmed.exchange(false, std::memory_order_acq_rel)) {
+                AbortExport(
+                    kHookRuntimeFailureExitCode,
+                    "MainWindow::fileOpen did not request an intercepted file path list");
+            }
+            Log("persistent session MainWindow::fileOpen returned after loading the target path");
+            return false;
+        }
+
+        case PersistentJobPhase::WaitForTarget: {
+            if (gSessionOpenCallActive.load(std::memory_order_acquire)) {
+                return false;
+            }
+            void* mdiArea = ReadMainWindowMdiArea(mainWindow);
+            std::vector<void*> subWindows;
+            if (mdiArea == nullptr || !CollectMdiSubWindows(mdiArea, subWindows)) {
+                return false;
+            }
+            void* activeSubWindow = gQMdiAreaActiveSubWindow(mdiArea);
+            if (activeSubWindow == nullptr || !ContainsPointer(subWindows, activeSubWindow)) {
+                return false;
+            }
+            void* targetCollisionThread = gCollisionThread.load(std::memory_order_acquire);
+            if (targetCollisionThread == nullptr) {
+                return false;
+            }
+            void* targetModel = static_cast<unsigned char*>(targetCollisionThread) -
+                kEmbeddedCollisionThreadOffset;
+            if (!CollisionThreadBelongsToModel(targetCollisionThread, targetModel)) {
+                return false;
+            }
+            gSessionTargetTreeWindow = static_cast<unsigned char*>(targetModel) -
+                kTreeWindowModelOffset;
+            gSessionTargetMdiSubWindow = activeSubWindow;
+            if (!gSessionTargetStateLogged) {
+                gSessionTargetStateLogged = true;
+                LogPointer("persistent session target CTreeWindow is ", gSessionTargetTreeWindow);
+                LogPointer("persistent session target collision thread is ", targetCollisionThread);
+                char targetState[192]{};
+                _snprintf_s(
+                    targetState,
+                    sizeof(targetState),
+                    _TRUNCATE,
+                    "persistent target initial state: collision_starts=%u running=%u inputs=%lld pending=%lld",
+                    gCollisionStartCount.load(std::memory_order_acquire),
+                    static_cast<unsigned int>(gQThreadIsRunning(targetCollisionThread)),
+                    static_cast<long long>(GeneratedCollisionInputCount(targetModel)),
+                    static_cast<long long>(PendingCollisionResultCount(targetModel)));
+                Log(targetState);
+            }
+            if (!TargetCollisionInitializationComplete(targetModel, targetCollisionThread)) {
+                return false;
+            }
+            LogCollisionResultState(
+                "persistent target initial collision pass completed",
+                targetModel);
+            if (!ContainsPointer(subWindows, gSessionTargetMdiSubWindow)) {
+                return false;
+            }
+            void* replacementAnchor = nullptr;
+            for (void* subWindow : subWindows) {
+                if (subWindow == gSessionTargetMdiSubWindow) {
+                    continue;
+                }
+                if (replacementAnchor != nullptr) {
+                    AbortExport(
+                        kHookRuntimeFailureExitCode,
+                        "persistent session observed more than one reusable anchor document");
+                }
+                replacementAnchor = subWindow;
+            }
+            if (replacementAnchor == nullptr) {
+                AbortExport(
+                    kHookRuntimeFailureExitCode,
+                    "persistent session could not find the replacement blank anchor document");
+            }
+            gSessionAnchorMdiSubWindow = replacementAnchor;
+            LogPointer(
+                "persistent session replacement blank anchor QMdiSubWindow is ",
+                gSessionAnchorMdiSubWindow);
+            if (gQMdiAreaActiveSubWindow(mdiArea) != gSessionTargetMdiSubWindow) {
+                gQMdiAreaSetActiveSubWindow(mdiArea, gSessionTargetMdiSubWindow);
+                if (gQMdiAreaActiveSubWindow(mdiArea) != gSessionTargetMdiSubWindow) {
+                    return false;
+                }
+            }
+            LogPointer(
+                "persistent session captured the target active QMdiSubWindow at ",
+                gSessionTargetMdiSubWindow);
+            gCollisionModel.store(targetModel, std::memory_order_release);
+            gCollisionThread.store(nullptr, std::memory_order_release);
+            gCollisionStartCount.store(0, std::memory_order_release);
+            gSynchronousCollisionCompleted.store(false, std::memory_order_release);
+            gGuiBakeRequested.store(false, std::memory_order_release);
+            gGuiExportStarted.store(false, std::memory_order_release);
+            gHookStartTick = GetTickCount64();
+            gPersistentJobPhase = PersistentJobPhase::Ready;
+            Log("persistent session target is ready for collision bake");
+            return true;
+        }
+
+        case PersistentJobPhase::Ready:
+            return true;
+
+        case PersistentJobPhase::Complete:
+            return false;
+    }
+    return false;
+}
+
+void ClosePersistentTarget(void* mainWindow) {
+    Log("persistent session closing only the exported target document");
+    gSessionClosingTarget.store(true, std::memory_order_release);
+    void* mdiArea = ReadMainWindowMdiArea(mainWindow);
+    void* targetSubWindow = gSessionTargetMdiSubWindow;
+    if (targetSubWindow == nullptr) {
+        targetSubWindow = FindQObjectParentByClass(
+            gSessionTargetTreeWindow,
+            "QMdiSubWindow");
+    }
+    if (mdiArea == nullptr || targetSubWindow == nullptr) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "persistent session could not resolve the target QMdiSubWindow");
+    }
+    LogPointer("persistent session target QMdiSubWindow is ", targetSubWindow);
+    gQMdiAreaSetActiveSubWindow(mdiArea, targetSubWindow);
+    void* activeBeforeClose = gQMdiAreaActiveSubWindow(mdiArea);
+    LogPointer("persistent session active QMdiSubWindow before close is ", activeBeforeClose);
+    if (activeBeforeClose != targetSubWindow) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "persistent session could not activate the exported target QMdiSubWindow");
+    }
+
+    std::vector<void*> subWindowsBeforeClose;
+    if (!CollectMdiSubWindows(mdiArea, subWindowsBeforeClose)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "persistent session could not enumerate SpeedTree MDI documents");
+    }
+    const auto targetIterator = std::find(
+        subWindowsBeforeClose.begin(),
+        subWindowsBeforeClose.end(),
+        targetSubWindow);
+    if (targetIterator == subWindowsBeforeClose.end()) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "persistent session target was not present in the SpeedTree MDI document list");
+    }
+    const int targetIndex = static_cast<int>(
+        std::distance(subWindowsBeforeClose.begin(), targetIterator));
+    char closeState[160]{};
+    _snprintf_s(
+        closeState,
+        sizeof(closeState),
+        _TRUNCATE,
+        "persistent session invoking SlotCloseTab(%d) for %zu MDI document(s)",
+        targetIndex,
+        subWindowsBeforeClose.size());
+    Log(closeState);
+
+    gSessionForceDiscardClose.store(true, std::memory_order_release);
+    const bool closeInvoked = InvokeQtInt(mainWindow, "SlotCloseTab", targetIndex);
+    gSessionForceDiscardClose.store(false, std::memory_order_release);
+    if (!closeInvoked) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "persistent session could not invoke SpeedTree SlotCloseTab(int)");
+    }
+    LogPointer(
+        "persistent session active QMdiSubWindow immediately after close is ",
+        gQMdiAreaActiveSubWindow(mdiArea));
+
+    const ULONGLONG deadline = GetTickCount64() + 30000;
+    while (GetTickCount64() < deadline) {
+        PumpMainThreadEvents();
+        std::vector<void*> remainingSubWindows;
+        const bool enumerated = CollectMdiSubWindows(mdiArea, remainingSubWindows);
+        const bool targetAlive = enumerated && ContainsPointer(
+            remainingSubWindows,
+            targetSubWindow);
+        const bool reusableDocumentState = enumerated &&
+            (gSessionAnchorMdiSubWindow != nullptr
+                ? ContainsPointer(remainingSubWindows, gSessionAnchorMdiSubWindow)
+                : remainingSubWindows.empty());
+        if (enumerated && !targetAlive && reusableDocumentState &&
+            gQObjectInherits(mainWindow, "MainWindow")) {
+            Log("persistent session target closed and the blank anchor remained alive");
+            gPersistentJobPhase = PersistentJobPhase::Complete;
+            return;
+        }
+        Sleep(25);
+    }
+    AbortExport(
+        kHookRuntimeFailureExitCode,
+        "persistent session target did not close while preserving the anchor");
+}
+
 void ProcessGuiBakeState(void* mainWindow) {
+    static thread_local bool processing = false;
+    if (processing) {
+        return;
+    }
+    struct ProcessingGuard {
+        bool& value;
+        ~ProcessingGuard() { value = false; }
+    } guard{processing};
+    processing = true;
+
     if (!gGuiBakeMode || gGuiExportStarted.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (gSessionServerMode &&
+        !gSessionJobActive.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (!PreparePersistentJob(mainWindow)) {
         return;
     }
     if (GetTickCount64() - gHookStartTick >= gTimeoutMs) {
@@ -857,6 +1659,15 @@ void ProcessGuiBakeState(void* mainWindow) {
     if (inputs <= 0 && pending <= 0) {
         return;
     }
+    // QThread::isRunning() becomes false before SpeedTree consumes the queued
+    // collision completion callback.  A reused process can therefore reach
+    // this point with the per-model post-collision flag still set.  Exporting
+    // in that interval skips the export-time collision refresh and emits the
+    // unpruned mesh.  Let the Qt event loop finish that callback first.
+    if (*(static_cast<unsigned char*>(collisionModel) + 0x9C89) != 0 &&
+        !gSynchronousCollisionCompleted.load(std::memory_order_acquire)) {
+        return;
+    }
 
     bool exportExpected = false;
     if (!gGuiExportStarted.compare_exchange_strong(
@@ -899,11 +1710,17 @@ void ProcessGuiBakeState(void* mainWindow) {
             kHookRuntimeFailureExitCode,
             "ExportCommandLineTree returned without creating the requested FBX");
     }
-    Log("GUI bake post-collision export completed; exiting SpeedTree");
+    Log("GUI bake post-collision export completed");
     // ExportCommandLineTree can leave queued collision callbacks behind. Running
     // the normal Qt teardown here races those callbacks against model destruction.
     // This is a dedicated wrapper-owned process, so finish with a clean process
     // exit code after the output file and worker completion have been verified.
+    if (gSessionServerMode) {
+        ClosePersistentTarget(mainWindow);
+        Log("persistent export is complete; blank anchor process remains running");
+        CompletePersistentSessionJob(ERROR_SUCCESS);
+        return;
+    }
     TerminateProcess(GetCurrentProcess(), 0);
     for (;;) {
         Sleep(INFINITE);
@@ -918,6 +1735,61 @@ void __fastcall HookedMainWindowOnIdle(void* mainWindow) {
 void __fastcall HookedMainWindowOnIdleDraw(void* mainWindow) {
     gOriginalMainWindowOnIdleDraw(mainWindow);
     ProcessGuiBakeState(mainWindow);
+}
+
+bool __cdecl HookedNotifyInternal(void* receiver, void* event) {
+    void* mainWindow = gSessionMainWindow.load(std::memory_order_acquire);
+    const bool result = gOriginalNotifyInternal(receiver, event);
+    if (gSessionServerMode && mainWindow != nullptr && receiver == mainWindow) {
+        ProcessGuiBakeState(mainWindow);
+    }
+    return result;
+}
+
+void* ResolveMainWindowFromController() {
+    void* mainWindow = nullptr;
+    __try {
+        auto** controllerStorage = reinterpret_cast<void**>(
+            gSpeedTreeBase + kApplicationControllerPointerRva);
+        void* controller = *controllerStorage;
+        if (controller != nullptr) {
+            void* candidate = static_cast<unsigned char*>(controller) - 0x28;
+            if (gQObjectInherits(candidate, "MainWindow")) {
+                mainWindow = candidate;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        mainWindow = nullptr;
+    }
+    return mainWindow;
+}
+
+DWORD WINAPI RunSessionGuiDriver(void*) {
+    Log("persistent session GUI driver thread started");
+    const ULONGLONG deadline = GetTickCount64() + gTimeoutMs;
+    while (GetTickCount64() < deadline) {
+        void* mainWindow = ResolveMainWindowFromController();
+        if (mainWindow != nullptr) {
+            LogPointer("persistent session controller MainWindow is ", mainWindow);
+            gSessionMainWindow.store(mainWindow, std::memory_order_release);
+            Log("persistent session attached to the blank anchor MainWindow");
+            for (;;) {
+                if (gSessionJobActive.load(std::memory_order_acquire) &&
+                    !PostQtWakeEvent(mainWindow)) {
+                    Log("persistent session could not post a Qt GUI wake event");
+                    TerminateProcess(
+                        GetCurrentProcess(),
+                        kHookRuntimeFailureExitCode);
+                    return kHookRuntimeFailureExitCode;
+                }
+                Sleep(50);
+            }
+        }
+        Sleep(50);
+    }
+    Log("persistent session could not resolve the blank anchor MainWindow before timeout");
+    TerminateProcess(GetCurrentProcess(), kHookRuntimeFailureExitCode);
+    return kHookRuntimeFailureExitCode;
 }
 
 void __fastcall HookedSpeedTreeExport(void* arg1, void* arg2, void* arg3, bool gameExport) {
@@ -1038,6 +1910,16 @@ bool ReadConfiguration() {
             static_cast<DWORD>(std::size(modeText))) > 0) {
         gGuiBakeMode = std::wcscmp(modeText, L"1") == 0;
     }
+    wchar_t serverModeText[16]{};
+    if (GetEnvironmentVariableW(
+            L"SPEEDTREE_COLLISION_CLI_SESSION_SERVER",
+            serverModeText,
+            static_cast<DWORD>(std::size(serverModeText))) > 0) {
+        gSessionServerMode = std::wcscmp(serverModeText, L"1") == 0;
+        if (gSessionServerMode) {
+            gGuiBakeMode = true;
+        }
+    }
     if (gGuiBakeMode) {
         GetEnvironmentVariableW(
             L"SPEEDTREE_COLLISION_CLI_OUTPUT",
@@ -1053,6 +1935,10 @@ bool ReadConfiguration() {
             gameText,
             static_cast<DWORD>(std::size(gameText)));
         gGuiGameExport = std::wcscmp(gameText, L"1") == 0;
+        if (gSessionServerMode) {
+            gPersistentJobPhase = PersistentJobPhase::Complete;
+            Log("persistent session will reuse the startup blank SPM anchor");
+        }
     }
     return true;
 }
@@ -1085,11 +1971,14 @@ bool InstallHooks() {
     HMODULE qtCore = GetModuleHandleW(L"Qt6Core.dll");
     HMODULE qtWidgets = GetModuleHandleW(L"Qt6Widgets.dll");
     if (qtCore == nullptr || qtWidgets == nullptr) {
-        Log("initialization failed: Qt6Core.dll or Qt6Widgets.dll is not loaded");
+        Log("initialization failed: required Qt 6.6 DLLs are not loaded");
         return false;
     }
 
     void* qThreadStart = GetProcAddress(qtCore, "?start@QThread@@QEAAXW4Priority@1@@Z");
+    void* qNotifyInternal = GetProcAddress(
+        qtCore,
+        "?notifyInternal2@QCoreApplication@@CA_NPEAVQObject@@PEAVQEvent@@@Z");
     gQThreadWait = Resolve<QThreadWaitFn>(qtCore, "?wait@QThread@@QEAA_NK@Z");
     gQThreadIsRunning = Resolve<QThreadIsRunningFn>(qtCore, "?isRunning@QThread@@QEBA_NXZ");
     gProcessEvents = Resolve<ProcessEventsFn>(
@@ -1102,6 +1991,7 @@ bool InstallHooks() {
         qtCore,
         "?children@QObject@@QEBAAEBV?$QList@PEAVQObject@@@@XZ");
     gQObjectInherits = Resolve<QObjectInheritsFn>(qtCore, "?inherits@QObject@@QEBA_NPEBD@Z");
+    gQObjectParent = Resolve<QObjectParentFn>(qtCore, "?parent@QObject@@QEBAPEAV1@XZ");
     gQWidgetFind = Resolve<QWidgetFindFn>(qtWidgets, "?find@QWidget@@SAPEAV1@_K@Z");
     gQCoreApplicationInstance = Resolve<QCoreApplicationInstanceFn>(
         qtCore,
@@ -1109,6 +1999,30 @@ bool InstallHooks() {
     gQApplicationAllWidgets = Resolve<QApplicationAllWidgetsFn>(
         qtWidgets,
         "?allWidgets@QApplication@@SA?AV?$QList@PEAVQWidget@@@@XZ");
+    gQStringCtor = Resolve<QStringCtorFn>(
+        qtCore,
+        "??0QString@@QEAA@PEBVQChar@@_J@Z");
+    gQArrayDataAllocate = Resolve<QArrayDataAllocateFn>(
+        qtCore,
+        "?allocate@QArrayData@@SAPEAXPEAPEAU1@_J11W4AllocationOption@1@@Z");
+    gQMdiAreaSetActiveSubWindow = Resolve<QMdiAreaSetActiveSubWindowFn>(
+        qtWidgets,
+        "?setActiveSubWindow@QMdiArea@@QEAAXPEAVQMdiSubWindow@@@Z");
+    gQMdiAreaActiveSubWindow = Resolve<QMdiAreaActiveSubWindowFn>(
+        qtWidgets,
+        "?activeSubWindow@QMdiArea@@QEBAPEAVQMdiSubWindow@@XZ");
+    gQMdiAreaSubWindowList = Resolve<QMdiAreaSubWindowListFn>(
+        qtWidgets,
+        "?subWindowList@QMdiArea@@QEBA?AV?$QList@PEAVQMdiSubWindow@@@@W4WindowOrder@1@@Z");
+    gQEventCtor = Resolve<QEventCtorFn>(
+        qtCore,
+        "??0QEvent@@QEAA@W4Type@0@@Z");
+    gPostEvent = Resolve<PostEventFn>(
+        qtCore,
+        "?postEvent@QCoreApplication@@SAXPEAVQObject@@PEAVQEvent@@H@Z");
+    gQMetaInvoke = Resolve<QMetaInvokeFn>(
+        qtCore,
+        "?invokeMethod@QMetaObject@@SA_NPEAVQObject@@PEBDW4ConnectionType@Qt@@VQGenericArgument@@333333333@Z");
     gMarkCollisionDirty = reinterpret_cast<MarkCollisionDirtyFn>(
         gSpeedTreeBase + kMarkCollisionDirtyRva);
     gCollisionDone = reinterpret_cast<CollisionDoneFn>(gSpeedTreeBase + kCollisionDoneRva);
@@ -1119,10 +2033,17 @@ bool InstallHooks() {
         gSpeedTreeBase + kMainWindowOnIdleDrawRva);
     gNativeSpeedTreeExport = reinterpret_cast<SpeedTreeExportFn>(
         gSpeedTreeBase + kSpeedTreeExportRva);
-    if (qThreadStart == nullptr || gQThreadWait == nullptr || gQThreadIsRunning == nullptr ||
+    if (qThreadStart == nullptr || qNotifyInternal == nullptr ||
+        gQThreadWait == nullptr || gQThreadIsRunning == nullptr ||
         gProcessEvents == nullptr || gSendPostedEvents == nullptr || gQObjectChildren == nullptr ||
-        gQObjectInherits == nullptr || gQWidgetFind == nullptr ||
-        gQCoreApplicationInstance == nullptr || gQApplicationAllWidgets == nullptr) {
+        gQObjectInherits == nullptr || gQObjectParent == nullptr || gQWidgetFind == nullptr ||
+        gQCoreApplicationInstance == nullptr || gQApplicationAllWidgets == nullptr ||
+        gQStringCtor == nullptr || gQArrayDataAllocate == nullptr ||
+        gQMdiAreaSetActiveSubWindow == nullptr || gQMdiAreaActiveSubWindow == nullptr ||
+        gQMdiAreaSubWindowList == nullptr ||
+        gQEventCtor == nullptr ||
+        gPostEvent == nullptr ||
+        gQMetaInvoke == nullptr) {
         Log("initialization failed: required Qt 6.6 symbols were not found");
         return false;
     }
@@ -1136,8 +2057,50 @@ bool InstallHooks() {
         return false;
     }
     if (gGuiBakeMode) {
-        if (gGuiExportPath[0] == L'\0' || gGuiExportOptionsPath[0] == L'\0') {
+        if (!gSessionServerMode &&
+            (gGuiExportPath[0] == L'\0' || gGuiExportOptionsPath[0] == L'\0')) {
             Log("initialization failed: GUI bake output or export-options path is empty");
+            RemoveHook(gQThreadStartHook);
+            return false;
+        }
+        if (gSessionServerMode && !InstallHook(
+                gMainWindowConfirmDiscardHook,
+                reinterpret_cast<void*>(gSpeedTreeBase + kMainWindowConfirmDiscardRva),
+                HookedMainWindowConfirmDiscard,
+                kMainWindowConfirmDiscardPrologue,
+                reinterpret_cast<void**>(&gOriginalMainWindowConfirmDiscard))) {
+            RemoveHook(gQThreadStartHook);
+            return false;
+        }
+        if (gSessionServerMode && !InstallHook(
+                gMainWindowRecoveryCheckHook,
+                reinterpret_cast<void*>(gSpeedTreeBase + kMainWindowRecoveryCheckRva),
+                HookedMainWindowRecoveryCheck,
+                kMainWindowRecoveryCheckPrologue,
+                reinterpret_cast<void**>(&gOriginalMainWindowRecoveryCheck))) {
+            RemoveHook(gMainWindowConfirmDiscardHook);
+            RemoveHook(gQThreadStartHook);
+            return false;
+        }
+        if (gSessionServerMode && !InstallHook(
+                gMainWindowOpenFileListHook,
+                reinterpret_cast<void*>(gSpeedTreeBase + kMainWindowOpenFileListRva),
+                HookedMainWindowOpenFileList,
+                kMainWindowOpenFileListPrologue,
+                reinterpret_cast<void**>(&gOriginalMainWindowOpenFileList))) {
+            RemoveHook(gMainWindowConfirmDiscardHook);
+            RemovePersistentSessionHooks();
+            RemoveHook(gQThreadStartHook);
+            return false;
+        }
+        if (gSessionServerMode && !InstallHook(
+                gNotifyInternalHook,
+                qNotifyInternal,
+                HookedNotifyInternal,
+                kQCoreNotifyInternalPrologue,
+                reinterpret_cast<void**>(&gOriginalNotifyInternal))) {
+            RemoveHook(gMainWindowConfirmDiscardHook);
+            RemovePersistentSessionHooks();
             RemoveHook(gQThreadStartHook);
             return false;
         }
@@ -1147,6 +2110,9 @@ bool InstallHooks() {
                 HookedMainWindowOnIdle,
                 kMainWindowOnIdlePrologue,
                 reinterpret_cast<void**>(&gOriginalMainWindowOnIdle))) {
+            RemoveHook(gNotifyInternalHook);
+            RemoveHook(gMainWindowConfirmDiscardHook);
+            RemovePersistentSessionHooks();
             RemoveHook(gQThreadStartHook);
             return false;
         }
@@ -1157,10 +2123,46 @@ bool InstallHooks() {
                 kMainWindowOnIdleDrawPrologue,
                 reinterpret_cast<void**>(&gOriginalMainWindowOnIdleDraw))) {
             RemoveHook(gMainWindowOnIdleHook);
+            RemoveHook(gNotifyInternalHook);
+            RemoveHook(gMainWindowConfirmDiscardHook);
+            RemovePersistentSessionHooks();
             RemoveHook(gQThreadStartHook);
             return false;
         }
         Log("GUI bake hooks installed for SpeedTree Modeler 10.1.0 / Qt 6.6.0");
+        if (gSessionServerMode) {
+            HANDLE driverThread = CreateThread(
+                nullptr,
+                0,
+                RunSessionGuiDriver,
+                nullptr,
+                0,
+                nullptr);
+            if (driverThread == nullptr) {
+                Log("initialization failed: persistent GUI driver thread could not start");
+                RemoveHook(gMainWindowOnIdleDrawHook);
+                RemoveHook(gMainWindowOnIdleHook);
+                RemoveHook(gNotifyInternalHook);
+                RemoveHook(gMainWindowConfirmDiscardHook);
+                RemovePersistentSessionHooks();
+                RemoveHook(gQThreadStartHook);
+                return false;
+            }
+            CloseHandle(driverThread);
+            HANDLE pipeThread = CreateThread(
+                nullptr,
+                0,
+                RunPersistentSessionPipeServer,
+                nullptr,
+                0,
+                nullptr);
+            if (pipeThread == nullptr) {
+                Log("initialization failed: persistent session pipe thread could not start");
+                TerminateProcess(GetCurrentProcess(), kHookRuntimeFailureExitCode);
+                return false;
+            }
+            CloseHandle(pipeThread);
+        }
     } else {
         if (!InstallHook(
                 gSpeedTreeExportHook,
@@ -1185,6 +2187,9 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
         return InstallHooks() ? TRUE : FALSE;
     }
     if (reason == DLL_PROCESS_DETACH && reserved == nullptr) {
+        RemoveHook(gMainWindowConfirmDiscardHook);
+        RemovePersistentSessionHooks();
+        RemoveHook(gNotifyInternalHook);
         RemoveHook(gMainWindowOnIdleDrawHook);
         RemoveHook(gMainWindowOnIdleHook);
         RemoveHook(gSpeedTreeExportHook);

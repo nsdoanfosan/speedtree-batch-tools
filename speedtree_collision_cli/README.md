@@ -16,6 +16,25 @@ SpeedTree Modeler 10.1.0의 기본 `-export` 명령이 잎 충돌 계산보다 �
 
 설치된 SpeedTree 파일과 입력 SPM은 수정하지 않습니다.
 
+## Persistent 세션
+
+여러 SPM을 연속 처리할 때는 하나의 SpeedTree 프로세스를 재사용할 수 있습니다. 시작 시 `blank.spm` 하나를 anchor 문서로 열어 두고, 각 작업마다 내부 Open 경로에 대상 SPM을 직접 전달한 뒤 `load → quality 3 bake → export → 대상 탭 닫기`를 수행합니다. 파일 선택창, 화면 좌표 클릭, 드래그 앤 드롭은 사용하지 않습니다.
+
+시작 복구 파일 질문은 wrapper가 만든 persistent 프로세스 안에서만 건너뜁니다. 복구 파일을 삭제하지 않으며 `ShowNewOnStart` 레지스트리 값도 프로세스 초기화 직후 원래 값으로 복구합니다. 대상이 정상 로드되어도 SpeedTree 탭 이름이 잠시 `blank.spm`으로 남을 수 있지만 내부 모델과 FBX 출력에는 영향을 주지 않습니다.
+
+```powershell
+.\speedtree_collision_cli\bin\speedtree_collision_cli.exe `
+  --persistent `
+  --session-anchor "$env:USERPROFILE\Downloads\blank.spm" `
+  -- "D:\path\tree.spm" `
+  -export_options "D:\path\Options_MA_Fbx.ini" `
+  -export "D:\path\tree.fbx"
+
+.\speedtree_collision_cli\bin\speedtree_collision_cli.exe --shutdown-session
+```
+
+`SK_tree_black_locast_03/04/05.spm`을 한 PID에서 연속 처리한 회귀 테스트에서도 세 작업의 FBX 생성과 대상 탭 닫기가 모두 완료됐습니다.
+
 `SK_bush_black_locast_01.spm` 검증 결과는 수동 GUI 내보내기와 동일한 33,488 버텍스 / 46,384 트라이앵글이었습니다. 네 재질의 삼각형 집합도 모두 완전히 일치했습니다.
 
 ## 빌드
@@ -48,6 +67,10 @@ Visual Studio 2022 Community의 C++ 도구가 필요합니다.
 - `--timeout-ms 600000`: 베이크 최대 대기 시간
 - `--log D:\path\collision_hook.log`: 상세 로그 경로
 - `--modeler D:\path\SpeedTree_Modeler.exe`: 모델러 경로 재정의
+- `--persistent`: 하나의 blank-anchored SpeedTree 프로세스 재사용
+- `--session-anchor D:\path\blank.spm`: persistent 프로세스가 유지할 anchor SPM
+- `--shutdown-session`: 실행 중인 persistent 프로세스 종료
+- `--no-persistent`: 환경 변수 설정과 관계없이 기존 one-shot 경로 사용
 
 ## 지원 빌드
 

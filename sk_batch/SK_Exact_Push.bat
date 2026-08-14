@@ -13,8 +13,13 @@ if errorlevel 1 goto collision_build_failed
 "%COLLISION_CLI%" --diagnose
 if errorlevel 1 goto collision_diagnose_failed
 set "SPEEDTREE_COLLISION_CLI_EXE=%COLLISION_CLI%"
+set "SPEEDTREE_COLLISION_PERSISTENT=1"
+if not defined SPEEDTREE_COLLISION_SESSION_ANCHOR set "SPEEDTREE_COLLISION_SESSION_ANCHOR=%USERPROFILE%\Downloads\blank.spm"
+if not exist "%SPEEDTREE_COLLISION_SESSION_ANCHOR%" goto collision_anchor_missing
 python "%~dp0exact_push.py" %*
-exit /b %errorlevel%
+set "SK_EXACT_PUSH_EXIT=%errorlevel%"
+"%COLLISION_CLI%" --shutdown-session >nul 2>&1
+exit /b %SK_EXACT_PUSH_EXIT%
 
 :collision_build_failed
 echo [ERROR] Failed to build the SpeedTree post-collision CLI.
@@ -23,3 +28,7 @@ exit /b 10
 :collision_diagnose_failed
 echo [ERROR] The installed SpeedTree version is not supported by the collision CLI.
 exit /b 11
+
+:collision_anchor_missing
+echo [ERROR] Persistent SpeedTree anchor was not found: "%SPEEDTREE_COLLISION_SESSION_ANCHOR%"
+exit /b 12
