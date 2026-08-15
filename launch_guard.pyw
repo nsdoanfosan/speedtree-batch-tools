@@ -27,6 +27,7 @@ from process_lifecycle import (
     owned_run,
     shutdown_process_supervisor,
     start_process_supervisor,
+    terminate_owned_process,
 )
 from shared_job_queue import InterprocessMutex, QueueError
 from artifact_retention import RetentionCapacityError, enforce_retention
@@ -52,6 +53,8 @@ SPEEDTREE_SESSION_TARGETS = {
     (REPO_DIR / "speedtree_batch_tools_gui.pyw").resolve(),
     (REPO_DIR / "sk_batch" / "sk_batch_gui.pyw").resolve(),
 }
+SPEEDTREE_SESSION_START_ATTEMPTS = 3
+SPEEDTREE_SESSION_RETRY_DELAY_SECONDS = 0.75
 
 
 def _rotated_log_path(index):
@@ -164,12 +167,13 @@ def run_startup_retention():
     return enforce_retention(phase="startup")
 
 
-def start_speedtree_session_host(target):
-    """Own one blank-anchored Modeler for every export in this GUI run."""
+def _start_speedtree_session_host_once(target):
+    """Start one blank-anchored host attempt and prove its pipe is ready."""
 
     if (
         target.resolve() not in SPEEDTREE_SESSION_TARGETS
         or os.environ.get("SPEEDTREE_COLLISION_PERSISTENT") != "1"
+        or os.environ.get("SPEEDTREE_COLLISION_ISOLATED_WINDOW", "1") != "0"
     ):
         return None
     cli = Path(os.environ.get("SPEEDTREE_COLLISION_CLI_EXE", "")).expanduser()
@@ -197,6 +201,7 @@ def start_speedtree_session_host(target):
         "--log",
         str(log_path.with_suffix(".hook.log")),
     ]
+    process = None
     try:
         process = owned_popen(
             command,
@@ -204,11 +209,6 @@ def start_speedtree_session_host(target):
             stdout=log_handle,
             stderr=subprocess.STDOUT,
         )
-    except BaseException:
-        log_handle.close()
-        raise
-
-    try:
         deadline = time.monotonic() + 45.0
         while time.monotonic() < deadline:
             ping = owned_run(
@@ -237,8 +237,53 @@ def start_speedtree_session_host(target):
             f"see {log_path}"
         )
     except BaseException:
-        log_handle.close()
+        try:
+            if process is not None and process.poll() is None:
+                terminate_owned_process(
+                    process,
+                    reason="speedtree_session_start_failed",
+                    terminate_grace=1,
+                    kill_grace=3,
+                )
+        finally:
+            log_handle.close()
         raise
+
+
+def start_speedtree_session_host(target):
+    """Start the persistent host with bounded replacement after early exits."""
+
+    if (
+        target.resolve() not in SPEEDTREE_SESSION_TARGETS
+        or os.environ.get("SPEEDTREE_COLLISION_PERSISTENT") != "1"
+        or os.environ.get("SPEEDTREE_COLLISION_ISOLATED_WINDOW", "1") != "0"
+    ):
+        return None
+    configured_attempts = os.environ.get(
+        "SPEEDTREE_COLLISION_SESSION_START_ATTEMPTS",
+        str(SPEEDTREE_SESSION_START_ATTEMPTS),
+    )
+    try:
+        attempts = max(1, min(5, int(configured_attempts)))
+    except ValueError:
+        attempts = SPEEDTREE_SESSION_START_ATTEMPTS
+
+    failures = []
+    for attempt in range(1, attempts + 1):
+        try:
+            return _start_speedtree_session_host_once(target)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            failures.append(f"attempt {attempt}/{attempts}: {exc}")
+            record_error(
+                "speedtree_persistent_session_start_retry",
+                failures[-1],
+            )
+            if attempt < attempts:
+                time.sleep(SPEEDTREE_SESSION_RETRY_DELAY_SECONDS * attempt)
+    raise RuntimeError(
+        "SpeedTree persistent session host could not be started after "
+        f"{attempts} attempts: " + " | ".join(failures)
+    )
 
 
 def stop_speedtree_session_host(host):
