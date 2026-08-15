@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
     [ValidateSet("Release", "Debug")]
-    [string]$Configuration = "Release"
+    [string]$Configuration = "Release",
+
+    [switch]$IfNeeded
 )
 
 $ErrorActionPreference = "Stop"
@@ -29,7 +31,29 @@ $launcherOutput = Join-Path $outputDirectory "speedtree_collision_cli.exe"
 $hookObject = Join-Path $outputDirectory "hook.obj"
 $launcherObject = Join-Path $outputDirectory "launcher.obj"
 
-$hookCommand = 'call "{0}" >nul && cl.exe {1} /Fo"{2}" /LD "{3}" /link user32.lib /OUT:"{4}"' -f `
+if ($IfNeeded -and
+    (Test-Path -LiteralPath $hookOutput -PathType Leaf) -and
+    (Test-Path -LiteralPath $launcherOutput -PathType Leaf)) {
+    $inputPaths = @(
+        $PSCommandPath,
+        $hookSource,
+        $launcherSource,
+        (Join-Path $sourceDirectory "session_protocol.h")
+    )
+    $latestInput = ($inputPaths | ForEach-Object {
+        (Get-Item -LiteralPath $_).LastWriteTimeUtc
+    } | Measure-Object -Maximum).Maximum
+    $oldestOutput = (@($hookOutput, $launcherOutput) | ForEach-Object {
+        (Get-Item -LiteralPath $_).LastWriteTimeUtc
+    } | Measure-Object -Minimum).Minimum
+
+    if ($oldestOutput -ge $latestInput) {
+        Write-Host "SpeedTree collision CLI is up to date."
+        return
+    }
+}
+
+$hookCommand = 'call "{0}" >nul && cl.exe {1} /Fo"{2}" /LD "{3}" /link user32.lib gdi32.lib opengl32.lib /OUT:"{4}"' -f `
     $vcvars, $common, $hookObject, $hookSource, $hookOutput
 $launcherCommand = 'call "{0}" >nul && cl.exe {1} /Fo"{2}" "{3}" /link bcrypt.lib /OUT:"{4}"' -f `
     $vcvars, $common, $launcherObject, $launcherSource, $launcherOutput

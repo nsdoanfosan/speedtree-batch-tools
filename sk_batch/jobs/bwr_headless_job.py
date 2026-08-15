@@ -608,7 +608,7 @@ def main():
             "executable": file_fingerprint(collision_cli),
             "hook": file_fingerprint(collision_hook),
             "policy": (
-                "quality_3_gui_bake_then_synchronous_export_collision_refresh"
+                "native_cli_collision_high_shade_pruning_then_bundled_fbx_xml"
             ),
         }
         settings.texture_contract_path = (

@@ -1,5 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <GL/gl.h>
 
 #include <algorithm>
 #include <atomic>
@@ -24,8 +25,17 @@ constexpr std::uintptr_t kMainWindowOpenFileListRva = 0x137750;
 constexpr std::uintptr_t kMainWindowConfirmDiscardRva = 0x131880;
 constexpr std::uintptr_t kMainWindowRecoveryCheckRva = 0x1325E0;
 constexpr std::uintptr_t kMarkCollisionDirtyRva = 0x3D90B0;
+constexpr std::uintptr_t kForceGeneratorRefreshRva = 0x3D90C0;
 constexpr std::uintptr_t kCollisionDoneRva = 0x3D25D0;
 constexpr std::uintptr_t kCollisionComputeRva = 0x3EE760;
+constexpr std::uintptr_t kNativeExportBuildRva = 0xAA530;
+constexpr std::uintptr_t kNativeModelUpdateRva = 0x3D1170;
+constexpr std::uintptr_t kNativeExportFinalizeGeometryRva = 0xA7580;
+constexpr std::uintptr_t kNativeExportFinalizeDocumentRva = 0xB1510;
+constexpr std::uintptr_t kTreeDocumentPrepareRva = 0x728F00;
+constexpr std::uintptr_t kTreeDocumentModelStageRva = 0x366AC0;
+constexpr std::uintptr_t kGenerateShadeVolumeRva = 0x2FE10;
+constexpr std::uintptr_t kScheduleCollisionRva = 0x3BF790;
 constexpr std::uintptr_t kApplicationControllerPointerRva = 0x22A0BF8;
 constexpr std::uintptr_t kCollisionThreadVtableRva = 0x19DA008;
 constexpr std::ptrdiff_t kTreeWindowModelOffset = 0x68;
@@ -77,6 +87,30 @@ constexpr unsigned char kMainWindowRecoveryCheckPrologue[15] = {
     0x48, 0x89, 0x7c, 0x24, 0x20,
 };
 
+constexpr unsigned char kNativeExportBuildPrologue[15] = {
+    0x48, 0x89, 0x5c, 0x24, 0x10,
+    0x48, 0x89, 0x74, 0x24, 0x18,
+    0x48, 0x89, 0x7c, 0x24, 0x20,
+};
+
+constexpr unsigned char kNativeModelUpdatePrologue[15] = {
+    0x48, 0x89, 0x5c, 0x24, 0x08,
+    0x48, 0x89, 0x74, 0x24, 0x10,
+    0x57, 0x48, 0x83, 0xec, 0x20,
+};
+
+constexpr unsigned char kNativeExportFinalizeGeometryPrologue[15] = {
+    0x48, 0x89, 0x5c, 0x24, 0x10,
+    0x48, 0x89, 0x74, 0x24, 0x18,
+    0x48, 0x89, 0x7c, 0x24, 0x20,
+};
+
+constexpr unsigned char kNativeExportFinalizeDocumentPrologue[15] = {
+    0x48, 0x89, 0x5c, 0x24, 0x10,
+    0x48, 0x89, 0x74, 0x24, 0x18,
+    0x48, 0x89, 0x7c, 0x24, 0x20,
+};
+
 constexpr unsigned char kQDialogExecPrologue[12] = {
     0x40, 0x55, 0x56, 0x57,
     0x48, 0x83, 0xec, 0x50,
@@ -99,6 +133,7 @@ using QObjectChildrenFn = const void*(__fastcall*)(const void* object);
 using QObjectInheritsFn = bool(__fastcall*)(const void* object, const char* className);
 using QObjectParentFn = void*(__fastcall*)(const void* object);
 using MarkCollisionDirtyFn = void(__fastcall*)(void* treeModel);
+using ForceGeneratorRefreshFn = void(__fastcall*)(void* treeModel, bool force);
 using ApplicationUpdateFn = void(__fastcall*)(void* controller);
 using MainWindowIdleFn = void(__fastcall*)(void* mainWindow);
 using MainWindowConfirmDiscardFn = bool(__fastcall*)(void* mainWindow);
@@ -115,6 +150,13 @@ using MainWindowOpenFileListFn = void*(__fastcall*)(
     int options);
 using CollisionDoneFn = void(__fastcall*)(void* model);
 using CollisionComputeFn = void(__fastcall*)(void* model);
+using NativeExportBuildFn = void(__fastcall*)(void* exportBuilder);
+using NativeModelUpdateFn = bool(__fastcall*)(void* model, int variation);
+using NativeExportFinalizeGeometryFn = void(__fastcall*)(void* exportBuilder, bool separate);
+using NativeExportFinalizeDocumentFn = void(__fastcall*)(void* exportBuilder);
+using TreeDocumentPrepareFn = void(__fastcall*)(void* treeDocument);
+using TreeDocumentModelStageFn = void(__fastcall*)(void* modelInterface);
+using ScheduleCollisionFn = void(__fastcall*)(void* model, bool force);
 using QCoreApplicationInstanceFn = void*(__cdecl*)();
 
 struct QGenericArgumentCompat {
@@ -186,6 +228,13 @@ struct HookRecord {
     bool installed = false;
 };
 
+struct NativeStateProbe {
+    std::uintptr_t rva;
+    const char* label;
+    unsigned char original = 0;
+    bool armed = false;
+};
+
 #pragma pack(push, 1)
 struct RttiCompleteObjectLocator64 {
     std::uint32_t signature;
@@ -200,6 +249,10 @@ struct RttiCompleteObjectLocator64 {
 std::atomic<void*> gCollisionThread{nullptr};
 QThreadStartFn gOriginalQThreadStart = nullptr;
 SpeedTreeExportFn gOriginalSpeedTreeExport = nullptr;
+NativeExportBuildFn gOriginalNativeExportBuild = nullptr;
+NativeModelUpdateFn gOriginalNativeModelUpdate = nullptr;
+NativeExportFinalizeGeometryFn gOriginalNativeExportFinalizeGeometry = nullptr;
+NativeExportFinalizeDocumentFn gOriginalNativeExportFinalizeDocument = nullptr;
 SpeedTreeExportFn gNativeSpeedTreeExport = nullptr;
 MainWindowIdleFn gOriginalMainWindowOnIdle = nullptr;
 MainWindowIdleFn gOriginalMainWindowOnIdleDraw = nullptr;
@@ -225,6 +278,9 @@ std::atomic<void*> gCollisionModel{nullptr};
 std::atomic<bool> gSynchronousCollisionCompleted{false};
 std::atomic<unsigned int> gCollisionStartCount{0};
 std::atomic<bool> gGuiExportStarted{false};
+std::atomic<bool> gNativeCliExportActive{false};
+std::atomic<unsigned char*> gNativeMainWindow{nullptr};
+std::atomic<unsigned int> gGuiModelUpdateCount{0};
 std::atomic<bool> gGuiBakeRequested{false};
 QCoreApplicationInstanceFn gQCoreApplicationInstance = nullptr;
 QApplicationAllWidgetsFn gQApplicationAllWidgets = nullptr;
@@ -239,6 +295,10 @@ QMdiAreaActiveSubWindowFn gQMdiAreaActiveSubWindow = nullptr;
 QMdiAreaSubWindowListFn gQMdiAreaSubWindowList = nullptr;
 HookRecord gQThreadStartHook;
 HookRecord gSpeedTreeExportHook;
+HookRecord gNativeExportBuildHook;
+HookRecord gNativeModelUpdateHook;
+HookRecord gNativeExportFinalizeGeometryHook;
+HookRecord gNativeExportFinalizeDocumentHook;
 HookRecord gMainWindowOnIdleHook;
 HookRecord gMainWindowOnIdleDrawHook;
 HookRecord gNotifyInternalHook;
@@ -246,12 +306,47 @@ HookRecord gMainWindowConfirmDiscardHook;
 HookRecord gMainWindowRecoveryCheckHook;
 HookRecord gQDialogExecHook;
 HookRecord gMainWindowOpenFileListHook;
+NativeStateProbe gNativeStateProbes[] = {
+    {0x135A59, "native export probe 135A59"},
+    {0x135A9D, "native export probe 135A9D"},
+    {0x135ABF, "native export probe 135ABF"},
+    {0x135D31, "native export probe 135D31"},
+    {0x135D95, "native export probe 135D95"},
+    {0x135DA6, "native export probe 135DA6"},
+    {0xA1F52, "native exporter probe A1F52"},
+    {0xA1F62, "native exporter probe A1F62"},
+    {0xA2186, "native exporter probe A2186"},
+    {0xA3B38, "native exporter probe A3B38"},
+    {0xA411A, "native exporter probe A411A"},
+    {0xA4C7C, "native exporter probe A4C7C"},
+    {0xA4CB0, "native exporter probe A4CB0"},
+    {0xA4D67, "native exporter probe A4D67"},
+    {0xA4E94, "native exporter probe A4E94"},
+    {0xA4F57, "native exporter probe A4F57"},
+    {0xA513B, "native exporter probe A513B"},
+    {0xA5455, "native exporter probe A5455"},
+};
+NativeStateProbe gCollisionTreeProbe{
+    0x3E0789,
+    "collision tree before spatial resolution",
+};
+NativeStateProbe gCollisionSpatialInputProbe{
+    0x3E0813,
+    "collision spatial input",
+};
+PVOID gNativeStateProbeHandler = nullptr;
+std::atomic<bool> gLoggedNativeAccessViolation{false};
 HMODULE gSpeedTreeModule = nullptr;
 std::uintptr_t gSpeedTreeBase = 0;
 std::size_t gSpeedTreeImageSize = 0;
+HWND gHeadlessOpenGlWindow = nullptr;
+HDC gHeadlessOpenGlDc = nullptr;
+HGLRC gHeadlessOpenGlContext = nullptr;
 wchar_t gLogPath[32768]{};
 wchar_t gGuiExportPath[32768]{};
 wchar_t gGuiExportOptionsPath[32768]{};
+wchar_t gSecondaryExportPath[32768]{};
+wchar_t gSecondaryExportOptionsPath[32768]{};
 wchar_t gPersistentInputPath[32768]{};
 DWORD gTimeoutMs = kDefaultTimeoutMs;
 ULONGLONG gHookStartTick = 0;
@@ -313,6 +408,36 @@ void LogPointer(const char* prefix, const void* pointer) {
     Log(buffer);
 }
 
+void LogSpeedTreeCallStack(const char* phase) {
+    void* frames[32]{};
+    const USHORT count = CaptureStackBackTrace(0, 32, frames, nullptr);
+    char header[160]{};
+    _snprintf_s(
+        header,
+        sizeof(header),
+        _TRUNCATE,
+        "%s: %u captured frames",
+        phase,
+        static_cast<unsigned int>(count));
+    Log(header);
+    for (USHORT index = 0; index < count; ++index) {
+        const auto address = reinterpret_cast<std::uintptr_t>(frames[index]);
+        if (address < gSpeedTreeBase ||
+            address >= gSpeedTreeBase + gSpeedTreeImageSize) {
+            continue;
+        }
+        char row[160]{};
+        _snprintf_s(
+            row,
+            sizeof(row),
+            _TRUNCATE,
+            "SpeedTree stack[%u] RVA=0x%llX",
+            static_cast<unsigned int>(index),
+            static_cast<unsigned long long>(address - gSpeedTreeBase));
+        Log(row);
+    }
+}
+
 bool IsInSpeedTreeImage(const void* address, std::size_t bytes) {
     const auto value = reinterpret_cast<std::uintptr_t>(address);
     if (value < gSpeedTreeBase || bytes > gSpeedTreeImageSize) {
@@ -348,6 +473,201 @@ bool IsCollisionThread(const void* object) {
         return std::strcmp(name, kCollisionThreadRttiName) == 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
+    }
+}
+
+const char* ReadSpeedTreeRttiName(const void* object) {
+    if (object == nullptr || gSpeedTreeBase == 0 || gSpeedTreeImageSize == 0) {
+        return nullptr;
+    }
+    __try {
+        const auto vtable = *reinterpret_cast<void* const* const*>(object);
+        if (vtable == nullptr || !IsInSpeedTreeImage(vtable - 1, sizeof(void*))) {
+            return nullptr;
+        }
+        const auto locator = reinterpret_cast<const RttiCompleteObjectLocator64*>(vtable[-1]);
+        if (!IsInSpeedTreeImage(locator, sizeof(*locator)) || locator->signature != 1) {
+            return nullptr;
+        }
+        const auto typeDescriptor = reinterpret_cast<const unsigned char*>(
+            gSpeedTreeBase + static_cast<std::uint32_t>(locator->typeDescriptorRva));
+        constexpr std::size_t kTypeDescriptorHeaderBytes = sizeof(void*) * 2;
+        if (!IsInSpeedTreeImage(typeDescriptor, kTypeDescriptorHeaderBytes + 2)) {
+            return nullptr;
+        }
+        return reinterpret_cast<const char*>(typeDescriptor + kTypeDescriptorHeaderBytes);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+void LogCollisionInputTypes(const char* phase, void* model) {
+    if (model == nullptr) {
+        return;
+    }
+    __try {
+        auto* bytes = static_cast<unsigned char*>(model);
+        auto** begin = *reinterpret_cast<void***>(bytes + 0xD8);
+        auto** end = *reinterpret_cast<void***>(bytes + 0xE0);
+        if (begin == nullptr || end < begin || end - begin > 10000) {
+            return;
+        }
+        for (auto** current = begin; current != end; ++current) {
+            void* input = *current;
+            const char* typeName = ReadSpeedTreeRttiName(input);
+            std::uintptr_t vtableRva = 0;
+            if (input != nullptr) {
+                const auto vtable = *reinterpret_cast<void* const* const*>(input);
+                if (IsInSpeedTreeImage(vtable, sizeof(void*))) {
+                    vtableRva = reinterpret_cast<std::uintptr_t>(vtable) - gSpeedTreeBase;
+                }
+            }
+            std::uintptr_t collisionSourceVtableRva = 0;
+            std::uintptr_t collisionSourceMethodRva = 0;
+            std::uintptr_t generatorDefinitionVtableRva = 0;
+            std::uintptr_t generatorDefinitionMethodRva = 0;
+            std::size_t childSourceCount = 0;
+            std::uintptr_t firstChildSourceVtableRva = 0;
+            std::uintptr_t firstChildSourceMethodRva = 0;
+            int sourceGeometryMode = -1;
+            int sourcePruneMode = -1;
+            float sourcePruneAmount = -1.0f;
+            unsigned int sourceDisabledFlags = 0;
+            unsigned int sourceCachedFlags = 0;
+            std::uintptr_t sourceMeshData = 0;
+            std::uintptr_t sourceOwnerModel = 0;
+            unsigned int sourceOwnerShade = 0;
+            int sourceOwnerQuality = -1;
+            int sourceInactive = -1;
+            int sourceOwnerInactive = -1;
+            if (input != nullptr) {
+                void* generatorDefinition = *reinterpret_cast<void**>(
+                    static_cast<unsigned char*>(input) + 0xC0);
+                if (generatorDefinition != nullptr) {
+                    const auto definitionVtable =
+                        *reinterpret_cast<void* const* const*>(generatorDefinition);
+                    if (IsInSpeedTreeImage(definitionVtable, 0xDD8)) {
+                        generatorDefinitionVtableRva =
+                            reinterpret_cast<std::uintptr_t>(definitionVtable) - gSpeedTreeBase;
+                        generatorDefinitionMethodRva =
+                            reinterpret_cast<std::uintptr_t>(definitionVtable[0xDD0 / sizeof(void*)]) -
+                            gSpeedTreeBase;
+                    }
+                }
+                void* collisionSource = *reinterpret_cast<void**>(
+                    static_cast<unsigned char*>(input) + 0x330);
+                if (collisionSource != nullptr) {
+                    const auto sourceVtable =
+                        *reinterpret_cast<void* const* const*>(collisionSource);
+                    if (IsInSpeedTreeImage(sourceVtable, 0xA18)) {
+                        collisionSourceVtableRva =
+                            reinterpret_cast<std::uintptr_t>(sourceVtable) - gSpeedTreeBase;
+                        collisionSourceMethodRva =
+                            reinterpret_cast<std::uintptr_t>(sourceVtable[0xA10 / sizeof(void*)]) -
+                            gSpeedTreeBase;
+                    }
+                }
+                auto** childSources = *reinterpret_cast<void***>(
+                    static_cast<unsigned char*>(input) + 0xE0);
+                childSourceCount = *reinterpret_cast<unsigned int*>(
+                    static_cast<unsigned char*>(input) + 0xF8);
+                if (childSources != nullptr && childSourceCount != 0 &&
+                    childSourceCount < 100000 && childSources[0] != nullptr) {
+                    const auto childVtable =
+                        *reinterpret_cast<void* const* const*>(childSources[0]);
+                    if (IsInSpeedTreeImage(childVtable, 0xA18)) {
+                        firstChildSourceVtableRva =
+                            reinterpret_cast<std::uintptr_t>(childVtable) - gSpeedTreeBase;
+                        firstChildSourceMethodRva =
+                            reinterpret_cast<std::uintptr_t>(childVtable[0xA10 / sizeof(void*)]) -
+                            gSpeedTreeBase;
+                        auto* childBytes = static_cast<unsigned char*>(childSources[0]);
+                        const auto sourceInactiveFn = reinterpret_cast<bool(__fastcall*)(void*)>(
+                            childVtable[0x1E0 / sizeof(void*)]);
+                        sourceInactive = sourceInactiveFn(childSources[0]) ? 1 : 0;
+                        void* ownerGenerator = *reinterpret_cast<void**>(childBytes + 0x128);
+                        if (ownerGenerator != nullptr) {
+                            const auto ownerVtable =
+                                *reinterpret_cast<void* const* const*>(ownerGenerator);
+                            const auto ownerInactiveFn = reinterpret_cast<bool(__fastcall*)(void*)>(
+                                ownerVtable[0x1E0 / sizeof(void*)]);
+                            sourceOwnerInactive = ownerInactiveFn(ownerGenerator) ? 1 : 0;
+                            void* ownerModel = *reinterpret_cast<void**>(
+                                static_cast<unsigned char*>(ownerGenerator) + 0xB8);
+                            if (ownerModel != nullptr) {
+                                sourceOwnerModel = reinterpret_cast<std::uintptr_t>(ownerModel);
+                                auto* ownerBytes = static_cast<unsigned char*>(ownerModel);
+                                sourceOwnerShade = ownerBytes[0x9BDC];
+                                sourceOwnerQuality =
+                                    *reinterpret_cast<int*>(ownerBytes + 0x9BD8);
+                            }
+                        }
+                        sourceDisabledFlags =
+                            static_cast<unsigned int>(childBytes[0x240]) |
+                            (static_cast<unsigned int>(childBytes[0x241]) << 8);
+                        auto* propertyBlock = *reinterpret_cast<unsigned char**>(childBytes + 0x138);
+                        const auto evaluateInt = reinterpret_cast<int(__fastcall*)(void*, void*, bool)>(
+                            gSpeedTreeBase + 0x316A80);
+                        const auto evaluateFloat = reinterpret_cast<float(__fastcall*)(void*, void*)>(
+                            gSpeedTreeBase + 0x316AB0);
+                        if (propertyBlock != nullptr && firstChildSourceMethodRva == 0x556A40) {
+                            sourceGeometryMode = evaluateInt(
+                                propertyBlock + 0xA0, childBytes + 0x1D8, false);
+                            sourcePruneMode = evaluateInt(
+                                propertyBlock + 0x2F0, childBytes + 0x1D8, false);
+                            sourcePruneAmount = evaluateFloat(
+                                propertyBlock + 0x2F8, childBytes + 0x1D8);
+                            sourceCachedFlags = childBytes[0x718];
+                            sourceMeshData = reinterpret_cast<std::uintptr_t>(
+                                *reinterpret_cast<void**>(childBytes + 0x588));
+                        } else if (propertyBlock != nullptr &&
+                                   firstChildSourceMethodRva == 0x5886F0) {
+                            sourceGeometryMode = evaluateInt(
+                                propertyBlock + 0x190, childBytes + 0x1D8, false);
+                            sourcePruneMode = evaluateInt(
+                                propertyBlock + 0x3D0, childBytes + 0x1D8, false);
+                            sourcePruneAmount = evaluateFloat(
+                                propertyBlock + 0x3D8, childBytes + 0x1D8);
+                            sourceCachedFlags = childBytes[0x7CC];
+                            sourceMeshData = reinterpret_cast<std::uintptr_t>(
+                                *reinterpret_cast<void**>(childBytes + 0x638));
+                        }
+                    }
+                }
+            }
+            char message[512]{};
+            _snprintf_s(
+                message,
+                sizeof(message),
+                _TRUNCATE,
+                "%s input[%td] vtable=0x%llX type=%s definition=0x%llX method_DD0=0x%llX direct_source=0x%llX method_A10=0x%llX children=%zu first_child=0x%llX method_A10=0x%llX geom=%d prune=%d amount=%.6f disabled=0x%X cached=0x%X mesh=%p inactive=%d owner=%p owner_inactive=%d owner_quality=%d owner_shade=%u selected=%p",
+                phase,
+                current - begin,
+                static_cast<unsigned long long>(vtableRva),
+                typeName != nullptr ? typeName : "<unknown>",
+                static_cast<unsigned long long>(generatorDefinitionVtableRva),
+                static_cast<unsigned long long>(generatorDefinitionMethodRva),
+                static_cast<unsigned long long>(collisionSourceVtableRva),
+                static_cast<unsigned long long>(collisionSourceMethodRva),
+                childSourceCount,
+                static_cast<unsigned long long>(firstChildSourceVtableRva),
+                static_cast<unsigned long long>(firstChildSourceMethodRva),
+                sourceGeometryMode,
+                sourcePruneMode,
+                static_cast<double>(sourcePruneAmount),
+                sourceDisabledFlags,
+                sourceCachedFlags,
+                reinterpret_cast<void*>(sourceMeshData),
+                sourceInactive,
+                reinterpret_cast<void*>(sourceOwnerModel),
+                sourceOwnerInactive,
+                sourceOwnerQuality,
+                sourceOwnerShade,
+                model);
+            Log(message);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("collision input type inspection raised an exception");
     }
 }
 
@@ -524,13 +844,45 @@ bool __fastcall HookedMainWindowConfirmDiscard(void* mainWindow) {
     return gOriginalMainWindowConfirmDiscard(mainWindow);
 }
 
+void LogCollisionResultState(const char* phase, void* model);
+std::ptrdiff_t GeneratedCollisionInputCount(void* model);
+[[noreturn]] void AbortExport(DWORD exitCode, const char* reason);
+
+void LogCollisionScheduleState(const char* phase, void* model) {
+    if (model == nullptr) {
+        return;
+    }
+    __try {
+        const auto* bytes = static_cast<const unsigned char*>(model);
+        char message[448]{};
+        _snprintf_s(
+            message,
+            sizeof(message),
+            _TRUNCATE,
+            "%s: flags[1d3=%u 1d5=%u 9818=%u 9938=%u 9bdc=%u 9c89=%u 9f21=%u 9cb0=%u] rebuild[5384=%.6f 9cb4=%d]",
+            phase,
+            static_cast<unsigned int>(bytes[0x1D3]),
+            static_cast<unsigned int>(bytes[0x1D5]),
+            static_cast<unsigned int>(bytes[0x9818]),
+            static_cast<unsigned int>(bytes[0x9938]),
+            static_cast<unsigned int>(bytes[0x9BDC]),
+            static_cast<unsigned int>(bytes[0x9C89]),
+            static_cast<unsigned int>(bytes[0x9F21]),
+            static_cast<unsigned int>(bytes[0x9CB0]),
+            *reinterpret_cast<const float*>(bytes + 0x5384),
+            *reinterpret_cast<const int*>(bytes + 0x9CB4));
+        Log(message);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("collision schedule state could not be read");
+    }
+}
+
 void __fastcall HookedQThreadStart(void* thread, int priority) {
     if (IsCollisionThread(thread)) {
         gCollisionThread.store(thread, std::memory_order_release);
         const unsigned int startCount = gCollisionStartCount.fetch_add(
             1,
             std::memory_order_acq_rel) + 1;
-        LogPointer("observed CCollisionThread at ", thread);
         char countMessage[128]{};
         _snprintf_s(
             countMessage,
@@ -539,6 +891,34 @@ void __fastcall HookedQThreadStart(void* thread, int priority) {
             "CCollisionThread start count is %u",
             startCount);
         Log(countMessage);
+        LogCollisionResultState(
+            "collision thread state before start",
+            gCollisionModel.load(std::memory_order_acquire));
+        if (gNativeCliExportActive.load(std::memory_order_acquire)) {
+            void* collisionModel = nullptr;
+            __try {
+                collisionModel = *reinterpret_cast<void**>(
+                    static_cast<unsigned char*>(thread) + 0x10);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                collisionModel = nullptr;
+            }
+            if (collisionModel == nullptr) {
+                AbortExport(
+                    kHookRuntimeFailureExitCode,
+                    "native CLI collision thread has no owning model");
+            }
+            gCollisionModel.store(collisionModel, std::memory_order_release);
+            LogCollisionResultState(
+                "native CLI export collision refresh started",
+                collisionModel);
+            gCollisionCompute(collisionModel);
+            gCollisionDone(collisionModel);
+            gSynchronousCollisionCompleted.store(true, std::memory_order_release);
+            LogCollisionResultState(
+                "native CLI export collision refresh completed",
+                collisionModel);
+            return;
+        }
         if (gGuiBakeMode &&
             gGuiExportStarted.load(std::memory_order_acquire) &&
             !gSessionClosingTarget.load(std::memory_order_acquire)) {
@@ -556,6 +936,866 @@ void __fastcall HookedQThreadStart(void* thread, int priority) {
         }
     }
     gOriginalQThreadStart(thread, priority);
+}
+
+bool ReplaceModelUpdateBranch(
+    std::uintptr_t rva,
+    const unsigned char* expected,
+    const unsigned char* replacement,
+    std::size_t byteCount) {
+    auto* target = reinterpret_cast<unsigned char*>(gSpeedTreeBase + rva);
+    if (std::memcmp(target, expected, byteCount) != 0) {
+        return false;
+    }
+    DWORD oldProtection = 0;
+    if (!VirtualProtect(target, byteCount, PAGE_EXECUTE_READWRITE, &oldProtection)) {
+        return false;
+    }
+    std::memcpy(target, replacement, byteCount);
+    FlushInstructionCache(GetCurrentProcess(), target, byteCount);
+    DWORD ignoredProtection = 0;
+    VirtualProtect(target, byteCount, oldProtection, &ignoredProtection);
+    return true;
+}
+
+bool EnsureHeadlessOpenGlContext() {
+    if (gHeadlessOpenGlContext != nullptr) {
+        return wglMakeCurrent(gHeadlessOpenGlDc, gHeadlessOpenGlContext) == TRUE;
+    }
+
+    constexpr wchar_t className[] = L"SpeedTreeCollisionCliOffscreen";
+    WNDCLASSW windowClass{};
+    windowClass.style = CS_OWNDC;
+    windowClass.lpfnWndProc = DefWindowProcW;
+    windowClass.hInstance = GetModuleHandleW(nullptr);
+    windowClass.lpszClassName = className;
+    if (RegisterClassW(&windowClass) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        Log("native CLI could not register its offscreen OpenGL window class");
+        return false;
+    }
+
+    gHeadlessOpenGlWindow = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        className,
+        L"",
+        WS_POPUP,
+        0,
+        0,
+        1,
+        1,
+        nullptr,
+        nullptr,
+        GetModuleHandleW(nullptr),
+        nullptr);
+    if (gHeadlessOpenGlWindow == nullptr) {
+        Log("native CLI could not create its offscreen OpenGL window");
+        return false;
+    }
+
+    gHeadlessOpenGlDc = GetDC(gHeadlessOpenGlWindow);
+    if (gHeadlessOpenGlDc == nullptr) {
+        Log("native CLI could not acquire its offscreen OpenGL device context");
+        return false;
+    }
+
+    PIXELFORMATDESCRIPTOR pixelFormat{};
+    pixelFormat.nSize = sizeof(pixelFormat);
+    pixelFormat.nVersion = 1;
+    pixelFormat.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+    pixelFormat.iPixelType = PFD_TYPE_RGBA;
+    pixelFormat.cColorBits = 32;
+    pixelFormat.cAlphaBits = 8;
+    pixelFormat.cDepthBits = 24;
+    pixelFormat.cStencilBits = 8;
+    pixelFormat.iLayerType = PFD_MAIN_PLANE;
+    const int selectedPixelFormat = ChoosePixelFormat(gHeadlessOpenGlDc, &pixelFormat);
+    if (selectedPixelFormat == 0 ||
+        !SetPixelFormat(gHeadlessOpenGlDc, selectedPixelFormat, &pixelFormat)) {
+        Log("native CLI could not configure its offscreen OpenGL pixel format");
+        return false;
+    }
+
+    HGLRC bootstrapContext = wglCreateContext(gHeadlessOpenGlDc);
+    if (bootstrapContext == nullptr || !wglMakeCurrent(gHeadlessOpenGlDc, bootstrapContext)) {
+        Log("native CLI could not activate its bootstrap OpenGL context");
+        return false;
+    }
+
+    using WglCreateContextAttribsArbFn = HGLRC(WINAPI*)(HDC, HGLRC, const int*);
+    const auto createContextAttribs = reinterpret_cast<WglCreateContextAttribsArbFn>(
+        wglGetProcAddress("wglCreateContextAttribsARB"));
+    if (createContextAttribs != nullptr) {
+        constexpr int kWglContextMajorVersionArb = 0x2091;
+        constexpr int kWglContextMinorVersionArb = 0x2092;
+        constexpr int kWglContextProfileMaskArb = 0x9126;
+        constexpr int kWglContextCompatibilityProfileBitArb = 0x00000002;
+        const int attributes[] = {
+            kWglContextMajorVersionArb,
+            4,
+            kWglContextMinorVersionArb,
+            5,
+            kWglContextProfileMaskArb,
+            kWglContextCompatibilityProfileBitArb,
+            0,
+        };
+        HGLRC modernContext = createContextAttribs(
+            gHeadlessOpenGlDc,
+            nullptr,
+            attributes);
+        if (modernContext != nullptr) {
+            wglMakeCurrent(nullptr, nullptr);
+            wglDeleteContext(bootstrapContext);
+            bootstrapContext = modernContext;
+            if (!wglMakeCurrent(gHeadlessOpenGlDc, bootstrapContext)) {
+                wglDeleteContext(bootstrapContext);
+                Log("native CLI could not activate its OpenGL 4.5 compatibility context");
+                return false;
+            }
+        }
+    }
+
+    gHeadlessOpenGlContext = bootstrapContext;
+    const auto* version = glGetString(GL_VERSION);
+    char message[256]{};
+    _snprintf_s(
+        message,
+        sizeof(message),
+        _TRUNCATE,
+        "native CLI activated an offscreen OpenGL context: %s",
+        version == nullptr ? "unknown" : reinterpret_cast<const char*>(version));
+    Log(message);
+    return true;
+}
+
+bool SetNativeRawExportBranchBypass(bool enabled) {
+    constexpr unsigned char firstOriginal[] = {0x0F, 0x84, 0x0F, 0x01, 0x00, 0x00};
+    constexpr unsigned char firstBypass[] = {0xE9, 0x10, 0x01, 0x00, 0x00, 0x90};
+    constexpr unsigned char secondOriginal[] = {0x74, 0x15};
+    constexpr unsigned char secondBypass[] = {0xEB, 0x15};
+    constexpr unsigned char thirdOriginal[] = {0x74, 0x37};
+    constexpr unsigned char thirdBypass[] = {0xEB, 0x37};
+    const unsigned char* firstExpected = enabled ? firstOriginal : firstBypass;
+    const unsigned char* firstReplacement = enabled ? firstBypass : firstOriginal;
+    const unsigned char* secondExpected = enabled ? secondOriginal : secondBypass;
+    const unsigned char* secondReplacement = enabled ? secondBypass : secondOriginal;
+    const unsigned char* thirdExpected = enabled ? thirdOriginal : thirdBypass;
+    const unsigned char* thirdReplacement = enabled ? thirdBypass : thirdOriginal;
+    return ReplaceModelUpdateBranch(
+               0x3D119F, firstExpected, firstReplacement, sizeof(firstOriginal)) &&
+        ReplaceModelUpdateBranch(
+               0x3D12D6, secondExpected, secondReplacement, sizeof(secondOriginal)) &&
+        ReplaceModelUpdateBranch(
+               0x3D132C, thirdExpected, thirdReplacement, sizeof(thirdOriginal));
+}
+
+bool SetNativeModelUpdateInteractiveBranches(bool enabled) {
+    constexpr unsigned char firstOriginal[] = {0x0F, 0x84, 0x0F, 0x01, 0x00, 0x00};
+    constexpr unsigned char firstEnabled[] = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+    constexpr unsigned char secondOriginal[] = {0x74, 0x15};
+    constexpr unsigned char secondEnabled[] = {0x90, 0x90};
+    constexpr unsigned char thirdOriginal[] = {0x74, 0x37};
+    constexpr unsigned char thirdEnabled[] = {0x90, 0x90};
+    const unsigned char* firstExpected = enabled ? firstOriginal : firstEnabled;
+    const unsigned char* firstReplacement = enabled ? firstEnabled : firstOriginal;
+    const unsigned char* secondExpected = enabled ? secondOriginal : secondEnabled;
+    const unsigned char* secondReplacement = enabled ? secondEnabled : secondOriginal;
+    const unsigned char* thirdExpected = enabled ? thirdOriginal : thirdEnabled;
+    const unsigned char* thirdReplacement = enabled ? thirdEnabled : thirdOriginal;
+    return ReplaceModelUpdateBranch(
+               0x3D119F, firstExpected, firstReplacement, sizeof(firstOriginal)) &&
+        ReplaceModelUpdateBranch(
+               0x3D12D6, secondExpected, secondReplacement, sizeof(secondOriginal)) &&
+        ReplaceModelUpdateBranch(
+               0x3D132C, thirdExpected, thirdReplacement, sizeof(thirdOriginal));
+}
+
+bool SetNativeMainWindowUiTailBypass(bool enabled) {
+    constexpr unsigned char original[] = {
+        0x48, 0x8B, 0x81, 0x18, 0x04, 0x00, 0x00,
+    };
+    constexpr unsigned char bypass[] = {
+        0xE9, 0x10, 0x00, 0x00, 0x00, 0x90, 0x90,
+    };
+    return ReplaceModelUpdateBranch(
+        0x13B1E5,
+        enabled ? original : bypass,
+        enabled ? bypass : original,
+        sizeof(original));
+}
+
+bool SetNativePrepareUiCallbackBypass(bool enabled) {
+    // The interactive generator-preparation routine ends with a MainWindow
+    // scene/view refresh pair. Native CLI mode owns neither target object, so
+    // keep all generator work and jump over only those two UI-only callbacks.
+    constexpr unsigned char original[] = {
+        0x48, 0x8B, 0x0D, 0xAB, 0x34, 0xEC, 0x01,
+    };
+    constexpr unsigned char bypass[] = {
+        0xE9, 0x1B, 0x00, 0x00, 0x00, 0x90, 0x90,
+    };
+    return ReplaceModelUpdateBranch(
+        0x3DD746,
+        enabled ? original : bypass,
+        enabled ? bypass : original,
+        sizeof(original));
+}
+
+bool SetNativeGeneratorUiRefreshBypass(bool enabled) {
+    // A generator refresh optionally updates the interactive renderer. The
+    // renderer test reports GUI mode during the scoped core rebuild, but the
+    // native CLI owns no renderer object. Avoid the renderer query itself and
+    // supply its normal "not available" result in eax.
+    constexpr unsigned char original[] = {
+        0x48, 0x8B, 0x0D, 0xB0, 0x89, 0xFD, 0x01,
+    };
+    constexpr unsigned char bypass[] = {
+        0x31, 0xC0, 0xE9, 0x09, 0x00, 0x00, 0x00,
+    };
+    return ReplaceModelUpdateBranch(
+        0x2C8241,
+        enabled ? original : bypass,
+        enabled ? bypass : original,
+        sizeof(original));
+}
+
+bool SetNativeCurrentViewLookupBypass(bool enabled) {
+    // Post-generation notification asks the MainWindow for its active editing
+    // view. There is no such view in the native exporter; return null and let
+    // the model's normal null-view branch continue.
+    constexpr unsigned char original[] = {
+        0x48, 0x8B, 0x0D, 0xE9, 0xE6, 0xEC, 0x01,
+    };
+    constexpr unsigned char bypass[] = {
+        0x31, 0xC0, 0xE9, 0x09, 0x00, 0x00, 0x00,
+    };
+    return ReplaceModelUpdateBranch(
+        0x3D2508,
+        enabled ? original : bypass,
+        enabled ? bypass : original,
+        sizeof(original));
+}
+
+bool SetNativeUiModeQueryBypass(bool enabled) {
+    // This post-generation UI-state query leads into QML object discovery in
+    // GUI mode. Report the state that selects its existing no-view branch.
+    constexpr unsigned char original[] = {
+        0x48, 0x8B, 0x0D, 0xCC, 0xE6, 0xEC, 0x01,
+    };
+    constexpr unsigned char bypass[] = {
+        0xB0, 0x01, 0xE9, 0x09, 0x00, 0x00, 0x00,
+    };
+    return ReplaceModelUpdateBranch(
+        0x3D2525,
+        enabled ? original : bypass,
+        enabled ? bypass : original,
+        sizeof(original));
+}
+
+bool SetNativeModelWindowNotificationBypass(bool enabled) {
+    // Model finalization emits a window-only notification whose return value
+    // is unused. Skip it in native CLI mode after all model work is complete.
+    constexpr unsigned char original[] = {
+        0x40, 0x53, 0x48, 0x83, 0xEC, 0x30,
+    };
+    constexpr unsigned char bypass[] = {
+        0xC3, 0x90, 0x90, 0x90, 0x90, 0x90,
+    };
+    return ReplaceModelUpdateBranch(
+        0x148630,
+        enabled ? original : bypass,
+        enabled ? bypass : original,
+        sizeof(original));
+}
+
+bool SetNativeSelectedNodeRedrawBypass(bool enabled) {
+    // Modeler's active tree view reports this predicate true; that path also
+    // performs generator refresh work needed by collision-pruned branches.
+    constexpr unsigned char original[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x08,
+    };
+    constexpr unsigned char bypass[] = {
+        0xB0, 0x01, 0xC3, 0x90, 0x90,
+    };
+    return ReplaceModelUpdateBranch(
+        0x149030,
+        enabled ? original : bypass,
+        enabled ? bypass : original,
+        sizeof(original));
+}
+
+bool SetNativeRendererAvailabilityBypass(bool enabled) {
+    // Several core rebuild loops ask the application whether an interactive
+    // renderer exists. During native CLI regeneration it never does. Patch the
+    // shared query for the scoped rebuild instead of chasing every call site.
+    constexpr unsigned char original[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x08,
+    };
+    constexpr unsigned char bypass[] = {
+        0x31, 0xC0, 0xC3, 0x90, 0x90,
+    };
+    return ReplaceModelUpdateBranch(
+        0x136A90,
+        enabled ? original : bypass,
+        enabled ? bypass : original,
+        sizeof(original));
+}
+
+bool SetNativeEditorModeFallback(bool enabled) {
+    // The active tree view reports editor mode 6 during the correct GUI bake.
+    constexpr unsigned char original[] = {
+        0x40, 0x53, 0x48, 0x83, 0xEC, 0x30,
+    };
+    constexpr unsigned char fallback[] = {
+        0xB8, 0x06, 0x00, 0x00, 0x00, 0xC3,
+    };
+    return ReplaceModelUpdateBranch(
+        0x1395B0,
+        enabled ? original : fallback,
+        enabled ? fallback : original,
+        sizeof(original));
+}
+
+bool SetNativeEditorStateFallback(bool enabled) {
+    // This UI-state predicate already returns false when the native CLI owns no
+    // editor object. Avoid QML discovery and use that same fallback directly.
+    constexpr unsigned char original[] = {
+        0x40, 0x53, 0x48, 0x83, 0xEC, 0x30,
+    };
+    constexpr unsigned char fallback[] = {
+        0x31, 0xC0, 0xC3, 0x90, 0x90, 0x90,
+    };
+    return ReplaceModelUpdateBranch(
+        0x139AF0,
+        enabled ? original : fallback,
+        enabled ? fallback : original,
+        sizeof(original));
+}
+
+bool SetNativeEditingViewFallback(bool enabled) {
+    // Active-view lookup is optional: its callers have an explicit null-view
+    // path with default model values. Native CLI should take that path.
+    constexpr unsigned char original[] = {
+        0x48, 0x83, 0xEC, 0x28, 0x80, 0xB9,
+    };
+    constexpr unsigned char fallback[] = {
+        0x31, 0xC0, 0xC3, 0x90, 0x90, 0x90,
+    };
+    return ReplaceModelUpdateBranch(
+        0x1364F0,
+        enabled ? original : fallback,
+        enabled ? fallback : original,
+        sizeof(original));
+}
+
+bool SetNativeViewOptionFallback(bool enabled) {
+    // A view-option predicate has a built-in false result when no editor view
+    // exists. Use that result directly during the scoped native rebuild.
+    constexpr unsigned char original[] = {
+        0x40, 0x53, 0x48, 0x83, 0xEC, 0x30,
+    };
+    constexpr unsigned char fallback[] = {
+        0x31, 0xC0, 0xC3, 0x90, 0x90, 0x90,
+    };
+    return ReplaceModelUpdateBranch(
+        0x139910,
+        enabled ? original : fallback,
+        enabled ? fallback : original,
+        sizeof(original));
+}
+
+bool SetNativeQmlViewLookupFallback(bool enabled) {
+    // Shared QML view discovery used by multiple typed view accessors. Native
+    // CLI has no QML document, and every accessor accepts a null result.
+    constexpr unsigned char original[] = {
+        0x48, 0x83, 0xEC, 0x38, 0x80, 0xB9,
+    };
+    constexpr unsigned char fallback[] = {
+        0x31, 0xC0, 0xC3, 0x90, 0x90, 0x90,
+    };
+    return ReplaceModelUpdateBranch(
+        0x1365B0,
+        enabled ? original : fallback,
+        enabled ? fallback : original,
+        sizeof(original));
+}
+
+bool SetNativeSecondaryViewOptionFallback(bool enabled) {
+    // A second view predicate also defines false as its no-editor result.
+    constexpr unsigned char original[] = {
+        0x40, 0x53, 0x48, 0x83, 0xEC, 0x30,
+    };
+    constexpr unsigned char fallback[] = {
+        0x31, 0xC0, 0xC3, 0x90, 0x90, 0x90,
+    };
+    return ReplaceModelUpdateBranch(
+        0x139E70,
+        enabled ? original : fallback,
+        enabled ? fallback : original,
+        sizeof(original));
+}
+
+bool SetNativeWindowRefreshNoop(bool enabled) {
+    // MainWindow vtable +0xE0 is a pure interactive refresh notification. Its
+    // return value is never consumed by the model path.
+    constexpr unsigned char original[] = {
+        0x48, 0x83, 0xEC, 0x28, 0x80, 0xB9, 0xED,
+    };
+    constexpr unsigned char noop[] = {
+        0xC3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+    };
+    return ReplaceModelUpdateBranch(
+        0x13CF70,
+        enabled ? original : noop,
+        enabled ? noop : original,
+        sizeof(original));
+}
+
+bool SetNativeWindowModelNotificationNoop(bool enabled) {
+    // MainWindow vtable +0xD0 is another void editor notification embedded in
+    // an otherwise model-only bounds/update pass.
+    constexpr unsigned char original[] = {
+        0x48, 0x83, 0xEC, 0x38, 0x80, 0xB9,
+    };
+    constexpr unsigned char noop[] = {
+        0xC3, 0x90, 0x90, 0x90, 0x90, 0x90,
+    };
+    return ReplaceModelUpdateBranch(
+        0x13AE90,
+        enabled ? original : noop,
+        enabled ? noop : original,
+        sizeof(original));
+}
+
+bool SetNativeOnIdleNoop(bool enabled) {
+    // MainWindow::OnIdle is exclusively interactive UI maintenance. Native
+    // export pumps Qt events for progress, but must not enter this GUI loop.
+    constexpr unsigned char original[] = {
+        0x40, 0x55, 0x53, 0x56, 0x57,
+    };
+    constexpr unsigned char noop[] = {
+        0x31, 0xC0, 0xC3, 0x90, 0x90,
+    };
+    return ReplaceModelUpdateBranch(
+        0x13B7F0,
+        enabled ? original : noop,
+        enabled ? noop : original,
+        sizeof(original));
+}
+
+bool SetNativeDeferredUiUpdateNoop(bool enabled) {
+    // A second Qt-driven MainWindow handler performs deferred editor/view
+    // maintenance. It is not part of model generation or FBX serialization.
+    constexpr unsigned char original[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x08,
+    };
+    constexpr unsigned char noop[] = {
+        0x31, 0xC0, 0xC3, 0x90, 0x90,
+    };
+    return ReplaceModelUpdateBranch(
+        0x13C390,
+        enabled ? original : noop,
+        enabled ? noop : original,
+        sizeof(original));
+}
+
+bool InstallCollisionTreeProbe();
+
+bool __fastcall HookedNativeModelUpdate(void* model, int variation) {
+    if (!gNativeCliExportActive.load(std::memory_order_acquire)) {
+        if (!gGuiBakeMode) {
+            return gOriginalNativeModelUpdate(model, variation);
+        }
+        const unsigned int updateNumber =
+            gGuiModelUpdateCount.fetch_add(1, std::memory_order_acq_rel) + 1;
+        char phase[160]{};
+        _snprintf_s(
+            phase,
+            sizeof(phase),
+            _TRUNCATE,
+            "GUI model update %u entry",
+            updateNumber);
+        LogCollisionResultState(phase, model);
+        __try {
+            void* application = *reinterpret_cast<void**>(
+                gSpeedTreeBase + 0x22A0BF8);
+            void** applicationVtable = *reinterpret_cast<void***>(application);
+            const auto getBool = [&](std::size_t byteOffset) {
+                const auto function = reinterpret_cast<bool(__fastcall*)(void*)>(
+                    applicationVtable[byteOffset / sizeof(void*)]);
+                return function(application);
+            };
+            const auto getInt = [&](std::size_t byteOffset) {
+                const auto function = reinterpret_cast<int(__fastcall*)(void*)>(
+                    applicationVtable[byteOffset / sizeof(void*)]);
+                return function(application);
+            };
+            const auto getPointer = [&](std::size_t byteOffset) {
+                const auto function = reinterpret_cast<void*(__fastcall*)(void*)>(
+                    applicationVtable[byteOffset / sizeof(void*)]);
+                return function(application);
+            };
+            char uiState[384]{};
+            _snprintf_s(
+                uiState,
+                sizeof(uiState),
+                _TRUNCATE,
+                "GUI application getters: renderer=%d selected_redraw=%d editor_mode=%d editor_state=%d view_option=%d secondary_option=%d editing_view=%p ui_mode=%d",
+                getInt(0x208),
+                getBool(0xF8) ? 1 : 0,
+                getInt(0x5F8),
+                getBool(0x390) ? 1 : 0,
+                getBool(0x230) ? 1 : 0,
+                getBool(0x1E8) ? 1 : 0,
+                getPointer(0x140),
+                getBool(0x388) ? 1 : 0);
+            Log(uiState);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("GUI application getter diagnostics raised an exception");
+        }
+        const bool guiResult = gOriginalNativeModelUpdate(model, variation);
+        _snprintf_s(
+            phase,
+            sizeof(phase),
+            _TRUNCATE,
+            "GUI model update %u exit",
+            updateNumber);
+        LogCollisionResultState(phase, model);
+        return guiResult;
+    }
+    if (!EnsureHeadlessOpenGlContext()) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI model update could not create its headless render context");
+    }
+    auto* modelBytes = static_cast<unsigned char*>(model);
+    modelBytes[0x9BDC] = 1;
+    const bool result = gOriginalNativeModelUpdate(model, variation);
+    LogCollisionResultState(
+        "native CLI raw model update with headless render context",
+        model);
+
+    // The interactive model-update path performs these two core model operations
+    // before tagging every generator cache for a complete rebuild.  Calling the
+    // surrounding GUI controller path is unsafe in the native exporter because
+    // it dereferences widgets that do not exist in CLI mode.
+    const auto prepareInteractiveGenerators =
+        reinterpret_cast<bool(__fastcall*)(void*)>(gSpeedTreeBase + 0x3DA640);
+    const auto rebuildInteractiveGenerators =
+        reinterpret_cast<void(__fastcall*)(void*, bool)>(gSpeedTreeBase + 0x3E9490);
+    prepareInteractiveGenerators(model);
+    rebuildInteractiveGenerators(model, true);
+    auto* generatorState = *reinterpret_cast<unsigned char**>(modelBytes + 0x7B0);
+    auto* generatorStateEnd = *reinterpret_cast<unsigned char**>(modelBytes + 0x7B8);
+    for (; generatorState < generatorStateEnd; generatorState += 0x2420) {
+        constexpr std::size_t dirtyFlagOffsets[] = {
+            0x3F8, 0x6C0, 0x988, 0xC50, 0xF18, 0x11E0,
+            0x14A8, 0x1770, 0x1A38, 0x1D00, 0x1FC8, 0x2290,
+        };
+        for (const std::size_t offset : dirtyFlagOffsets) {
+            *reinterpret_cast<unsigned int*>(generatorState + offset) |= 5u;
+        }
+    }
+    LogCollisionResultState(
+        "native CLI interactive generator preparation completed",
+        model);
+    void* treeDocument = modelBytes - kTreeWindowModelOffset;
+    const auto prepareTreeDocument = reinterpret_cast<TreeDocumentPrepareFn>(
+        gSpeedTreeBase + kTreeDocumentPrepareRva);
+    const auto stageTreeDocumentModel = reinterpret_cast<TreeDocumentModelStageFn>(
+        gSpeedTreeBase + kTreeDocumentModelStageRva);
+    prepareTreeDocument(treeDocument);
+    void* modelInterface = static_cast<unsigned char*>(treeDocument) + 0x18;
+    stageTreeDocumentModel(modelInterface);
+    void** modelInterfaceVtable = *reinterpret_cast<void***>(modelInterface);
+    auto finishModelStage = reinterpret_cast<bool(__fastcall*)(void*)>(
+        modelInterfaceVtable[0xD8 / sizeof(void*)]);
+    finishModelStage(modelInterface);
+    LogCollisionResultState(
+        "native CLI full document stage after raw generation",
+        model);
+    const auto generateShadeVolume = reinterpret_cast<void(__fastcall*)(void*, int)>(
+        gSpeedTreeBase + kGenerateShadeVolumeRva);
+    generateShadeVolume(model, 5);
+    Log("native CLI shade-pruning volume generation completed");
+    gMarkCollisionDirty(model);
+    modelBytes[0x9C68] = 1;
+    modelBytes[0x9C89] = 1;
+    *reinterpret_cast<int*>(modelBytes + 0x9C8C) = 0;
+    *reinterpret_cast<int*>(modelBytes + 0x9C94) = 0;
+    LogCollisionResultState(
+        "native CLI model marked dirty after full input generation",
+        model);
+    gCollisionCompute(model);
+    gCollisionDone(model);
+    gSynchronousCollisionCompleted.store(true, std::memory_order_release);
+    LogCollisionResultState(
+        "native CLI full post-input collision computation completed",
+        model);
+    auto* nativeMainWindow = gNativeMainWindow.load(std::memory_order_acquire);
+    if (nativeMainWindow == nullptr) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI post-prune model update has no owning MainWindow");
+    }
+    if (!SetNativeMainWindowUiTailBypass(true)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not guard the post-prune model-update UI tail");
+    }
+    if (!SetNativePrepareUiCallbackBypass(true)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not guard the generator-preparation UI callback");
+    }
+    if (!SetNativeGeneratorUiRefreshBypass(true)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not guard the optional generator renderer refresh");
+    }
+    if (!SetNativeCurrentViewLookupBypass(true)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not guard the optional current-view lookup");
+    }
+    if (!SetNativeUiModeQueryBypass(true)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not guard the post-generation UI-mode query");
+    }
+    if (!SetNativeModelWindowNotificationBypass(true)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not guard the model-window notification");
+    }
+    if (!SetNativeSelectedNodeRedrawBypass(true)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not guard selected-node redraws");
+    }
+    if (!SetNativeRendererAvailabilityBypass(true)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not override interactive-renderer availability");
+    }
+    if (!SetNativeEditorModeFallback(true)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not apply the no-view editor-mode fallback");
+    }
+    if (!SetNativeEditorStateFallback(true)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not apply the no-view editor-state fallback");
+    }
+    if (!SetNativeEditingViewFallback(true)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not apply the null editing-view fallback");
+    }
+    if (!SetNativeViewOptionFallback(true)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not apply the no-view option fallback");
+    }
+    if (!SetNativeQmlViewLookupFallback(true)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not apply the shared QML-view fallback");
+    }
+    if (!SetNativeSecondaryViewOptionFallback(true)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not apply the secondary no-view option fallback");
+    }
+    if (!SetNativeWindowRefreshNoop(true)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not disable interactive window refreshes");
+    }
+    if (!SetNativeWindowModelNotificationNoop(true)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not disable the window model notification");
+    }
+    const unsigned char originalCliMode = nativeMainWindow[0x615];
+    void* const originalIdleViewState =
+        *reinterpret_cast<void**>(nativeMainWindow + 0x4B0);
+    nativeMainWindow[0x615] = 0;
+    const bool postCollisionResult = gOriginalNativeModelUpdate(model, variation);
+    // Restore UI-only idle state changed by the scoped interactive rebuild.
+    // The model itself remains regenerated, while the native exporter's
+    // original non-interactive window state is preserved.
+    *reinterpret_cast<unsigned short*>(nativeMainWindow + 0x3C8) = 0;
+    *reinterpret_cast<void**>(nativeMainWindow + 0x4B0) = originalIdleViewState;
+    // Interactive Modeler schedules one final collision worker after the
+    // regenerated meshes and shade volume are committed. Invoke that exact
+    // scheduler so it prepares the thread/commit state; HookedQThreadStart
+    // executes the worker synchronously without relying on a GUI event loop.
+    gSynchronousCollisionCompleted.store(false, std::memory_order_release);
+    const auto scheduleCollision =
+        reinterpret_cast<void(__fastcall*)(void*, bool)>(gSpeedTreeBase + 0x3BF790);
+    scheduleCollision(model, false);
+    if (!gSynchronousCollisionCompleted.load(std::memory_order_acquire)) {
+        Log("native CLI collision scheduler did not start a worker; using direct fallback");
+        gCollisionCompute(model);
+        gCollisionDone(model);
+        gSynchronousCollisionCompleted.store(true, std::memory_order_release);
+    }
+    LogCollisionScheduleState(
+        "native CLI collision-complete commit preconditions",
+        model);
+    const auto commitCollisionGeneratorChanges =
+        reinterpret_cast<void(__fastcall*)(void*, bool)>(gSpeedTreeBase + 0x3DDD30);
+    commitCollisionGeneratorChanges(model, true);
+    LogCollisionResultState(
+        "native CLI collision-complete generator commit finished",
+        model);
+    nativeMainWindow[0x615] = originalCliMode;
+    LogCollisionResultState(
+        "native CLI final post-regeneration collision computation completed",
+        model);
+    if (!SetNativeWindowModelNotificationNoop(false)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not restore the window model notification");
+    }
+    if (!SetNativeWindowRefreshNoop(false)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not restore interactive window refreshes");
+    }
+    if (!SetNativeSecondaryViewOptionFallback(false)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not restore the secondary view-option query");
+    }
+    if (!SetNativeQmlViewLookupFallback(false)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not restore shared QML-view discovery");
+    }
+    if (!SetNativeViewOptionFallback(false)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not restore the view-option query");
+    }
+    if (!SetNativeEditingViewFallback(false)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not restore the editing-view query");
+    }
+    if (!SetNativeEditorStateFallback(false)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not restore the editor-state query");
+    }
+    if (!SetNativeEditorModeFallback(false)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not restore the editor-mode query");
+    }
+    if (!SetNativeRendererAvailabilityBypass(false)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not restore interactive-renderer availability");
+    }
+    if (!SetNativeSelectedNodeRedrawBypass(false)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not restore selected-node redraws");
+    }
+    if (!SetNativeModelWindowNotificationBypass(false)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not restore the model-window notification");
+    }
+    if (!SetNativeUiModeQueryBypass(false)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not restore the post-generation UI-mode query");
+    }
+    if (!SetNativeCurrentViewLookupBypass(false)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not restore the optional current-view lookup");
+    }
+    if (!SetNativeGeneratorUiRefreshBypass(false)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not restore the optional generator renderer refresh");
+    }
+    if (!SetNativePrepareUiCallbackBypass(false)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not restore the generator-preparation UI callback");
+    }
+    if (!SetNativeMainWindowUiTailBypass(false)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not restore the post-prune model-update UI tail");
+    }
+    LogCollisionResultState(
+        "native CLI post-prune model regeneration completed",
+        model);
+    return result && postCollisionResult;
+}
+
+void __fastcall HookedNativeExportFinalizeGeometry(void* exportBuilder, bool separate) {
+    if (gNativeCliExportActive.load(std::memory_order_acquire)) {
+        LogCollisionResultState(
+            "native CLI finalize geometry entry",
+            gCollisionModel.load(std::memory_order_acquire));
+    }
+    gOriginalNativeExportFinalizeGeometry(exportBuilder, separate);
+    if (gNativeCliExportActive.load(std::memory_order_acquire)) {
+        LogCollisionResultState(
+            "native CLI finalize geometry exit",
+            gCollisionModel.load(std::memory_order_acquire));
+    }
+}
+
+void __fastcall HookedNativeExportFinalizeDocument(void* exportBuilder) {
+    if (gNativeCliExportActive.load(std::memory_order_acquire)) {
+        LogCollisionResultState(
+            "native CLI finalize document entry",
+            gCollisionModel.load(std::memory_order_acquire));
+    }
+    gOriginalNativeExportFinalizeDocument(exportBuilder);
+    if (gNativeCliExportActive.load(std::memory_order_acquire)) {
+        LogCollisionResultState(
+            "native CLI finalize document exit",
+            gCollisionModel.load(std::memory_order_acquire));
+    }
+}
+
+void __fastcall HookedNativeExportBuild(void* exportBuilder) {
+    if (gNativeCliExportActive.load(std::memory_order_acquire) &&
+        !gSynchronousCollisionCompleted.load(std::memory_order_acquire)) {
+        void* collisionModel = gCollisionModel.load(std::memory_order_acquire);
+        LogCollisionResultState(
+            "native CLI geometry build entry",
+            collisionModel);
+        if (GeneratedCollisionInputCount(collisionModel) <= 0) {
+            AbortExport(
+                kNoGeneratedCollisionInputsExitCode,
+                "native CLI geometry build received no collision inputs");
+        }
+        auto* collisionBytes = static_cast<unsigned char*>(collisionModel);
+        collisionBytes[0x9C68] = 1;
+        *reinterpret_cast<int*>(collisionBytes + 0x9C8C) = 0;
+        *reinterpret_cast<int*>(collisionBytes + 0x9C94) = 0;
+        LogCollisionResultState(
+            "native CLI collision state normalized for full pruning",
+            collisionModel);
+        Log("executing collision core before native CLI geometry build");
+        gCollisionCompute(collisionModel);
+        gCollisionDone(collisionModel);
+        gSynchronousCollisionCompleted.store(true, std::memory_order_release);
+        LogCollisionResultState(
+            "native CLI pre-build collision computation completed",
+            collisionModel);
+    }
+    gOriginalNativeExportBuild(exportBuilder);
 }
 
 [[noreturn]] void AbortExport(DWORD exitCode, const char* reason) {
@@ -1095,6 +2335,518 @@ void LogCollisionResultState(const char* phase, void* model) {
         }
     }
     Log(message);
+}
+
+struct CollisionRecordAggregates {
+    double floats[9]{};
+    std::uint64_t primitiveCount = 0;
+    std::uint64_t flags[9]{};
+};
+
+struct CollisionTreeCounts {
+    std::size_t nodes = 0;
+    std::size_t primaryRecords = 0;
+    std::size_t secondaryRecords = 0;
+    std::size_t primaryPruned = 0;
+    std::size_t secondaryPruned = 0;
+    std::uint64_t primaryHashSum = 0;
+    std::uint64_t secondaryHashSum = 0;
+    std::uint64_t primaryHashXor = 0;
+    std::uint64_t secondaryHashXor = 0;
+    CollisionRecordAggregates primaryAggregates{};
+    CollisionRecordAggregates secondaryAggregates{};
+};
+
+std::uint64_t HashCollisionRecordBytes(const unsigned char* record) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    const auto append = [&hash](const unsigned char* bytes, std::size_t size) {
+        for (std::size_t index = 0; index < size; ++index) {
+            hash ^= bytes[index];
+            hash *= 1099511628211ULL;
+        }
+    };
+    // Skip pointer and padding fields.  These ranges contain only the bounds,
+    // primitive counts, prune weights, and flags used by spatial resolution.
+    append(record, 0x22);
+    append(record + 0x28, 0x01);
+    append(record + 0x40, 0x07);
+    append(record + 0x48, 0x06);
+    return hash;
+}
+
+void CountCollisionRecordVector(
+    const unsigned char* begin,
+    const unsigned char* end,
+    std::size_t& records,
+    std::size_t& pruned,
+    std::uint64_t& hashSum,
+    std::uint64_t& hashXor,
+    CollisionRecordAggregates& aggregates) {
+    constexpr std::size_t kRecordSize = 0x68;
+    if (begin == nullptr || end < begin ||
+        static_cast<std::size_t>(end - begin) % kRecordSize != 0) {
+        return;
+    }
+    const std::size_t count = static_cast<std::size_t>(end - begin) / kRecordSize;
+    if (count > 10000000) {
+        return;
+    }
+    records += count;
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto* record = begin + index * kRecordSize;
+        const std::uint64_t recordHash = HashCollisionRecordBytes(record);
+        hashSum += recordHash;
+        hashXor ^= recordHash;
+        constexpr std::size_t floatOffsets[] = {
+            0x00, 0x04, 0x08, 0x0C, 0x10, 0x14, 0x1C, 0x48, 0x64,
+        };
+        for (std::size_t field = 0; field < std::size(floatOffsets); ++field) {
+            aggregates.floats[field] +=
+                *reinterpret_cast<const float*>(record + floatOffsets[field]);
+        }
+        aggregates.primitiveCount +=
+            *reinterpret_cast<const std::uint32_t*>(record + 0x40);
+        constexpr std::size_t flagOffsets[] = {
+            0x20, 0x21, 0x28, 0x44, 0x45, 0x46, 0x4C, 0x4D, 0x60,
+        };
+        for (std::size_t field = 0; field < std::size(flagOffsets); ++field) {
+            aggregates.flags[field] += record[flagOffsets[field]];
+        }
+        if (record[0x44] != 0) {
+            ++pruned;
+        }
+    }
+}
+
+void LogCollisionTreeSummary(const char* phase, void* model) {
+    if (model == nullptr) {
+        return;
+    }
+    __try {
+        auto* map = static_cast<unsigned char*>(model) + 0x9BC8;
+        auto* header = *reinterpret_cast<unsigned char**>(map);
+        if (header == nullptr) {
+            return;
+        }
+        auto* node = *reinterpret_cast<unsigned char**>(header);
+        CollisionTreeCounts counts{};
+        while (node != header && counts.nodes < 1000000) {
+            ++counts.nodes;
+            auto* primaryBegin = *reinterpret_cast<unsigned char**>(node + 0x48);
+            auto* primaryEnd = *reinterpret_cast<unsigned char**>(node + 0x50);
+            auto* secondaryBegin = *reinterpret_cast<unsigned char**>(node + 0x88);
+            auto* secondaryEnd = *reinterpret_cast<unsigned char**>(node + 0x90);
+            CountCollisionRecordVector(
+                primaryBegin,
+                primaryEnd,
+                counts.primaryRecords,
+                counts.primaryPruned,
+                counts.primaryHashSum,
+                counts.primaryHashXor,
+                counts.primaryAggregates);
+            CountCollisionRecordVector(
+                secondaryBegin,
+                secondaryEnd,
+                counts.secondaryRecords,
+                counts.secondaryPruned,
+                counts.secondaryHashSum,
+                counts.secondaryHashXor,
+                counts.secondaryAggregates);
+
+            auto* right = *reinterpret_cast<unsigned char**>(node + 0x10);
+            if (right[0x19] == 0) {
+                node = right;
+                auto* left = *reinterpret_cast<unsigned char**>(node);
+                while (left[0x19] == 0) {
+                    node = left;
+                    left = *reinterpret_cast<unsigned char**>(node);
+                }
+            } else {
+                auto* parent = *reinterpret_cast<unsigned char**>(node + 0x08);
+                while (parent[0x19] == 0 &&
+                       node == *reinterpret_cast<unsigned char**>(parent + 0x10)) {
+                    node = parent;
+                    parent = *reinterpret_cast<unsigned char**>(parent + 0x08);
+                }
+                node = parent;
+            }
+        }
+        char message[512]{};
+        _snprintf_s(
+            message,
+            sizeof(message),
+            _TRUNCATE,
+            "%s: nodes=%zu primary=%zu pruned=%zu hash=%016llX/%016llX secondary=%zu pruned=%zu hash=%016llX/%016llX map_size=%zu",
+            phase,
+            counts.nodes,
+            counts.primaryRecords,
+            counts.primaryPruned,
+            static_cast<unsigned long long>(counts.primaryHashSum),
+            static_cast<unsigned long long>(counts.primaryHashXor),
+            counts.secondaryRecords,
+            counts.secondaryPruned,
+            static_cast<unsigned long long>(counts.secondaryHashSum),
+            static_cast<unsigned long long>(counts.secondaryHashXor),
+            *reinterpret_cast<std::size_t*>(map + sizeof(void*)));
+        Log(message);
+        const auto logAggregates = [phase](
+            const char* group,
+            const CollisionRecordAggregates& values) {
+            char aggregateMessage[1024]{};
+            _snprintf_s(
+                aggregateMessage,
+                sizeof(aggregateMessage),
+                _TRUNCATE,
+                "%s %s aggregates: f=%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g primitives=%llu flags=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu",
+                phase,
+                group,
+                values.floats[0],
+                values.floats[1],
+                values.floats[2],
+                values.floats[3],
+                values.floats[4],
+                values.floats[5],
+                values.floats[6],
+                values.floats[7],
+                values.floats[8],
+                static_cast<unsigned long long>(values.primitiveCount),
+                static_cast<unsigned long long>(values.flags[0]),
+                static_cast<unsigned long long>(values.flags[1]),
+                static_cast<unsigned long long>(values.flags[2]),
+                static_cast<unsigned long long>(values.flags[3]),
+                static_cast<unsigned long long>(values.flags[4]),
+                static_cast<unsigned long long>(values.flags[5]),
+                static_cast<unsigned long long>(values.flags[6]),
+                static_cast<unsigned long long>(values.flags[7]),
+                static_cast<unsigned long long>(values.flags[8]));
+            Log(aggregateMessage);
+        };
+        logAggregates("primary", counts.primaryAggregates);
+        logAggregates("secondary", counts.secondaryAggregates);
+        auto* modelBytes = static_cast<unsigned char*>(model);
+        const int shadeResolution =
+            *reinterpret_cast<const int*>(modelBytes + 0x9C38);
+        auto* shadeBegin = *reinterpret_cast<const unsigned char**>(modelBytes + 0x9C40);
+        auto* shadeEnd = *reinterpret_cast<const unsigned char**>(modelBytes + 0x9C48);
+        std::ptrdiff_t shadeCount = -1;
+        double shadeSum = 0.0;
+        float shadeMinimum = 0.0f;
+        float shadeMaximum = 0.0f;
+        if (shadeBegin != nullptr && shadeEnd >= shadeBegin &&
+            static_cast<std::size_t>(shadeEnd - shadeBegin) % 0x10 == 0) {
+            shadeCount = (shadeEnd - shadeBegin) / 0x10;
+            if (shadeCount > 0 && shadeCount <= 10000000) {
+                shadeMinimum = *reinterpret_cast<const float*>(shadeBegin + 0x0C);
+                shadeMaximum = shadeMinimum;
+                for (std::ptrdiff_t index = 0; index < shadeCount; ++index) {
+                    const float value = *reinterpret_cast<const float*>(
+                        shadeBegin + index * 0x10 + 0x0C);
+                    shadeSum += value;
+                    if (value < shadeMinimum) {
+                        shadeMinimum = value;
+                    }
+                    if (value > shadeMaximum) {
+                        shadeMaximum = value;
+                    }
+                }
+            }
+        }
+        const auto* shadeBounds = reinterpret_cast<const float*>(modelBytes + 0x5258);
+        char shadeMessage[768]{};
+        _snprintf_s(
+            shadeMessage,
+            sizeof(shadeMessage),
+            _TRUNCATE,
+            "%s shade volume: resolution=%d count=%td sum=%.9g min=%.9g max=%.9g bounds=%.9g,%.9g,%.9g,%.9g,%.9g,%.9g",
+            phase,
+            shadeResolution,
+            shadeCount,
+            shadeSum,
+            shadeMinimum,
+            shadeMaximum,
+            shadeBounds[0],
+            shadeBounds[1],
+            shadeBounds[2],
+            shadeBounds[3],
+            shadeBounds[4],
+            shadeBounds[5]);
+        Log(shadeMessage);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("collision tree inspection raised an exception");
+    }
+}
+
+void LogCollisionSpatialInput(CONTEXT* context) {
+    if (context == nullptr) {
+        return;
+    }
+    __try {
+        auto* model = static_cast<unsigned char*>(
+            gCollisionModel.load(std::memory_order_acquire));
+        auto* frame = reinterpret_cast<unsigned char*>(context->Rbp);
+        auto* begin = *reinterpret_cast<unsigned char**>(frame + 0x10);
+        auto* end = *reinterpret_cast<unsigned char**>(frame + 0x18);
+        std::ptrdiff_t count = -1;
+        if (begin != nullptr && end >= begin &&
+            static_cast<std::size_t>(end - begin) % 0x40 == 0) {
+            count = (end - begin) / 0x40;
+        }
+        void* source = model == nullptr
+            ? nullptr
+            : *reinterpret_cast<void**>(model + 0x50F0);
+        std::uintptr_t vtableRva = 0;
+        std::uintptr_t methodA20Rva = 0;
+        const char* typeName = "<null>";
+        if (source != nullptr) {
+            auto** vtable = *reinterpret_cast<void***>(source);
+            vtableRva = reinterpret_cast<std::uintptr_t>(vtable) - gSpeedTreeBase;
+            methodA20Rva = reinterpret_cast<std::uintptr_t>(vtable[0xA20 / sizeof(void*)]) -
+                gSpeedTreeBase;
+            if (const char* name = ReadSpeedTreeRttiName(source); name != nullptr) {
+                typeName = name;
+            }
+        }
+        char message[512]{};
+        _snprintf_s(
+            message,
+            sizeof(message),
+            _TRUNCATE,
+            "%s: count=%td begin=%p end=%p source=%p type=%s vtable=0x%llX method_A20=0x%llX",
+            gCollisionSpatialInputProbe.label,
+            count,
+            begin,
+            end,
+            source,
+            typeName,
+            static_cast<unsigned long long>(vtableRva),
+            static_cast<unsigned long long>(methodA20Rva));
+        Log(message);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("collision spatial input inspection raised an exception");
+    }
+}
+
+LONG CALLBACK HandleNativeStateProbe(EXCEPTION_POINTERS* information) {
+    if (information == nullptr || information->ExceptionRecord == nullptr ||
+        information->ContextRecord == nullptr) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (information->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+        !gLoggedNativeAccessViolation.exchange(true, std::memory_order_acq_rel)) {
+        const auto address = reinterpret_cast<std::uintptr_t>(
+            information->ExceptionRecord->ExceptionAddress);
+        char message[512]{};
+        _snprintf_s(
+            message,
+            sizeof(message),
+            _TRUNCATE,
+            "native CLI access violation at RVA=0x%llX operation=%llu address=%p rcx=%p rdx=%p r8=%p r9=%p",
+            static_cast<unsigned long long>(address - gSpeedTreeBase),
+            static_cast<unsigned long long>(information->ExceptionRecord->ExceptionInformation[0]),
+            reinterpret_cast<void*>(information->ExceptionRecord->ExceptionInformation[1]),
+            reinterpret_cast<void*>(information->ContextRecord->Rcx),
+            reinterpret_cast<void*>(information->ContextRecord->Rdx),
+            reinterpret_cast<void*>(information->ContextRecord->R8),
+            reinterpret_cast<void*>(information->ContextRecord->R9));
+        Log(message);
+        LogSpeedTreeCallStack("native CLI access violation call stack");
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (information->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    auto* address = static_cast<unsigned char*>(
+        information->ExceptionRecord->ExceptionAddress);
+    auto* collisionTreeTarget = reinterpret_cast<unsigned char*>(
+        gSpeedTreeBase + gCollisionTreeProbe.rva);
+    if (gCollisionTreeProbe.armed && address == collisionTreeTarget) {
+        DWORD oldProtection = 0;
+        if (!VirtualProtect(
+                collisionTreeTarget,
+                1,
+                PAGE_EXECUTE_READWRITE,
+                &oldProtection)) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        *collisionTreeTarget = gCollisionTreeProbe.original;
+        FlushInstructionCache(GetCurrentProcess(), collisionTreeTarget, 1);
+        DWORD ignoredProtection = 0;
+        VirtualProtect(
+            collisionTreeTarget,
+            1,
+            oldProtection,
+            &ignoredProtection);
+        gCollisionTreeProbe.armed = false;
+        LogCollisionTreeSummary(
+            gCollisionTreeProbe.label,
+            gCollisionModel.load(std::memory_order_acquire));
+        information->ContextRecord->Rip =
+            reinterpret_cast<DWORD64>(collisionTreeTarget);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    auto* collisionSpatialInputTarget = reinterpret_cast<unsigned char*>(
+        gSpeedTreeBase + gCollisionSpatialInputProbe.rva);
+    if (gCollisionSpatialInputProbe.armed && address == collisionSpatialInputTarget) {
+        DWORD oldProtection = 0;
+        if (!VirtualProtect(
+                collisionSpatialInputTarget,
+                1,
+                PAGE_EXECUTE_READWRITE,
+                &oldProtection)) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        *collisionSpatialInputTarget = gCollisionSpatialInputProbe.original;
+        FlushInstructionCache(GetCurrentProcess(), collisionSpatialInputTarget, 1);
+        DWORD ignoredProtection = 0;
+        VirtualProtect(
+            collisionSpatialInputTarget,
+            1,
+            oldProtection,
+            &ignoredProtection);
+        gCollisionSpatialInputProbe.armed = false;
+        LogCollisionSpatialInput(information->ContextRecord);
+        information->ContextRecord->Rip =
+            reinterpret_cast<DWORD64>(collisionSpatialInputTarget);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    for (auto& probe : gNativeStateProbes) {
+        auto* target = reinterpret_cast<unsigned char*>(gSpeedTreeBase + probe.rva);
+        if (!probe.armed || address != target) {
+            continue;
+        }
+        DWORD oldProtection = 0;
+        if (!VirtualProtect(target, 1, PAGE_EXECUTE_READWRITE, &oldProtection)) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        *target = probe.original;
+        FlushInstructionCache(GetCurrentProcess(), target, 1);
+        DWORD ignoredProtection = 0;
+        VirtualProtect(target, 1, oldProtection, &ignoredProtection);
+        probe.armed = false;
+        LogCollisionResultState(
+            probe.label,
+            gCollisionModel.load(std::memory_order_acquire));
+        information->ContextRecord->Rip = reinterpret_cast<DWORD64>(target);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+bool EnsureNativeStateProbeHandler() {
+    if (gNativeStateProbeHandler != nullptr) {
+        return true;
+    }
+    gNativeStateProbeHandler = AddVectoredExceptionHandler(1, HandleNativeStateProbe);
+    if (gNativeStateProbeHandler == nullptr) {
+        Log("native exporter state probes could not install their exception handler");
+        return false;
+    }
+    return true;
+}
+
+bool InstallCollisionTreeProbe() {
+    if (!EnsureNativeStateProbeHandler()) {
+        return false;
+    }
+    auto* target = reinterpret_cast<unsigned char*>(
+        gSpeedTreeBase + gCollisionTreeProbe.rva);
+    gCollisionTreeProbe.original = *target;
+    DWORD oldProtection = 0;
+    if (!VirtualProtect(target, 1, PAGE_EXECUTE_READWRITE, &oldProtection)) {
+        Log("collision tree probe could not change page protection");
+        return false;
+    }
+    *target = 0xCC;
+    FlushInstructionCache(GetCurrentProcess(), target, 1);
+    DWORD ignoredProtection = 0;
+    VirtualProtect(target, 1, oldProtection, &ignoredProtection);
+    gCollisionTreeProbe.armed = true;
+    auto* spatialInputTarget = reinterpret_cast<unsigned char*>(
+        gSpeedTreeBase + gCollisionSpatialInputProbe.rva);
+    gCollisionSpatialInputProbe.original = *spatialInputTarget;
+    if (!VirtualProtect(
+            spatialInputTarget,
+            1,
+            PAGE_EXECUTE_READWRITE,
+            &oldProtection)) {
+        Log("collision spatial input probe could not change page protection");
+        return false;
+    }
+    *spatialInputTarget = 0xCC;
+    FlushInstructionCache(GetCurrentProcess(), spatialInputTarget, 1);
+    VirtualProtect(spatialInputTarget, 1, oldProtection, &ignoredProtection);
+    gCollisionSpatialInputProbe.armed = true;
+    return true;
+}
+
+bool InstallNativeStateProbes() {
+    if (!EnsureNativeStateProbeHandler()) {
+        return false;
+    }
+    for (auto& probe : gNativeStateProbes) {
+        auto* target = reinterpret_cast<unsigned char*>(gSpeedTreeBase + probe.rva);
+        if (*target != 0xE8) {
+            Log("native exporter state probe rejected a non-call instruction");
+            return false;
+        }
+        probe.original = *target;
+        DWORD oldProtection = 0;
+        if (!VirtualProtect(target, 1, PAGE_EXECUTE_READWRITE, &oldProtection)) {
+            Log("native exporter state probe could not change page protection");
+            return false;
+        }
+        *target = 0xCC;
+        FlushInstructionCache(GetCurrentProcess(), target, 1);
+        DWORD ignoredProtection = 0;
+        VirtualProtect(target, 1, oldProtection, &ignoredProtection);
+        probe.armed = true;
+    }
+    return true;
+}
+
+void RemoveNativeStateProbes() {
+    for (auto& probe : gNativeStateProbes) {
+        if (!probe.armed) {
+            continue;
+        }
+        auto* target = reinterpret_cast<unsigned char*>(gSpeedTreeBase + probe.rva);
+        DWORD oldProtection = 0;
+        if (VirtualProtect(target, 1, PAGE_EXECUTE_READWRITE, &oldProtection)) {
+            *target = probe.original;
+            FlushInstructionCache(GetCurrentProcess(), target, 1);
+            DWORD ignoredProtection = 0;
+            VirtualProtect(target, 1, oldProtection, &ignoredProtection);
+        }
+        probe.armed = false;
+    }
+    if (gCollisionTreeProbe.armed) {
+        auto* target = reinterpret_cast<unsigned char*>(
+            gSpeedTreeBase + gCollisionTreeProbe.rva);
+        DWORD oldProtection = 0;
+        if (VirtualProtect(target, 1, PAGE_EXECUTE_READWRITE, &oldProtection)) {
+            *target = gCollisionTreeProbe.original;
+            FlushInstructionCache(GetCurrentProcess(), target, 1);
+            DWORD ignoredProtection = 0;
+            VirtualProtect(target, 1, oldProtection, &ignoredProtection);
+        }
+        gCollisionTreeProbe.armed = false;
+    }
+    if (gCollisionSpatialInputProbe.armed) {
+        auto* target = reinterpret_cast<unsigned char*>(
+            gSpeedTreeBase + gCollisionSpatialInputProbe.rva);
+        DWORD oldProtection = 0;
+        if (VirtualProtect(target, 1, PAGE_EXECUTE_READWRITE, &oldProtection)) {
+            *target = gCollisionSpatialInputProbe.original;
+            FlushInstructionCache(GetCurrentProcess(), target, 1);
+            DWORD ignoredProtection = 0;
+            VirtualProtect(target, 1, oldProtection, &ignoredProtection);
+        }
+        gCollisionSpatialInputProbe.armed = false;
+    }
+    if (gNativeStateProbeHandler != nullptr) {
+        RemoveVectoredExceptionHandler(gNativeStateProbeHandler);
+        gNativeStateProbeHandler = nullptr;
+    }
 }
 
 std::string WideToUtf8(const wchar_t* text) {
@@ -1827,8 +3579,53 @@ DWORD WINAPI RunSessionGuiDriver(void*) {
     return kHookRuntimeFailureExitCode;
 }
 
+std::string WidePathToUtf8(const wchar_t* value) {
+    const int required = WideCharToMultiByte(
+        CP_UTF8, 0, value, -1, nullptr, 0, nullptr, nullptr);
+    if (required <= 1) {
+        return {};
+    }
+    std::string result(static_cast<std::size_t>(required), '\0');
+    WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        value,
+        -1,
+        result.data(),
+        required,
+        nullptr,
+        nullptr);
+    result.pop_back();
+    return result;
+}
+
+void RunSecondaryNativeExport(void* mainWindow, bool gameExport) {
+    if (gSecondaryExportPath[0] == L'\0') {
+        return;
+    }
+    std::string secondaryOutput = WidePathToUtf8(gSecondaryExportPath);
+    std::string secondaryOptions = WidePathToUtf8(gSecondaryExportOptionsPath);
+    if (secondaryOutput.empty() || secondaryOptions.empty()) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI bundled export paths could not be encoded as UTF-8");
+    }
+    Log("native CLI starting bundled secondary export in the loaded process");
+    gOriginalSpeedTreeExport(
+        mainWindow,
+        &secondaryOutput,
+        &secondaryOptions,
+        gameExport);
+    if (!gSynchronousCollisionCompleted.load(std::memory_order_acquire)) {
+        AbortExport(
+            kNoGeneratedCollisionInputsExitCode,
+            "native CLI bundled secondary export lost collision state");
+    }
+    Log("native CLI bundled secondary export completed");
+}
+
 void __fastcall HookedSpeedTreeExport(void* arg1, void* arg2, void* arg3, bool gameExport) {
-    Log("SpeedTree export intercepted; waiting for post-collision computation");
+    Log("SpeedTree native CLI export intercepted");
     __try {
         const auto* firstText = static_cast<const std::string*>(arg2);
         const auto* secondText = static_cast<const std::string*>(arg3);
@@ -1846,73 +3643,104 @@ void __fastcall HookedSpeedTreeExport(void* arg1, void* arg2, void* arg3, bool g
         Log("native export argument logging failed");
     }
 
-    if (gCollisionThread.load(std::memory_order_acquire) == nullptr) {
-        Log("stock CLI did not start CCollisionThread; forcing the quality-3 compute path");
-        if (!ForcePostCollisionComputation()) {
+    void* collisionModel = FindCollisionModelFromEmbeddedThread();
+    if (collisionModel == nullptr) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI export could not resolve the loaded collision model");
+    }
+    gCollisionModel.store(collisionModel, std::memory_order_release);
+    *reinterpret_cast<int*>(
+        static_cast<unsigned char*>(collisionModel) +
+        kCoreModelCollisionQualityOffset) = 3;
+    static_cast<unsigned char*>(collisionModel)[0x9BDC] = 1;
+    LogCollisionResultState("native CLI collision model before dirty", collisionModel);
+    gMarkCollisionDirty(collisionModel);
+    LogCollisionResultState("native CLI collision model after dirty", collisionModel);
+    gSynchronousCollisionCompleted.store(false, std::memory_order_release);
+    gCollisionStartCount.store(0, std::memory_order_release);
+    gNativeMainWindow.store(static_cast<unsigned char*>(arg1), std::memory_order_release);
+    gNativeCliExportActive.store(true, std::memory_order_release);
+    if (!SetNativeOnIdleNoop(true)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not disable MainWindow::OnIdle during export");
+    }
+    if (!SetNativeDeferredUiUpdateNoop(true)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not disable deferred UI updates during export");
+    }
+    __try {
+        auto* mainWindow = static_cast<unsigned char*>(arg1);
+        if (mainWindow[0x615] == 0) {
             AbortExport(
                 kHookRuntimeFailureExitCode,
-                "export aborted: SpeedTree collision compute path could not be invoked");
+                "native CLI model finalization requires the Modeler CLI mode flag");
         }
-    }
+        void* treeDocument = *reinterpret_cast<void**>(mainWindow + 0x418);
+        if (treeDocument == nullptr ||
+            static_cast<unsigned char*>(treeDocument) + kTreeWindowModelOffset !=
+                collisionModel) {
+            AbortExport(
+                kHookRuntimeFailureExitCode,
+                "native CLI exporter document does not own the collision model");
+        }
 
-    if (gSynchronousCollisionCompleted.load(std::memory_order_acquire)) {
-        Log("synchronous post-collision computation completed; continuing original export");
-        gOriginalSpeedTreeExport(arg1, arg2, arg3, gameExport);
-        Log("original export returned");
-        return;
-    }
+        const auto prepareTreeDocument = reinterpret_cast<TreeDocumentPrepareFn>(
+            gSpeedTreeBase + kTreeDocumentPrepareRva);
+        const auto stageTreeDocumentModel = reinterpret_cast<TreeDocumentModelStageFn>(
+            gSpeedTreeBase + kTreeDocumentModelStageRva);
+        prepareTreeDocument(treeDocument);
+        void* modelInterface = static_cast<unsigned char*>(treeDocument) + 0x18;
+        stageTreeDocumentModel(modelInterface);
+        void** modelInterfaceVtable = *reinterpret_cast<void***>(modelInterface);
+        auto finishModelStage = reinterpret_cast<bool(__fastcall*)(void*)>(
+            modelInterfaceVtable[0xD8 / sizeof(void*)]);
+        finishModelStage(modelInterface);
 
-    // The stock CLI calls export immediately after open. Give the normal open path a
-    // short event-pumping window in case thread startup was posted to the main queue.
-    const ULONGLONG discoveryDeadline = GetTickCount64() + 5000;
-    void* collisionThread = gCollisionThread.load(std::memory_order_acquire);
-    while (collisionThread == nullptr && GetTickCount64() < discoveryDeadline) {
-        PumpMainThreadEvents();
-        Sleep(10);
-        collisionThread = gCollisionThread.load(std::memory_order_acquire);
-    }
-    if (collisionThread == nullptr) {
+        void* controller = mainWindow + 0x28;
+        void** controllerVtable = *reinterpret_cast<void***>(controller);
+        auto updateModel = reinterpret_cast<bool(__fastcall*)(void*, bool)>(
+            controllerVtable[0x558 / sizeof(void*)]);
+        bool handled = updateModel(controller, false);
+        if (!handled) {
+            handled = updateModel(controller, true);
+        }
+        if (!handled) {
+            auto finishCliModel = reinterpret_cast<void(__fastcall*)(void*)>(
+                controllerVtable[0xD0 / sizeof(void*)]);
+            Log("native CLI model update requested its CLI-only finalization branch");
+            finishCliModel(controller);
+        }
+        LogCollisionResultState(
+            "native CLI model finalization completed",
+            collisionModel);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        gNativeCliExportActive.store(false, std::memory_order_release);
         AbortExport(
-            kNoCollisionThreadExitCode,
-            "export aborted: no CCollisionThread was observed; refusing to emit an unculled FBX");
+            kHookRuntimeFailureExitCode,
+            "native CLI model finalization raised an internal exception");
     }
-
-    const ULONGLONG deadline = GetTickCount64() + gTimeoutMs;
-    bool completed = false;
-    while (GetTickCount64() < deadline) {
-        if (gQThreadWait(collisionThread, 50)) {
-            completed = true;
-            break;
-        }
-        PumpMainThreadEvents();
-    }
-    if (!completed) {
-        AbortExport(kCollisionTimeoutExitCode, "export aborted: post-collision computation timed out");
-    }
-
-    if (gQThreadIsRunning(collisionThread)) {
-        AbortExport(kHookRuntimeFailureExitCode, "export aborted: collision thread still reports running after wait");
-    }
-
-    void* collisionModel = gCollisionModel.load(std::memory_order_acquire);
-    LogCollisionResultState("after worker wait", collisionModel);
-
-    // CCollisionThread::Done is delivered back to the GUI/main thread. Pump queued
-    // delivery before the exporter reads the model state.
-    for (int pass = 0; pass < 20; ++pass) {
-        PumpMainThreadEvents();
-        Sleep(10);
-    }
-    LogCollisionResultState("after queued Done pump", collisionModel);
-    if (PendingCollisionResultCount(collisionModel) > 0) {
-        Log("queued Done was not delivered; invoking collision finalization on the main thread");
-        gCollisionDone(collisionModel);
-        LogCollisionResultState("after direct Done", collisionModel);
-    }
-
-    Log("post-collision computation completed; continuing original export");
     gOriginalSpeedTreeExport(arg1, arg2, arg3, gameExport);
-    Log("original export returned");
+    RunSecondaryNativeExport(arg1, gameExport);
+    if (!SetNativeDeferredUiUpdateNoop(false)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not restore deferred UI updates after export");
+    }
+    if (!SetNativeOnIdleNoop(false)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "native CLI could not restore MainWindow::OnIdle after export");
+    }
+    gNativeCliExportActive.store(false, std::memory_order_release);
+    if (!gSynchronousCollisionCompleted.load(std::memory_order_acquire)) {
+        AbortExport(
+            kNoGeneratedCollisionInputsExitCode,
+            "native CLI exporter never produced collision inputs before serialization");
+    }
+    Log("native CLI post-collision export completed");
 }
 
 template <typename FunctionType>
@@ -1926,6 +3754,14 @@ bool ReadConfiguration() {
         L"SPEEDTREE_COLLISION_CLI_LOG",
         gLogPath,
         static_cast<DWORD>(std::size(gLogPath)));
+    GetEnvironmentVariableW(
+        L"SPEEDTREE_COLLISION_CLI_SECONDARY_OUTPUT",
+        gSecondaryExportPath,
+        static_cast<DWORD>(std::size(gSecondaryExportPath)));
+    GetEnvironmentVariableW(
+        L"SPEEDTREE_COLLISION_CLI_SECONDARY_OPTIONS",
+        gSecondaryExportOptionsPath,
+        static_cast<DWORD>(std::size(gSecondaryExportOptionsPath)));
 
     wchar_t timeoutText[64]{};
     if (GetEnvironmentVariableW(
@@ -2180,6 +4016,20 @@ bool InstallHooks() {
             RemoveHook(gQThreadStartHook);
             return false;
         }
+        if (!InstallHook(
+                gNativeModelUpdateHook,
+                reinterpret_cast<void*>(gSpeedTreeBase + kNativeModelUpdateRva),
+                HookedNativeModelUpdate,
+                kNativeModelUpdatePrologue,
+                reinterpret_cast<void**>(&gOriginalNativeModelUpdate))) {
+            RemoveHook(gMainWindowOnIdleDrawHook);
+            RemoveHook(gMainWindowOnIdleHook);
+            RemoveHook(gNotifyInternalHook);
+            RemoveHook(gMainWindowConfirmDiscardHook);
+            RemovePersistentSessionHooks();
+            RemoveHook(gQThreadStartHook);
+            return false;
+        }
         Log("GUI bake hooks installed for SpeedTree Modeler 10.1.0 / Qt 6.6.0");
         if (gSessionServerMode) {
             HANDLE driverThread = CreateThread(
@@ -2216,15 +4066,25 @@ bool InstallHooks() {
         }
     } else {
         if (!InstallHook(
+                gNativeModelUpdateHook,
+                reinterpret_cast<void*>(gSpeedTreeBase + kNativeModelUpdateRva),
+                HookedNativeModelUpdate,
+                kNativeModelUpdatePrologue,
+                reinterpret_cast<void**>(&gOriginalNativeModelUpdate))) {
+            RemoveHook(gQThreadStartHook);
+            return false;
+        }
+        if (!InstallHook(
                 gSpeedTreeExportHook,
                 gNativeSpeedTreeExport,
                 HookedSpeedTreeExport,
                 kSpeedTreeExportPrologue,
                 reinterpret_cast<void**>(&gOriginalSpeedTreeExport))) {
+            RemoveHook(gNativeModelUpdateHook);
             RemoveHook(gQThreadStartHook);
             return false;
         }
-        Log("legacy CLI hooks installed for SpeedTree Modeler 10.1.0 / Qt 6.6.0");
+        Log("native CLI collision hooks installed for SpeedTree Modeler 10.1.0");
     }
     return true;
 }
@@ -2244,6 +4104,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
         RemoveHook(gMainWindowOnIdleDrawHook);
         RemoveHook(gMainWindowOnIdleHook);
         RemoveHook(gSpeedTreeExportHook);
+        RemoveHook(gNativeModelUpdateHook);
         RemoveHook(gQThreadStartHook);
     }
     return TRUE;

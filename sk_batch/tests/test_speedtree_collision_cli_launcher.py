@@ -7,31 +7,44 @@ LAUNCHER_SOURCE = REPO / "speedtree_collision_cli" / "launcher.cpp"
 HOOK_SOURCE = REPO / "speedtree_collision_cli" / "hook.cpp"
 INTEGRATED_BAT = REPO / "SpeedTree_Batch_Tools.bat"
 SK_BATCH_BAT = REPO / "sk_batch" / "SK_Batch.bat"
+SK_EXACT_PUSH_BAT = REPO / "sk_batch" / "SK_Exact_Push.bat"
+BUILD_SCRIPT = REPO / "speedtree_collision_cli" / "build.ps1"
 
 
 class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
-    def test_gui_bake_uses_an_active_private_windows_desktop(self):
+    def test_native_cli_is_hidden_and_gui_bake_remains_diagnostic_only(self):
         source = LAUNCHER_SOURCE.read_text(encoding="utf-8")
 
         self.assertIn("CreateDesktopW", source)
         self.assertIn("startup.lpDesktop = isolatedDesktopName.data();", source)
         self.assertIn("startup.wShowWindow = SW_SHOW;", source)
-        self.assertIn("startup.wShowWindow = SW_SHOWNOACTIVATE;", source)
+        self.assertIn("nativeCli ? SW_HIDE : SW_SHOWNOACTIVATE", source)
         self.assertNotIn("startup.wShowWindow = SW_SHOWMINNOACTIVE;", source)
         self.assertIn("STARTF_USESHOWWINDOW", source)
         self.assertNotIn("SetWindowPos", source)
         self.assertIn('value == L"--interactive-window"', source)
+        self.assertIn('value == L"--gui-bake"', source)
+        self.assertIn('L"SPEEDTREE_COLLISION_NATIVE_CLI"', source)
         self.assertIn("if (isolateWindow && persistent)", source)
         self.assertIn("persistent mode is disabled for this export", source)
 
-    def test_batch_launchers_choose_one_shot_for_private_desktop_mode(self):
-        for launcher in (INTEGRATED_BAT, SK_BATCH_BAT):
+    def test_batch_launchers_force_the_headless_native_cli(self):
+        for launcher in (INTEGRATED_BAT, SK_BATCH_BAT, SK_EXACT_PUSH_BAT):
             source = launcher.read_text(encoding="utf-8")
-            self.assertIn(
-                'if /I "%SPEEDTREE_COLLISION_ISOLATED_WINDOW%"=="1"',
-                source,
-            )
+            self.assertIn('set "SPEEDTREE_COLLISION_NATIVE_CLI=1"', source)
             self.assertIn('set "SPEEDTREE_COLLISION_PERSISTENT=0"', source)
+            self.assertNotIn("SPEEDTREE_COLLISION_SESSION_ANCHOR", source)
+            self.assertIn('build.ps1" -IfNeeded', source)
+
+    def test_build_freshness_covers_every_cli_source_input(self):
+        source = BUILD_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("[switch]$IfNeeded", source)
+        self.assertIn('$PSCommandPath,', source)
+        self.assertIn('$hookSource,', source)
+        self.assertIn('$launcherSource,', source)
+        self.assertIn('Join-Path $sourceDirectory "session_protocol.h"', source)
+        self.assertIn("$oldestOutput -ge $latestInput", source)
 
     def test_disappeared_persistent_pipe_starts_a_replacement(self):
         source = LAUNCHER_SOURCE.read_text(encoding="utf-8")
@@ -86,6 +99,17 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         self.assertIn("FileWriteTime(logPath)", source)
         self.assertIn("kProgressStallExitCode", source)
         self.assertIn("no meaningful CPU, I/O, memory, or hook-log", source)
+
+    def test_native_cli_can_bundle_a_second_export_in_one_process(self):
+        launcher = LAUNCHER_SOURCE.read_text(encoding="utf-8")
+        hook = HOOK_SOURCE.read_text(encoding="utf-8")
+
+        self.assertIn('value == L"--secondary-export-options"', launcher)
+        self.assertIn('value == L"--secondary-export"', launcher)
+        self.assertIn("SPEEDTREE_COLLISION_CLI_SECONDARY_OUTPUT", launcher)
+        self.assertIn("SPEEDTREE_COLLISION_CLI_SECONDARY_OPTIONS", launcher)
+        self.assertIn("RunSecondaryNativeExport", hook)
+        self.assertIn("native CLI bundled secondary export completed", hook)
 
     def test_persistent_session_host_and_busy_pipe_wait_are_available(self):
         source = LAUNCHER_SOURCE.read_text(encoding="utf-8")

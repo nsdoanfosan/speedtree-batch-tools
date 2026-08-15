@@ -146,7 +146,6 @@ from artifact_content_key import (
 )
 from artifact_retention import (
     estimate_output_reservation_bytes,
-    managed_output_reservation,
 )
 
 from sk_common import (
@@ -15710,15 +15709,12 @@ class App:
             cluster_blend_backup = (
                 LOG_DIR / f"{spm.stem}_pre_repair_{stamp}.blend"
             )
-            with managed_output_reservation(
-                cluster_blend_backup,
-                estimate_output_reservation_bytes(
-                    blend,
-                    minimum_bytes=blend.stat().st_size,
-                    multiplier=1,
-                ),
-            ):
-                shutil.copy2(blend, cluster_blend_backup)
+            # Startup retention already cleaned the managed roots.  A repair
+            # item must not re-scan every managed artifact while holding the
+            # global retention mutex just to make its transaction backup.
+            # That old hot-path reservation serialized otherwise independent
+            # Blender workers and could fail an item after a 120-second wait.
+            shutil.copy2(blend, cluster_blend_backup)
 
         def restore_cluster_repair_outputs():
             # This backup belongs only to the raw BWR producer transaction.

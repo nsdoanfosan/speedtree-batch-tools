@@ -9,25 +9,15 @@ set "COLLISION_CLI=%COLLISION_DIR%\bin\speedtree_collision_cli.exe"
 set "COLLISION_HOOK=%COLLISION_DIR%\bin\speedtree_collision_hook.dll"
 set "SPEEDTREE_BATCH_LAUNCH_SOURCE=bat:SpeedTree_Batch_Tools.bat"
 
-if exist "%COLLISION_CLI%" if exist "%COLLISION_HOOK%" goto collision_ready
-echo [INFO] Building the SpeedTree post-collision CLI...
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%COLLISION_DIR%\build.ps1"
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%COLLISION_DIR%\build.ps1" -IfNeeded
 if errorlevel 1 goto collision_build_failed
 
 :collision_ready
 "%COLLISION_CLI%" --diagnose >nul
 if errorlevel 1 goto collision_diagnose_failed
 set "SPEEDTREE_COLLISION_CLI_EXE=%COLLISION_CLI%"
-if not defined SPEEDTREE_COLLISION_ISOLATED_WINDOW set "SPEEDTREE_COLLISION_ISOLATED_WINDOW=1"
-if /I "%SPEEDTREE_COLLISION_ISOLATED_WINDOW%"=="1" (
-    set "SPEEDTREE_COLLISION_PERSISTENT=0"
-) else if not defined SPEEDTREE_COLLISION_PERSISTENT (
-    set "SPEEDTREE_COLLISION_PERSISTENT=1"
-)
-if "%SPEEDTREE_COLLISION_PERSISTENT%"=="1" (
-    if not defined SPEEDTREE_COLLISION_SESSION_ANCHOR set "SPEEDTREE_COLLISION_SESSION_ANCHOR=%USERPROFILE%\Downloads\blank.spm"
-    if not exist "%SPEEDTREE_COLLISION_SESSION_ANCHOR%" goto collision_anchor_missing
-)
+set "SPEEDTREE_COLLISION_NATIVE_CLI=1"
+set "SPEEDTREE_COLLISION_PERSISTENT=0"
 
 where.exe pythonw >nul 2>&1
 if errorlevel 1 goto python_missing
@@ -69,10 +59,6 @@ goto show_error
 
 :collision_diagnose_failed
 echo [ERROR] The installed SpeedTree version is not supported by the collision CLI.
-goto show_error
-
-:collision_anchor_missing
-echo [ERROR] Persistent SpeedTree anchor was not found: "%SPEEDTREE_COLLISION_SESSION_ANCHOR%"
 goto show_error
 
 :show_error
