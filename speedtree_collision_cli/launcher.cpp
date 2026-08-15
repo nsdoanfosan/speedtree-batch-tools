@@ -24,6 +24,9 @@
 
 namespace {
 
+constexpr wchar_t kCapabilityContract[] =
+    L"SPEEDTREE_COLLISION_CLI_CONTRACT=native-bundle-verification-v1";
+
 constexpr wchar_t kDefaultModelerPath[] =
     L"C:\\Program Files\\SpeedTree\\SpeedTree Modeler v10.1.0\\win64\\SpeedTree_Modeler.exe";
 constexpr wchar_t kExpectedModelerSha256[] =
@@ -695,6 +698,7 @@ int wmain(int argc, wchar_t** argv) {
         }
         if (diagnose) {
             std::wcout << L"Supported installation verified.\n";
+            std::wcout << kCapabilityContract << L"\n";
             return 0;
         }
         if (pingSession) {

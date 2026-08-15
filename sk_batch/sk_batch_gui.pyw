@@ -12513,7 +12513,26 @@ class App:
         # export cache fingerprints are intentionally path-sensitive. Using
         # the configured source checkout here caused one official-Modeler FBX
         # export, followed by a second collision-CLI FBX/XML export in BWR.
-        addon_dir = Path(ADDON_ENTRY_DIR).absolute()
+        installed_addon_dir = Path(ADDON_ENTRY_DIR).absolute()
+        try:
+            configured_addon_dir = configured_fbx_ini.parents[2]
+        except IndexError:
+            configured_addon_dir = None
+        # Production always prefers the exact Blender junction entry. CI and
+        # portable development have no Blender install; only there, use the
+        # explicitly configured add-on checkout that owns the supplied preset.
+        addon_dir = next(
+            (
+                candidate
+                for candidate in (
+                    installed_addon_dir,
+                    configured_addon_dir,
+                )
+                if candidate is not None
+                and (candidate / "speedtree_cli.py").is_file()
+            ),
+            installed_addon_dir,
+        )
         speedtree_cli = addon_dir / "speedtree_cli.py"
         preset_dir = addon_dir / "presets" / "speedtree_10_1"
         fbx_ini = preset_dir / configured_fbx_ini.name

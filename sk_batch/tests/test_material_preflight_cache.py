@@ -320,6 +320,10 @@ class MaterialPreflightCacheTests(unittest.TestCase):
             }
             with mock.patch.object(
                 gui,
+                "ADDON_ENTRY_DIR",
+                root / "missing-installed-addon",
+            ), mock.patch.object(
+                gui,
                 "load_material_preflight_cache",
                 return_value=cached,
             ) as load:
@@ -406,6 +410,10 @@ class MaterialPreflightCacheTests(unittest.TestCase):
             })
             app._run_limited = mock.Mock(return_value=(0, root / "run.log"))
             with mock.patch.object(
+                gui,
+                "ADDON_ENTRY_DIR",
+                root / "missing-installed-addon",
+            ), mock.patch.object(
                 gui,
                 "load_material_preflight_cache",
                 side_effect=AssertionError("force must bypass cache lookup"),

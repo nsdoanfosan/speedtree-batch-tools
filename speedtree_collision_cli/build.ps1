@@ -30,6 +30,7 @@ $hookOutput = Join-Path $outputDirectory "speedtree_collision_hook.dll"
 $launcherOutput = Join-Path $outputDirectory "speedtree_collision_cli.exe"
 $hookObject = Join-Path $outputDirectory "hook.obj"
 $launcherObject = Join-Path $outputDirectory "launcher.obj"
+$capabilityContract = "SPEEDTREE_COLLISION_CLI_CONTRACT=native-bundle-verification-v1"
 
 if ($IfNeeded -and
     (Test-Path -LiteralPath $hookOutput -PathType Leaf) -and
@@ -48,8 +49,12 @@ if ($IfNeeded -and
     } | Measure-Object -Minimum).Minimum
 
     if ($oldestOutput -ge $latestInput) {
-        Write-Host "SpeedTree collision CLI is up to date."
-        return
+        $diagnoseOutput = @(& $launcherOutput --diagnose 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $diagnoseOutput -contains $capabilityContract) {
+            Write-Host "SpeedTree collision CLI is up to date."
+            return
+        }
+        Write-Host "SpeedTree collision CLI capability contract is stale; rebuilding."
     }
 }
 
