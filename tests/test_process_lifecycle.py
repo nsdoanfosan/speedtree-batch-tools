@@ -23,6 +23,8 @@ import process_lifecycle
 from process_lifecycle import (
     ProcessLifecycleError,
     WINDOWS_CREATE_BREAKAWAY_FROM_JOB,
+    WINDOWS_CREATE_NO_WINDOW,
+    WINDOWS_CREATE_SUSPENDED,
     _process_start_identity,
     external_handoff_popen,
     owned_popen,
@@ -452,6 +454,27 @@ class ProcessLifecycleWindowsTests(unittest.TestCase):
             )
         finally:
             job.close()
+
+    def test_owned_windows_launches_are_hidden_by_default(self):
+        self.assertEqual(
+            process_lifecycle._WindowsJob.creationflags(),
+            WINDOWS_CREATE_SUSPENDED | WINDOWS_CREATE_NO_WINDOW,
+        )
+        requested = 0x00000200  # CREATE_NEW_PROCESS_GROUP
+        self.assertEqual(
+            process_lifecycle._WindowsJob.creationflags(requested),
+            requested | WINDOWS_CREATE_SUSPENDED | WINDOWS_CREATE_NO_WINDOW,
+        )
+
+    def test_owned_windows_launches_forbid_visible_or_detached_consoles(self):
+        for requested in (0x00000008, 0x00000010):
+            with self.subTest(requested=requested):
+                with self.assertRaises(ProcessLifecycleError) as raised:
+                    process_lifecycle._WindowsJob.creationflags(requested)
+                self.assertEqual(
+                    raised.exception.reason_token,
+                    "process_console_window_forbidden",
+                )
 
     def test_windows_7_nested_job_contract_fails_before_job_creation(self):
         unsupported = mock.Mock(major=6, minor=1)

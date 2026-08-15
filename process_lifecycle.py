@@ -28,6 +28,9 @@ from typing import Iterable
 
 
 WINDOWS_CREATE_SUSPENDED = 0x00000004
+WINDOWS_DETACHED_PROCESS = 0x00000008
+WINDOWS_CREATE_NEW_CONSOLE = 0x00000010
+WINDOWS_CREATE_NO_WINDOW = 0x08000000
 WINDOWS_CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 DEFAULT_GRACE_SECONDS = 1.0
 DEFAULT_KILL_GRACE_SECONDS = 3.0
@@ -212,9 +215,18 @@ class _WindowsJob:
 
     @staticmethod
     def creationflags(requested_flags=0):
-        if int(requested_flags) & WINDOWS_CREATE_BREAKAWAY_FROM_JOB:
+        requested_flags = int(requested_flags)
+        if requested_flags & WINDOWS_CREATE_BREAKAWAY_FROM_JOB:
             raise ProcessLifecycleError("process_job_breakaway_forbidden")
-        return int(requested_flags) | WINDOWS_CREATE_SUSPENDED
+        if requested_flags & (
+            WINDOWS_DETACHED_PROCESS | WINDOWS_CREATE_NEW_CONSOLE
+        ):
+            raise ProcessLifecycleError("process_console_window_forbidden")
+        return (
+            requested_flags
+            | WINDOWS_CREATE_SUSPENDED
+            | WINDOWS_CREATE_NO_WINDOW
+        )
 
     def assign(self, process):
         with self._handle_lock:
@@ -1289,6 +1301,7 @@ __all__ = [
     "DEFAULT_KILL_GRACE_SECONDS",
     "ProcessLifecycleError",
     "ProcessSupervisor",
+    "WINDOWS_CREATE_NO_WINDOW",
     "WINDOWS_CREATE_SUSPENDED",
     "complete_owned_process",
     "external_handoff_popen",
