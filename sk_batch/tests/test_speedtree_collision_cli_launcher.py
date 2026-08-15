@@ -51,7 +51,7 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         launcher = LAUNCHER_SOURCE.read_text(encoding="utf-8")
         contract = (
             "SPEEDTREE_COLLISION_CLI_CONTRACT="
-            "native-bundle-verification-v1"
+            "native-bundle-single-bake-v2"
         )
 
         self.assertIn(contract, launcher)
@@ -124,6 +124,15 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         self.assertIn("SPEEDTREE_COLLISION_CLI_SECONDARY_OPTIONS", launcher)
         self.assertIn("RunSecondaryNativeExport", hook)
         self.assertIn("native CLI bundled secondary export completed", hook)
+        self.assertIn("gSecondaryNativeSerializationActive", hook)
+        self.assertIn(
+            "bundled secondary model update suppressed",
+            hook,
+        )
+        self.assertIn(
+            "bundled secondary collision refresh suppressed",
+            hook,
+        )
 
     def test_verification_exports_skip_only_the_expensive_post_bake(self):
         launcher = LAUNCHER_SOURCE.read_text(encoding="utf-8")

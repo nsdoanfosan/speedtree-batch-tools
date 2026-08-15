@@ -279,6 +279,7 @@ std::atomic<bool> gSynchronousCollisionCompleted{false};
 std::atomic<unsigned int> gCollisionStartCount{0};
 std::atomic<bool> gGuiExportStarted{false};
 std::atomic<bool> gNativeCliExportActive{false};
+std::atomic<bool> gSecondaryNativeSerializationActive{false};
 std::atomic<unsigned char*> gNativeMainWindow{nullptr};
 std::atomic<unsigned int> gGuiModelUpdateCount{0};
 std::atomic<bool> gGuiBakeRequested{false};
@@ -895,6 +896,16 @@ void __fastcall HookedQThreadStart(void* thread, int priority) {
         LogCollisionResultState(
             "collision thread state before start",
             gCollisionModel.load(std::memory_order_acquire));
+        if (gSecondaryNativeSerializationActive.load(std::memory_order_acquire)) {
+            // The primary export already committed the exact quality-3
+            // Collision/Prune result. ExportCommandLineTree schedules another
+            // refresh for the bundled XML serializer even though the loaded
+            // model has not changed. Do not recompute or recommit that model;
+            // let the secondary builder serialize the same frozen geometry.
+            gSynchronousCollisionCompleted.store(true, std::memory_order_release);
+            Log("native CLI bundled secondary collision refresh suppressed; reusing committed model");
+            return;
+        }
         if (gNativeCliExportActive.load(std::memory_order_acquire)) {
             void* collisionModel = nullptr;
             __try {
@@ -1402,6 +1413,14 @@ bool SetNativeDeferredUiUpdateNoop(bool enabled) {
 bool InstallCollisionTreeProbe();
 
 bool __fastcall HookedNativeModelUpdate(void* model, int variation) {
+    if (gSecondaryNativeSerializationActive.load(std::memory_order_acquire)) {
+        // A second exporter preset must not regenerate the unchanged document.
+        // Returning success preserves the primary export's committed pruned
+        // model while still allowing the original serializer/build stages to
+        // run for XML (or another bundled format).
+        Log("native CLI bundled secondary model update suppressed; reusing committed Collision/Prune result");
+        return true;
+    }
     if (!gNativeCliExportActive.load(std::memory_order_acquire)) {
         if (!gGuiBakeMode) {
             return gOriginalNativeModelUpdate(model, variation);
@@ -3612,11 +3631,13 @@ void RunSecondaryNativeExport(void* mainWindow, bool gameExport) {
             "native CLI bundled export paths could not be encoded as UTF-8");
     }
     Log("native CLI starting bundled secondary export in the loaded process");
+    gSecondaryNativeSerializationActive.store(true, std::memory_order_release);
     gOriginalSpeedTreeExport(
         mainWindow,
         &secondaryOutput,
         &secondaryOptions,
         gameExport);
+    gSecondaryNativeSerializationActive.store(false, std::memory_order_release);
     if (!gVerificationOnly &&
         !gSynchronousCollisionCompleted.load(std::memory_order_acquire)) {
         AbortExport(
