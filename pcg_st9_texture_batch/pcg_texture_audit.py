@@ -27,6 +27,18 @@ from pathlib import Path
 BATCH_TOOLS_DIR = Path(__file__).resolve().parent.parent
 if str(BATCH_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(BATCH_TOOLS_DIR))
+
+# The production worker is launched by file path.  Without these aliases,
+# downstream contract modules importing ``pcg_texture_audit`` create a second
+# module instance beside ``__main__``.  Its report-local digest/receipt caches
+# and persistent-dirty state then never reach this worker's final cache save,
+# so every exact Cluster target repeats the same expensive validation.
+if __name__ == "__main__":
+    sys.modules.setdefault("pcg_texture_audit", sys.modules[__name__])
+    sys.modules.setdefault(
+        "pcg_st9_texture_batch.pcg_texture_audit",
+        sys.modules[__name__],
+    )
 from atlas_manifest_resolver import (
     AtlasManifestResolutionError,
     atlas_manifest_mirror_repair_plan,
@@ -409,6 +421,21 @@ def report_file_sha256_cache():
     return report_cache["file_sha256_memo"]
 
 
+def report_reuses_stable_exact_evidence():
+    """Whether one read-only report may reuse its first stable exact read.
+
+    The memo is born with the report and never survives its boundary.  Its
+    first value is still a stat-bracketed full digest; reuse only removes
+    duplicate consumers of those same bytes during one immutable audit pass.
+    Mutation-authority passes keep re-reading every authority boundary.
+    """
+    report_cache = _REPORT_SCAN_CACHE.get()
+    return bool(
+        report_cache is not None
+        and not report_cache.get("mutation_authority")
+    )
+
+
 def _publish_report_session_evidence(report_cache, destination):
     """Export compact exact rows for the immediately following relation pass.
 
@@ -530,16 +557,32 @@ def report_spm_structural_semantic_fingerprint(path, *, raw_sha256=None):
         raw_sha256=current_raw_sha256,
     )
     with _PERSISTENT_CACHE_LOCK:
-        entry = _persistent_spm_analysis().get(path_key)
-        if (
+        persistent = _persistent_spm_analysis()
+        entry = persistent.get(path_key)
+        if not (
             entry
             and entry.get("size") == size
             and entry.get("mtime_ns") == mtime_ns
             and entry.get("content_identity_sha256") == current_raw_sha256
         ):
-            entry["structural_semantic_fingerprint_schema"] = 1
-            entry["structural_semantic_fingerprint"] = result
-            _PERSISTENT_SPM_ANALYSIS_DIRTY = True
+            # Physical normalization validation can be the first consumer of
+            # an SPM in a scoped Cluster audit.  Retain its expensive XML
+            # structural projection even when the broader material analysis
+            # has not populated this path yet; `_spm_analysis` deliberately
+            # treats this partial row as a cold semantic miss and completes it
+            # without losing these exact-content fields.
+            entry = {
+                "size": size,
+                "mtime_ns": mtime_ns,
+                "content_identity_sha256": current_raw_sha256,
+                "content_identity_algorithm": (
+                    SPM_CONTENT_IDENTITY_ALGORITHM
+                ),
+            }
+            persistent[path_key] = entry
+        entry["structural_semantic_fingerprint_schema"] = 1
+        entry["structural_semantic_fingerprint"] = result
+        _PERSISTENT_SPM_ANALYSIS_DIRTY = True
     return result
 
 
@@ -1822,7 +1865,7 @@ def _spm_analysis(path, *, include_decoded_handoff=False):
     if not mutation_authority:
         _SPM_ANALYSIS_CACHE[cache_key] = analysis
     if (size or mtime_ns) and not mutation_authority:
-        persistent[path_key] = {
+        completed_entry = {
             "size": size,
             "mtime_ns": mtime_ns,
             "content_identity_sha256": content_identity_sha256,
@@ -1839,6 +1882,22 @@ def _spm_analysis(path, *, include_decoded_handoff=False):
             "generator_delivery_snapshot_schema": 1,
             "generator_delivery_snapshot": generator_delivery_snapshot,
         }
+        if (
+            disk_entry
+            and disk_entry.get("size") == size
+            and disk_entry.get("mtime_ns") == mtime_ns
+            and disk_entry.get("content_identity_sha256")
+            == content_identity_sha256
+            and disk_entry.get("structural_semantic_fingerprint_schema") == 1
+            and disk_entry.get("structural_semantic_fingerprint")
+        ):
+            completed_entry.update({
+                "structural_semantic_fingerprint_schema": 1,
+                "structural_semantic_fingerprint": disk_entry[
+                    "structural_semantic_fingerprint"
+                ],
+            })
+        persistent[path_key] = completed_entry
         _PERSISTENT_SPM_ANALYSIS_DIRTY = True
     handoff = make_decoded_spm_handoff(
         path, text, size=size, mtime_ns=mtime_ns)
@@ -2739,7 +2798,7 @@ def _atlas_source_pair_key(albedo, alpha):
     )
 
 
-def _existing_atlas_registry(atlas_root, folder):
+def _existing_atlas_registry(atlas_root, folder, target_spms=None):
     """Index live blends, Blender backups, and scoped source manifests.
 
     ``.blend1`` is never considered runnable output, but its base remains
@@ -2783,7 +2842,16 @@ def _existing_atlas_registry(atlas_root, folder):
     # scope identity files remain diagnostic name-reservation evidence only.
     manifest_records = []
     seen_manifests = set()
-    for target in _atlas_manifest_targets(folder):
+    manifest_targets = (
+        _atlas_manifest_targets(folder)
+        if target_spms is None
+        else unique(
+            Path(target)
+            for target in target_spms
+            if target and Path(target).suffix.casefold() == ".spm"
+        )
+    )
+    for target in manifest_targets:
         resolution = _atlas_manifest_resolution(target)
         for selected in resolution["selected"]:
             manifest_path = Path(selected["path"])
@@ -2941,7 +3009,24 @@ def assign_leaf_atlas_bases(sources, folder, atlas_root=None):
     available.  Cluster internals commonly expose only ``Material`` names, so
     those sources receive the asset fallback and a stable per-source index.
     """
-    registry = _existing_atlas_registry(atlas_root, folder)
+    exact_target_spms = unique(
+        [
+            target.get("spm")
+            for source in sources
+            for target in source.get("targets") or []
+            if isinstance(target, dict) and target.get("spm")
+        ]
+        + [
+            source.get("target_spm")
+            for source in sources
+            if source.get("target_spm")
+        ]
+    )
+    registry = _existing_atlas_registry(
+        atlas_root,
+        folder,
+        target_spms=exact_target_spms or None,
+    )
     unavailable = set(registry)
     plans = []
     fallback = []
@@ -3077,6 +3162,11 @@ def _atlas_manifest_resolution(spm):
         resolution = resolve_atlas_manifests(
             target,
             diagnostic_only=diagnostic_only,
+            # Read-only live audits consume only the resolver-selected
+            # operational records.  Enumerating every legacy/scope shadow
+            # diagnostic for every sibling SPM produced thousands of JSON
+            # reads per exact Cluster target without changing that selection.
+            include_shadow_diagnostics=not diagnostic_only,
         )
         if cache is not None:
             cache[cache_key] = resolution
@@ -3677,6 +3767,7 @@ def current_leaf_atlas_inventory(folder, cfg, target_spms):
             registry = _existing_atlas_registry(
                 cfg.get("atlas_root"),
                 folder,
+                target_spms=target_spms,
             )
         return registry
 
@@ -7343,6 +7434,112 @@ def audit_folder(
     return item
 
 
+def audit_cluster_assembly_folder(
+    folder,
+    cfg,
+    *,
+    include_refs=False,
+    target_mesh_names=None,
+    provider_spms=None,
+):
+    """Build only the exact live Assembly contract consumed by SK Batch.
+
+    Material/Atlas generation readiness belongs to the material preflight and
+    Blender repair stages. The SK Batch live gate consumes only the Assembly
+    dependency/handoff contract, so running the full PCG Texture board audit
+    here needlessly rescanned every sibling manifest, source image, and SBS
+    graph for each target.
+    """
+    del cfg, include_refs
+    folder = Path(folder)
+    preferred = preferred_sk_spms(folder)
+    loose = loose_sk_spms(folder)
+    sources = source_spms(folder)
+    chosen = preferred[0] if preferred else (
+        loose[0] if loose else (sources[0] if sources else None)
+    )
+    target_spms = []
+    for mesh_name in target_mesh_names or []:
+        target = (
+            find_sk_spm_for_mesh(folder, mesh_name)
+            or find_source_spm_for_mesh(folder, mesh_name)
+        )
+        if target and target not in target_spms:
+            target_spms.append(target)
+    if not target_spms and chosen:
+        target_spms = [chosen]
+
+    clusters = (
+        [Path(path) for path in provider_spms]
+        if provider_spms is not None
+        else cluster_spms(folder)
+    )
+    dependency_spms, assembly_source_spms = cluster_dependency_spms(
+        target_spms
+    )
+    cluster_usage = cluster_material_usage(dependency_spms, clusters)
+    try:
+        from pcg_cluster_assembly_contract import (
+            build_cluster_assembly_contract,
+        )
+    except ImportError:
+        from .pcg_cluster_assembly_contract import (
+            build_cluster_assembly_contract,
+        )
+    cluster_assembly = build_cluster_assembly_contract(
+        folder,
+        target_spms,
+        clusters,
+        cluster_usage=cluster_usage,
+        assembly_source_spms=assembly_source_spms,
+        atlas_resolution_reader=_atlas_manifest_resolution,
+    )
+    handoff = cluster_assembly.get("handoff") or {}
+    return {
+        "folder": str(folder),
+        "name": folder.name,
+        "source_spms": [str(path) for path in sources],
+        "sk_spms": [str(path) for path in preferred],
+        "loose_sk_spms": [
+            str(path) for path in loose if path not in preferred
+        ],
+        "chosen_spm": str(chosen) if chosen else None,
+        "materials": [],
+        "materials_missing_m_prefix": [],
+        "material_renames_needed": [],
+        "sbs_files": [],
+        "texture_dir": str(folder / "texture"),
+        "texture_dirs": [],
+        "m_graph_names": {},
+        "cluster_items": [],
+        "preserved_cluster_materials": [],
+        "leaf_mesh_sources": [],
+        "leaf_atlas_lineage": {},
+        "leaf_source_provenance": [],
+        "leaf_atlas_inventory": [],
+        "legacy_cluster_states": [],
+        "leaf_mesh_target_spms": [str(path) for path in target_spms],
+        "managed_leaf_outputs": [],
+        "cluster_assembly": cluster_assembly,
+        "cluster_hierarchy": cluster_assembly.get("hierarchy") or {},
+        "cluster_source_rows": [],
+        "assembly_handoff": handoff,
+        "ignored_cluster_spms": [],
+        "source_refs": [],
+        "normal_convention": "unknown",
+        "ao_policy": "not_applicable_in_cluster_assembly_only_audit",
+        "sdf_policy": "not_applicable_in_cluster_assembly_only_audit",
+        "status": (
+            "ready"
+            if handoff.get("status") in {"ready", "pass_through"}
+            else "needs_texture_work"
+        ),
+        "actions": [],
+        "audit_complete": True,
+        "audit_mode": "cluster_assembly_only",
+    }
+
+
 def derive_status_actions(item):
     """item의 필드에서 status/actions를 계산한다.
 
@@ -8274,7 +8471,8 @@ def _audit_report_folders(
 def make_report(
         cfg, targets=None, include_refs=False, pcg_targets=None,
         target_mesh_names=None, progress_callback=None, item_callback=None,
-        cancel_check=None, session_evidence=None, mutation_authority=False):
+        cancel_check=None, session_evidence=None, mutation_authority=False,
+        cluster_assembly_only=False):
     startup_started = time.perf_counter()
     phase_started = startup_started
     startup_phases = []
@@ -8351,7 +8549,11 @@ def make_report(
         with use_blend_source_index(
             blend_source_session, audit_scope=folder
         ):
-            return audit_folder(
+            audit_reader = (
+                audit_cluster_assembly_folder
+                if cluster_assembly_only else audit_folder
+            )
+            return audit_reader(
                 folder, cfg, include_refs=include_refs,
                 target_mesh_names=folder_target_mesh_names(
                     folder, report_target_mesh_names)
@@ -8446,19 +8648,25 @@ def make_report(
         for args in buffered_progress:
             progress_callback(*args)
     sbs_metrics = {"cache_hits": 0, "cache_misses": 0}
-    attach_global_m_graphs(
-        items,
-        cfg,
-        metrics=sbs_metrics,
-        # An explicit target is an exact audit boundary.  Do not recurse the
-        # entire tree merely to resolve SBS graphs for one selected folder;
-        # the selected folder(s) and their already-discovered SBS files are
-        # sufficient for this scoped execution plan.
-        discovery_roots=folders if targets else None,
-    )
+    if not cluster_assembly_only:
+        attach_global_m_graphs(
+            items,
+            cfg,
+            metrics=sbs_metrics,
+            # An explicit target is an exact audit boundary. Do not recurse
+            # the entire tree merely to resolve SBS graphs for one folder.
+            discovery_roots=folders if targets else None,
+        )
+    else:
+        sbs_metrics.update({
+            "status": "skipped_cluster_assembly_only",
+            "directory_count": 0,
+            "file_count": 0,
+        })
     finish_phase("global_sbs_discovery", **sbs_metrics)
-    resolve_shared_atlas_entries(items, cfg)
-    refresh_texture_output_contract_states(items, cfg)
+    if not cluster_assembly_only:
+        resolve_shared_atlas_entries(items, cfg)
+        refresh_texture_output_contract_states(items, cfg)
     finish_phase("primary_postprocess", item_count=len(items))
     target_mesh_map = target_mesh_map_from_pcg_targets(pcg_targets)
     target_source_map = target_mesh_source_map(pcg_targets)
@@ -8621,14 +8829,32 @@ def make_report(
     session_cache_metrics["physical_json_documents_unique_files"] = len(
         report_cache.get("json_documents") or {}
     ) if report_cache is not None else 0
-    total_invocation_guard = startup_total_invocation_guard(
-        session_cache_metrics,
-        audit_scope_count=len(folders),
-        spm_count=int(provider_metrics.get("inventory_file_count", 0)),
+    total_invocation_guard = (
+        {
+            "schema_version": 1,
+            "kind": "pcg_primary_total_invocation_guard",
+            "status": "not_applicable",
+            "audit_scope_count": len(folders),
+            "spm_count": int(
+                provider_metrics.get("inventory_file_count", 0)
+            ),
+            "rules": {},
+            "violations": [],
+        }
+        if cluster_assembly_only
+        else startup_total_invocation_guard(
+            session_cache_metrics,
+            audit_scope_count=len(folders),
+            spm_count=int(provider_metrics.get("inventory_file_count", 0)),
+        )
     )
     report = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "status": report_status,
+        "audit_mode": (
+            "cluster_assembly_only"
+            if cluster_assembly_only else "full_pcg_texture"
+        ),
         "config": cfg,
         "startup_timing": {
             "schema_version": 1,
@@ -8818,7 +9044,17 @@ def main():
             "receipt; used by producer normalization input/output validation"
         ),
     )
+    parser.add_argument(
+        "--cluster-assembly-only",
+        action="store_true",
+        help=(
+            "Build only the exact Cluster Assembly live contract consumed "
+            "by SK Batch; requires --target-mesh"
+        ),
+    )
     args = parser.parse_args()
+    if args.cluster_assembly_only and not args.target_mesh:
+        parser.error("--cluster-assembly-only requires --target-mesh")
     emit_progress_marker(
         CLUSTER_LIVE_AUDIT_START_MARKER,
         target_count=len(args.target or []),
@@ -8884,6 +9120,7 @@ def main():
             pcg_targets=pcg_targets,
             target_mesh_names=args.target_mesh,
             progress_callback=report_progress,
+            cluster_assembly_only=args.cluster_assembly_only,
         )
     except Exception as exc:
         emit_progress_marker(

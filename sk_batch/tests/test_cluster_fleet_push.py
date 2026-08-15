@@ -257,6 +257,7 @@ class ClusterFleetPushTests(unittest.TestCase):
                 command[command.index("--target-mesh") + 1],
                 "SK_tree_Weeping_Willow_01",
             )
+            self.assertIn("--cluster-assembly-only", command)
             self.assertEqual(
                 command[command.index("--json") + 1],
                 str(report.resolve()),

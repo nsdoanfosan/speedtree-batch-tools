@@ -155,6 +155,67 @@ class StartupLatencyReceiptTests(unittest.TestCase):
 
 
 class ContentIdentityCacheTests(unittest.TestCase):
+    def test_read_only_report_hashes_each_exact_artifact_once(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary) / "shared.fbx"
+            artifact.write_bytes(b"shared artifact")
+            token = audit._REPORT_SCAN_CACHE.set(
+                audit._new_report_scan_cache()
+            )
+            try:
+                with mock.patch.object(
+                    assembly,
+                    "file_content_key_snapshot",
+                    wraps=assembly.file_content_key_snapshot,
+                ) as snapshot:
+                    first = assembly.file_fingerprint(artifact)
+                    second = assembly.file_fingerprint(artifact)
+            finally:
+                audit._REPORT_SCAN_CACHE.reset(token)
+
+            self.assertEqual(first, second)
+            self.assertEqual(snapshot.call_count, 1)
+
+    def test_structural_projection_persists_before_full_spm_analysis(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spm = Path(temporary) / "SK_cluster.spm"
+            write_minimal_spm(spm, marker="cluster")
+            semantic = "c" * 64
+            audit._SPM_ANALYSIS_CACHE.clear()
+            old_persistent = audit._PERSISTENT_SPM_ANALYSIS
+            old_dirty = audit._PERSISTENT_SPM_ANALYSIS_DIRTY
+            audit._PERSISTENT_SPM_ANALYSIS = {}
+            audit._PERSISTENT_SPM_ANALYSIS_DIRTY = False
+            try:
+                with mock.patch.object(
+                    audit,
+                    "pipeline_spm_structural_fingerprint",
+                    return_value=semantic,
+                ) as calculate:
+                    first = audit.report_spm_structural_semantic_fingerprint(
+                        spm
+                    )
+                    second = audit.report_spm_structural_semantic_fingerprint(
+                        spm
+                    )
+                self.assertEqual(first, semantic)
+                self.assertEqual(second, semantic)
+                self.assertEqual(calculate.call_count, 1)
+
+                audit._spm_analysis(spm)
+                entry = audit._PERSISTENT_SPM_ANALYSIS[
+                    audit.startup_path_key(spm)
+                ]
+                self.assertEqual(entry["leaf_binding_schema"], 6)
+                self.assertEqual(
+                    entry["structural_semantic_fingerprint"], semantic
+                )
+                self.assertTrue(audit._PERSISTENT_SPM_ANALYSIS_DIRTY)
+            finally:
+                audit._PERSISTENT_SPM_ANALYSIS = old_persistent
+                audit._PERSISTENT_SPM_ANALYSIS_DIRTY = old_dirty
+                audit._SPM_ANALYSIS_CACHE.clear()
+
     def test_mutation_authority_spm_analysis_ignores_memory_and_disk_rows(self):
         with tempfile.TemporaryDirectory() as temporary:
             spm = Path(temporary) / "SK_tree.spm"
@@ -454,6 +515,120 @@ class ContentIdentityCacheTests(unittest.TestCase):
 
 
 class ProviderAndAuditTests(unittest.TestCase):
+    def test_cluster_assembly_only_report_skips_unrelated_board_audits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "Tree"
+            folder = root / "tree_fixture"
+            folder.mkdir(parents=True)
+            target = folder / "SK_tree_fixture_01.spm"
+            write_minimal_spm(target)
+            cfg = {
+                "tree_root": str(root),
+                "atlas_root": str(root / "atlas"),
+                "source_texture_roots": [],
+                "required_export_maps": [],
+            }
+
+            with mock.patch.object(
+                audit,
+                "resolve_leaf_atlas_lineage",
+            ) as leaf_lineage, mock.patch.object(
+                audit,
+                "material_texture_items",
+            ) as texture_items, mock.patch.object(
+                audit,
+                "attach_global_m_graphs",
+            ) as sbs_graphs:
+                report = audit.make_report(
+                    cfg,
+                    targets=[folder],
+                    target_mesh_names=[target.stem],
+                    cluster_assembly_only=True,
+                )
+
+            self.assertEqual(report["status"], "ok")
+            self.assertEqual(report["audit_mode"], "cluster_assembly_only")
+            self.assertEqual(
+                report["items"][0]["audit_mode"],
+                "cluster_assembly_only",
+            )
+            self.assertEqual(
+                report["startup_timing"]["total_invocation_guard"][
+                    "status"
+                ],
+                "not_applicable",
+            )
+            self.assertEqual(
+                report["items"][0]["cluster_assembly"]["handoff"][
+                    "status"
+                ],
+                "pass_through",
+            )
+            leaf_lineage.assert_not_called()
+            texture_items.assert_not_called()
+            sbs_graphs.assert_not_called()
+
+    def test_exact_atlas_registry_resolves_only_requested_targets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "tree"
+            folder.mkdir()
+            requested = folder / "SK_tree_01.spm"
+            sibling = folder / "SK_tree_02.spm"
+            write_minimal_spm(requested, marker="one")
+            write_minimal_spm(sibling, marker="two")
+            resolution = {
+                "target_spm": str(requested.resolve()),
+                "selected": [],
+            }
+
+            with mock.patch.object(
+                audit,
+                "_atlas_manifest_targets",
+            ) as broad_scan, mock.patch.object(
+                audit,
+                "_atlas_manifest_resolution",
+                return_value=resolution,
+            ) as resolve:
+                registry = audit._existing_atlas_registry(
+                    None,
+                    folder,
+                    target_spms=[requested],
+                )
+
+            self.assertEqual(registry, {})
+            broad_scan.assert_not_called()
+            resolve.assert_called_once_with(requested)
+
+    def test_read_only_manifest_resolution_skips_shadow_diagnostics(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "SK_tree.spm"
+            write_minimal_spm(target)
+            expected = {
+                "target_spm": str(target.resolve()),
+                "selected": [],
+            }
+            token = audit._REPORT_SCAN_CACHE.set(
+                audit._new_report_scan_cache()
+            )
+            try:
+                with mock.patch.object(
+                    audit,
+                    "resolve_atlas_manifests",
+                    return_value=expected,
+                ) as resolve:
+                    first = audit._atlas_manifest_resolution(target)
+                    second = audit._atlas_manifest_resolution(target)
+            finally:
+                audit._REPORT_SCAN_CACHE.reset(token)
+
+            self.assertIs(first, expected)
+            self.assertIs(second, expected)
+            resolve.assert_called_once_with(
+                target.resolve(strict=False),
+                diagnostic_only=True,
+                include_shadow_diagnostics=False,
+            )
+
     def test_provider_discovery_is_pair_inventory_cold_and_content_cached_warm(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "Tree"
