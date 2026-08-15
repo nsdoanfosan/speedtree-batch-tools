@@ -533,6 +533,19 @@ def augment_texture_readiness_contract(
         for binding in readiness.get("bindings") or []
     ]
     readiness["bindings"] = bindings
+    warnings = list(readiness.get("warnings") or [])
+    missing = list(readiness.get("missing") or [])
+    readiness["warnings"] = warnings
+    readiness["missing"] = missing
+    if not any(
+        binding.get("status") == "not_managed"
+        for binding in bindings
+    ):
+        # Atlas provenance, SPM texture slots and live Generator delivery are
+        # used only to classify unmanaged declared sources. Managed bindings
+        # already carry the exact texture-set contract consumed by Repair and
+        # Push, so a fleet-wide Atlas audit here cannot change the result.
+        return readiness
     parsed = read_stmat_material_sources(stmat_path)
     parsed_by_index = {
         int(material["material_index"]): material
@@ -583,8 +596,6 @@ def augment_texture_readiness_contract(
         if source_texture_roots is not None
         else PCG_DEFAULT_CONFIG.get("source_texture_roots") or []
     )
-    warnings = list(readiness.get("warnings") or [])
-    missing = list(readiness.get("missing") or [])
     if atlas_manifest_diagnostic is not None:
         readiness["atlas_manifest_diagnostic"] = atlas_manifest_diagnostic
     live_evidence = _capture_live_material_export_evidence(

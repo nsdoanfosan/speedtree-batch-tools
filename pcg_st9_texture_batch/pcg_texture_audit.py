@@ -6508,7 +6508,11 @@ def _atlas_provisional_source_declarations_cached(asset_root_text):
         # This is a read-only provenance lookup. Metadata disagreement may
         # disable mutation authority, but it must not prevent a material
         # preflight or erase disjoint live Provider declarations.
-        resolution = resolve_atlas_manifests(target, diagnostic_only=True)
+        resolution = resolve_atlas_manifests(
+            target,
+            diagnostic_only=True,
+            include_shadow_diagnostics=False,
+        )
         for selected in resolution["selected"]:
             key = os.path.normcase(selected["path"]).casefold()
             if key in seen_manifests:
