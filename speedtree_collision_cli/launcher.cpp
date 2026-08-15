@@ -519,7 +519,11 @@ void PrintUsage() {
         << L"  --ping-session        Check whether the persistent session is ready\n"
         << L"  --shutdown-session    Stop the persistent SpeedTree process and exit\n"
         << L"  --session-anchor <spm>  Blank SPM kept open by the persistent process\n"
-        << L"  --isolated-window     Run Modeler on a private Windows desktop (default)\n"
+        << L"  --native-cli          Force the headless native CLI path (default)\n"
+        << L"  --gui-bake            Use the legacy Modeler bake path for diagnosis\n"
+        << L"  --secondary-export-options <ini>  Native CLI second export preset\n"
+        << L"  --secondary-export <path>  Native CLI second output in the same process\n"
+        << L"  --isolated-window     Legacy GUI bake: use a private Windows desktop\n"
         << L"  --interactive-window  Show Modeler normally for diagnosis\n"
         << L"  --diagnose            Verify installed binary hashes and exit\n\n"
         << L"Example:\n"
@@ -559,10 +563,15 @@ int wmain(int argc, wchar_t** argv) {
         DWORD stallTimeoutMs = kDefaultStallTimeoutMs;
         std::filesystem::path logPath;
         std::filesystem::path sessionAnchor;
+        std::filesystem::path secondaryExportOptions;
+        std::filesystem::path secondaryExportOutput;
         bool diagnose = false;
         bool serveSession = false;
         bool pingSession = false;
         bool shutdownSession = false;
+        bool nativeCli =
+            GetEnvironment(L"SPEEDTREE_COLLISION_NATIVE_CLI") !=
+            std::optional<std::wstring>(L"0");
         bool isolateWindow =
             GetEnvironment(L"SPEEDTREE_COLLISION_ISOLATED_WINDOW") !=
             std::optional<std::wstring>(L"0");
@@ -609,6 +618,15 @@ int wmain(int argc, wchar_t** argv) {
                 pingSession = true;
             } else if (value == L"--shutdown-session") {
                 shutdownSession = true;
+            } else if (value == L"--native-cli") {
+                nativeCli = true;
+            } else if (value == L"--gui-bake") {
+                nativeCli = false;
+            } else if (
+                value == L"--secondary-export-options" && index + 1 < argc) {
+                secondaryExportOptions = argv[++index];
+            } else if (value == L"--secondary-export" && index + 1 < argc) {
+                secondaryExportOutput = argv[++index];
             } else if (value == L"--session-anchor" && index + 1 < argc) {
                 sessionAnchor = argv[++index];
             } else if (value == L"--isolated-window") {
@@ -640,6 +658,22 @@ int wmain(int argc, wchar_t** argv) {
                 modelerArguments.push_back(value);
                 passthrough = true;
             }
+        }
+
+        // Production uses the real Modeler command-line exporter and extends
+        // its model calculation before serialization. It owns no GUI document
+        // session, so the legacy persistent/private-desktop modes do not apply.
+        if (nativeCli) {
+            persistent = false;
+            isolateWindow = false;
+        }
+        if (secondaryExportOptions.empty() != secondaryExportOutput.empty()) {
+            std::wcerr << L"--secondary-export-options and --secondary-export must be provided together.\n";
+            return 2;
+        }
+        if (!secondaryExportOutput.empty() && !nativeCli) {
+            std::wcerr << L"A bundled second export is supported only by native CLI mode.\n";
+            return 2;
         }
 
         if (!VerifySupportedInstallation(modeler, diagnose)) {
@@ -740,9 +774,21 @@ int wmain(int argc, wchar_t** argv) {
             std::wcerr << L"Both a valid -export_options file and an -export output path are required.\n";
             return 2;
         }
+        if (!secondaryExportOptions.empty() &&
+            !std::filesystem::is_regular_file(secondaryExportOptions)) {
+            std::wcerr << L"Secondary export options were not found: "
+                       << secondaryExportOptions << L"\n";
+            return 2;
+        }
         std::optional<std::filesystem::file_time_type> outputWriteTimeBefore;
+        std::optional<std::filesystem::file_time_type> secondaryWriteTimeBefore;
         if (!serveSession && std::filesystem::is_regular_file(outputFbx)) {
             outputWriteTimeBefore = std::filesystem::last_write_time(outputFbx);
+        }
+        if (!secondaryExportOutput.empty() &&
+            std::filesystem::is_regular_file(secondaryExportOutput)) {
+            secondaryWriteTimeBefore =
+                std::filesystem::last_write_time(secondaryExportOutput);
         }
 
         if (logPath.empty()) {
@@ -823,9 +869,16 @@ int wmain(int argc, wchar_t** argv) {
         // opens a known blank SPM at startup and keeps that document as the
         // reusable process anchor.
         std::wstring command = QuoteWindowsArgument(modeler.wstring());
-        const std::filesystem::path startupModel = persistent ? sessionAnchor : inputModel;
-        command.push_back(L' ');
-        command += QuoteWindowsArgument(std::filesystem::absolute(startupModel).wstring());
+        if (nativeCli) {
+            for (const auto& argument : modelerArguments) {
+                command.push_back(L' ');
+                command += QuoteWindowsArgument(argument);
+            }
+        } else {
+            const std::filesystem::path startupModel = persistent ? sessionAnchor : inputModel;
+            command.push_back(L' ');
+            command += QuoteWindowsArgument(std::filesystem::absolute(startupModel).wstring());
+        }
         std::vector<wchar_t> mutableCommand(command.begin(), command.end());
         mutableCommand.push_back(L'\0');
 
@@ -837,13 +890,23 @@ int wmain(int argc, wchar_t** argv) {
             std::to_wstring(timeoutMs));
         const auto restoreGuiBake = SetTemporaryEnvironment(
             L"SPEEDTREE_COLLISION_CLI_GUI_BAKE",
-            L"1");
+            nativeCli ? L"0" : L"1");
         const auto restoreOutput = SetTemporaryEnvironment(
             L"SPEEDTREE_COLLISION_CLI_OUTPUT",
             serveSession ? L"" : std::filesystem::absolute(outputFbx).wstring());
         const auto restoreExportOptions = SetTemporaryEnvironment(
             L"SPEEDTREE_COLLISION_CLI_EXPORT_OPTIONS",
             serveSession ? L"" : std::filesystem::absolute(exportOptions).wstring());
+        const auto restoreSecondaryOutput = SetTemporaryEnvironment(
+            L"SPEEDTREE_COLLISION_CLI_SECONDARY_OUTPUT",
+            secondaryExportOutput.empty()
+                ? L""
+                : std::filesystem::absolute(secondaryExportOutput).wstring());
+        const auto restoreSecondaryOptions = SetTemporaryEnvironment(
+            L"SPEEDTREE_COLLISION_CLI_SECONDARY_OPTIONS",
+            secondaryExportOptions.empty()
+                ? L""
+                : std::filesystem::absolute(secondaryExportOptions).wstring());
         const auto restoreGameExport = SetTemporaryEnvironment(
             L"SPEEDTREE_COLLISION_CLI_GAME_EXPORT",
             gameExport ? L"1" : L"0");
@@ -883,7 +946,7 @@ int wmain(int argc, wchar_t** argv) {
             startup.wShowWindow = SW_SHOW;
             startup.lpDesktop = isolatedDesktopName.data();
         } else {
-            startup.wShowWindow = SW_SHOWNOACTIVATE;
+            startup.wShowWindow = nativeCli ? SW_HIDE : SW_SHOWNOACTIVATE;
         }
         PROCESS_INFORMATION process{};
         RegistryValueRestore showNewOnStartRestore{};
@@ -910,6 +973,8 @@ int wmain(int argc, wchar_t** argv) {
 
         RestoreEnvironment(restoreSessionServer);
         RestoreEnvironment(restoreGameExport);
+        RestoreEnvironment(restoreSecondaryOptions);
+        RestoreEnvironment(restoreSecondaryOutput);
         RestoreEnvironment(restoreExportOptions);
         RestoreEnvironment(restoreOutput);
         RestoreEnvironment(restoreGuiBake);
@@ -1091,6 +1156,18 @@ int wmain(int argc, wchar_t** argv) {
             std::filesystem::last_write_time(outputFbx) == *outputWriteTimeBefore) {
             std::wcerr << L"The requested FBX was not updated; stale output was rejected.\n";
             return 9;
+        }
+        if (!secondaryExportOutput.empty()) {
+            if (!std::filesystem::is_regular_file(secondaryExportOutput)) {
+                std::wcerr << L"SpeedTree exited successfully but the secondary output was not created.\n";
+                return 9;
+            }
+            if (secondaryWriteTimeBefore.has_value() &&
+                std::filesystem::last_write_time(secondaryExportOutput) ==
+                    *secondaryWriteTimeBefore) {
+                std::wcerr << L"The secondary output was not updated; stale output was rejected.\n";
+                return 9;
+            }
         }
 
         std::wcout << L"Post-collision export completed.\n";

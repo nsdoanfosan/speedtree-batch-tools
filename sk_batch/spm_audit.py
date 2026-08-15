@@ -117,6 +117,7 @@ PROBE_CACHE_SUFFIX = ".skbatch_probe_cache.json"
 SPM_PROCESS_LOCK_SUFFIX = ".skbatch_process.lock"
 SPM_MATERIAL_NAME_TRANSFORM_CONTRACT_VERSION = 1
 SPM_VERTEX_RED_TRANSFORM_CONTRACT_VERSION = 1
+SPM_COLLISION_PRUNING_TRANSFORM_CONTRACT_VERSION = 1
 SPEEDTREE_EXPORT_MUTEX_ENV = "SPEEDTREE_EXPORT_MUTEX_NAME"
 SPEEDTREE_EXPORT_MUTEX_DEFAULT = (
     r"Local\PARK.SpeedTree.Modeler.Export.v1.slot0"
@@ -142,6 +143,13 @@ BONE_VALUE_RE = re.compile(
     r"(<Name>Physics:(?:Bone style|Bones)</Name>\s*<Value>)[^<]*(</Value>)",
     re.DOTALL,
 )
+COLLISION_QUALITY_RE = re.compile(
+    r"(<m_eCollisionQuality>)([^<]*)(</m_eCollisionQuality>)"
+)
+SHADE_PRUNING_RE = re.compile(
+    r"(<m_bShadePruning>)([^<]*)(</m_bShadePruning>)"
+)
+GLOBAL_GROWTH_CURVE_RE = re.compile(r"(?P<indent>[ \t]*)<GrowthCurve>")
 
 
 class ManualCalibrationRequired(RuntimeError):
@@ -2373,6 +2381,57 @@ def apply_material_renames(text, renames):
     return MATERIAL_RE.sub(sub, text), applied
 
 
+def normalize_collision_pruning_settings(text):
+    """Force the model-wide Collision High + Shade Pruning authoring contract.
+
+    SpeedTree serializes Collision Off/Low/Medium/High in
+    ``m_eCollisionQuality``; value 3 is On/High. ``m_bShadePruning`` controls
+    the prune pass whose removed branch triangles must survive into FBX.  The
+    tags live in ``Window/Extra`` and are independent of generator settings.
+    """
+    # findall returns the three capture groups. Keep just the authored value.
+    quality_before = [row[1].strip() for row in COLLISION_QUALITY_RE.findall(text)]
+    shade_before = [row[1].strip() for row in SHADE_PRUNING_RE.findall(text)]
+    normalized = COLLISION_QUALITY_RE.sub(r"\g<1>3\g<3>", text)
+    normalized = SHADE_PRUNING_RE.sub(r"\g<1>true\g<3>", normalized)
+    inserted = []
+
+    missing_quality = not quality_before
+    missing_shade = not shade_before
+    if missing_quality or missing_shade:
+        growth = GLOBAL_GROWTH_CURVE_RE.search(normalized)
+        if growth is None:
+            raise ValueError(
+                "SPM has no global GrowthCurve insertion point for collision/pruning settings"
+            )
+        indent = growth.group("indent")
+        lines = []
+        if missing_quality:
+            lines.append(f"{indent}<m_eCollisionQuality>3</m_eCollisionQuality>")
+            inserted.append("m_eCollisionQuality")
+        if missing_shade:
+            lines.append(f"{indent}<m_bShadePruning>true</m_bShadePruning>")
+            inserted.append("m_bShadePruning")
+        normalized = (
+            normalized[: growth.start()]
+            + "\n".join(lines)
+            + "\n"
+            + normalized[growth.start() :]
+        )
+
+    report = {
+        "contract_version": SPM_COLLISION_PRUNING_TRANSFORM_CONTRACT_VERSION,
+        "collision_enabled": True,
+        "collision_quality": 3,
+        "shade_pruning": True,
+        "quality_before": quality_before,
+        "shade_pruning_before": shade_before,
+        "inserted": inserted,
+        "changed": normalized != text,
+    }
+    return normalized, report
+
+
 def target_generators_have_base_links(text, target_indices):
     """Whether selected Branch generators actually produce Branch<-Base nodes.
 
@@ -2512,6 +2571,54 @@ def backup_spm(path):
     backup = backup_dir / f"{Path(path).stem}.skbatch_backup_{ts}.spm"
     shutil.copy2(path, backup)
     return str(backup)
+
+
+def normalize_collision_pruning_file(
+    spm_path,
+    *,
+    dry_run=False,
+    create_backup=True,
+):
+    """Apply only the cheap global collision/pruning transform to one SPM."""
+    candidate = Path(spm_path).expanduser().resolve()
+    with spm_exclusive_lock(candidate):
+        source = read_spm(candidate)
+        normalized, contract = normalize_collision_pruning_settings(source)
+        report = {
+            "spm": str(candidate),
+            "status": "would-normalize" if contract["changed"] else "already-ok",
+            "backup": None,
+            "collision_pruning": contract,
+        }
+        if contract["changed"] and not dry_run:
+            if create_backup:
+                report["backup"] = backup_spm(candidate)
+            write_spm(candidate, normalized)
+            report["status"] = "normalized"
+        return report
+
+
+def recursive_live_spm_paths(root):
+    """Yield authored SPMs while pruning pipeline/history directories."""
+    root = Path(root).expanduser().resolve()
+    for current, directory_names, file_names in os.walk(root):
+        directory_names[:] = [
+            name
+            for name in directory_names
+            if not name.startswith(".")
+            and "backup" not in name.casefold()
+            and name.casefold() != "reports"
+        ]
+        current_path = Path(current)
+        for name in file_names:
+            folded = name.casefold()
+            if not folded.endswith(".spm"):
+                continue
+            if folded.startswith("__spm_sync_preflight_") or folded.startswith(
+                "_codex_probe_"
+            ):
+                continue
+            yield current_path / name
 
 
 def _terminate_speedtree_tree(process):
@@ -4806,6 +4913,12 @@ def _apply_non_bone_transforms_from_receipt(
         final_text, applied = apply_material_renames(final_text, renames)
         report["material_renames"] = applied
 
+    if cfg.get("normalize_collision_pruning", False):
+        final_text, collision_pruning = normalize_collision_pruning_settings(
+            final_text
+        )
+        report["collision_pruning"] = collision_pruning
+
     if apply_tree_red:
         final_text, vertex_report = apply_leaf_parent_red_gradient(final_text)
         report["vertex_colors"] = vertex_report
@@ -4849,6 +4962,9 @@ def _apply_non_bone_transforms_from_receipt(
     report["non_bone_transform_contracts"] = {
         "material_name_version": SPM_MATERIAL_NAME_TRANSFORM_CONTRACT_VERSION,
         "vertex_red_version": SPM_VERTEX_RED_TRANSFORM_CONTRACT_VERSION,
+        "collision_pruning_version": (
+            SPM_COLLISION_PRUNING_TRANSFORM_CONTRACT_VERSION
+        ),
     }
     report["spm_transform_changed"] = changed
     report["status"] = "calibrated" if changed else "already-ok"
@@ -5023,6 +5139,11 @@ def _process_spm_locked(
         report["planned_materials"] = renames
         report["current_generators"] = audit["generators"]
         report["bone_graph"] = audit.get("bone_graph")
+        if cfg.get("normalize_collision_pruning", False):
+            _planned_text, collision_pruning = (
+                normalize_collision_pruning_settings(source_text)
+            )
+            report["collision_pruning"] = collision_pruning
         if cluster_root_mode:
             report["cluster_root_bone_plan"] = plan_cluster_root_bones(
                 source_text
@@ -5160,6 +5281,16 @@ def _process_spm_locked(
                 write_spm(spm_path, text)
                 report["material_renames"] = applied
 
+        collision_pruning_changed = False
+        if cfg.get("normalize_collision_pruning", False):
+            text = read_spm(spm_path)
+            text, collision_pruning = normalize_collision_pruning_settings(text)
+            report["collision_pruning"] = collision_pruning
+            if collision_pruning["changed"]:
+                write_spm(spm_path, text)
+                collision_pruning_changed = True
+                changed = True
+
         vertex_changed = False
         if apply_tree_red:
             text = read_spm(spm_path)
@@ -5204,7 +5335,12 @@ def _process_spm_locked(
 
         report["status"] = (
             "calibrated"
-            if (changed or report["material_renames"] or vertex_changed)
+            if (
+                changed
+                or report["material_renames"]
+                or vertex_changed
+                or collision_pruning_changed
+            )
             else "already-ok"
         )
     except ManualCalibrationRequired as exc:
@@ -5280,8 +5416,19 @@ def _process_spm_locked(
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("spm", nargs="+")
+    parser.add_argument("spm", nargs="*")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--recursive-root",
+        action="append",
+        default=[],
+        help="include every .spm below this root (excluding _spm_backups)",
+    )
+    parser.add_argument(
+        "--normalize-collision-pruning-only",
+        action="store_true",
+        help="only set Collision On/High and Shade Pruning On; do not calibrate bones",
+    )
     parser.add_argument(
         "--force-rerun",
         action="store_true",
@@ -5290,16 +5437,29 @@ def main():
     parser.add_argument("--report")
     args = parser.parse_args()
     cfg = load_config()
+    spm_inputs = [Path(value) for value in args.spm]
+    for root_value in args.recursive_root:
+        spm_inputs.extend(recursive_live_spm_paths(root_value))
+    spm_inputs = list(dict.fromkeys(path.resolve() for path in spm_inputs))
+    if not spm_inputs:
+        parser.error("provide at least one SPM or --recursive-root")
     reports = []
-    for spm in args.spm:
+    for spm in spm_inputs:
         print(f"== {spm}")
         try:
-            rep = process_spm(
-                spm,
-                cfg,
-                dry_run=args.dry_run,
-                force_rerun=args.force_rerun,
-            )
+            if args.normalize_collision_pruning_only:
+                rep = normalize_collision_pruning_file(
+                    spm,
+                    dry_run=args.dry_run,
+                    create_backup=cfg.get("backup_spm", True),
+                )
+            else:
+                rep = process_spm(
+                    spm,
+                    cfg,
+                    dry_run=args.dry_run,
+                    force_rerun=args.force_rerun,
+                )
         except Exception as exc:
             print(f"FAILED: {exc}")
             rep = {"spm": spm, "status": "failed", "error": str(exc)}

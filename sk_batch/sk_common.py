@@ -125,6 +125,10 @@ DEFAULT_CONFIG = {
     # Blender as long pivot bones or hundreds of Start/End pairs.
     "cluster_root_only_bones": True,
     "rename_materials": True,    # checklist item 2: M_ prefix
+    # Global SpeedTree post settings are normalized once at the same cheap,
+    # format-preserving stage as material names.  Quality 3 is Collision On / High;
+    # shade pruning is the branch/leaf removal pass used by the final FBX.
+    "normalize_collision_pruning": True,
     # Direct leaf-parent Branches receive R=0 at the root and R=1 at the tip.
     # This is tree-only and preserves the established G channel contract.
     "tree_leaf_parent_red_gradient": True,
