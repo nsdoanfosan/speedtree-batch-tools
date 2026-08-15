@@ -64,8 +64,23 @@ def _default_addon_dir():
     )
 
 
+def _default_addon_entry_dir():
+    """Preserve Blender's junction path for path-sensitive export receipts."""
+    override = os.environ.get("SPEEDTREE_BWR_ADDON_DIR")
+    if override:
+        return Path(override).expanduser().absolute()
+    installed = discover_installed_addon_source(
+        "speedtree_bone_weight_repair",
+        resolve_junction=False,
+    )
+    if installed is not None:
+        return installed
+    return _default_addon_dir()
+
+
 ADDON_DIR = _default_addon_dir()
-PRESET_DIR = ADDON_DIR / "presets" / "speedtree_10_1"
+ADDON_ENTRY_DIR = _default_addon_entry_dir()
+PRESET_DIR = ADDON_ENTRY_DIR / "presets" / "speedtree_10_1"
 
 CONFIG_PATH = TOOL_DIR / "sk_batch_config.json"
 STATE_PATH = TOOL_DIR / "sk_batch_state.json"
@@ -124,6 +139,10 @@ DEFAULT_CONFIG = {
     # When one authored SPM state needs both XML bone inventory and FBX mesh
     # verification, serialize both before the same hidden Modeler process exits.
     "bundle_bone_verification": True,
+    # Cluster ① writes and verifies the exact durable collision/prune FBX+XML
+    # bundle that linked ② consumes. This replaces a discarded verification
+    # export plus a later production export with one cache-backed invocation.
+    "cluster_production_export_handoff": True,
     # Positive bone receipts are independent of the large GUI state JSON.
     # Keeping them in one ignored tool cache avoids sidecars in asset folders.
     "spm_calibration_receipt_dir": str(TOOL_DIR / "cache" / "spm_calibration"),

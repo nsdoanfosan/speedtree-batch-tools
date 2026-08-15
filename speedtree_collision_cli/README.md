@@ -45,6 +45,12 @@ Blender Bone Weight Repair add-on은 두 산출물이 동시에 stale일 때 이
 경로를 자동 사용합니다. 각 산출물의 content cache는 독립적으로 유지되므로
 한쪽만 stale이면 그 파일만 내보냅니다.
 
+SK Batch의 ① 뼈 검증처럼 임시 FBX/XML에서 뼈와 geometry 존재 여부만
+확인하는 경로는 `--verification-only`를 사용합니다. 이 옵션은 원래 CLI
+직렬화와 한 프로세스 이중 출력은 유지하지만, 최종 자산에서만 필요한
+Collision/Prune 재계산은 수행하지 않습니다. 생산 FBX 내보내기에는 이 옵션을
+사용하지 않으므로 High Collision/Prune 계약에는 영향이 없습니다.
+
 ## SPM 정규화
 
 SK Batch의 `spm_audit.py`는 재질 `M_` 이름 보정과 같은 비-bone 변환 단계에서
@@ -82,6 +88,7 @@ BAT 실행기는 매번 이 빠른 freshness 검사를 거칩니다. 소스 또�
 - `--stall-timeout-ms 30000`: CPU/I/O/메모리/로그가 모두 멈춘 시간 제한
 - `--log D:\path\collision_hook.log`: 상세 로그
 - `--modeler D:\path\SpeedTree_Modeler.exe`: 설치 경로 재정의
+- `--verification-only`: 임시 감사 출력에서 Collision/Prune bake 생략
 - `--gui-bake`: 이전 GUI 기반 구현을 명시적으로 사용하는 진단 전용 옵션
 
 `--persistent`, `--session-anchor`, `--isolated-window`는 이전 GUI 호환 경로에만

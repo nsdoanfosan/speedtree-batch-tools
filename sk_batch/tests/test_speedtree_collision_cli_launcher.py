@@ -111,6 +111,20 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         self.assertIn("RunSecondaryNativeExport", hook)
         self.assertIn("native CLI bundled secondary export completed", hook)
 
+    def test_verification_exports_skip_only_the_expensive_post_bake(self):
+        launcher = LAUNCHER_SOURCE.read_text(encoding="utf-8")
+        hook = HOOK_SOURCE.read_text(encoding="utf-8")
+
+        self.assertIn('value == L"--verification-only"', launcher)
+        self.assertIn("SPEEDTREE_COLLISION_CLI_VERIFICATION_ONLY", launcher)
+        self.assertIn("SPEEDTREE_COLLISION_CLI_VERIFICATION_ONLY", hook)
+        self.assertIn(
+            "native CLI verification-only export skips Collision/Prune bake",
+            hook,
+        )
+        self.assertIn("gOriginalSpeedTreeExport(arg1, arg2, arg3, gameExport);", hook)
+        self.assertIn("RunSecondaryNativeExport(arg1, gameExport);", hook)
+
     def test_persistent_session_host_and_busy_pipe_wait_are_available(self):
         source = LAUNCHER_SOURCE.read_text(encoding="utf-8")
 

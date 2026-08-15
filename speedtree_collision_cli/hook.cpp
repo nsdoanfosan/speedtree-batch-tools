@@ -353,6 +353,7 @@ ULONGLONG gHookStartTick = 0;
 bool gGuiBakeMode = false;
 bool gGuiGameExport = false;
 bool gSessionServerMode = false;
+bool gVerificationOnly = false;
 std::atomic<bool> gSessionJobActive{false};
 std::atomic<bool> gSessionJobComplete{false};
 std::atomic<DWORD> gSessionJobStatus{ERROR_SUCCESS};
@@ -3616,7 +3617,8 @@ void RunSecondaryNativeExport(void* mainWindow, bool gameExport) {
         &secondaryOutput,
         &secondaryOptions,
         gameExport);
-    if (!gSynchronousCollisionCompleted.load(std::memory_order_acquire)) {
+    if (!gVerificationOnly &&
+        !gSynchronousCollisionCompleted.load(std::memory_order_acquire)) {
         AbortExport(
             kNoGeneratedCollisionInputsExitCode,
             "native CLI bundled secondary export lost collision state");
@@ -3641,6 +3643,14 @@ void __fastcall HookedSpeedTreeExport(void* arg1, void* arg2, void* arg3, bool g
         Log(argumentsMessage);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Log("native export argument logging failed");
+    }
+
+    if (gVerificationOnly) {
+        Log("native CLI verification-only export skips Collision/Prune bake");
+        gOriginalSpeedTreeExport(arg1, arg2, arg3, gameExport);
+        RunSecondaryNativeExport(arg1, gameExport);
+        Log("native CLI bundled verification export completed");
+        return;
     }
 
     void* collisionModel = FindCollisionModelFromEmbeddedThread();
@@ -3780,6 +3790,13 @@ bool ReadConfiguration() {
             modeText,
             static_cast<DWORD>(std::size(modeText))) > 0) {
         gGuiBakeMode = std::wcscmp(modeText, L"1") == 0;
+    }
+    wchar_t verificationText[16]{};
+    if (GetEnvironmentVariableW(
+            L"SPEEDTREE_COLLISION_CLI_VERIFICATION_ONLY",
+            verificationText,
+            static_cast<DWORD>(std::size(verificationText))) > 0) {
+        gVerificationOnly = std::wcscmp(verificationText, L"1") == 0;
     }
     wchar_t serverModeText[16]{};
     if (GetEnvironmentVariableW(
