@@ -116,6 +116,14 @@ DEFAULT_CONFIG = {
     "value_floor": 0.02,
     "max_calibration_rounds": 4,
     "probe_cache_enabled": True,
+    # ① SPM bone verification must use the repository's headless native CLI.
+    # The BAT launcher builds/diagnoses it and publishes the exact path through
+    # SPEEDTREE_COLLISION_CLI_EXE.  The old direct Modeler path remains only as
+    # the installed-modeler identity consumed by the wrapper.
+    "require_native_speedtree_cli": True,
+    # When one authored SPM state needs both XML bone inventory and FBX mesh
+    # verification, serialize both before the same hidden Modeler process exits.
+    "bundle_bone_verification": True,
     # Positive bone receipts are independent of the large GUI state JSON.
     # Keeping them in one ignored tool cache avoids sidecars in asset folders.
     "spm_calibration_receipt_dir": str(TOOL_DIR / "cache" / "spm_calibration"),

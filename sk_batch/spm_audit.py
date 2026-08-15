@@ -124,6 +124,12 @@ SPEEDTREE_EXPORT_MUTEX_DEFAULT = (
 )
 SPEEDTREE_EXPORT_ABSOLUTE_MAX_SECONDS = 900.0
 SPEEDTREE_EXPORT_CRASH_RETRIES = 2
+DEFAULT_SPEEDTREE_COLLISION_CLI = (
+    BATCH_TOOLS_DIR
+    / "speedtree_collision_cli"
+    / "bin"
+    / "speedtree_collision_cli.exe"
+)
 SPM_REPLACE_MAX_ATTEMPTS = 9
 SPM_REPLACE_INITIAL_BACKOFF_SECONDS = 0.05
 SPM_REPLACE_MAX_BACKOFF_SECONDS = 1.0
@@ -3908,8 +3914,10 @@ def export_verify_xml(spm_path, cfg, out_path):
         cfg["xml_ini"],
         purpose=f"{Path(spm_path).name} verification XML export",
     )
+    executable, native_cli = _verification_speedtree_executable(cfg)
     cmd = [
-        cfg["speedtree_exe"],
+        str(executable),
+        *(["--native-cli"] if native_cli else []),
         str(spm_path),
         "-export_options",
         cfg["xml_ini"],
@@ -3972,8 +3980,10 @@ def export_verify_fbx_geometry(spm_path, cfg, out_path):
         cfg["fbx_ini"],
         purpose=f"{Path(spm_path).name} verification FBX export",
     )
+    executable, native_cli = _verification_speedtree_executable(cfg)
     cmd = [
-        cfg["speedtree_exe"],
+        str(executable),
+        *(["--native-cli"] if native_cli else []),
         str(spm_path),
         "-export_options",
         cfg["fbx_ini"],
@@ -4032,6 +4042,170 @@ def export_verify_fbx_geometry(spm_path, cfg, out_path):
     # SpeedTree writes binary FBX. A real mesh contains the FBX property name
     # "Vertices" in clear text; armature-only/container-only exports do not.
     return b"Vertices" in path.read_bytes()
+
+
+def _verification_speedtree_executable(cfg, *, require_native=None):
+    """Resolve the headless native CLI used by initial bone verification.
+
+    SK_Batch.bat publishes the freshly diagnosed launcher through the
+    environment.  Older code ignored that value here and called the GUI
+    Modeler from ``speedtree_exe`` directly, which reintroduced recovery
+    Questions and one visible process per verification during stage ①.
+    """
+    if require_native is None:
+        require_native = bool(cfg.get("require_native_speedtree_cli", False))
+    published = os.environ.get("SPEEDTREE_COLLISION_CLI_EXE")
+    configured = cfg.get("speedtree_exe")
+    configured_path = (
+        Path(configured).expanduser()
+        if configured
+        else None
+    )
+    candidates = []
+    if published:
+        candidates.append(Path(published).expanduser())
+    if (
+        configured_path is not None
+        and configured_path.name.casefold() == "speedtree_collision_cli.exe"
+    ):
+        candidates.append(configured_path)
+    candidates.append(DEFAULT_SPEEDTREE_COLLISION_CLI)
+
+    seen = set()
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        key = os.path.normcase(str(candidate))
+        if key in seen:
+            continue
+        seen.add(key)
+        hook = candidate.with_name("speedtree_collision_hook.dll")
+        if candidate.is_file() and hook.is_file():
+            return candidate, True
+
+    if require_native:
+        raise RuntimeError(
+            "SpeedTree native collision CLI is required for stage ① but is "
+            "not built. Run speedtree_collision_cli\\build.ps1 -IfNeeded."
+        )
+    if not configured:
+        raise RuntimeError("SpeedTree executable is not configured")
+    return configured_path, False
+
+
+def _bundled_bone_verification_enabled(cfg):
+    if not cfg.get("bundle_bone_verification", False):
+        return False
+    try:
+        _verification_speedtree_executable(cfg, require_native=True)
+    except RuntimeError:
+        if cfg.get("require_native_speedtree_cli", False):
+            raise
+        return False
+    return True
+
+
+def export_verify_xml_fbx_bundle(spm_path, cfg, xml_out, fbx_out):
+    """Export FBX and XML from one unchanged SPM state in one CLI process."""
+    require_texture_skip_writing(
+        cfg["fbx_ini"],
+        purpose=f"{Path(spm_path).name} bundled verification FBX export",
+    )
+    require_texture_skip_writing(
+        cfg["xml_ini"],
+        purpose=f"{Path(spm_path).name} bundled verification XML export",
+    )
+    executable, _native_cli = _verification_speedtree_executable(
+        cfg,
+        require_native=True,
+    )
+    xml_path = Path(xml_out)
+    fbx_path = Path(fbx_out)
+    xml_path.parent.mkdir(parents=True, exist_ok=True)
+    xml_stage = _attempt_output_path(xml_path, 0)
+    _unlink_with_backoff(
+        xml_path,
+        operation="speedtree_bundle:discard_stale_xml",
+    )
+    _unlink_with_backoff(
+        xml_stage,
+        operation="speedtree_bundle:discard_stale_xml_stage",
+    )
+    cmd = [
+        str(executable),
+        "--native-cli",
+        "--secondary-export-options",
+        str(cfg["xml_ini"]),
+        "--secondary-export",
+        str(xml_stage),
+        str(spm_path),
+        "-export_options",
+        str(cfg["fbx_ini"]),
+        "-export",
+        str(fbx_path),
+    ]
+    timeout = float(cfg.get("spm_verify_timeout", 120))
+    try:
+        try:
+            result = run_speedtree_export(
+                cmd,
+                Path(spm_path).parent,
+                timeout,
+                stream_output=bool(
+                    cfg.get("spm_stream_modeler_output", True)
+                ),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise SpeedTreeExportTimeout(
+                "FBX+XML",
+                timeout,
+                evidence=getattr(exc, "evidence", {}),
+            ) from exc
+        returncode, stdout, stderr = result
+        if returncode != 0 or not fbx_path.exists() or not xml_stage.exists():
+            detail = (stderr or stdout or "").strip()[-500:]
+            evidence = dict(getattr(result, "evidence", {}) or {})
+            evidence.update(
+                {
+                    "stage": "FBX+XML",
+                    "category": (
+                        "access_violation"
+                        if _crashed_with_access_violation(returncode)
+                        else (
+                            "output_missing"
+                            if returncode == 0
+                            else "non_retryable_returncode"
+                        )
+                    ),
+                    "returncode": int(returncode),
+                    "returncode_hex": (
+                        f"0x{(int(returncode) & 0xFFFFFFFF):08X}"
+                    ),
+                    "fbx_output_exists": fbx_path.exists(),
+                    "xml_output_exists": xml_stage.exists(),
+                }
+            )
+            evidence["failure_kind"] = (
+                "process_exporter_crash"
+                if evidence["category"] == "access_violation"
+                else "internal_error"
+            )
+            raise SpeedTreeExportProcessError(
+                "SpeedTree bundled FBX/XML verify export failed "
+                f"({returncode}): {detail}",
+                evidence,
+            )
+        os.replace(xml_stage, xml_path)
+        return {
+            "xml": xml_path,
+            "fbx": fbx_path,
+            "fbx_has_geometry": b"Vertices" in fbx_path.read_bytes(),
+        }
+    finally:
+        if xml_stage.exists():
+            _unlink_with_backoff(
+                xml_stage,
+                operation="speedtree_bundle:discard_xml_stage",
+            )
 
 
 def bone_counts_from_xml(xml_path):
@@ -4110,10 +4284,20 @@ def calibrate_cluster_root_bones(
         xml_out = Path(tmp) / f"{Path(spm_path).stem}_cluster_root.xml"
         fbx_out = Path(tmp) / f"{Path(spm_path).stem}_cluster_root.fbx"
         log(
-            "  [Cluster bones] SpeedTree structural-root XML verification: "
+            "  [Cluster bones] SpeedTree structural-root verification: "
             f"{plan['expected_root_bone_count']} roots"
         )
-        export_verify_xml(spm_path, cfg, xml_out)
+        if _bundled_bone_verification_enabled(cfg):
+            bundle = export_verify_xml_fbx_bundle(
+                spm_path,
+                cfg,
+                xml_out,
+                fbx_out,
+            )
+            fbx_has_geometry = bundle["fbx_has_geometry"]
+        else:
+            export_verify_xml(spm_path, cfg, xml_out)
+            fbx_has_geometry = None
         inventory = cluster_root_bones_from_xml(xml_out)
         if inventory["bone_count"] != plan["expected_root_bone_count"]:
             raise RuntimeError(
@@ -4135,8 +4319,14 @@ def calibrate_cluster_root_bones(
                 f"expected {plan['expected_root_generator_counts']}, "
                 f"exported {inventory['root_generator_counts']}"
             )
-        log("  [Cluster bones] SpeedTree FBX geometry verification")
-        if not export_verify_fbx_geometry(spm_path, cfg, fbx_out):
+        if fbx_has_geometry is None:
+            log("  [Cluster bones] SpeedTree FBX geometry verification")
+            fbx_has_geometry = export_verify_fbx_geometry(
+                spm_path,
+                cfg,
+                fbx_out,
+            )
+        if not fbx_has_geometry:
             raise RuntimeError(
                 "Cluster structural-root bone compaction produced an FBX "
                 "without mesh geometry"
@@ -4450,6 +4640,8 @@ def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=Non
     probe_cache_hit = cached_probe is not None
     with tempfile.TemporaryDirectory(prefix="skbatch_cal_") as tmp:
         xml_out = Path(tmp) / f"{Path(spm_path).stem}_cal.xml"
+        fbx_out = Path(tmp) / f"{Path(spm_path).stem}_geometry_check.fbx"
+        bundle_verification = _bundled_bone_verification_enabled(cfg)
 
         # -- probe: Absolute/1 == exactly 1 bone per branch -> total branch count.
         # The probe depends on topology, selected generators, SpeedTree, and the
@@ -4677,6 +4869,7 @@ def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=Non
         final_counts = {}
         total = 0
         observations = []
+        relative_geometry_ok = None
         for round_index in range(max_rounds):
             r = max(value_floor, min(value_cap, r))
             write_spm(
@@ -4689,7 +4882,17 @@ def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=Non
                 ),
             )
             log(f"  [SpeedTree] XML Relative 검증 시작 (round {round_index + 1})")
-            final_counts = bone_counts_from_xml(export_verify_xml(spm_path, cfg, xml_out))
+            if bundle_verification:
+                bundle = export_verify_xml_fbx_bundle(
+                    spm_path,
+                    cfg,
+                    xml_out,
+                    fbx_out,
+                )
+                relative_geometry_ok = bundle["fbx_has_geometry"]
+            else:
+                export_verify_xml(spm_path, cfg, xml_out)
+            final_counts = bone_counts_from_xml(xml_out)
             total = sum(final_counts.values())
             observations.append((r, total))
             rounds.append({"phase": f"relative round {round_index + 1}", "value": round(r, 4), "total_bones": total})
@@ -4734,21 +4937,45 @@ def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=Non
         absolute_fallback = None
         material_reference_fallbacks = []
         if not has_base_links:
-            fbx_out = Path(tmp) / f"{Path(spm_path).stem}_geometry_check.fbx"
-            log("  [SpeedTree] FBX geometry 검증 시작")
-            if not export_verify_fbx_geometry(spm_path, cfg, fbx_out):
+            if bundle_verification:
+                geometry_ok = relative_geometry_ok
+            else:
+                log("  [SpeedTree] FBX geometry 검증 시작")
+                geometry_ok = export_verify_fbx_geometry(
+                    spm_path,
+                    cfg,
+                    fbx_out,
+                )
+            if not geometry_ok:
                 # Certain root/frond assets export an armature but silently drop
                 # every mesh after Relative bone calibration. Absolute/1 is the
                 # known-good SpeedTree representation for those assets.
                 fallback_text = apply_branch_values(original_text, target_indices, 0.0, 1.0)
                 write_spm(spm_path, fallback_text)
-                log("  [SpeedTree] XML Absolute/1 fallback 검증 시작")
-                final_counts = bone_counts_from_xml(export_verify_xml(spm_path, cfg, xml_out))
+                log("  [SpeedTree] Absolute/1 fallback 검증 시작")
+                if bundle_verification:
+                    fallback_bundle = export_verify_xml_fbx_bundle(
+                        spm_path,
+                        cfg,
+                        xml_out,
+                        fbx_out,
+                    )
+                    fallback_geometry_ok = fallback_bundle[
+                        "fbx_has_geometry"
+                    ]
+                else:
+                    export_verify_xml(spm_path, cfg, xml_out)
+                    if fbx_out.exists():
+                        fbx_out.unlink()
+                    log("  [SpeedTree] FBX Absolute/1 fallback 검증 시작")
+                    fallback_geometry_ok = export_verify_fbx_geometry(
+                        spm_path,
+                        cfg,
+                        fbx_out,
+                    )
+                final_counts = bone_counts_from_xml(xml_out)
                 total = sum(final_counts.values())
-                if fbx_out.exists():
-                    fbx_out.unlink()
-                log("  [SpeedTree] FBX Absolute/1 fallback 검증 시작")
-                if not export_verify_fbx_geometry(spm_path, cfg, fbx_out):
+                if not fallback_geometry_ok:
                     fallback_text, material_reference_fallbacks = repair_external_frond_material_references(
                         fallback_text
                     )
@@ -4777,9 +5004,16 @@ def calibrate_bones(spm_path, cfg, log=print, source_text=None, source_audit=Non
                     )
                 log(f"  [geometry fallback] Absolute/1 -> {total} bones with valid FBX geometry")
         else:
-            fbx_out = Path(tmp) / f"{Path(spm_path).stem}_geometry_check.fbx"
-            log("  [SpeedTree] FBX final geometry verification")
-            if not export_verify_fbx_geometry(spm_path, cfg, fbx_out):
+            if bundle_verification:
+                geometry_ok = relative_geometry_ok
+            else:
+                log("  [SpeedTree] FBX final geometry verification")
+                geometry_ok = export_verify_fbx_geometry(
+                    spm_path,
+                    cfg,
+                    fbx_out,
+                )
+            if not geometry_ok:
                 stop_for_manual(
                     (
                         "final Relative calibration produced an FBX without "

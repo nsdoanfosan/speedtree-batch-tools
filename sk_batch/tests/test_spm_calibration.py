@@ -297,6 +297,60 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
             }
             self.assertEqual(enabled, {"Structural A", "Structural B"})
 
+    def test_cluster_calibration_bundles_xml_and_fbx_in_one_native_load(self):
+        source_xml = cluster_graph_xml()
+        cfg = {
+            "cluster_root_only_bones": True,
+            "bundle_bone_verification": True,
+            "rename_materials": False,
+            "tree_leaf_parent_red_gradient": False,
+            "backup_spm": False,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            cluster_dir = Path(tmp) / "cluster"
+            cluster_dir.mkdir()
+            spm_path = cluster_dir / "SK_leaf_bundle_01.spm"
+            spm_audit.write_spm(spm_path, source_xml)
+
+            def fake_bundle(_spm_path, _cfg, xml_out, fbx_out):
+                Path(xml_out).write_text(
+                    cluster_export_xml(["Structural A", "Structural B"]),
+                    encoding="utf-8",
+                )
+                Path(fbx_out).write_bytes(b"Vertices")
+                return {
+                    "xml": Path(xml_out),
+                    "fbx": Path(fbx_out),
+                    "fbx_has_geometry": True,
+                }
+
+            with mock.patch.object(
+                spm_audit,
+                "_verification_speedtree_executable",
+                return_value=(Path("speedtree_collision_cli.exe"), True),
+            ), mock.patch.object(
+                spm_audit,
+                "export_verify_xml_fbx_bundle",
+                side_effect=fake_bundle,
+            ) as bundled, mock.patch.object(
+                spm_audit,
+                "export_verify_xml",
+                side_effect=AssertionError("separate XML export used"),
+            ), mock.patch.object(
+                spm_audit,
+                "export_verify_fbx_geometry",
+                side_effect=AssertionError("separate FBX export used"),
+            ):
+                report = spm_audit.process_spm(
+                    spm_path,
+                    cfg,
+                    log=lambda _message: None,
+                )
+
+            self.assertEqual(bundled.call_count, 1)
+            self.assertEqual(report["status"], "calibrated")
+            self.assertEqual(report["total_bones"], 2)
+
     def test_cluster_fixed_point_skips_speedtree_without_prior_receipt(self):
         source_xml = cluster_graph_xml()
         fixed = spm_audit.apply_cluster_root_bone_plan(
@@ -456,6 +510,83 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
 
         self.assertEqual(caught.exception.stage, "XML")
         self.assertEqual(caught.exception.timeout_seconds, 120.0)
+
+    def test_bundled_verification_uses_native_cli_and_one_process(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fbx_ini = root / "Options_Fbx.ini"
+            xml_ini = root / "Options_Xml.ini"
+            for options in (fbx_ini, xml_ini):
+                options.write_text(
+                    "[Options]\nTextureSkipWriting=true\n",
+                    encoding="utf-8",
+                )
+            xml_out = root / "verify.xml"
+            fbx_out = root / "verify.fbx"
+            captured = {}
+
+            def fake_run(command, _cwd, _timeout, **_kwargs):
+                captured["command"] = list(command)
+                Path(command[command.index("-export") + 1]).write_bytes(
+                    b"binary FBX Vertices payload"
+                )
+                Path(
+                    command[command.index("--secondary-export") + 1]
+                ).write_text("<SpeedTreeRaw />", encoding="utf-8")
+                return 0, "", ""
+
+            cfg = {
+                "fbx_ini": str(fbx_ini),
+                "xml_ini": str(xml_ini),
+                "spm_verify_timeout": 120,
+            }
+            with mock.patch.object(
+                spm_audit,
+                "_verification_speedtree_executable",
+                return_value=(root / "speedtree_collision_cli.exe", True),
+            ), mock.patch.object(
+                spm_audit,
+                "run_speedtree_export",
+                side_effect=fake_run,
+            ) as run:
+                result = spm_audit.export_verify_xml_fbx_bundle(
+                    root / "tree.spm",
+                    cfg,
+                    xml_out,
+                    fbx_out,
+                )
+
+            self.assertEqual(run.call_count, 1)
+            self.assertIn("--native-cli", captured["command"])
+            self.assertIn("--secondary-export-options", captured["command"])
+            self.assertIn("--secondary-export", captured["command"])
+            self.assertTrue(result["fbx_has_geometry"])
+            self.assertTrue(xml_out.is_file())
+            self.assertTrue(fbx_out.is_file())
+
+    def test_stage_one_verification_honors_bat_native_cli_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            launcher = root / "speedtree_collision_cli.exe"
+            hook = root / "speedtree_collision_hook.dll"
+            launcher.write_bytes(b"launcher")
+            hook.write_bytes(b"hook")
+
+            with mock.patch.dict(
+                os.environ,
+                {"SPEEDTREE_COLLISION_CLI_EXE": str(launcher)},
+            ):
+                executable, native = (
+                    spm_audit._verification_speedtree_executable(
+                        {
+                            "speedtree_exe": "SpeedTree_Modeler.exe",
+                            "require_native_speedtree_cli": True,
+                        }
+                    )
+                )
+
+            self.assertEqual(executable, launcher.resolve())
+            self.assertTrue(native)
 
     def test_speedtree_export_tempfile_fallback_never_creates_a_pipe(self):
         """The rollout fallback preserves the former no-PIPE contract.
