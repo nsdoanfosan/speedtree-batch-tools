@@ -164,6 +164,9 @@ skin deformer를 완전히 생략한 경우에만, 실제 imported deform bone �
 FBX를 만들지 않는다. 최종 BWR과 동일한 개조 CLI·동일 preset으로 collision/prune
 FBX+XML bundle을 한 번 생산하거나 ①의 정확한 receipt를 재사용한 뒤, 그 `.stmat`의
 실제 Material 목록을 검사한다. 이어지는 BWR은 같은 export cache를 소비한다.
+재질 사전검사와 BWR의 FBX 아티팩트 지문·입력 지문이 모두 같으면 BWR은 이미
+검증된 leaf/material 계약도 재사용한다. 어느 지문이라도 다르면 기존 SPM 실검사로
+즉시 되돌아가므로 오래된 검사 결과를 통과시키지 않는다.
 성공한 라이브 Repair 검사는 상태 파일에 `blend_resume_receipt`를 남긴다. 다음
 비강제 실행은 이 영수증이 묶은 SPM, blend, Repair 보고서, wind JSON, stmat,
 텍스처, 의존 SPM과 출력 설정이 모두 같을 때 완료 행을 worker/progress 대기열에

@@ -44,6 +44,9 @@ FBX와 XML이 모두 필요하면 한 Modeler 프로세스에서 연속 내보�
 Blender Bone Weight Repair add-on은 두 산출물이 동시에 stale일 때 이 묶음
 경로를 자동 사용합니다. 각 산출물의 content cache는 독립적으로 유지되므로
 한쪽만 stale이면 그 파일만 내보냅니다.
+두 형식을 함께 내보낼 때 High Collision/Prune 계산과 generator commit은 첫
+산출물에서 한 번만 수행합니다. 두 번째 serializer는 변경되지 않은 committed
+model을 그대로 사용하므로 XML을 위해 같은 Collision thread를 다시 돌리지 않습니다.
 
 SK Batch의 ① 뼈 검증처럼 임시 FBX/XML에서 뼈와 geometry 존재 여부만
 확인하는 경로는 `--verification-only`를 사용합니다. 이 옵션은 원래 CLI

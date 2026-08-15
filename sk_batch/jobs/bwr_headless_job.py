@@ -11,6 +11,7 @@ interactive user add-on in a background batch. Re-running on an existing .blend
 is a clean idempotent update (the operator wipes its previous build).
 """
 import argparse
+import copy
 import json
 import os
 import shutil
@@ -153,6 +154,45 @@ def record_stage_duration(report, name, started):
         perf_counter() - started,
         6,
     )
+
+
+def reusable_preflight_spm_contracts(material_preflight, current_fbx_export):
+    """Reuse leaf/material inspection only for the exact exported artifacts."""
+    if not isinstance(material_preflight, dict):
+        return None
+    if material_preflight.get("status") != "ok":
+        return None
+    previous_export = material_preflight.get("speedtree_export") or {}
+    if not isinstance(previous_export, dict) or not isinstance(
+        current_fbx_export, dict
+    ):
+        return None
+
+    def artifact_signature(export):
+        rows = []
+        for artifact in export.get("artifacts") or ():
+            if not isinstance(artifact, dict):
+                return ()
+            rows.append((
+                str(artifact.get("relative_path") or "").casefold(),
+                int(artifact.get("size") or 0),
+                str(artifact.get("sha256") or "").casefold(),
+            ))
+        return tuple(sorted(rows))
+
+    previous_signature = artifact_signature(previous_export)
+    current_signature = artifact_signature(current_fbx_export)
+    if not previous_signature or previous_signature != current_signature:
+        return None
+    if str(previous_export.get("input_fingerprint") or "") != str(
+        current_fbx_export.get("input_fingerprint") or ""
+    ):
+        return None
+    leaf = material_preflight.get("leaf_reference_contract")
+    material = material_preflight.get("material_export_contract")
+    if not isinstance(leaf, dict) or not isinstance(material, dict):
+        return None
+    return copy.deepcopy(leaf), copy.deepcopy(material)
 
 
 def save_cluster_source_mainfile(bpy_module, filepath, report):
@@ -990,9 +1030,28 @@ def main():
             "status": "blocked",
             "issues": ["missing_pipeline_report"],
         }
-        leaf_reference_contract = inspect_spm_leaf_contract(speedtree_spm)
-        material_export_contract = inspect_speedtree_material_export(
-            speedtree_spm, leaf_reference_contract
+        post_repair_spm_contract_started = perf_counter()
+        reusable_contracts = reusable_preflight_spm_contracts(
+            material_preflight,
+            fbx_export,
+        )
+        if reusable_contracts is None:
+            leaf_reference_contract = inspect_spm_leaf_contract(speedtree_spm)
+            material_export_contract = inspect_speedtree_material_export(
+                speedtree_spm, leaf_reference_contract
+            )
+            report["spm_contract_inspection_source"] = "live_fallback"
+        else:
+            leaf_reference_contract, material_export_contract = (
+                reusable_contracts
+            )
+            report["spm_contract_inspection_source"] = (
+                "validated_preflight_exact_export"
+            )
+        record_stage_duration(
+            report,
+            "post_repair_spm_contracts",
+            post_repair_spm_contract_started,
         )
         report["leaf_reference_contract"] = leaf_reference_contract
         report["material_export_contract"] = material_export_contract
@@ -1051,6 +1110,7 @@ def main():
             removed_empty_slots = remove_unused_empty_material_slots(merged_object)
             report["removed_unused_empty_material_slots"] = removed_empty_slots
             empty_material_slots = material_slot_issues(merged_object)
+            vertex_payload_started = perf_counter()
             vertex_payload_contract = pack_speedtree_vertex_payload(
                 merged_object,
                 mirror_to_nanite_uv=True,
@@ -1059,6 +1119,11 @@ def main():
             vertex_color_contract = inspect_object_vertex_colors(
                 merged_object,
                 require_green_signal=args.wind == "TREE",
+            )
+            record_stage_duration(
+                report,
+                "vertex_payload_finalize",
+                vertex_payload_started,
             )
             report["vertex_color_contract"] = vertex_color_contract
             if "green_channel_has_no_signal" in vertex_color_contract.get("warnings", []):
@@ -1088,6 +1153,7 @@ def main():
                 or (not empty_material_slots and not material_export_blocked)
             )
         ):
+            blend_save_started = perf_counter()
             if is_cluster_source:
                 save_result = save_cluster_source_mainfile(
                     bpy,
@@ -1105,6 +1171,11 @@ def main():
                     + ", ".join(sorted(save_result))
                 )
             report["blend_resaved"] = True
+            record_stage_duration(
+                report,
+                "blend_save",
+                blend_save_started,
+            )
 
         missing_outputs = [
             report[key]
@@ -1282,8 +1353,14 @@ def main():
                 file_fingerprint(canonical_xml)
             )
         if pipeline_data is not None:
+            blend_fingerprint_started = perf_counter()
             pipeline_data["source_blend_identity"] = file_fingerprint(
                 Path(blend_path)
+            )
+            record_stage_duration(
+                report,
+                "blend_identity_fingerprint",
+                blend_fingerprint_started,
             )
             pipeline_data["speedtree_live_source_identity"] = {
                 "spm": source_identity(canonical_spm),
@@ -1312,7 +1389,13 @@ def main():
                 pipeline_data["repair_push_export_postcondition"] = (
                     export_object_postcondition(bpy.data)
                 )
+            pipeline_report_started = perf_counter()
             write_report(pipeline_path, pipeline_data)
+            record_stage_duration(
+                report,
+                "pipeline_report_write",
+                pipeline_report_started,
+            )
         if preflight["status"] == "blocked":
             reasons = []
             if blocking_export_collection_issues:
