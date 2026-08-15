@@ -97,6 +97,80 @@ def _record_error_process(
 
 
 class LaunchGuardTests(unittest.TestCase):
+    def test_persistent_session_host_retries_early_exit_then_succeeds(self):
+        module = load_guard_module()
+        target = REPO_DIR / "sk_batch" / "sk_batch_gui.pyw"
+        replacement = {"process": object(), "replacement": True}
+        start_once = mock.Mock(
+            side_effect=[
+                RuntimeError("host exited before ready"),
+                replacement,
+            ]
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SPEEDTREE_COLLISION_PERSISTENT": "1",
+                "SPEEDTREE_COLLISION_ISOLATED_WINDOW": "0",
+                "SPEEDTREE_COLLISION_SESSION_START_ATTEMPTS": "3",
+            },
+        ), mock.patch.dict(
+            module["start_speedtree_session_host"].__globals__,
+            {
+                "_start_speedtree_session_host_once": start_once,
+                "record_error": (record_error := mock.Mock()),
+            },
+        ), mock.patch.object(module["time"], "sleep") as sleep:
+            result = module["start_speedtree_session_host"](target)
+
+        self.assertIs(result, replacement)
+        self.assertEqual(start_once.call_count, 2)
+        record_error.assert_called_once()
+        sleep.assert_called_once_with(
+            module["SPEEDTREE_SESSION_RETRY_DELAY_SECONDS"]
+        )
+
+    def test_persistent_session_host_retry_is_bounded(self):
+        module = load_guard_module()
+        target = REPO_DIR / "sk_batch" / "sk_batch_gui.pyw"
+        start_once = mock.Mock(side_effect=RuntimeError("unexpected close"))
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SPEEDTREE_COLLISION_PERSISTENT": "1",
+                "SPEEDTREE_COLLISION_ISOLATED_WINDOW": "0",
+                "SPEEDTREE_COLLISION_SESSION_START_ATTEMPTS": "3",
+            },
+        ), mock.patch.dict(
+            module["start_speedtree_session_host"].__globals__,
+            {
+                "_start_speedtree_session_host_once": start_once,
+                "record_error": mock.Mock(),
+            },
+        ), mock.patch.object(module["time"], "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "after 3 attempts"):
+                module["start_speedtree_session_host"](target)
+
+        self.assertEqual(start_once.call_count, 3)
+
+    def test_private_desktop_mode_does_not_start_a_persistent_host(self):
+        module = load_guard_module()
+        target = REPO_DIR / "sk_batch" / "sk_batch_gui.pyw"
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SPEEDTREE_COLLISION_PERSISTENT": "1",
+                "SPEEDTREE_COLLISION_ISOLATED_WINDOW": "1",
+            },
+        ), mock.patch.dict(
+            module["start_speedtree_session_host"].__globals__,
+            {"_start_speedtree_session_host_once": (start_once := mock.Mock())},
+        ):
+            result = module["start_speedtree_session_host"](target)
+
+        self.assertIsNone(result)
+        start_once.assert_not_called()
+
     def test_guard_exists_and_every_launcher_routes_through_it(self):
         self.assertTrue(GUARD.is_file(), f"missing launch guard: {GUARD}")
         headless_launchers = {

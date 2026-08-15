@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <bcrypt.h>
+#include <psapi.h>
 
 #include <algorithm>
 #include <array>
@@ -18,6 +19,7 @@
 
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "user32.lib")
 
 namespace {
@@ -29,10 +31,12 @@ constexpr wchar_t kExpectedModelerSha256[] =
 constexpr wchar_t kExpectedQtCoreSha256[] =
     L"fe3c6e86e01acfcacdd9939031d501e6e6237999b99d17f26853a5ee2ccaf959";
 constexpr DWORD kDefaultTimeoutMs = 10 * 60 * 1000;
+constexpr DWORD kDefaultStallTimeoutMs = 30 * 1000;
 constexpr DWORD kNoCollisionThreadExitCode = 0xC0111001;
 constexpr DWORD kCollisionTimeoutExitCode = 0xC0111002;
 constexpr DWORD kHookRuntimeFailureExitCode = 0xC0111003;
 constexpr DWORD kNoGeneratedCollisionInputsExitCode = 0xC0111004;
+constexpr DWORD kProgressStallExitCode = 0xC0111005;
 
 struct EnvironmentRestore {
     std::wstring name;
@@ -45,6 +49,19 @@ struct RegistryValueRestore {
     DWORD type = REG_NONE;
     std::vector<unsigned char> data;
     bool active = false;
+};
+
+struct DesktopHandle {
+    HDESK value = nullptr;
+
+    DesktopHandle() = default;
+    DesktopHandle(const DesktopHandle&) = delete;
+    DesktopHandle& operator=(const DesktopHandle&) = delete;
+    ~DesktopHandle() {
+        if (value != nullptr) {
+            CloseDesktop(value);
+        }
+    }
 };
 
 bool SetTemporaryStringRegistryValue(
@@ -257,6 +274,69 @@ bool SendSessionRequest(
     return success;
 }
 
+bool IsRestartableSessionPipeError(DWORD error) {
+    switch (error) {
+        case ERROR_SUCCESS:
+        case ERROR_FILE_NOT_FOUND:
+        case ERROR_PIPE_BUSY:
+        case ERROR_BAD_PIPE:
+        case ERROR_BROKEN_PIPE:
+        case ERROR_NO_DATA:
+        case ERROR_PIPE_NOT_CONNECTED:
+        case ERROR_SEM_TIMEOUT:
+            return true;
+        default:
+            return false;
+    }
+}
+
+struct ProcessActivitySnapshot {
+    ULONGLONG cpu100ns = 0;
+    ULONGLONG ioBytes = 0;
+    SIZE_T workingSetBytes = 0;
+    DWORD pageFaultCount = 0;
+};
+
+ULONGLONG FileTimeValue(const FILETIME& value) {
+    ULARGE_INTEGER converted{};
+    converted.LowPart = value.dwLowDateTime;
+    converted.HighPart = value.dwHighDateTime;
+    return converted.QuadPart;
+}
+
+bool ReadProcessActivity(HANDLE process, ProcessActivitySnapshot& snapshot) {
+    FILETIME creation{};
+    FILETIME exit{};
+    FILETIME kernel{};
+    FILETIME user{};
+    IO_COUNTERS io{};
+    PROCESS_MEMORY_COUNTERS memory{};
+    memory.cb = sizeof(memory);
+    if (!GetProcessTimes(process, &creation, &exit, &kernel, &user) ||
+        !GetProcessIoCounters(process, &io) ||
+        !GetProcessMemoryInfo(process, &memory, sizeof(memory))) {
+        return false;
+    }
+    snapshot.cpu100ns = FileTimeValue(kernel) + FileTimeValue(user);
+    snapshot.ioBytes = io.ReadTransferCount + io.WriteTransferCount +
+        io.OtherTransferCount;
+    snapshot.workingSetBytes = memory.WorkingSetSize;
+    snapshot.pageFaultCount = memory.PageFaultCount;
+    return true;
+}
+
+template <typename T>
+T AbsoluteDifference(T left, T right) {
+    return left >= right ? left - right : right - left;
+}
+
+std::optional<std::filesystem::file_time_type> FileWriteTime(
+    const std::filesystem::path& path) {
+    std::error_code error;
+    const auto value = std::filesystem::last_write_time(path, error);
+    return error ? std::nullopt : std::optional(value);
+}
+
 bool CopySessionPath(
     wchar_t (&destination)[speedtree_collision_cli::kSessionPathCapacity],
     const std::filesystem::path& path) {
@@ -431,6 +511,7 @@ void PrintUsage() {
         << L"Wrapper options:\n"
         << L"  --modeler <path>      Override SpeedTree_Modeler.exe path\n"
         << L"  --timeout-ms <value>  Collision wait timeout (default: 600000)\n"
+        << L"  --stall-timeout-ms <value>  Restart after no CPU/I/O/log progress (default: 30000)\n"
         << L"  --log <path>          Hook diagnostic log path\n"
         << L"  --persistent          Reuse one blank-anchored SpeedTree process\n"
         << L"  --no-persistent       Force the legacy one-process-per-export path\n"
@@ -438,6 +519,8 @@ void PrintUsage() {
         << L"  --ping-session        Check whether the persistent session is ready\n"
         << L"  --shutdown-session    Stop the persistent SpeedTree process and exit\n"
         << L"  --session-anchor <spm>  Blank SPM kept open by the persistent process\n"
+        << L"  --isolated-window     Run Modeler on a private Windows desktop (default)\n"
+        << L"  --interactive-window  Show Modeler normally for diagnosis\n"
         << L"  --diagnose            Verify installed binary hashes and exit\n\n"
         << L"Example:\n"
         << L"  speedtree_collision_cli.exe -- tree.spm -export_options Options_MA_Fbx.ini -export tree.fbx\n";
@@ -460,6 +543,10 @@ int ExplainExitCode(DWORD code) {
         std::wcerr << L"The GUI bake path produced no collision inputs; unculled export was blocked.\n";
         return 23;
     }
+    if (code == kProgressStallExitCode) {
+        std::wcerr << L"SpeedTree made no meaningful progress; the stalled export was stopped.\n";
+        return 24;
+    }
     return static_cast<int>(code);
 }
 
@@ -469,17 +556,33 @@ int wmain(int argc, wchar_t** argv) {
     try {
         std::filesystem::path modeler = kDefaultModelerPath;
         DWORD timeoutMs = kDefaultTimeoutMs;
+        DWORD stallTimeoutMs = kDefaultStallTimeoutMs;
         std::filesystem::path logPath;
         std::filesystem::path sessionAnchor;
         bool diagnose = false;
         bool serveSession = false;
         bool pingSession = false;
         bool shutdownSession = false;
+        bool isolateWindow =
+            GetEnvironment(L"SPEEDTREE_COLLISION_ISOLATED_WINDOW") !=
+            std::optional<std::wstring>(L"0");
         bool persistent = GetEnvironment(L"SPEEDTREE_COLLISION_PERSISTENT") ==
             std::optional<std::wstring>(L"1");
         if (const auto configuredAnchor =
                 GetEnvironment(L"SPEEDTREE_COLLISION_SESSION_ANCHOR")) {
             sessionAnchor = *configuredAnchor;
+        }
+        if (const auto configuredStallTimeout =
+                GetEnvironment(L"SPEEDTREE_COLLISION_STALL_TIMEOUT_MS")) {
+            wchar_t* end = nullptr;
+            const unsigned long parsed = wcstoul(
+                configuredStallTimeout->c_str(),
+                &end,
+                10);
+            if (end != configuredStallTimeout->c_str() && *end == L'\0' &&
+                parsed >= 5000) {
+                stallTimeoutMs = parsed;
+            }
         }
         std::vector<std::wstring> modelerArguments;
 
@@ -508,6 +611,10 @@ int wmain(int argc, wchar_t** argv) {
                 shutdownSession = true;
             } else if (value == L"--session-anchor" && index + 1 < argc) {
                 sessionAnchor = argv[++index];
+            } else if (value == L"--isolated-window") {
+                isolateWindow = true;
+            } else if (value == L"--interactive-window") {
+                isolateWindow = false;
             } else if (value == L"--modeler" && index + 1 < argc) {
                 modeler = argv[++index];
             } else if (value == L"--timeout-ms" && index + 1 < argc) {
@@ -518,6 +625,14 @@ int wmain(int argc, wchar_t** argv) {
                     return 2;
                 }
                 timeoutMs = parsed;
+            } else if (value == L"--stall-timeout-ms" && index + 1 < argc) {
+                wchar_t* end = nullptr;
+                const unsigned long parsed = wcstoul(argv[++index], &end, 10);
+                if (end == argv[index] || *end != L'\0' || parsed < 5000) {
+                    std::wcerr << L"Invalid --stall-timeout-ms value.\n";
+                    return 2;
+                }
+                stallTimeoutMs = parsed;
             } else if (value == L"--log" && index + 1 < argc) {
                 logPath = argv[++index];
             } else {
@@ -574,6 +689,16 @@ int wmain(int argc, wchar_t** argv) {
         if (!serveSession && modelerArguments.empty()) {
             PrintUsage();
             return 2;
+        }
+        if (isolateWindow && serveSession) {
+            std::wcerr << L"Persistent fileOpen sessions are not supported on a private "
+                       << L"Windows desktop; use the default one-shot isolated export.\n";
+            return 15;
+        }
+        if (isolateWindow && persistent) {
+            std::wcout << L"Private-desktop isolation requires one process per SPM; "
+                       << L"persistent mode is disabled for this export.\n";
+            persistent = false;
         }
 
         std::filesystem::path inputModel;
@@ -668,11 +793,13 @@ int wmain(int argc, wchar_t** argv) {
                            << existingResponse.speedTreeProcessId << L".\n";
                 return 0;
             }
-            if (pipeError != ERROR_FILE_NOT_FOUND && pipeError != ERROR_PIPE_BUSY) {
+            if (!IsRestartableSessionPipeError(pipeError)) {
                 std::wcerr << L"Could not contact the persistent SpeedTree session (error "
                            << pipeError << L").\n";
                 return 12;
             }
+            std::wcerr << L"The previous persistent SpeedTree session disappeared "
+                       << L"(pipe error " << pipeError << L"); starting a replacement.\n";
         }
 
         if (serveSession) {
@@ -724,15 +851,40 @@ int wmain(int argc, wchar_t** argv) {
             L"SPEEDTREE_COLLISION_CLI_SESSION_SERVER",
             persistent ? L"1" : L"0");
 
+        DesktopHandle isolatedDesktop;
+        std::wstring isolatedDesktopName;
+        if (isolateWindow) {
+            std::wstringstream name;
+            name << L"SpeedTreeBatch_" << GetCurrentProcessId() << L"_"
+                 << GetTickCount64();
+            isolatedDesktopName = name.str();
+            isolatedDesktop.value = CreateDesktopW(
+                isolatedDesktopName.c_str(),
+                nullptr,
+                nullptr,
+                0,
+                GENERIC_ALL,
+                nullptr);
+            if (isolatedDesktop.value == nullptr) {
+                std::wcerr << L"Could not create the private SpeedTree desktop (error "
+                           << GetLastError() << L").\n";
+                return 14;
+            }
+        }
+
         STARTUPINFOW startup{};
         startup.cb = sizeof(startup);
         startup.dwFlags = STARTF_USESHOWWINDOW;
-        // SpeedTree suspends the MainWindow OnIdle/OnIdleDraw path while its
-        // window is minimized.  The collision bake hook is intentionally
-        // driven by that real GUI event path, so keep the window visible while
-        // avoiding focus/activation.  Minimizing here makes the export wait
-        // until a user manually restores the window.
-        startup.wShowWindow = SW_SHOWNOACTIVATE;
+        if (isolateWindow) {
+            // The private desktop is never switched onto the user's input
+            // station. SpeedTree can therefore remain normally shown and active
+            // for its GUI-driven collision path without taking the user's focus,
+            // receiving their mouse input, or appearing on their taskbar.
+            startup.wShowWindow = SW_SHOW;
+            startup.lpDesktop = isolatedDesktopName.data();
+        } else {
+            startup.wShowWindow = SW_SHOWNOACTIVATE;
+        }
         PROCESS_INFORMATION process{};
         RegistryValueRestore showNewOnStartRestore{};
         if (persistent && !SetTemporaryStringRegistryValue(
@@ -789,16 +941,20 @@ int wmain(int argc, wchar_t** argv) {
         }
         CloseHandle(process.hThread);
 
-        if (persistent) {
-            const DWORD inputIdleResult = WaitForInputIdle(process.hProcess, timeoutMs);
-            if (inputIdleResult != 0) {
-                RestoreRegistryValue(HKEY_CURRENT_USER, showNewOnStartRestore);
-                std::wcerr << L"SpeedTree did not reach its initialized input-idle state (error "
-                           << inputIdleResult << L").\n";
-                TerminateProcess(process.hProcess, 13);
-                CloseHandle(process.hProcess);
-                return 13;
-            }
+        const DWORD initializationTimeoutMs = (std::min)(timeoutMs, stallTimeoutMs);
+        const DWORD inputIdleResult = WaitForInputIdle(
+            process.hProcess,
+            initializationTimeoutMs);
+        if (inputIdleResult != 0) {
+            RestoreRegistryValue(HKEY_CURRENT_USER, showNewOnStartRestore);
+            std::wcerr << L"SpeedTree did not reach its initialized input-idle state (error "
+                       << inputIdleResult << L").\n";
+            TerminateProcess(process.hProcess, 13);
+            CloseHandle(process.hProcess);
+            return 13;
+        }
+        if (isolateWindow) {
+            std::wcout << L"SpeedTree is active on an isolated Windows desktop.\n";
         }
 
         if (serveSession) {
@@ -843,7 +999,9 @@ int wmain(int argc, wchar_t** argv) {
                 std::wcerr << L"The persistent SpeedTree session did not accept the first job "
                            << L"(pipe error " << pipeError << L").\n";
                 std::wcerr << L"Hook log: " << std::filesystem::absolute(logPath) << L"\n";
-                return 12;
+                return childExitCode != STILL_ACTIVE && childExitCode != 0
+                    ? ExplainExitCode(childExitCode)
+                    : 12;
             }
             CloseHandle(process.hProcess);
             if (response.status != ERROR_SUCCESS) {
@@ -865,11 +1023,49 @@ int wmain(int argc, wchar_t** argv) {
 
         const DWORD processWaitMs = timeoutMs + 5 * 60 * 1000;
         const ULONGLONG waitDeadline = GetTickCount64() + processWaitMs;
+        ULONGLONG lastMeaningfulProgress = GetTickCount64();
+        ProcessActivitySnapshot activityBaseline{};
+        ReadProcessActivity(process.hProcess, activityBaseline);
+        auto logWriteTime = FileWriteTime(logPath);
         DWORD waitResult = WAIT_TIMEOUT;
         while (GetTickCount64() < waitDeadline) {
-            waitResult = WaitForSingleObject(process.hProcess, 100);
+            waitResult = WaitForSingleObject(process.hProcess, 250);
             if (waitResult == WAIT_OBJECT_0 || waitResult == WAIT_FAILED) {
                 break;
+            }
+            ProcessActivitySnapshot currentActivity{};
+            const bool activityRead = ReadProcessActivity(
+                process.hProcess,
+                currentActivity);
+            const auto currentLogWriteTime = FileWriteTime(logPath);
+            const bool logAdvanced = currentLogWriteTime.has_value() &&
+                (!logWriteTime.has_value() || *currentLogWriteTime != *logWriteTime);
+            const bool cpuAdvanced = activityRead &&
+                currentActivity.cpu100ns >= activityBaseline.cpu100ns + 2'500'000;
+            const bool ioAdvanced = activityRead &&
+                currentActivity.ioBytes >= activityBaseline.ioBytes + 4 * 1024;
+            const bool memoryAdvanced = activityRead &&
+                AbsoluteDifference(
+                    currentActivity.workingSetBytes,
+                    activityBaseline.workingSetBytes) >= 512 * 1024;
+            const bool pageFaultsAdvanced = activityRead &&
+                currentActivity.pageFaultCount >= activityBaseline.pageFaultCount + 64;
+            if (logAdvanced || cpuAdvanced || ioAdvanced ||
+                memoryAdvanced || pageFaultsAdvanced) {
+                lastMeaningfulProgress = GetTickCount64();
+                if (activityRead) {
+                    activityBaseline = currentActivity;
+                }
+                logWriteTime = currentLogWriteTime;
+            }
+            if (GetTickCount64() - lastMeaningfulProgress >= stallTimeoutMs) {
+                std::wcerr << L"SpeedTree produced no meaningful CPU, I/O, memory, or hook-log "
+                           << L"progress for " << stallTimeoutMs
+                           << L" ms. The exact launched child will be terminated for retry.\n";
+                TerminateProcess(process.hProcess, kProgressStallExitCode);
+                WaitForSingleObject(process.hProcess, 5000);
+                CloseHandle(process.hProcess);
+                return ExplainExitCode(kProgressStallExitCode);
             }
         }
         if (waitResult != WAIT_OBJECT_0) {

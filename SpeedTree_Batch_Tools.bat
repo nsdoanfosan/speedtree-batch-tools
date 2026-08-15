@@ -18,9 +18,16 @@ if errorlevel 1 goto collision_build_failed
 "%COLLISION_CLI%" --diagnose >nul
 if errorlevel 1 goto collision_diagnose_failed
 set "SPEEDTREE_COLLISION_CLI_EXE=%COLLISION_CLI%"
-set "SPEEDTREE_COLLISION_PERSISTENT=1"
-if not defined SPEEDTREE_COLLISION_SESSION_ANCHOR set "SPEEDTREE_COLLISION_SESSION_ANCHOR=%USERPROFILE%\Downloads\blank.spm"
-if not exist "%SPEEDTREE_COLLISION_SESSION_ANCHOR%" goto collision_anchor_missing
+if not defined SPEEDTREE_COLLISION_ISOLATED_WINDOW set "SPEEDTREE_COLLISION_ISOLATED_WINDOW=1"
+if /I "%SPEEDTREE_COLLISION_ISOLATED_WINDOW%"=="1" (
+    set "SPEEDTREE_COLLISION_PERSISTENT=0"
+) else if not defined SPEEDTREE_COLLISION_PERSISTENT (
+    set "SPEEDTREE_COLLISION_PERSISTENT=1"
+)
+if "%SPEEDTREE_COLLISION_PERSISTENT%"=="1" (
+    if not defined SPEEDTREE_COLLISION_SESSION_ANCHOR set "SPEEDTREE_COLLISION_SESSION_ANCHOR=%USERPROFILE%\Downloads\blank.spm"
+    if not exist "%SPEEDTREE_COLLISION_SESSION_ANCHOR%" goto collision_anchor_missing
+)
 
 where.exe pythonw >nul 2>&1
 if errorlevel 1 goto python_missing

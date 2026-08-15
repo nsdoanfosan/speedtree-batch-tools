@@ -1411,6 +1411,9 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "speedtree_root_exit": ReasonRow(
         UNCLASSIFIED, "sk_batch/spm_audit.py", "",
     ),
+    "speedtree_session_start_failed": ReasonRow(
+        INFORMATIONAL, "launch_guard.pyw", "lifecycle_event",
+    ),
     "speedtree_spm_filename": ReasonRow(
         UNCLASSIFIED, "cluster_bark_source_resolution.py", "",
     ),
