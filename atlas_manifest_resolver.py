@@ -1091,6 +1091,7 @@ def resolve_atlas_manifests(
     expected_export_scope_id=None,
     require_generator_complete=False,
     diagnostic_only=False,
+    include_shadow_diagnostics=True,
 ):
     """Resolve exact Atlas records for one SPM and return auditable evidence.
 
@@ -1099,8 +1100,10 @@ def resolve_atlas_manifests(
     fail closed.  A read-only live audit may opt into ``diagnostic_only``.  In
     that mode the same records remain visible as diagnostics, but deterministic
     valid winners are returned so metadata cannot erase the live Assembly graph.
-    Foreign-target and caller-filtered records are rejected with reasons, while
-    diagnostic legacy records are always shadowed.
+    Foreign-target and caller-filtered records are rejected with reasons. The
+    default also records every diagnostic legacy/scope shadow. Selected-only
+    read-only consumers may disable that unrelated inventory without changing
+    operational candidate resolution or conflict handling.
     """
     target = Path(target_spm).expanduser().resolve(strict=False)
     owner_target = _manifest_owner_target(target)
@@ -1275,40 +1278,41 @@ def resolve_atlas_manifests(
             "_identity_rank": identity_rank,
         })
 
-    for path, kind in _diagnostic_specs(owner_target, pair_identity):
-        payload, read_error = _read_payload(path)
-        row = {
-            "path": str(path.resolve(strict=False)),
-            "kind": kind,
-            "reason": (
-                read_error
-                or "diagnostic_only_legacy_shadow"
-                if kind == "legacy_material_manifest"
-                else read_error or "diagnostic_only_scope_identity_shadow"
-            ),
-        }
-        if payload is not None:
-            row["declared_spm"] = str(payload.get("spm") or "")
-            row["source_identity"] = _source_identity(
-                payload,
-                path,
-                target_parent=owner_parent,
-            )
-            try:
-                row["ownership_claims"] = sorted(
-                    _candidate_claims(
-                        payload,
-                        row["source_identity"],
-                        kind,
-                    )
+    if include_shadow_diagnostics:
+        for path, kind in _diagnostic_specs(owner_target, pair_identity):
+            payload, read_error = _read_payload(path)
+            row = {
+                "path": str(path.resolve(strict=False)),
+                "kind": kind,
+                "reason": (
+                    read_error
+                    or "diagnostic_only_legacy_shadow"
+                    if kind == "legacy_material_manifest"
+                    else read_error or "diagnostic_only_scope_identity_shadow"
+                ),
+            }
+            if payload is not None:
+                row["declared_spm"] = str(payload.get("spm") or "")
+                row["source_identity"] = _source_identity(
+                    payload,
+                    path,
+                    target_parent=owner_parent,
                 )
-            except _GeneratorContractError as exc:
-                row["ownership_claims"] = []
-                row["ownership_contract_error"] = {
-                    "reason": exc.reason,
-                    **copy.deepcopy(exc.details),
-                }
-        resolution["shadowed"].append(row)
+                try:
+                    row["ownership_claims"] = sorted(
+                        _candidate_claims(
+                            payload,
+                            row["source_identity"],
+                            kind,
+                        )
+                    )
+                except _GeneratorContractError as exc:
+                    row["ownership_claims"] = []
+                    row["ownership_contract_error"] = {
+                        "reason": exc.reason,
+                        **copy.deepcopy(exc.details),
+                    }
+            resolution["shadowed"].append(row)
 
     if fatal and not diagnostic_only:
         evidence = resolution_evidence(resolution)

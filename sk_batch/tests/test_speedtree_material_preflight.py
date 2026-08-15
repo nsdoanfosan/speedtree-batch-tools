@@ -155,6 +155,47 @@ def write_stmat(spm, material_names):
 
 
 class SpeedTreeMaterialPreflightTests(unittest.TestCase):
+    def test_managed_bindings_skip_unmanaged_provenance_audit(self):
+        readiness = {
+            "status": "ok",
+            "bindings": [{
+                "material": "M_Bark_test_Mat",
+                "material_index": 0,
+                "status": "ok",
+                "resolved": {"color": "T_Bark_test_color.tga"},
+            }],
+            "missing": [],
+            "warnings": [],
+        }
+        with mock.patch.object(
+            preflight,
+            "read_stmat_material_sources",
+        ) as read_stmat, mock.patch.object(
+            preflight,
+            "inspect_spm_texture_slots",
+        ) as inspect_slots, mock.patch.object(
+            preflight,
+            "resolve_atlas_manifests",
+        ) as resolve_atlas, mock.patch.object(
+            preflight,
+            "atlas_provisional_source_declarations",
+        ) as provisional, mock.patch.object(
+            preflight,
+            "_capture_live_material_export_evidence",
+        ) as live_evidence:
+            result = preflight.augment_texture_readiness_contract(
+                readiness,
+                "unused.stmat",
+                "unused.spm",
+            )
+
+        self.assertEqual(result, readiness)
+        read_stmat.assert_not_called()
+        inspect_slots.assert_not_called()
+        resolve_atlas.assert_not_called()
+        provisional.assert_not_called()
+        live_evidence.assert_not_called()
+
     def evaluate_issue64_fixture(self, mutate_snapshot=None):
         fixture_path = (
             Path(__file__).parent
@@ -988,7 +1029,15 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                 return_value=[],
             ):
                 readiness = preflight.augment_texture_readiness_contract(
-                    {"bindings": [], "warnings": [], "missing": []},
+                    {
+                        "bindings": [{
+                            "material": "M_leaf_shared",
+                            "material_index": 0,
+                            "status": "not_managed",
+                        }],
+                        "warnings": [],
+                        "missing": [],
+                    },
                     root / "SK_overlapping_providers.stmat",
                     spm,
                 )

@@ -1542,6 +1542,17 @@ class AtlasManifestResolverTests(unittest.TestCase):
                 },
             )
 
+            selected_only = resolve_atlas_manifests(
+                target,
+                diagnostic_only=True,
+                include_shadow_diagnostics=False,
+            )
+            self.assertEqual(
+                [row["path"] for row in selected_only["selected"]],
+                [str(selected.resolve())],
+            )
+            self.assertEqual(selected_only["shadowed"], [])
+
     def test_resolution_and_read_only_evidence_never_rewrite_manifests(self):
         with tempfile.TemporaryDirectory() as temporary:
             root, target, _blend, payload = self.fixture(temporary)
