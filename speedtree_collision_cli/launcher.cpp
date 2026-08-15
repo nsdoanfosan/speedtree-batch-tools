@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <bcrypt.h>
+#include <psapi.h>
 
 #include <algorithm>
 #include <array>
@@ -18,6 +19,7 @@
 
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "user32.lib")
 
 namespace {
@@ -29,10 +31,12 @@ constexpr wchar_t kExpectedModelerSha256[] =
 constexpr wchar_t kExpectedQtCoreSha256[] =
     L"fe3c6e86e01acfcacdd9939031d501e6e6237999b99d17f26853a5ee2ccaf959";
 constexpr DWORD kDefaultTimeoutMs = 10 * 60 * 1000;
+constexpr DWORD kDefaultStallTimeoutMs = 30 * 1000;
 constexpr DWORD kNoCollisionThreadExitCode = 0xC0111001;
 constexpr DWORD kCollisionTimeoutExitCode = 0xC0111002;
 constexpr DWORD kHookRuntimeFailureExitCode = 0xC0111003;
 constexpr DWORD kNoGeneratedCollisionInputsExitCode = 0xC0111004;
+constexpr DWORD kProgressStallExitCode = 0xC0111005;
 
 struct EnvironmentRestore {
     std::wstring name;
@@ -286,6 +290,53 @@ bool IsRestartableSessionPipeError(DWORD error) {
     }
 }
 
+struct ProcessActivitySnapshot {
+    ULONGLONG cpu100ns = 0;
+    ULONGLONG ioBytes = 0;
+    SIZE_T workingSetBytes = 0;
+    DWORD pageFaultCount = 0;
+};
+
+ULONGLONG FileTimeValue(const FILETIME& value) {
+    ULARGE_INTEGER converted{};
+    converted.LowPart = value.dwLowDateTime;
+    converted.HighPart = value.dwHighDateTime;
+    return converted.QuadPart;
+}
+
+bool ReadProcessActivity(HANDLE process, ProcessActivitySnapshot& snapshot) {
+    FILETIME creation{};
+    FILETIME exit{};
+    FILETIME kernel{};
+    FILETIME user{};
+    IO_COUNTERS io{};
+    PROCESS_MEMORY_COUNTERS memory{};
+    memory.cb = sizeof(memory);
+    if (!GetProcessTimes(process, &creation, &exit, &kernel, &user) ||
+        !GetProcessIoCounters(process, &io) ||
+        !GetProcessMemoryInfo(process, &memory, sizeof(memory))) {
+        return false;
+    }
+    snapshot.cpu100ns = FileTimeValue(kernel) + FileTimeValue(user);
+    snapshot.ioBytes = io.ReadTransferCount + io.WriteTransferCount +
+        io.OtherTransferCount;
+    snapshot.workingSetBytes = memory.WorkingSetSize;
+    snapshot.pageFaultCount = memory.PageFaultCount;
+    return true;
+}
+
+template <typename T>
+T AbsoluteDifference(T left, T right) {
+    return left >= right ? left - right : right - left;
+}
+
+std::optional<std::filesystem::file_time_type> FileWriteTime(
+    const std::filesystem::path& path) {
+    std::error_code error;
+    const auto value = std::filesystem::last_write_time(path, error);
+    return error ? std::nullopt : std::optional(value);
+}
+
 bool CopySessionPath(
     wchar_t (&destination)[speedtree_collision_cli::kSessionPathCapacity],
     const std::filesystem::path& path) {
@@ -460,6 +511,7 @@ void PrintUsage() {
         << L"Wrapper options:\n"
         << L"  --modeler <path>      Override SpeedTree_Modeler.exe path\n"
         << L"  --timeout-ms <value>  Collision wait timeout (default: 600000)\n"
+        << L"  --stall-timeout-ms <value>  Restart after no CPU/I/O/log progress (default: 30000)\n"
         << L"  --log <path>          Hook diagnostic log path\n"
         << L"  --persistent          Reuse one blank-anchored SpeedTree process\n"
         << L"  --no-persistent       Force the legacy one-process-per-export path\n"
@@ -491,6 +543,10 @@ int ExplainExitCode(DWORD code) {
         std::wcerr << L"The GUI bake path produced no collision inputs; unculled export was blocked.\n";
         return 23;
     }
+    if (code == kProgressStallExitCode) {
+        std::wcerr << L"SpeedTree made no meaningful progress; the stalled export was stopped.\n";
+        return 24;
+    }
     return static_cast<int>(code);
 }
 
@@ -500,6 +556,7 @@ int wmain(int argc, wchar_t** argv) {
     try {
         std::filesystem::path modeler = kDefaultModelerPath;
         DWORD timeoutMs = kDefaultTimeoutMs;
+        DWORD stallTimeoutMs = kDefaultStallTimeoutMs;
         std::filesystem::path logPath;
         std::filesystem::path sessionAnchor;
         bool diagnose = false;
@@ -514,6 +571,18 @@ int wmain(int argc, wchar_t** argv) {
         if (const auto configuredAnchor =
                 GetEnvironment(L"SPEEDTREE_COLLISION_SESSION_ANCHOR")) {
             sessionAnchor = *configuredAnchor;
+        }
+        if (const auto configuredStallTimeout =
+                GetEnvironment(L"SPEEDTREE_COLLISION_STALL_TIMEOUT_MS")) {
+            wchar_t* end = nullptr;
+            const unsigned long parsed = wcstoul(
+                configuredStallTimeout->c_str(),
+                &end,
+                10);
+            if (end != configuredStallTimeout->c_str() && *end == L'\0' &&
+                parsed >= 5000) {
+                stallTimeoutMs = parsed;
+            }
         }
         std::vector<std::wstring> modelerArguments;
 
@@ -556,6 +625,14 @@ int wmain(int argc, wchar_t** argv) {
                     return 2;
                 }
                 timeoutMs = parsed;
+            } else if (value == L"--stall-timeout-ms" && index + 1 < argc) {
+                wchar_t* end = nullptr;
+                const unsigned long parsed = wcstoul(argv[++index], &end, 10);
+                if (end == argv[index] || *end != L'\0' || parsed < 5000) {
+                    std::wcerr << L"Invalid --stall-timeout-ms value.\n";
+                    return 2;
+                }
+                stallTimeoutMs = parsed;
             } else if (value == L"--log" && index + 1 < argc) {
                 logPath = argv[++index];
             } else {
@@ -864,7 +941,10 @@ int wmain(int argc, wchar_t** argv) {
         }
         CloseHandle(process.hThread);
 
-        const DWORD inputIdleResult = WaitForInputIdle(process.hProcess, timeoutMs);
+        const DWORD initializationTimeoutMs = (std::min)(timeoutMs, stallTimeoutMs);
+        const DWORD inputIdleResult = WaitForInputIdle(
+            process.hProcess,
+            initializationTimeoutMs);
         if (inputIdleResult != 0) {
             RestoreRegistryValue(HKEY_CURRENT_USER, showNewOnStartRestore);
             std::wcerr << L"SpeedTree did not reach its initialized input-idle state (error "
@@ -943,11 +1023,49 @@ int wmain(int argc, wchar_t** argv) {
 
         const DWORD processWaitMs = timeoutMs + 5 * 60 * 1000;
         const ULONGLONG waitDeadline = GetTickCount64() + processWaitMs;
+        ULONGLONG lastMeaningfulProgress = GetTickCount64();
+        ProcessActivitySnapshot activityBaseline{};
+        ReadProcessActivity(process.hProcess, activityBaseline);
+        auto logWriteTime = FileWriteTime(logPath);
         DWORD waitResult = WAIT_TIMEOUT;
         while (GetTickCount64() < waitDeadline) {
-            waitResult = WaitForSingleObject(process.hProcess, 100);
+            waitResult = WaitForSingleObject(process.hProcess, 250);
             if (waitResult == WAIT_OBJECT_0 || waitResult == WAIT_FAILED) {
                 break;
+            }
+            ProcessActivitySnapshot currentActivity{};
+            const bool activityRead = ReadProcessActivity(
+                process.hProcess,
+                currentActivity);
+            const auto currentLogWriteTime = FileWriteTime(logPath);
+            const bool logAdvanced = currentLogWriteTime.has_value() &&
+                (!logWriteTime.has_value() || *currentLogWriteTime != *logWriteTime);
+            const bool cpuAdvanced = activityRead &&
+                currentActivity.cpu100ns >= activityBaseline.cpu100ns + 2'500'000;
+            const bool ioAdvanced = activityRead &&
+                currentActivity.ioBytes >= activityBaseline.ioBytes + 4 * 1024;
+            const bool memoryAdvanced = activityRead &&
+                AbsoluteDifference(
+                    currentActivity.workingSetBytes,
+                    activityBaseline.workingSetBytes) >= 512 * 1024;
+            const bool pageFaultsAdvanced = activityRead &&
+                currentActivity.pageFaultCount >= activityBaseline.pageFaultCount + 64;
+            if (logAdvanced || cpuAdvanced || ioAdvanced ||
+                memoryAdvanced || pageFaultsAdvanced) {
+                lastMeaningfulProgress = GetTickCount64();
+                if (activityRead) {
+                    activityBaseline = currentActivity;
+                }
+                logWriteTime = currentLogWriteTime;
+            }
+            if (GetTickCount64() - lastMeaningfulProgress >= stallTimeoutMs) {
+                std::wcerr << L"SpeedTree produced no meaningful CPU, I/O, memory, or hook-log "
+                           << L"progress for " << stallTimeoutMs
+                           << L" ms. The exact launched child will be terminated for retry.\n";
+                TerminateProcess(process.hProcess, kProgressStallExitCode);
+                WaitForSingleObject(process.hProcess, 5000);
+                CloseHandle(process.hProcess);
+                return ExplainExitCode(kProgressStallExitCode);
             }
         }
         if (waitResult != WAIT_OBJECT_0) {

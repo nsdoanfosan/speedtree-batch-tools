@@ -77,6 +77,15 @@ constexpr unsigned char kMainWindowRecoveryCheckPrologue[15] = {
     0x48, 0x89, 0x7c, 0x24, 0x20,
 };
 
+constexpr unsigned char kQDialogExecPrologue[12] = {
+    0x40, 0x55, 0x56, 0x57,
+    0x48, 0x83, 0xec, 0x50,
+    0x48, 0x8b, 0x79, 0x08,
+};
+
+constexpr int kQMessageBoxQuestionIcon = 4;
+constexpr int kQMessageBoxNoButton = 0x00010000;
+
 constexpr char kCollisionThreadRttiName[] = ".?AVCCollisionThread@@";
 
 using QThreadStartFn = void(__fastcall*)(void* thread, int priority);
@@ -94,6 +103,8 @@ using ApplicationUpdateFn = void(__fastcall*)(void* controller);
 using MainWindowIdleFn = void(__fastcall*)(void* mainWindow);
 using MainWindowConfirmDiscardFn = bool(__fastcall*)(void* mainWindow);
 using MainWindowRecoveryCheckFn = void(__fastcall*)(void* mainWindow);
+using QDialogExecFn = int(__fastcall*)(void* dialog);
+using QMessageBoxIconFn = int(__fastcall*)(const void* messageBox);
 using MainWindowOpenFileListFn = void*(__fastcall*)(
     void* mainWindow,
     void* result,
@@ -207,6 +218,8 @@ MainWindowIdleFn gMainWindowOnIdle = nullptr;
 MainWindowIdleFn gMainWindowOnIdleDraw = nullptr;
 MainWindowConfirmDiscardFn gOriginalMainWindowConfirmDiscard = nullptr;
 MainWindowRecoveryCheckFn gOriginalMainWindowRecoveryCheck = nullptr;
+QDialogExecFn gOriginalQDialogExec = nullptr;
+QMessageBoxIconFn gQMessageBoxIcon = nullptr;
 MainWindowOpenFileListFn gOriginalMainWindowOpenFileList = nullptr;
 std::atomic<void*> gCollisionModel{nullptr};
 std::atomic<bool> gSynchronousCollisionCompleted{false};
@@ -231,6 +244,7 @@ HookRecord gMainWindowOnIdleDrawHook;
 HookRecord gNotifyInternalHook;
 HookRecord gMainWindowConfirmDiscardHook;
 HookRecord gMainWindowRecoveryCheckHook;
+HookRecord gQDialogExecHook;
 HookRecord gMainWindowOpenFileListHook;
 HMODULE gSpeedTreeModule = nullptr;
 std::uintptr_t gSpeedTreeBase = 0;
@@ -418,16 +432,37 @@ void RemoveHook(HookRecord& record) {
 }
 
 void RemovePersistentSessionHooks() {
+    RemoveHook(gQDialogExecHook);
     RemoveHook(gMainWindowRecoveryCheckHook);
     RemoveHook(gMainWindowOpenFileListHook);
 }
 
 void __fastcall HookedMainWindowRecoveryCheck(void* mainWindow) {
     (void)mainWindow;
-    // Every GUI-bake process is wrapper-owned and must be non-interactive. Keep
-    // SpeedTree's autosave/backup file intact, but do not let an existing .sbk
-    // stop either a one-shot export or a persistent document load.
-    Log("wrapper GUI bake skipped SpeedTree's recovery-file question");
+    // This detour replaces the recovery-check entry point. Deliberately do not
+    // call the original: its .sbk lookup, recovery decision, and QMessageBox
+    // construction logic must not execute at all in a wrapper-owned bake.
+    // The autosave/backup file itself remains intact for manual Modeler use.
+    Log("wrapper GUI bake bypassed SpeedTree's entire recovery-check logic before .sbk lookup");
+}
+
+int __fastcall HookedQDialogExec(void* dialog) {
+    if (dialog != nullptr && gQObjectInherits(dialog, "QMessageBox")) {
+        int icon = -1;
+        __try {
+            icon = gQMessageBoxIcon(dialog);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            icon = -1;
+        }
+        if (icon == kQMessageBoxQuestionIcon) {
+            // Wrapper-owned GUI bake processes are intentionally non-interactive.
+            // Suppress the final Qt Question modal itself, independently of which
+            // SpeedTree recovery/file-open path created it or which .sbk exists.
+            Log("wrapper GUI bake suppressed a Qt Question modal with No semantics");
+            return kQMessageBoxNoButton;
+        }
+    }
+    return gOriginalQDialogExec(dialog);
 }
 
 bool BuildSessionTargetPathList(void* result) {
@@ -1999,6 +2034,10 @@ bool InstallHooks() {
     gQApplicationAllWidgets = Resolve<QApplicationAllWidgetsFn>(
         qtWidgets,
         "?allWidgets@QApplication@@SA?AV?$QList@PEAVQWidget@@@@XZ");
+    void* qDialogExec = GetProcAddress(qtWidgets, "?exec@QDialog@@UEAAHXZ");
+    gQMessageBoxIcon = Resolve<QMessageBoxIconFn>(
+        qtWidgets,
+        "?icon@QMessageBox@@QEBA?AW4Icon@1@XZ");
     gQStringCtor = Resolve<QStringCtorFn>(
         qtCore,
         "??0QString@@QEAA@PEBVQChar@@_J@Z");
@@ -2038,6 +2077,7 @@ bool InstallHooks() {
         gProcessEvents == nullptr || gSendPostedEvents == nullptr || gQObjectChildren == nullptr ||
         gQObjectInherits == nullptr || gQObjectParent == nullptr || gQWidgetFind == nullptr ||
         gQCoreApplicationInstance == nullptr || gQApplicationAllWidgets == nullptr ||
+        qDialogExec == nullptr || gQMessageBoxIcon == nullptr ||
         gQStringCtor == nullptr || gQArrayDataAllocate == nullptr ||
         gQMdiAreaSetActiveSubWindow == nullptr || gQMdiAreaActiveSubWindow == nullptr ||
         gQMdiAreaSubWindowList == nullptr ||
@@ -2078,6 +2118,17 @@ bool InstallHooks() {
                 HookedMainWindowRecoveryCheck,
                 kMainWindowRecoveryCheckPrologue,
                 reinterpret_cast<void**>(&gOriginalMainWindowRecoveryCheck))) {
+            RemoveHook(gMainWindowConfirmDiscardHook);
+            RemoveHook(gQThreadStartHook);
+            return false;
+        }
+        if (!InstallHook(
+                gQDialogExecHook,
+                qDialogExec,
+                HookedQDialogExec,
+                kQDialogExecPrologue,
+                reinterpret_cast<void**>(&gOriginalQDialogExec))) {
+            RemoveHook(gMainWindowRecoveryCheckHook);
             RemoveHook(gMainWindowConfirmDiscardHook);
             RemoveHook(gQThreadStartHook);
             return false;

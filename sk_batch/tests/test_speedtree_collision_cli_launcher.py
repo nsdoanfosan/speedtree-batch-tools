@@ -41,7 +41,7 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         self.assertIn("ERROR_PIPE_NOT_CONNECTED", source)
         self.assertIn("starting a replacement", source)
 
-    def test_recovery_question_is_skipped_for_every_gui_bake_mode(self):
+    def test_entire_recovery_check_is_bypassed_for_every_gui_bake_mode(self):
         source = HOOK_SOURCE.read_text(encoding="utf-8")
 
         recovery_hook = source[
@@ -59,9 +59,33 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
             "                gMainWindowRecoveryCheckHook,",
             source,
         )
-        self.assertIn("recovery-file question", recovery_hook)
+        self.assertIn("entire recovery-check logic", recovery_hook)
+        self.assertIn("its .sbk lookup, recovery decision, and QMessageBox", recovery_hook)
         self.assertNotIn("gOriginalMainWindowRecoveryCheck(mainWindow)", recovery_hook)
-        self.assertIn("autosave/backup file intact", recovery_hook)
+        self.assertIn("backup file itself remains intact", recovery_hook)
+
+    def test_qt_question_modal_is_the_no_semantics_fallback(self):
+        source = HOOK_SOURCE.read_text(encoding="utf-8")
+        dialog_hook = source[
+            source.index("int __fastcall HookedQDialogExec"):
+            source.index("bool BuildSessionTargetPathList")
+        ]
+
+        self.assertIn('gQObjectInherits(dialog, "QMessageBox")', dialog_hook)
+        self.assertIn("kQMessageBoxQuestionIcon", dialog_hook)
+        self.assertIn("return kQMessageBoxNoButton;", dialog_hook)
+        self.assertIn("suppressed a Qt Question modal", dialog_hook)
+        self.assertIn('GetProcAddress(qtWidgets, "?exec@QDialog@@UEAAHXZ")', source)
+
+    def test_one_shot_process_wait_has_a_progress_watchdog(self):
+        source = LAUNCHER_SOURCE.read_text(encoding="utf-8")
+
+        self.assertIn("SPEEDTREE_COLLISION_STALL_TIMEOUT_MS", source)
+        self.assertIn("ReadProcessActivity", source)
+        self.assertIn("GetProcessMemoryInfo", source)
+        self.assertIn("FileWriteTime(logPath)", source)
+        self.assertIn("kProgressStallExitCode", source)
+        self.assertIn("no meaningful CPU, I/O, memory, or hook-log", source)
 
     def test_persistent_session_host_and_busy_pipe_wait_are_available(self):
         source = LAUNCHER_SOURCE.read_text(encoding="utf-8")

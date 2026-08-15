@@ -24,9 +24,9 @@ SpeedTree Modeler 10.1.0의 기본 `-export` 명령이 잎 충돌 계산보다 �
 
 Modeler는 기본적으로 wrapper 전용 Windows desktop에서 `SW_SHOW`의 정상 GUI 상태로 실행됩니다. 그 desktop을 사용자의 input desktop으로 전환하지 않으므로 SpeedTree 내부의 활성 창·렌더·collision 경로는 유지하면서도 현재 화면, 포커스, 마우스 입력, 작업 표시줄과 Alt+Tab에는 노출되지 않습니다. 진단을 위해 사용자 desktop에 표시해야 할 때만 `--interactive-window` 또는 `SPEEDTREE_COLLISION_ISOLATED_WINDOW=0`을 사용합니다.
 
-대화형 persistent host가 예기치 않게 닫히면 launch guard가 기본 3회까지 새 process tree로 재시작합니다. export 중 기존 named pipe가 끊기면 client는 죽은 세션을 성공으로 넘기지 않고 replacement host를 시작합니다. 기본 격리 모드를 포함해 Blender exporter는 Modeler crash 결과에 대해 최대 3회의 fresh staging 재시도를 수행하며, 모든 재시도가 실패한 경우에만 해당 export가 실패합니다.
+대화형 persistent host가 예기치 않게 닫히면 launch guard가 기본 3회까지 새 process tree로 재시작합니다. export 중 기존 named pipe가 끊기면 client는 죽은 세션을 성공으로 넘기지 않고 replacement host를 시작합니다. 기본 격리 모드를 포함해 Blender exporter는 Modeler crash 결과에 대해 최대 3회의 fresh staging 재시도를 수행하며, 모든 재시도가 실패한 경우에만 해당 export가 실패합니다. one-shot CLI는 프로세스 CPU·I/O·working set·page fault 또는 hook 로그 중 하나라도 의미 있게 변하면 계속 기다리지만 모든 신호가 기본 30초 동안 멈추면 정확히 자신이 실행한 Modeler만 종료하고 재시도 가능한 stall 결과를 반환합니다.
 
-복구 파일 질문은 wrapper가 만든 모든 GUI bake 프로세스에서 건너뜁니다. SpeedTree 자동저장 설정과 `.sbk` 복구 파일은 변경하거나 삭제하지 않으므로, 수동으로 연 Modeler의 복구 기능은 그대로 유지됩니다. `ShowNewOnStart` 레지스트리 값도 persistent 프로세스 초기화 직후 원래 값으로 복구합니다. 대상이 정상 로드되어도 SpeedTree 탭 이름이 잠시 `blank.spm`으로 남을 수 있지만 내부 모델과 FBX 출력에는 영향을 주지 않습니다.
+복구 질문은 두 단계로 차단합니다. 핵심 1차 차단은 SpeedTree의 `MainWindowRecoveryCheck` 원본을 아예 호출하지 않아 `QMessageBox` 객체와 Question 창 생성 경로 자체를 시작하지 않습니다. 특정 경로나 `.sbk` 이름은 판별하지 않습니다. 2차 안전망은 다른 내부 경로가 1차를 우회한 경우에만 Qt의 최종 `QDialog::exec()` 경계에서 `QMessageBox`의 `Question` 아이콘을 판별해 화면 표시 직전에 차단하고 `No`를 반환합니다. SpeedTree 자동저장 설정과 `.sbk` 복구 파일은 변경하거나 삭제하지 않으므로, 수동으로 연 Modeler의 복구 기능은 그대로 유지됩니다. `ShowNewOnStart` 레지스트리 값도 persistent 프로세스 초기화 직후 원래 값으로 복구합니다. 대상이 정상 로드되어도 SpeedTree 탭 이름이 잠시 `blank.spm`으로 남을 수 있지만 내부 모델과 FBX 출력에는 영향을 주지 않습니다.
 
 ```powershell
 .\speedtree_collision_cli\bin\speedtree_collision_cli.exe `
@@ -83,6 +83,7 @@ Visual Studio 2022 Community의 C++ 도구가 필요합니다.
 - `--session-anchor D:\path\blank.spm`: persistent 프로세스가 유지할 anchor SPM
 - `--isolated-window`: Modeler를 전용 Windows desktop에서 정상 활성 상태로 격리(기본값)
 - `--interactive-window`: 현재 화면에 Modeler 표시(진단 전용)
+- `--stall-timeout-ms 30000`: CPU/I/O/메모리/hook 로그 진행이 모두 멈춘 상태의 최대 허용 시간
 - `--shutdown-session`: 실행 중인 persistent 프로세스 종료
 - `--no-persistent`: 환경 변수 설정과 관계없이 기존 one-shot 경로 사용
 
