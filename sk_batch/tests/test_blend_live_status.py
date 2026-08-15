@@ -3018,6 +3018,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 command[command.index("--target-mesh") + 1],
                 "Tree_elm_01",
             )
+            self.assertIn("--cluster-assembly-only", command)
             self.assertIsNone(app._run_limited.call_args.args[2])
             progress_limits = app._run_limited.call_args.kwargs[
                 "inactivity_timeout_by_marker"

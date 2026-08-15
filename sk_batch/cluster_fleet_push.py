@@ -137,6 +137,7 @@ def build_receipt_refresh_command(target, report_path):
         str(spm.parent),
         "--target-mesh",
         spm.stem,
+        "--cluster-assembly-only",
         "--json",
         str(Path(report_path).resolve()),
     ]

@@ -148,6 +148,24 @@ def _report_file_sha256_memo():
     return reader() if callable(reader) else None
 
 
+def _report_reuses_stable_exact_evidence():
+    """Use one exact read per artifact only inside a read-only report."""
+    audit = (
+        sys.modules.get("pcg_texture_audit")
+        or sys.modules.get("pcg_st9_texture_batch.pcg_texture_audit")
+    )
+    reader = getattr(audit, "report_reuses_stable_exact_evidence", None)
+    return bool(reader()) if callable(reader) else False
+
+
+def _exact_evidence_reader(memo):
+    if _report_reuses_stable_exact_evidence():
+        reader = getattr(memo, "get_or_compute", None)
+        if callable(reader):
+            return reader
+    return getattr(memo, "get_or_compute_verified", None)
+
+
 def file_fingerprint(path, hash_content=True):
     candidate = Path(path)
     if not hash_content:
@@ -203,7 +221,7 @@ def file_fingerprint(path, hash_content=True):
             )
         return snapshot["digest"]
 
-    single_flight = getattr(memo, "get_or_compute_verified", None)
+    single_flight = _exact_evidence_reader(memo)
     try:
         sha256 = (
             single_flight(cache_key, compute)
@@ -1543,9 +1561,7 @@ def _physical_source_3d_artifacts(
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")).hexdigest()
-    single_flight = getattr(
-        validation_cache, "get_or_compute_verified", None
-    )
+    single_flight = _exact_evidence_reader(validation_cache)
     if callable(single_flight):
         try:
             return copy.deepcopy(single_flight(
@@ -1795,9 +1811,7 @@ def _physical_normalization_receipt(
             separators=(",", ":"),
         ).encode("utf-8")
         cache_key = hashlib.sha256(cache_payload).hexdigest()
-        single_flight = getattr(
-            validation_cache, "get_or_compute_verified", None
-        )
+        single_flight = _exact_evidence_reader(validation_cache)
         if callable(single_flight):
             try:
                 return copy.deepcopy(single_flight(

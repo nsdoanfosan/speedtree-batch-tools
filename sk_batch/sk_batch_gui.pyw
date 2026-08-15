@@ -13846,6 +13846,7 @@ class App:
                     if spm.stem.casefold().startswith("sk_")
                     else spm.stem
                 ),
+                "--cluster-assembly-only",
                 "--expected-production-source-revision",
                 expected_production_source_revision,
                 "--json", str(audit_report),
