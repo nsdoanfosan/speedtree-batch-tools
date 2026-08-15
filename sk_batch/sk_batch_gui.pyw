@@ -149,6 +149,7 @@ from artifact_retention import (
 )
 
 from sk_common import (
+    ADDON_ENTRY_DIR,
     CALIBRATION_CACHE_VERSION,
     LOG_DIR,
     PUSH_ABORT_KINDS,
@@ -12380,7 +12381,13 @@ class App:
             )
         return result
 
-    def _material_preflight_cache_context(self, fbx_ini, speedtree_cli):
+    def _material_preflight_cache_context(
+        self,
+        fbx_ini,
+        speedtree_cli,
+        xml_ini=None,
+        speedtree_exe=None,
+    ):
         cached = self.__dict__.get("_material_preflight_cache_context_value")
         if isinstance(cached, dict):
             return cached
@@ -12392,7 +12399,11 @@ class App:
         # export preset and installed SpeedTree identity belong in this
         # automatic runtime signature.  A user force-run still bypasses the
         # cache through the existing path.
-        semantic_files = (Path(fbx_ini),)
+        semantic_files = tuple(
+            Path(path)
+            for path in (fbx_ini, xml_ini)
+            if path is not None
+        )
         cache_dir = Path(
             self.cfg.get("material_preflight_cache_dir")
             or (TOOL_DIR / "cache" / "material_preflight")
@@ -12400,7 +12411,9 @@ class App:
         try:
             runtime_signature = material_preflight_runtime_signature(
                 semantic_files=semantic_files,
-                speedtree_exe=self.cfg["speedtree_exe"],
+                speedtree_exe=(
+                    speedtree_exe or self.cfg["speedtree_exe"]
+                ),
             )
         except OSError:
             # Missing test/development inputs disable this optimization.  The
@@ -12490,14 +12503,51 @@ class App:
         """Run the existing fast pre-Blender material contract check."""
         spm = Path(spm)
         speedtree_spm = Path(speedtree_spm)
-        fbx_ini = Path(self.cfg["fbx_ini"]).resolve()
+        configured_fbx_ini = Path(self.cfg["fbx_ini"]).resolve()
+        configured_xml_ini = Path(
+            self.cfg.get("xml_ini")
+            or configured_fbx_ini.with_name("Options_HI_Xml.ini")
+        ).resolve()
+        # Blender Repair loads the junction-installed add-on. Material
+        # preflight must use that exact helper and its exact preset paths;
+        # export cache fingerprints are intentionally path-sensitive. Using
+        # the configured source checkout here caused one official-Modeler FBX
+        # export, followed by a second collision-CLI FBX/XML export in BWR.
+        installed_addon_dir = Path(ADDON_ENTRY_DIR).absolute()
         try:
-            speedtree_cli = fbx_ini.parents[2] / "speedtree_cli.py"
-        except IndexError as exc:
-            raise BatchItemError(
-                f"SpeedTree export helper 경로를 찾을 수 없음: {fbx_ini}",
-                kind="data_error",
-            ) from exc
+            configured_addon_dir = configured_fbx_ini.parents[2]
+        except IndexError:
+            configured_addon_dir = None
+        # Production always prefers the exact Blender junction entry. CI and
+        # portable development have no Blender install; only there, use the
+        # explicitly configured add-on checkout that owns the supplied preset.
+        addon_dir = next(
+            (
+                candidate
+                for candidate in (
+                    installed_addon_dir,
+                    configured_addon_dir,
+                )
+                if candidate is not None
+                and (candidate / "speedtree_cli.py").is_file()
+            ),
+            installed_addon_dir,
+        )
+        speedtree_cli = addon_dir / "speedtree_cli.py"
+        preset_dir = addon_dir / "presets" / "speedtree_10_1"
+        fbx_ini = preset_dir / configured_fbx_ini.name
+        xml_ini = preset_dir / configured_xml_ini.name
+        if not fbx_ini.is_file():
+            fbx_ini = configured_fbx_ini
+        if not xml_ini.is_file():
+            xml_ini = configured_xml_ini
+        collision_cli = Path(
+            os.environ.get("SPEEDTREE_COLLISION_CLI_EXE")
+            or (
+                REPO_DIR / "speedtree_collision_cli" / "bin"
+                / "speedtree_collision_cli.exe"
+            )
+        ).resolve()
         if not speedtree_cli.is_file():
             raise BatchItemError(
                 f"SpeedTree export helper 없음: {speedtree_cli}",
@@ -12506,6 +12556,8 @@ class App:
         cache_context = self._material_preflight_cache_context(
             fbx_ini,
             speedtree_cli,
+            xml_ini,
+            collision_cli,
         )
         material_report = LOG_DIR / (
             f"{spm.stem}_material_preflight_{stamp}.json"
@@ -12547,8 +12599,9 @@ class App:
             str(TOOL_DIR / "jobs" / "speedtree_material_preflight.py"),
             "--spm", str(speedtree_spm),
             "--canonical-spm", str(spm),
-            "--speedtree-exe", str(self.cfg["speedtree_exe"]),
+            "--speedtree-exe", str(collision_cli),
             "--fbx-ini", str(fbx_ini),
+            "--xml-ini", str(xml_ini),
             "--speedtree-cli", str(speedtree_cli),
             "--report", str(material_report),
             "--timeout", str(export_timeout),
@@ -15244,8 +15297,6 @@ class App:
         return True
 
     def _job_blender(self, iid, spm, item):
-        from spm_audit import audit_spm, sk_readiness
-
         spm = self._prepare_pair_for_job(spm)
         cluster_source = is_cluster_source_spm(spm)
         relation_sensitive = bool(
@@ -15399,31 +15450,10 @@ class App:
                         f"{spm.name} → {speedtree_spm}"
                     )
         blend = blend_path_for(spm)
-        leaf_ok, leaf_reason = self._leaf_reference_ready(speedtree_spm)
-        if not leaf_ok:
-            status = self._record_live_blend_status(iid, spm)
-            contract = inspect_spm_leaf_contract(speedtree_spm)
-            self.log(f"  [② 조기 차단] {spm.name}: {leaf_reason}")
-            raise BatchItemError(
-                leaf_reason,
-                kind="data_error",
-                report={
-                    "status": "blocked",
-                    "error": leaf_reason,
-                    "blend_status": status,
-                    "leaf_reference_contract": contract,
-                },
-            )
-        mesh_block = material_preflight_mesh_reference_block(speedtree_spm)
-        if mesh_block is not None:
-            self.log(
-                f"  [② 조기 차단] {spm.name}: {mesh_block['error']}"
-            )
-            raise BatchItemError(
-                mesh_block["error"],
-                kind="data_error",
-                report=mesh_block,
-            )
+        # The material-preflight child performs both leaf and external-mesh
+        # checks before it enters the shared SpeedTree export gate. Repeating
+        # those exact SPM parses here doubled the read cost without providing
+        # an earlier safety boundary.
         cluster_receipt_resolution = None
         cluster_receipt_resolved = False
 
@@ -15589,17 +15619,6 @@ class App:
                     "open_windows": open_windows,
                 },
             )
-        if should_calibrate_spm(item):
-            readiness = sk_readiness(
-                audit_spm(
-                    spm,
-                    analyze_bone_graph=not item.get(
-                        "manual_bones_locked", False
-                    ),
-                )
-            )
-            if not readiness["ready"]:
-                raise RuntimeError(f"SK 미제작: {readiness['error']}")
         entry = self.state.setdefault(iid, {})
         self.log(f"재질 사전검사 시작: {spm.name} (Blender 실행 전)")
         self.ui_queue.put((

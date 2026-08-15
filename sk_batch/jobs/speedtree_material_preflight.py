@@ -1,7 +1,8 @@
-"""Fast pre-Blender SpeedTree FBX/STMAT material preflight.
+"""Fast pre-Blender SpeedTree FBX/XML/STMAT material preflight.
 
-This process performs only the cached SpeedTree FBX export and read-only SPM /
-STMAT checks.  Blender is launched only after this succeeds.
+This process produces the exact cached collision/prune FBX+XML bundle consumed
+by Blender Repair, then performs read-only SPM/STMAT checks. Blender is launched
+only after this succeeds and reuses the same export receipts.
 """
 from __future__ import annotations
 
@@ -111,6 +112,7 @@ def parse_args():
     parser.add_argument("--canonical-spm", default="")
     parser.add_argument("--speedtree-exe", required=True)
     parser.add_argument("--fbx-ini", required=True)
+    parser.add_argument("--xml-ini", required=True)
     parser.add_argument("--speedtree-cli", required=True)
     parser.add_argument("--report", required=True)
     parser.add_argument("--timeout", type=int, default=900)
@@ -895,28 +897,27 @@ def augment_texture_readiness_contract(
 
 def run_export(args, speedtree_cli):
     spm = Path(args.spm)
-    target = spm.parent / "fbx" / f"{spm.stem}.fbx"
+    fbx_target = spm.parent / "fbx" / f"{spm.stem}.fbx"
+    xml_target = spm.parent / "xml" / f"{spm.stem}.xml"
     require_texture_skip_writing(
         args.fbx_ini,
         purpose=f"{spm.name} material-preflight FBX export",
     )
+    require_texture_skip_writing(
+        args.xml_ini,
+        purpose=f"{spm.name} material-preflight XML export",
+    )
+    export_bundle = getattr(speedtree_cli, "export_bundle", None)
+    if not callable(export_bundle):
+        raise RuntimeError(
+            "Installed SpeedTree BWR helper does not support one-process "
+            "FBX/XML export_bundle; update the junction-installed add-on."
+        )
     original_gate = getattr(speedtree_cli, "speedtree_export_gate", None)
     if not callable(original_gate):
-        # Older helpers do not expose the shared gate.  Preserve their existing
-        # execution behavior, but still tell the parent that the child has
-        # entered the child-authoritative export timeout phase.
-        emit_progress_marker(
-            SPEEDTREE_SLOT_ACQUIRED_MARKER,
-            spm=spm.name,
-            gate="unavailable",
-        )
-        return speedtree_cli.export_target(
-            exe=Path(args.speedtree_exe),
-            spm=spm,
-            options=Path(args.fbx_ini),
-            kind="fbx",
-            target=target,
-            timeout_seconds=max(1, int(args.timeout)),
+        raise RuntimeError(
+            "Installed SpeedTree BWR helper does not expose the shared "
+            "SpeedTree export gate."
         )
 
     @contextmanager
@@ -934,16 +935,17 @@ def run_export(args, speedtree_cli):
 
     # The helper still owns the one machine-wide mutex. This process-local
     # wrapper only exposes the exact wait/acquire boundary to the parent GUI.
-    # The material-preflight child is single-threaded and runs one export, so
+    # The material-preflight child is single-threaded and runs one bundle, so
     # the temporary module binding cannot overlap another call in this process.
     speedtree_cli.speedtree_export_gate = reported_gate
     try:
-        return speedtree_cli.export_target(
+        return export_bundle(
             exe=Path(args.speedtree_exe),
             spm=spm,
-            options=Path(args.fbx_ini),
-            kind="fbx",
-            target=target,
+            targets=(
+                ("fbx", fbx_target, Path(args.fbx_ini)),
+                ("xml", xml_target, Path(args.xml_ini)),
+            ),
             timeout_seconds=max(1, int(args.timeout)),
         )
     finally:
@@ -1363,7 +1365,34 @@ def main():
                 status="ok",
             )
             progress_stage = "speedtree_export"
-            report["speedtree_export"] = run_export(args, speedtree_cli)
+            export_bundle = run_export(args, speedtree_cli)
+            if (
+                isinstance(export_bundle, dict)
+                and isinstance(export_bundle.get("fbx"), dict)
+                and isinstance(export_bundle.get("xml"), dict)
+            ):
+                report["speedtree_export"] = export_bundle["fbx"]
+                report["speedtree_xml_export"] = export_bundle["xml"]
+                report["speedtree_export_bundle"] = {
+                    "policy": (
+                        "native_collision_prune_fbx_xml_one_process_shared_with_bwr"
+                    ),
+                    "fbx_cache_hit": bool(
+                        export_bundle["fbx"].get("cache_hit")
+                    ),
+                    "xml_cache_hit": bool(
+                        export_bundle["xml"].get("cache_hit")
+                    ),
+                    "process_started": any(
+                        not bool(row.get("cache_hit"))
+                        for row in export_bundle.values()
+                    ),
+                }
+            else:
+                # Test/integration adapters that replace run_export may still
+                # return the historical single-FBX row. The real run_export
+                # above requires the exact two-target native bundle.
+                report["speedtree_export"] = export_bundle
             emit_progress_marker(
                 MATERIAL_PREFLIGHT_EXPORT_DONE_MARKER,
                 spm=canonical_spm.name,

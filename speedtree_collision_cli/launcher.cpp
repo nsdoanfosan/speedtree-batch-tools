@@ -24,6 +24,9 @@
 
 namespace {
 
+constexpr wchar_t kCapabilityContract[] =
+    L"SPEEDTREE_COLLISION_CLI_CONTRACT=native-bundle-verification-v1";
+
 constexpr wchar_t kDefaultModelerPath[] =
     L"C:\\Program Files\\SpeedTree\\SpeedTree Modeler v10.1.0\\win64\\SpeedTree_Modeler.exe";
 constexpr wchar_t kExpectedModelerSha256[] =
@@ -520,6 +523,7 @@ void PrintUsage() {
         << L"  --shutdown-session    Stop the persistent SpeedTree process and exit\n"
         << L"  --session-anchor <spm>  Blank SPM kept open by the persistent process\n"
         << L"  --native-cli          Force the headless native CLI path (default)\n"
+        << L"  --verification-only   Skip Collision/Prune bake for temporary audit exports\n"
         << L"  --gui-bake            Use the legacy Modeler bake path for diagnosis\n"
         << L"  --secondary-export-options <ini>  Native CLI second export preset\n"
         << L"  --secondary-export <path>  Native CLI second output in the same process\n"
@@ -569,6 +573,7 @@ int wmain(int argc, wchar_t** argv) {
         bool serveSession = false;
         bool pingSession = false;
         bool shutdownSession = false;
+        bool verificationOnly = false;
         bool nativeCli =
             GetEnvironment(L"SPEEDTREE_COLLISION_NATIVE_CLI") !=
             std::optional<std::wstring>(L"0");
@@ -620,6 +625,8 @@ int wmain(int argc, wchar_t** argv) {
                 shutdownSession = true;
             } else if (value == L"--native-cli") {
                 nativeCli = true;
+            } else if (value == L"--verification-only") {
+                verificationOnly = true;
             } else if (value == L"--gui-bake") {
                 nativeCli = false;
             } else if (
@@ -675,6 +682,10 @@ int wmain(int argc, wchar_t** argv) {
             std::wcerr << L"A bundled second export is supported only by native CLI mode.\n";
             return 2;
         }
+        if (verificationOnly && !nativeCli) {
+            std::wcerr << L"Verification-only export is supported only by native CLI mode.\n";
+            return 2;
+        }
 
         if (!VerifySupportedInstallation(modeler, diagnose)) {
             return 3;
@@ -687,6 +698,7 @@ int wmain(int argc, wchar_t** argv) {
         }
         if (diagnose) {
             std::wcout << L"Supported installation verified.\n";
+            std::wcout << kCapabilityContract << L"\n";
             return 0;
         }
         if (pingSession) {
@@ -891,6 +903,9 @@ int wmain(int argc, wchar_t** argv) {
         const auto restoreGuiBake = SetTemporaryEnvironment(
             L"SPEEDTREE_COLLISION_CLI_GUI_BAKE",
             nativeCli ? L"0" : L"1");
+        const auto restoreVerificationOnly = SetTemporaryEnvironment(
+            L"SPEEDTREE_COLLISION_CLI_VERIFICATION_ONLY",
+            verificationOnly ? L"1" : L"0");
         const auto restoreOutput = SetTemporaryEnvironment(
             L"SPEEDTREE_COLLISION_CLI_OUTPUT",
             serveSession ? L"" : std::filesystem::absolute(outputFbx).wstring());
@@ -977,6 +992,7 @@ int wmain(int argc, wchar_t** argv) {
         RestoreEnvironment(restoreSecondaryOutput);
         RestoreEnvironment(restoreExportOptions);
         RestoreEnvironment(restoreOutput);
+        RestoreEnvironment(restoreVerificationOnly);
         RestoreEnvironment(restoreGuiBake);
         RestoreEnvironment(restoreTimeout);
         RestoreEnvironment(restoreLog);

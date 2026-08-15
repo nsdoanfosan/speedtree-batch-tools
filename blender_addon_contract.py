@@ -386,8 +386,18 @@ def source_expectations_from_environment(environ=None):
     return result
 
 
-def discover_installed_addon_source(addon_id, *, appdata=None):
-    """Resolve the newest Blender junction/package for one known add-on."""
+def discover_installed_addon_source(
+    addon_id,
+    *,
+    appdata=None,
+    resolve_junction=True,
+):
+    """Find the newest Blender junction/package for one known add-on.
+
+    Source validation normally wants the resolved Git checkout. Export cache
+    handoff instead needs the junction entry path Blender reports from
+    ``__file__`` because SpeedTree option identities are path-sensitive.
+    """
     if addon_id not in ADDONS:
         raise AddonContractError(f"unknown Blender add-on: {addon_id}")
     appdata = appdata or os.environ.get("APPDATA")
@@ -413,6 +423,8 @@ def discover_installed_addon_source(addon_id, *, appdata=None):
     for version in versions:
         candidate = version / "scripts" / "addons" / module_name
         if candidate.is_dir():
+            if not resolve_junction:
+                return candidate.absolute()
             try:
                 return candidate.resolve()
             except OSError:

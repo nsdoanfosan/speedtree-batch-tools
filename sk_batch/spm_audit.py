@@ -37,6 +37,7 @@ import ctypes
 import errno
 import gzip
 import hashlib
+import importlib.util
 import io
 import json
 import math
@@ -67,6 +68,7 @@ from process_lifecycle import (
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from sk_common import (
+        ADDON_ENTRY_DIR,
         SPM_BONE_CONTRACT_VERSION,
         calibration_settings_signature,
         file_content_fingerprint,
@@ -82,6 +84,7 @@ if __package__ in (None, ""):
     )
 else:
     from .sk_common import (
+        ADDON_ENTRY_DIR,
         SPM_BONE_CONTRACT_VERSION,
         calibration_settings_signature,
         file_content_fingerprint,
@@ -3917,7 +3920,7 @@ def export_verify_xml(spm_path, cfg, out_path):
     executable, native_cli = _verification_speedtree_executable(cfg)
     cmd = [
         str(executable),
-        *(["--native-cli"] if native_cli else []),
+        *(["--native-cli", "--verification-only"] if native_cli else []),
         str(spm_path),
         "-export_options",
         cfg["xml_ini"],
@@ -3983,7 +3986,7 @@ def export_verify_fbx_geometry(spm_path, cfg, out_path):
     executable, native_cli = _verification_speedtree_executable(cfg)
     cmd = [
         str(executable),
-        *(["--native-cli"] if native_cli else []),
+        *(["--native-cli", "--verification-only"] if native_cli else []),
         str(spm_path),
         "-export_options",
         cfg["fbx_ini"],
@@ -4133,6 +4136,7 @@ def export_verify_xml_fbx_bundle(spm_path, cfg, xml_out, fbx_out):
     cmd = [
         str(executable),
         "--native-cli",
+        "--verification-only",
         "--secondary-export-options",
         str(cfg["xml_ini"]),
         "--secondary-export",
@@ -4208,6 +4212,102 @@ def export_verify_xml_fbx_bundle(spm_path, cfg, xml_out, fbx_out):
             )
 
 
+_BWR_SPEEDTREE_CLI_MODULE = None
+
+
+def _load_bwr_speedtree_cli():
+    """Load the same junction-installed cache/export helper used by BWR."""
+    global _BWR_SPEEDTREE_CLI_MODULE
+    if _BWR_SPEEDTREE_CLI_MODULE is not None:
+        return _BWR_SPEEDTREE_CLI_MODULE
+    helper_path = Path(ADDON_ENTRY_DIR).absolute() / "speedtree_cli.py"
+    spec = importlib.util.spec_from_file_location(
+        "sk_batch_stage1_speedtree_cli",
+        helper_path,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(
+            "Cannot load the junction-installed BWR SpeedTree helper: "
+            + str(helper_path)
+        )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if not callable(getattr(module, "export_bundle", None)):
+        raise RuntimeError(
+            "The junction-installed BWR helper lacks export_bundle: "
+            + str(helper_path)
+        )
+    _BWR_SPEEDTREE_CLI_MODULE = module
+    return module
+
+
+def _production_export_option(cfg, key):
+    configured = Path(cfg[key]).resolve()
+    installed = (
+        Path(ADDON_ENTRY_DIR).absolute()
+        / "presets"
+        / "speedtree_10_1"
+        / configured.name
+    )
+    return installed if installed.is_file() else configured
+
+
+def export_verify_cluster_production_bundle(spm_path, cfg):
+    """Produce Cluster ① output once for later material preflight and BWR."""
+    spm_path = Path(spm_path).resolve()
+    fbx_options = _production_export_option(cfg, "fbx_ini")
+    xml_options = _production_export_option(cfg, "xml_ini")
+    require_texture_skip_writing(
+        fbx_options,
+        purpose=f"{spm_path.name} production FBX export",
+    )
+    require_texture_skip_writing(
+        xml_options,
+        purpose=f"{spm_path.name} production XML export",
+    )
+    executable, _native_cli = _verification_speedtree_executable(
+        cfg,
+        require_native=True,
+    )
+    helper = _load_bwr_speedtree_cli()
+    fbx_path = spm_path.parent / "fbx" / f"{spm_path.stem}.fbx"
+    xml_path = spm_path.parent / "xml" / f"{spm_path.stem}.xml"
+    exports = helper.export_bundle(
+        exe=Path(executable),
+        spm=spm_path,
+        targets=(
+            ("fbx", fbx_path, fbx_options),
+            ("xml", xml_path, xml_options),
+        ),
+        timeout_seconds=max(1, int(cfg.get("spm_verify_timeout", 120))),
+    )
+    if not isinstance(exports.get("fbx"), dict) or not isinstance(
+        exports.get("xml"), dict
+    ):
+        raise RuntimeError(
+            "Cluster production export did not return both FBX and XML"
+        )
+    # Match the add-on's production wrapper so its next cache read is a pure
+    # hit and does not need to repair an older XML timestamp.
+    minimum_mtime = max(
+        spm_path.stat().st_mtime_ns,
+        fbx_path.stat().st_mtime_ns,
+    )
+    mtime_sync = helper.synchronize_result_mtime(
+        exports["xml"],
+        minimum_mtime,
+    )
+    inventory = cluster_root_bones_from_xml(xml_path)
+    return {
+        "exports": exports,
+        "fbx": fbx_path,
+        "xml": xml_path,
+        "fbx_has_geometry": b"Vertices" in fbx_path.read_bytes(),
+        "inventory": inventory,
+        "xml_mtime_sync": mtime_sync,
+    }
+
+
 def bone_counts_from_xml(xml_path):
     root = ET.parse(xml_path).getroot()
     counts = {}
@@ -4280,57 +4380,77 @@ def calibrate_cluster_root_bones(
 
     patched_text = apply_cluster_root_bone_plan(original_text, plan)
     write_spm(spm_path, patched_text)
-    with tempfile.TemporaryDirectory(prefix="skbatch_cluster_root_") as tmp:
-        xml_out = Path(tmp) / f"{Path(spm_path).stem}_cluster_root.xml"
-        fbx_out = Path(tmp) / f"{Path(spm_path).stem}_cluster_root.fbx"
+    production_handoff = bool(
+        cfg.get("cluster_production_export_handoff", False)
+    )
+    if production_handoff:
+        # Non-bone transforms are applied by process_spm immediately after
+        # this deterministic plan. Verify only after those final SPM bytes are
+        # ready, writing the durable bundle consumed by linked ②.
+        inventory = {
+            "bone_count": plan["expected_root_bone_count"],
+            "root_bone_count": plan["expected_root_bone_count"],
+            "non_root_bone_count": 0,
+            "root_generator_counts": dict(
+                plan["expected_root_generator_counts"]
+            ),
+        }
         log(
-            "  [Cluster bones] SpeedTree structural-root verification: "
-            f"{plan['expected_root_bone_count']} roots"
+            "  [Cluster bones] logical root plan ready; exact production "
+            "FBX/XML verification deferred until final SPM transforms"
         )
-        if _bundled_bone_verification_enabled(cfg):
-            bundle = export_verify_xml_fbx_bundle(
-                spm_path,
-                cfg,
-                xml_out,
-                fbx_out,
+    else:
+        with tempfile.TemporaryDirectory(prefix="skbatch_cluster_root_") as tmp:
+            xml_out = Path(tmp) / f"{Path(spm_path).stem}_cluster_root.xml"
+            fbx_out = Path(tmp) / f"{Path(spm_path).stem}_cluster_root.fbx"
+            log(
+                "  [Cluster bones] SpeedTree structural-root verification: "
+                f"{plan['expected_root_bone_count']} roots"
             )
-            fbx_has_geometry = bundle["fbx_has_geometry"]
-        else:
-            export_verify_xml(spm_path, cfg, xml_out)
-            fbx_has_geometry = None
-        inventory = cluster_root_bones_from_xml(xml_out)
-        if inventory["bone_count"] != plan["expected_root_bone_count"]:
-            raise RuntimeError(
-                "Cluster structural-root bone count mismatch: "
-                f"expected {plan['expected_root_bone_count']}, "
-                f"exported {inventory['bone_count']}"
-            )
-        if inventory["non_root_bone_count"]:
-            raise RuntimeError(
-                "Cluster structural-root export still contains descendant bones: "
-                f"{inventory['non_root_bone_count']}"
-            )
-        if (
-            inventory["root_generator_counts"]
-            != plan["expected_root_generator_counts"]
-        ):
-            raise RuntimeError(
-                "Cluster structural-root generator mismatch: "
-                f"expected {plan['expected_root_generator_counts']}, "
-                f"exported {inventory['root_generator_counts']}"
-            )
-        if fbx_has_geometry is None:
-            log("  [Cluster bones] SpeedTree FBX geometry verification")
-            fbx_has_geometry = export_verify_fbx_geometry(
-                spm_path,
-                cfg,
-                fbx_out,
-            )
-        if not fbx_has_geometry:
-            raise RuntimeError(
-                "Cluster structural-root bone compaction produced an FBX "
-                "without mesh geometry"
-            )
+            if _bundled_bone_verification_enabled(cfg):
+                bundle = export_verify_xml_fbx_bundle(
+                    spm_path,
+                    cfg,
+                    xml_out,
+                    fbx_out,
+                )
+                fbx_has_geometry = bundle["fbx_has_geometry"]
+            else:
+                export_verify_xml(spm_path, cfg, xml_out)
+                fbx_has_geometry = None
+            inventory = cluster_root_bones_from_xml(xml_out)
+            if inventory["bone_count"] != plan["expected_root_bone_count"]:
+                raise RuntimeError(
+                    "Cluster structural-root bone count mismatch: "
+                    f"expected {plan['expected_root_bone_count']}, "
+                    f"exported {inventory['bone_count']}"
+                )
+            if inventory["non_root_bone_count"]:
+                raise RuntimeError(
+                    "Cluster structural-root export still contains descendant "
+                    f"bones: {inventory['non_root_bone_count']}"
+                )
+            if (
+                inventory["root_generator_counts"]
+                != plan["expected_root_generator_counts"]
+            ):
+                raise RuntimeError(
+                    "Cluster structural-root generator mismatch: "
+                    f"expected {plan['expected_root_generator_counts']}, "
+                    f"exported {inventory['root_generator_counts']}"
+                )
+            if fbx_has_geometry is None:
+                log("  [Cluster bones] SpeedTree FBX geometry verification")
+                fbx_has_geometry = export_verify_fbx_geometry(
+                    spm_path,
+                    cfg,
+                    fbx_out,
+                )
+            if not fbx_has_geometry:
+                raise RuntimeError(
+                    "Cluster structural-root bone compaction produced an FBX "
+                    "without mesh geometry"
+                )
 
     generator_counts = dict(
         sorted(
@@ -4342,8 +4462,9 @@ def calibrate_cluster_root_bones(
         **plan,
         "actual_root_bone_count": inventory["root_bone_count"],
         "actual_root_generator_counts": inventory["root_generator_counts"],
-        "verified_xml": True,
-        "verified_fbx_geometry": True,
+        "verified_xml": not production_handoff,
+        "verified_fbx_geometry": not production_handoff,
+        "production_verification_deferred": production_handoff,
     }
     rounds = [
         {
@@ -5552,6 +5673,82 @@ def _process_spm_locked(
                         or ["unknown logical mismatch"]
                     )
                 )
+            if cfg.get("cluster_production_export_handoff", False):
+                log(
+                    "  [Cluster bones] final collision/prune FBX+XML export "
+                    "and structural-root verification"
+                )
+                production = export_verify_cluster_production_bundle(
+                    spm_path,
+                    cfg,
+                )
+                inventory = production["inventory"]
+                calibration = report.get("calibration") or {}
+                expected_count = calibration.get(
+                    "expected_root_bone_count"
+                )
+                expected_generators = calibration.get(
+                    "expected_root_generator_counts"
+                ) or {}
+                if inventory["bone_count"] != expected_count:
+                    raise RuntimeError(
+                        "Cluster production root-bone count mismatch: "
+                        f"expected {expected_count}, exported "
+                        f"{inventory['bone_count']}"
+                    )
+                if inventory["non_root_bone_count"]:
+                    raise RuntimeError(
+                        "Cluster production export contains descendant bones: "
+                        f"{inventory['non_root_bone_count']}"
+                    )
+                if inventory["root_generator_counts"] != expected_generators:
+                    raise RuntimeError(
+                        "Cluster production root-generator mismatch: "
+                        f"expected {expected_generators}, exported "
+                        f"{inventory['root_generator_counts']}"
+                    )
+                if not production["fbx_has_geometry"]:
+                    raise RuntimeError(
+                        "Cluster production collision/prune FBX has no mesh "
+                        "geometry"
+                    )
+                exports = production["exports"]
+                report["cluster_production_export_handoff"] = {
+                    "status": "verified",
+                    "policy": (
+                        "one_native_collision_prune_bundle_shared_with_2"
+                    ),
+                    "fbx": {
+                        "path": str(production["fbx"]),
+                        "cache_hit": bool(
+                            exports["fbx"].get("cache_hit")
+                        ),
+                        "size": exports["fbx"].get("size"),
+                    },
+                    "xml": {
+                        "path": str(production["xml"]),
+                        "cache_hit": bool(
+                            exports["xml"].get("cache_hit")
+                        ),
+                        "size": exports["xml"].get("size"),
+                    },
+                    "root_bone_count": inventory["root_bone_count"],
+                    "root_generator_counts": inventory[
+                        "root_generator_counts"
+                    ],
+                    "xml_mtime_sync": production["xml_mtime_sync"],
+                }
+                calibration.update({
+                    "actual_root_bone_count": inventory[
+                        "root_bone_count"
+                    ],
+                    "actual_root_generator_counts": inventory[
+                        "root_generator_counts"
+                    ],
+                    "verified_xml": True,
+                    "verified_fbx_geometry": True,
+                    "production_verification_deferred": False,
+                })
 
         # Calibration temporarily writes Absolute/1 and Relative variants. If
         # the final logical XML is identical to the source, restore the exact

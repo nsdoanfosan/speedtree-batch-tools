@@ -55,13 +55,17 @@ SPM 안에 Atlas Leaf Mesh Builder 출력이 있으면 이름만 보지 않고 �
 경우에만 별도의 연결 오류로 차단한다.
 오래 걸리는 단계를 돌리기 전에 항상 먼저 눌러보는 용도.
 
-**① SPM 본 세팅 (파일별 편차 있음, 기본 4개 동시 실행)** — SPM만 수정:
+**① SPM 본 세팅 (파일별 편차 있음, 기본 4개 동시 실행)** — SPM 정규화와
+검증을 수행하며, 변경된 Cluster는 ②가 그대로 소비할 production bundle도 기록:
 - **Cluster 구조 루트 본 정규화**: `Cluster` 폴더의 SPM도 ①을 건너뛰지 않는다.
   각 Tree 루트 아래 첫 번째 실제 렌더 메시를 찾고 그 구조 루트만 `Absolute/1`,
   나머지 Branch는 `Absolute/0`으로 만든다. 메시가 없는 배치용 pivot Branch는
   숨김 처리한다. 한 SPM에 사용 조각이 여러 개면 구조 루트와 축도 여러 개다.
-  XML에서 각 사용 Cluster 조각마다 루트 본이 정확히 하나이고 descendant 본이
-  없는지, FBX에 실제 메시 지오메트리가 남는지까지 검증한 뒤 저장한다.
+  모든 SPM 변환을 마친 뒤 개조 CLI로 collision High와 shade pruning이 반영된
+  production FBX/XML을 한 Modeler 프로세스에서 내보낸다. XML에서 각 사용 Cluster
+  조각마다 루트 본이 정확히 하나이고 descendant 본이 없는지, 같은 FBX에 실제 메시
+  지오메트리가 남는지 검증한다. 이 번들과 export receipt는 ②의 재질 사전검사와
+  BWR이 그대로 재사용하므로 같은 SPM을 다시 열지 않는다.
   Blender Repair는 FBX의 짧은 `_End` marker를 축 본으로 쓰지 않는다. Raw XML의
   렌더 구조 루트 `Start→End`를 `Bone_N_Start` 본 하나로 재구성하고, 여러 조각은
   서로 parent가 없는 독립 축으로 유지한다. 일반 트리용 Base reparent는 Cluster에
@@ -156,8 +160,10 @@ skin deformer를 완전히 생략한 경우에만, 실제 imported deform bone �
 본 수가 하나가 아니면 정상 다축 리그를 평탄화하지 않고 즉시 실패한다.
 ("완료된 항목도 다시 실행"으로 강제 가능). 재실행 = 갱신. 배치 Blender는
 `--factory-startup`으로 시작하고 BWR만 명시적으로 켜므로 사용자용 애드온의 시작
-오류와 등록 비용을 가져오지 않는다. SpeedTree가 만든 `.stmat`의 실제 Material
-목록은 Blender를 띄우기 전에 가벼운 SpeedTree FBX 사전 export로 먼저 검사한다.
+오류와 등록 비용을 가져오지 않는다. Blender를 띄우기 전 재질 사전검사는 별도 공식
+FBX를 만들지 않는다. 최종 BWR과 동일한 개조 CLI·동일 preset으로 collision/prune
+FBX+XML bundle을 한 번 생산하거나 ①의 정확한 receipt를 재사용한 뒤, 그 `.stmat`의
+실제 Material 목록을 검사한다. 이어지는 BWR은 같은 export cache를 소비한다.
 성공한 라이브 Repair 검사는 상태 파일에 `blend_resume_receipt`를 남긴다. 다음
 비강제 실행은 이 영수증이 묶은 SPM, blend, Repair 보고서, wind JSON, stmat,
 텍스처, 의존 SPM과 출력 설정이 모두 같을 때 완료 행을 worker/progress 대기열에
@@ -312,7 +318,8 @@ phase 상태를 다시 해석하지 않는다.
   자동 대상으로 활성화한다. Base 역할 미분류는 제외·경고하고, Tree/Base 공유 GUID나
   본 속성 누락처럼 안전한 대상을 확정할 수 없는 구조는 원본을 수정하지 않고 오류 처리하며
   GUID와 원인을 JSON/GUI에 기록한다.
-- 같은 SPM의 FBX/XML은 SpeedTree 프로세스 두 개로 동시에 열지 않고 순서대로 export한다.
+- 같은 최종 SPM의 FBX/XML은 개조 CLI의 한 Modeler 프로세스에서 묶어 export하고,
+  ①→재질 사전검사→② 사이에는 경로·옵션·실행 파일이 같은 content receipt를 넘긴다.
   서로 다른 SPM의 ① 캘리브레이션 병렬 처리는 그대로 유지한다.
 - 실패 중 생성된 최신 `.blend`만 보고 완료로 건너뛰지 않는다. blend와 wind JSON이 모두
   존재하고 SPM보다 최신일 때만 ②를 건너뛴다.

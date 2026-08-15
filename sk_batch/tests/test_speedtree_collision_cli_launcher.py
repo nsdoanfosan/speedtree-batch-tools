@@ -45,6 +45,20 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         self.assertIn('$launcherSource,', source)
         self.assertIn('Join-Path $sourceDirectory "session_protocol.h"', source)
         self.assertIn("$oldestOutput -ge $latestInput", source)
+        self.assertIn("$diagnoseOutput -contains $capabilityContract", source)
+
+    def test_batch_launchers_reject_a_stale_cli_feature_contract(self):
+        launcher = LAUNCHER_SOURCE.read_text(encoding="utf-8")
+        contract = (
+            "SPEEDTREE_COLLISION_CLI_CONTRACT="
+            "native-bundle-verification-v1"
+        )
+
+        self.assertIn(contract, launcher)
+        for batch_launcher in (INTEGRATED_BAT, SK_BATCH_BAT, SK_EXACT_PUSH_BAT):
+            source = batch_launcher.read_text(encoding="utf-8")
+            self.assertIn(contract, source)
+            self.assertIn("findstr.exe /x", source)
 
     def test_disappeared_persistent_pipe_starts_a_replacement(self):
         source = LAUNCHER_SOURCE.read_text(encoding="utf-8")
@@ -110,6 +124,20 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         self.assertIn("SPEEDTREE_COLLISION_CLI_SECONDARY_OPTIONS", launcher)
         self.assertIn("RunSecondaryNativeExport", hook)
         self.assertIn("native CLI bundled secondary export completed", hook)
+
+    def test_verification_exports_skip_only_the_expensive_post_bake(self):
+        launcher = LAUNCHER_SOURCE.read_text(encoding="utf-8")
+        hook = HOOK_SOURCE.read_text(encoding="utf-8")
+
+        self.assertIn('value == L"--verification-only"', launcher)
+        self.assertIn("SPEEDTREE_COLLISION_CLI_VERIFICATION_ONLY", launcher)
+        self.assertIn("SPEEDTREE_COLLISION_CLI_VERIFICATION_ONLY", hook)
+        self.assertIn(
+            "native CLI verification-only export skips Collision/Prune bake",
+            hook,
+        )
+        self.assertIn("gOriginalSpeedTreeExport(arg1, arg2, arg3, gameExport);", hook)
+        self.assertIn("RunSecondaryNativeExport(arg1, gameExport);", hook)
 
     def test_persistent_session_host_and_busy_pipe_wait_are_available(self):
         source = LAUNCHER_SOURCE.read_text(encoding="utf-8")

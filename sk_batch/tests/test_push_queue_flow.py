@@ -2426,7 +2426,7 @@ class PushQueueFlowTests(unittest.TestCase):
             "child_progress_inactivity",
         )
 
-    def test_blender_job_has_one_live_audit_call_after_static_mesh_gate(self):
+    def test_blender_job_delegates_static_mesh_gate_to_material_preflight(self):
         tree = ast.parse(
             (SK_BATCH_DIR / "sk_batch_gui.pyw").read_text(encoding="utf-8")
         )
@@ -2440,9 +2440,9 @@ class PushQueueFlowTests(unittest.TestCase):
             for node in app_class.body
             if isinstance(node, ast.FunctionDef) and node.name == "_job_blender"
         )
-        # The single entry point is the recovery wrapper: the direct run
-        # admits a registered target block to repair before it terminates
-        # (#160).  It still has to be one call, still after the mesh gate.
+        # The single live-audit entry point remains the recovery wrapper. Leaf
+        # and external-mesh checks run once in the material-preflight child,
+        # before that child enters the SpeedTree gate.
         refresh_calls = [
             node
             for node in ast.walk(job)
@@ -2457,9 +2457,16 @@ class PushQueueFlowTests(unittest.TestCase):
             and isinstance(node.func, ast.Name)
             and node.func.id == "material_preflight_mesh_reference_block"
         ]
+        material_preflight_calls = [
+            node
+            for node in ast.walk(job)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_execute_material_preflight"
+        ]
         self.assertEqual(len(refresh_calls), 1)
-        self.assertEqual(len(mesh_calls), 1)
-        self.assertLess(mesh_calls[0].lineno, refresh_calls[0].lineno)
+        self.assertEqual(len(mesh_calls), 0)
+        self.assertEqual(len(material_preflight_calls), 1)
 
     def test_next_queued_job_keeps_live_audit_memo_generation(self):
         gui = load_gui_module()

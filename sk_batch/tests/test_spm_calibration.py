@@ -351,6 +351,85 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
             self.assertEqual(report["status"], "calibrated")
             self.assertEqual(report["total_bones"], 2)
 
+    def test_cluster_stage1_writes_one_durable_bundle_for_linked_stage2(self):
+        source_xml = cluster_graph_xml()
+        cfg = {
+            "cluster_root_only_bones": True,
+            "cluster_production_export_handoff": True,
+            "rename_materials": False,
+            "normalize_collision_pruning": False,
+            "tree_leaf_parent_red_gradient": False,
+            "backup_spm": False,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            cluster_dir = Path(tmp) / "cluster"
+            cluster_dir.mkdir()
+            spm_path = cluster_dir / "SK_leaf_handoff_01.spm"
+            fbx_path = cluster_dir / "fbx" / f"{spm_path.stem}.fbx"
+            xml_path = cluster_dir / "xml" / f"{spm_path.stem}.xml"
+            spm_audit.write_spm(spm_path, source_xml)
+
+            def fake_production(_spm_path, _cfg):
+                fbx_path.parent.mkdir()
+                xml_path.parent.mkdir()
+                fbx_path.write_bytes(b"Vertices")
+                xml_path.write_text(
+                    cluster_export_xml(["Structural A", "Structural B"]),
+                    encoding="utf-8",
+                )
+                return {
+                    "exports": {
+                        "fbx": {"cache_hit": False, "size": 8},
+                        "xml": {"cache_hit": False, "size": 128},
+                    },
+                    "fbx": fbx_path,
+                    "xml": xml_path,
+                    "fbx_has_geometry": True,
+                    "inventory": {
+                        "bone_count": 2,
+                        "root_bone_count": 2,
+                        "non_root_bone_count": 0,
+                        "root_generator_counts": {
+                            "Structural A": 1,
+                            "Structural B": 1,
+                        },
+                    },
+                    "xml_mtime_sync": {"changed": False},
+                }
+
+            with mock.patch.object(
+                spm_audit,
+                "export_verify_cluster_production_bundle",
+                side_effect=fake_production,
+            ) as production, mock.patch.object(
+                spm_audit,
+                "export_verify_xml_fbx_bundle",
+                side_effect=AssertionError("temporary verification bundle used"),
+            ), mock.patch.object(
+                spm_audit,
+                "export_verify_xml",
+                side_effect=AssertionError("separate XML export used"),
+            ), mock.patch.object(
+                spm_audit,
+                "export_verify_fbx_geometry",
+                side_effect=AssertionError("separate FBX export used"),
+            ):
+                report = spm_audit.process_spm(
+                    spm_path,
+                    cfg,
+                    log=lambda _message: None,
+                )
+
+            production.assert_called_once()
+            self.assertEqual(report["status"], "calibrated")
+            handoff = report["cluster_production_export_handoff"]
+            self.assertEqual(handoff["status"], "verified")
+            self.assertFalse(handoff["fbx"]["cache_hit"])
+            self.assertTrue(report["calibration"]["verified_xml"])
+            self.assertTrue(
+                report["calibration"]["verified_fbx_geometry"]
+            )
+
     def test_cluster_fixed_point_skips_speedtree_without_prior_receipt(self):
         source_xml = cluster_graph_xml()
         fixed = spm_audit.apply_cluster_root_bone_plan(
@@ -558,6 +637,7 @@ class SpmCalibrationEstimateTests(unittest.TestCase):
 
             self.assertEqual(run.call_count, 1)
             self.assertIn("--native-cli", captured["command"])
+            self.assertIn("--verification-only", captured["command"])
             self.assertIn("--secondary-export-options", captured["command"])
             self.assertIn("--secondary-export", captured["command"])
             self.assertTrue(result["fbx_has_geometry"])

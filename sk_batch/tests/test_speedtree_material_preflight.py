@@ -218,11 +218,14 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
             root = Path(temporary)
             spm = root / "SK_tree_test.spm"
             options = root / "Options.ini"
+            xml_options = root / "OptionsXml.ini"
             spm.write_bytes(b"spm")
             options.write_text("[Export]", encoding="utf-8")
+            xml_options.write_text("[Export]", encoding="utf-8")
             args = argparse.Namespace(
                 spm=str(spm),
                 fbx_ini=str(options),
+                xml_ini=str(xml_options),
                 speedtree_exe=str(root / "SpeedTree.exe"),
                 timeout=900,
             )
@@ -235,13 +238,16 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                 yield
                 events.append("gate_exit")
 
-            def export_target(**kwargs):
+            def export_bundle(**kwargs):
                 with helper.speedtree_export_gate():
                     events.append("export")
-                return {"status": "ok", "kwargs": kwargs}
+                return {
+                    "fbx": {"status": "ok", "kwargs": kwargs},
+                    "xml": {"status": "ok", "kwargs": kwargs},
+                }
 
             helper.speedtree_export_gate = original_gate
-            helper.export_target = export_target
+            helper.export_bundle = export_bundle
             output = io.StringIO()
             with mock.patch.object(
                 preflight,
@@ -251,7 +257,10 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
 
             self.assertEqual(events, ["gate_enter", "export", "gate_exit"])
             self.assertIs(helper.speedtree_export_gate, original_gate)
-            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["fbx"]["status"], "ok")
+            self.assertEqual(result["xml"]["status"], "ok")
+            targets = result["fbx"]["kwargs"]["targets"]
+            self.assertEqual([row[0] for row in targets], ["fbx", "xml"])
             text = output.getvalue()
             self.assertIn(preflight.SPEEDTREE_SLOT_WAIT_MARKER, text)
             self.assertIn(preflight.SPEEDTREE_SLOT_ACQUIRED_MARKER, text)
@@ -263,7 +272,7 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
             ), mock.patch("builtins.print", side_effect=OSError("closed log")):
                 result = preflight.run_export(args, helper)
 
-            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["fbx"]["status"], "ok")
             self.assertEqual(events, ["gate_enter", "export", "gate_exit"])
             self.assertIs(helper.speedtree_export_gate, original_gate)
 
