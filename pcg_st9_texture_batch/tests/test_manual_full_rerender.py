@@ -355,6 +355,65 @@ class ManualFullRerenderTests(unittest.TestCase):
 
 
 class ManualCookCacheTests(unittest.TestCase):
+    def test_isolated_cook_prunes_resources_and_dependencies_of_removed_graphs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sbs = root / "authoring.sbs"
+            sbs.write_text(
+                "<package><dependencies>"
+                '<dependency><filename v="?himself"/><uid v="1"/></dependency>'
+                '<dependency><filename v="used.sbsar"/><uid v="2"/></dependency>'
+                '<dependency><filename v="orphan.sbsar"/><uid v="3"/></dependency>'
+                "</dependencies><content><group><content>"
+                '<resource><identifier v="kept"/><uid v="10"/></resource>'
+                '<resource><identifier v="orphan"/><uid v="11"/></resource>'
+                "</content></group>"
+                '<graph><identifier v="T_Test"/><compNodes><compNode><compImplementation>'
+                '<compFilter><parameters><parameter><name v="outputsize"/><paramValue>'
+                '<constantValueInt2 v="12 12"/>'
+                '</paramValue></parameter><parameter><paramValue>'
+                '<constantValueString v="pkg:///Resources/kept?dependency=1"/>'
+                '</paramValue></parameter></parameters></compFilter>'
+                '<compInstance><path v="pkg:///Used?dependency=2"/></compInstance>'
+                '</compImplementation></compNode></compNodes><options><option>'
+                '<name v="defaultParentSize"/><value v="12x12"/>'
+                '</option></options></graph>'
+                '<graph><identifier v="T_Old"/><compNodes><compNode><compImplementation>'
+                '<compFilter><parameters><parameter><paramValue>'
+                '<constantValueString v="pkg:///Resources/orphan?dependency=1"/>'
+                '</paramValue></parameter></parameters></compFilter>'
+                '<compInstance><path v="pkg:///Orphan?dependency=3"/></compInstance>'
+                "</compImplementation></compNode></compNodes></graph>"
+                "</content></package>",
+                encoding="utf-8",
+            )
+            observed = {}
+
+            def fake_run(command, **_kwargs):
+                input_path = Path(command[command.index("--inputs") + 1])
+                observed["isolated"] = input_path.read_text(encoding="utf-8")
+                output_dir = Path(command[command.index("--output-path") + 1])
+                output_dir.mkdir(parents=True, exist_ok=True)
+                (output_dir / f"{input_path.stem}.sbsar").write_bytes(b"cooked")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(subprocess, "run", side_effect=fake_run):
+                sbs_auto.cook_sbs_graph_package(
+                    sbs, ["T_Test"], root / "cache", cfg={"designer_dir": r"C:\Designer"},
+                    isolated_output_size_log2=(5, 5),
+                )
+
+            isolated = observed["isolated"]
+            self.assertIn('identifier v="T_Test"', isolated)
+            self.assertNotIn('identifier v="T_Old"', isolated)
+            self.assertIn('identifier v="kept"', isolated)
+            self.assertNotIn('identifier v="orphan"', isolated)
+            self.assertIn('uid v="1"', isolated)
+            self.assertIn('uid v="2"', isolated)
+            self.assertNotIn('uid v="3"', isolated)
+            self.assertIn('constantValueInt2 v="5 5"', isolated)
+            self.assertIn('value v="5x5"', isolated)
+
     def test_isolated_cook_pins_cluster_dependency_without_editing_source(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

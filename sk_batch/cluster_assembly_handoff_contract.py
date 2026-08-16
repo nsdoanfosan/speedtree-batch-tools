@@ -116,6 +116,86 @@ def _refresh_current_artifact_fingerprints(value):
     return refreshed
 
 
+def _current_dependency_normalized_variants(spm, dependency, persisted):
+    """Resolve the provider through its current target receipt, not an alias.
+
+    Discovery receipts can retain the requested material identity even after
+    the Atlas publisher canonicalizes it (for example ``M_cluster_*`` to
+    ``M_leaf_*``).  The current target/scope receipt is authoritative for the
+    exported plan FBX filename, so recover its canonical material identity and
+    ask the PCG resolver to rebuild the normalized contract from current files.
+    """
+    spm = Path(spm).expanduser().resolve()
+    persisted = _refresh_current_artifact_fingerprints(persisted or {})
+    source_blend = str(
+        ((persisted.get("source_blend") or {}).get("path"))
+        or ((dependency.get("target_relation") or {}).get("source_blend"))
+        or ""
+    ).strip()
+    if not source_blend:
+        return persisted
+
+    receipt_paths = [
+        spm.parent / ".atlas_leaf_speedtree_targets" / f"{spm.stem}.json",
+    ]
+    scope_dir = spm.parent / ".atlas_leaf_speedtree_scopes"
+    if scope_dir.is_dir():
+        receipt_paths.extend(sorted(scope_dir.glob(f"*__{spm.stem}.json")))
+
+    identities = []
+    for receipt_path in receipt_paths:
+        if not receipt_path.is_file():
+            continue
+        try:
+            payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        declared_spm = str(payload.get("spm") or "").strip()
+        if declared_spm and _normalized_path(declared_spm) != _normalized_path(spm):
+            continue
+        declared_blend = str(payload.get("blend_file") or "").strip()
+        if (
+            not declared_blend
+            or _normalized_path(declared_blend) != _normalized_path(source_blend)
+        ):
+            continue
+        for value in (
+            payload.get("material_name"),
+            payload.get("atlas_asset_name"),
+            *[
+                group.get("material")
+                for group in payload.get("material_groups") or []
+                if isinstance(group, dict)
+            ],
+        ):
+            identity = str(value or "").strip()
+            if identity and identity not in identities:
+                identities.append(identity)
+
+    if not identities:
+        return persisted
+    from pcg_st9_texture_batch.pcg_cluster_assembly_contract import (
+        _atlas_normalized_variants,
+    )
+
+    for identity in identities:
+        current = _atlas_normalized_variants(
+            spm.parent,
+            identity,
+            [spm],
+            audit=None,
+            full_fbx_role_present=True,
+        )
+        variants = list((current or {}).get("variants") or [])
+        if variants and all(
+            (row.get("plan_fbx") or {}).get("exists")
+            and (row.get("plan_fbx") or {}).get("sha256")
+            for row in variants
+        ):
+            return _refresh_current_artifact_fingerprints(current)
+    return persisted
+
+
 def current_assembly_manifest_repair_handoff(spm_path, full_fbx_path):
     """Recover a live Repair handoff from the current production manifest.
 
@@ -178,12 +258,85 @@ def current_assembly_manifest_repair_handoff(spm_path, full_fbx_path):
             "manifest": file_fingerprint(manifest_path),
         }
         part_builder_inputs.append(role)
+
+    # A prior production manifest can predate provider-expansion logic and
+    # therefore persist only the primary provider for a role.  Recover any
+    # exact normalized SPM-only provider from the manifest's own PCG receipt
+    # and let the current Blender mesh plus topology matcher decide whether it
+    # is actually rendered.  This is deliberately not a blind Base removal:
+    # unmatched providers still fail closed before any public asset is saved.
+    pcg_receipt = evidence.get("pcg_receipt") or {}
+    receipt_path = Path(str(pcg_receipt.get("path") or ""))
+    if receipt_path.is_file():
+        try:
+            receipt_payload = json.loads(
+                receipt_path.read_text(encoding="utf-8")
+            )
+            receipt_contract = select_cluster_contract(
+                receipt_payload,
+                spm,
+            )
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                "current production Assembly PCG receipt is unreadable: "
+                + str(receipt_path)
+            ) from exc
+        existing_provider_keys = {
+            str(row.get("provider_key") or "").casefold()
+            for row in part_builder_inputs
+        }
+        for dependency in receipt_contract.get("dependencies") or []:
+            role_name = str(dependency.get("role") or "").casefold()
+            provider_key = _provider_key(role_name, dependency)
+            normalized = _current_dependency_normalized_variants(
+                spm,
+                dependency,
+                dependency.get("normalized_variants") or {},
+            )
+            target_material_names = [
+                str(value).strip()
+                for value in dependency.get("target_material_names") or []
+                if str(value).strip()
+            ]
+            if (
+                role_name not in ROLE_ORDER
+                or provider_key.casefold() in existing_provider_keys
+                or dependency.get("spm_only_provider_candidate") is not True
+                or not list(normalized.get("variants") or [])
+                or not target_material_names
+            ):
+                continue
+            material_identity = str(
+                normalized.get("material") or ""
+            ).strip()
+            aliases = list(dict.fromkeys(
+                target_material_names
+                + ([material_identity] if material_identity else [])
+                + [str(dependency.get("name") or "")]
+            ))
+            part_builder_inputs.append({
+                "role": role_name,
+                "provider_key": provider_key,
+                "role_identity": target_material_names[0],
+                "role_identity_aliases": aliases,
+                "assignments": [],
+                "rendered_provider_expansion_covered": True,
+                "speculative_provider_expansion": True,
+                "normalized_variants": normalized,
+                "current_manifest_authority": {
+                    "status": "current",
+                    "source": "production_manifest_pcg_provider_expansion",
+                    "manifest": file_fingerprint(manifest_path),
+                    "pcg_receipt": file_fingerprint(receipt_path),
+                },
+            })
+            existing_provider_keys.add(provider_key.casefold())
     return {
         "status": "ready",
         "issues": [],
         "spm": file_fingerprint(spm),
         "actual_fbx": file_fingerprint(full_fbx_path),
-        "pcg_receipt": evidence.get("pcg_receipt"),
+        "pcg_receipt": pcg_receipt,
         "full_skeletal_mesh": {"preserved": True},
         "assembly": {
             "requested": True,

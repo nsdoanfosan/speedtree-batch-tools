@@ -4934,11 +4934,16 @@ def build_cluster_assembly_contract(
             and not current_live_pair_covered
             and decisions == {"pass_through"}
         )
-        # A lower SPM material/CutoutMesh pair is useful provider provenance,
-        # but it cannot prove that the role is present in the latest Full FBX.
-        # Keep it diagnostic-only; actual FBX material faces decide rendered
-        # role presence.
-        rendered_provider_expansion_covered = False
+        # A lower SPM material/CutoutMesh pair cannot by itself prove that the
+        # provider is rendered in the latest Full FBX.  It can, however,
+        # safely expand the downstream revalidation inventory when exact
+        # normalized topology is available.  The Blender handoff still makes
+        # the final material+polygon decision, so an absent sibling remains a
+        # pass-through while a reimported/rendered sibling can no longer be
+        # omitted merely because it was not the primary same-role provider.
+        rendered_provider_expansion_covered = bool(
+            spm_only_provider_candidate
+        )
         normalized_variants_required = decision == "normalize_part"
         normalized_variants_missing = bool(
             normalized_variants_required and not normalized_variants

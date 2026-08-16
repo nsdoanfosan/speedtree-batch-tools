@@ -134,6 +134,190 @@ class CurrentFbxRoleAuthorityTests(unittest.TestCase):
                 file_fingerprint(source_blend)["sha256"],
             )
 
+    def test_current_manifest_recovers_omitted_spm_only_provider(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "Tree_01.spm"
+            full_fbx = root / "Tree_01.fbx"
+            assembly = root / "assembly"
+            provider = root / "Cluster"
+            assembly.mkdir()
+            provider.mkdir()
+            spm.write_bytes(b"spm-current")
+            full_fbx.write_bytes(b"fbx-current")
+            source_blend = provider / "leaf_07.blend"
+            plan_fbx = provider / "leaf_07_01.fbx"
+            normalized_manifest = provider / "leaf_07.json"
+            source_blend.write_bytes(b"blend-current")
+            plan_fbx.write_bytes(b"plan-current")
+            normalized_manifest.write_bytes(b"manifest-current")
+            normalized = {
+                "status": "ready",
+                "material": "M_cluster_tree_07",
+                "source_blend": file_fingerprint(source_blend),
+                "manifest": file_fingerprint(normalized_manifest),
+                "variants": [{
+                    "ordinal": 1,
+                    "plan_fbx": file_fingerprint(plan_fbx),
+                }],
+            }
+            receipt = root / "receipt.json"
+            receipt.write_text(json.dumps({
+                "cluster_assembly": {
+                    "folder": str(root),
+                    "dependencies": [{
+                        "role": "leaf",
+                        "name": "SK_cluster_tree_07",
+                        "target_material_names": ["leaf_tree_05"],
+                        "spm_only_provider_candidate": True,
+                        "normalized_variants": normalized,
+                    }],
+                    "handoff": {"roles": []},
+                },
+            }), encoding="utf-8")
+            manifest_path = (
+                assembly / "Tree_01_cluster_assembly_bindings.json"
+            )
+            manifest_path.write_text(json.dumps({
+                "kind": "sk_batch_cluster_nanite_assembly_inputs",
+                "status": "ready",
+                "content_decision": "build",
+                "parts": [{"prototype_id": "branch_01"}],
+                "handoff_evidence": {
+                    "pcg_receipt": file_fingerprint(receipt),
+                    "roles": {
+                        "branch:branch_01": {
+                            "role": "branch",
+                            "provider_key": "branch:branch_01",
+                            "polygon_indices": [0, 1],
+                            "normalized_variants": normalized,
+                        },
+                    },
+                },
+            }), encoding="utf-8")
+
+            handoff = current_assembly_manifest_repair_handoff(
+                spm, full_fbx
+            )
+
+            inputs = handoff["assembly"]["part_builder_inputs"]
+            self.assertEqual(len(inputs), 2)
+            recovered = next(
+                row for row in inputs
+                if row["provider_key"] == "leaf:cluster_tree_07"
+            )
+            self.assertEqual(recovered["role_identity"], "leaf_tree_05")
+            self.assertTrue(
+                recovered["rendered_provider_expansion_covered"]
+            )
+            self.assertEqual(
+                recovered["current_manifest_authority"]["source"],
+                "production_manifest_pcg_provider_expansion",
+            )
+
+    def test_current_manifest_uses_canonical_provider_receipt_alias(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "Tree_01.spm"
+            full_fbx = root / "Tree_01.fbx"
+            assembly = root / "assembly"
+            scope_dir = root / ".atlas_leaf_speedtree_scopes"
+            provider = root / "Cluster"
+            for folder in (assembly, scope_dir, provider):
+                folder.mkdir()
+            spm.write_bytes(b"spm-current")
+            full_fbx.write_bytes(b"fbx-current")
+            source_blend = provider / "leaf_07.blend"
+            source_blend.write_bytes(b"blend-current")
+            current_plan = provider / "m_leaf_tree_07__01.fbx"
+            current_plan.write_bytes(b"current-plan")
+            current_manifest = scope_dir / "scope__Tree_01.json"
+            current_manifest.write_text(json.dumps({
+                "spm": str(spm),
+                "blend_file": str(source_blend),
+                "material_name": "M_leaf_tree_07",
+                "material_groups": [{"material": "M_leaf_tree_07"}],
+            }), encoding="utf-8")
+            stale_plan = provider / "m_cluster_tree_07__01.fbx"
+            persisted = {
+                "status": "ready",
+                "material": "M_cluster_tree_07",
+                "source_blend": file_fingerprint(source_blend),
+                "variants": [{
+                    "ordinal": 1,
+                    "plan_fbx": file_fingerprint(stale_plan),
+                }],
+            }
+            canonical = {
+                "status": "ready",
+                "material": "M_leaf_tree_07",
+                "source_blend": file_fingerprint(source_blend),
+                "manifest": file_fingerprint(current_manifest),
+                "variants": [{
+                    "ordinal": 1,
+                    "plan_fbx": file_fingerprint(current_plan),
+                }],
+            }
+            receipt = root / "receipt.json"
+            receipt.write_text(json.dumps({
+                "cluster_assembly": {
+                    "folder": str(root),
+                    "dependencies": [{
+                        "role": "leaf",
+                        "name": "SK_cluster_tree_07",
+                        "target_material_names": ["leaf_tree_05"],
+                        "spm_only_provider_candidate": True,
+                        "normalized_variants": persisted,
+                    }],
+                    "handoff": {"roles": []},
+                },
+            }), encoding="utf-8")
+            (assembly / "Tree_01_cluster_assembly_bindings.json").write_text(
+                json.dumps({
+                    "kind": "sk_batch_cluster_nanite_assembly_inputs",
+                    "status": "ready",
+                    "content_decision": "build",
+                    "parts": [{"prototype_id": "branch_01"}],
+                    "handoff_evidence": {
+                        "pcg_receipt": file_fingerprint(receipt),
+                        "roles": {
+                            "branch:branch_01": {
+                                "role": "branch",
+                                "provider_key": "branch:branch_01",
+                                "polygon_indices": [0, 1],
+                                "normalized_variants": canonical,
+                            },
+                        },
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+            with mock.patch(
+                "pcg_st9_texture_batch.pcg_cluster_assembly_contract."
+                "_atlas_normalized_variants",
+                return_value=canonical,
+            ) as resolver:
+                handoff = current_assembly_manifest_repair_handoff(
+                    spm, full_fbx
+                )
+
+            recovered = next(
+                row for row in handoff["assembly"]["part_builder_inputs"]
+                if row["provider_key"] == "leaf:cluster_tree_07"
+            )
+            self.assertEqual(
+                recovered["normalized_variants"]["material"],
+                "M_leaf_tree_07",
+            )
+            self.assertEqual(
+                recovered["normalized_variants"]["variants"][0][
+                    "plan_fbx"
+                ]["path"],
+                str(current_plan.resolve()),
+            )
+            resolver.assert_called_once()
+
     def test_rendered_expansion_does_not_invent_absent_fbx_geometry(self):
         decision, evidence = _reconcile_role(
             {
@@ -1226,6 +1410,64 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                 handoff["role_demotions"][0]["code"],
                 "CLUSTER_ROLE_NOT_ASSEMBLED",
             )
+
+    def test_spm_only_provider_is_recovered_when_full_fbx_renders_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_Tree_willow_01.spm"
+            fbx = root / "tree.fbx"
+            receipt = root / "receipt.json"
+            spm.write_bytes(b"spm")
+            fbx.write_bytes(b"fbx")
+            write_receipt(
+                receipt,
+                spm,
+                fbx,
+                [("leaf", "leaf_willow_05", "reference_only")],
+                normalized_by_role={
+                    "leaf": {
+                        "status": "ready",
+                        "variants": [{"ordinal": 1}],
+                        "delivery_mode": "asset_registration_only",
+                        "target_deliveries": [{
+                            "schema_version": 3,
+                            "spm": str(spm),
+                            "delivery_mode": "asset_registration_only",
+                            "target_material_id": 26,
+                            "normalized_variants": [{
+                                "ordinal": 1,
+                                "target_mesh_id": 127,
+                            }],
+                            "generator_bindings": [],
+                        }],
+                    },
+                },
+            )
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+            role = payload["items"][0]["cluster_assembly"]["handoff"][
+                "roles"
+            ][0]
+            role["rendered_provider_expansion_covered"] = True
+            receipt.write_text(json.dumps(payload), encoding="utf-8")
+            inventory = build_blender_fbx_inventory(
+                [role_object(fbx, material="M_leaf_willow_05")],
+                fbx,
+                {"leaf": ["M_leaf_willow_05"]},
+            )
+
+            handoff = build_assembly_handoff(receipt, spm, inventory)
+
+            self.assertEqual(handoff["status"], "ready")
+            leaf = next(
+                row for row in handoff["roles"]
+                if row["provider_key"] == "leaf:leaf_willow_05"
+            )
+            self.assertEqual(leaf["decision"], "normalize_part")
+            self.assertTrue(leaf["provider_rendered_pair_covered"])
+            self.assertEqual(len(
+                handoff["assembly"]["part_builder_inputs"]
+            ), 1)
+            self.assertEqual(handoff["role_demotions"], [])
 
     def test_full_fbx_alias_does_not_override_provider_material_identity(self):
         with tempfile.TemporaryDirectory() as tmp:

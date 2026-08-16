@@ -79,8 +79,18 @@ def plan_nanite_assembly_material_normalization(global_slots, parts):
                 f"Nanite Assembly part {mesh} has no material slots"
             )
         desired_remap = []
+        local_key_to_index = {}
         for local_index, row in enumerate(local_slots):
             key = _slot_identity(row, f"part {mesh} material {local_index}")
+            duplicate_index = local_key_to_index.get(key)
+            if duplicate_index is not None:
+                raise NaniteAssemblyMaterialError(
+                    "Nanite Assembly part has duplicate material identity after "
+                    "reimport: "
+                    f"mesh={mesh}, slots={duplicate_index},{local_index}, key={key}. "
+                    "The material sidecar must compact the part before Assembly build."
+                )
+            local_key_to_index[key] = local_index
             global_index = key_to_index.get(key)
             if global_index is None:
                 global_index = len(canonical_slots)

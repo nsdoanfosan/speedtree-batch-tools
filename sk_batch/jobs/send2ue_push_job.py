@@ -88,47 +88,61 @@ from blender_addon_gateway import prepare_runtime
 
 
 def load_cluster_assembly_manifest(blend_dir, spm_path):
-    """Load the current asset-local Assembly manifest as the authority."""
-    direct_path = (
-        Path(blend_dir)
-        / "assembly"
-        / f"{Path(spm_path).stem}_cluster_assembly_bindings.json"
-    )
-    if direct_path.is_file():
-        manifest = json.loads(direct_path.read_text(encoding="utf-8"))
-        manifest["manifest"] = cluster_file_fingerprint(direct_path)
-        if manifest.get("kind") != "sk_batch_cluster_nanite_assembly_inputs":
-            raise RuntimeError("unsupported BWR Cluster Assembly manifest kind")
-        validate_manifest_artifacts(manifest)
-        return manifest
+    """Load the latest Repair decision, with direct artifacts as fallback.
 
-    # Pass-through content can legitimately have no direct build manifest.
-    # Its latest Repair report remains useful only for that content decision.
+    Pass-through Repair can leave an older ready bindings file in place, or it
+    can publish a pass-through receipt at the historical bindings path.  The
+    Repair report is therefore authoritative whenever it exists.
+    """
+    blend_dir = Path(blend_dir)
+    spm_path = Path(spm_path)
     pipeline_path = (
-        Path(blend_dir)
+        blend_dir
         / "reports"
-        / f"{Path(spm_path).stem}_speedtree_repair_pipeline_report_codex.json"
+        / f"{spm_path.stem}_speedtree_repair_pipeline_report_codex.json"
     )
-    if not pipeline_path.is_file():
-        return None
-    pipeline = json.loads(pipeline_path.read_text(encoding="utf-8"))
-    embedded = pipeline.get("cluster_assembly_manifest")
-    if not isinstance(embedded, dict):
-        return None
-    if embedded.get("status") == "pass_through":
-        return embedded
-    manifest_path = ((embedded.get("manifest") or {}).get("path") or "")
-    if not manifest_path or not Path(manifest_path).is_file():
-        raise RuntimeError(
-            "BWR Cluster Assembly manifest file is missing: " + str(manifest_path)
-        )
-    validate_file_fingerprint(
-        embedded.get("manifest"), "BWR Cluster Assembly manifest"
+    if pipeline_path.is_file():
+        pipeline = json.loads(pipeline_path.read_text(encoding="utf-8"))
+        embedded = pipeline.get("cluster_assembly_manifest")
+        if isinstance(embedded, dict):
+            if embedded.get("status") == "pass_through":
+                return embedded
+
+            manifest_record = embedded.get("manifest") or {}
+            manifest_path = Path(str(manifest_record.get("path") or ""))
+            if not manifest_path.is_file():
+                raise RuntimeError(
+                    "BWR Cluster Assembly manifest file is missing: "
+                    + str(manifest_path)
+                )
+            validate_file_fingerprint(
+                manifest_record, "BWR Cluster Assembly manifest"
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["manifest"] = manifest_record
+            if manifest.get("kind") != "sk_batch_cluster_nanite_assembly_inputs":
+                raise RuntimeError(
+                    "unsupported BWR Cluster Assembly manifest kind"
+                )
+            validate_manifest_artifacts(manifest)
+            return manifest
+
+    # Compatibility fallback for blends produced before Repair reports carried
+    # the Assembly content decision.  Pass-through is complete metadata and
+    # must not enter the ready-only artifact validator.
+    direct_path = (
+        blend_dir
+        / "assembly"
+        / f"{spm_path.stem}_cluster_assembly_bindings.json"
     )
-    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-    manifest["manifest"] = embedded.get("manifest")
+    if not direct_path.is_file():
+        return None
+    manifest = json.loads(direct_path.read_text(encoding="utf-8"))
+    manifest["manifest"] = cluster_file_fingerprint(direct_path)
     if manifest.get("kind") != "sk_batch_cluster_nanite_assembly_inputs":
         raise RuntimeError("unsupported BWR Cluster Assembly manifest kind")
+    if manifest.get("status") == "pass_through":
+        return manifest
     validate_manifest_artifacts(manifest)
     return manifest
 

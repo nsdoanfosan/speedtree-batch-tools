@@ -45,6 +45,7 @@ from cluster_assembly_builder import (  # noqa: E402
     _expected_normalized_bounds_for_variant,
     _exact_source_bone_influences,
     _export_selected_fbx,
+    _generated_material_sidecar,
     _normalized_prototype_for_component,
     _ordered_cross_object_correspondence,
     _partition_normalized_render_components,
@@ -59,10 +60,179 @@ from cluster_assembly_builder import (  # noqa: E402
     validate_normalized_prototype_unit_contract,
     validate_unreal_asset_contract,
     validate_unreal_bounds_contract,
+    validate_unreal_part_material_contracts,
     validate_unreal_normalized_prototype_bounds,
     validate_wind_json_against_skeleton,
     validate_persisted_residual_gate,
 )
+
+
+class GeneratedMaterialSlotContractTests(unittest.TestCase):
+    @staticmethod
+    def _sidecar_payload(mesh_name):
+        return {
+            "mesh_name": mesh_name,
+            "speedtree_handoff_contract": {
+                "kind": "speedtree",
+                "mesh_name": mesh_name,
+            },
+            "materials": [
+                {
+                    "name": "M_bark_tree_01",
+                    "slot_name": "M_bark_tree_01",
+                    "slot_index": 0,
+                    "speedtree_intent": {
+                        "material_instance_base": "bark_tree_01",
+                    },
+                },
+                {
+                    "name": "M_leaf_tree_01_001",
+                    "slot_name": "M_leaf_tree_01_001",
+                    "slot_index": 1,
+                    "speedtree_intent": {
+                        "material_instance_base": "leaf_tree_01_001",
+                    },
+                },
+                {
+                    "name": "M_unused_tree_01",
+                    "slot_name": "M_unused_tree_01",
+                    "slot_index": 2,
+                    "speedtree_intent": {
+                        "material_instance_base": "unused_tree_01",
+                    },
+                },
+            ],
+            "validation_children": [{
+                "asset_unit": mesh_name,
+                "json_name": mesh_name,
+                "material_slots": [
+                    "M_bark_tree_01",
+                    "M_leaf_tree_01_001",
+                    "M_unused_tree_01",
+                ],
+                "handoff_materials": [
+                    "M_bark_tree_01",
+                    "M_leaf_tree_01_001",
+                    "M_unused_tree_01",
+                ],
+            }],
+        }
+
+    def test_generated_base_sidecar_uses_only_actual_fbx_slots(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "Full.json"
+            source.write_text(
+                json.dumps(self._sidecar_payload("SK_tree_01")),
+                encoding="utf-8",
+            )
+
+            result = _generated_material_sidecar(
+                {"_material_pipeline_json_path": str(source)},
+                "SK_tree_01_NA_Base",
+                root,
+                expected_material_slots=[
+                    "M_leaf_tree_01.001",
+                    "M_bark_tree_01",
+                ],
+            )
+
+            payload = json.loads(
+                Path(result["generated"]["path"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                [row["slot_name"] for row in payload["materials"]],
+                ["M_leaf_tree_01_001", "M_bark_tree_01"],
+            )
+            self.assertEqual(
+                [row["slot_index"] for row in payload["materials"]],
+                [0, 1],
+            )
+            self.assertEqual(
+                payload["validation_children"][0]["material_slots"],
+                ["M_leaf_tree_01.001", "M_bark_tree_01"],
+            )
+
+    def test_unreal_part_preflight_rejects_reimported_duplicate_slot(self):
+        class Interface:
+            def __init__(self, name):
+                self.name = name
+
+            def get_name(self):
+                return self.name
+
+        class Slot:
+            def __init__(self, name, material_name):
+                self.name = name
+                self.interface = Interface(material_name)
+
+            def get_editor_property(self, name):
+                if name == "material_slot_name":
+                    return self.name
+                if name == "material_interface":
+                    return self.interface
+                raise AttributeError(name)
+
+        class Mesh:
+            def __init__(self, materials):
+                self.materials = materials
+
+            def get_editor_property(self, name):
+                if name == "materials":
+                    return self.materials
+                raise AttributeError(name)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_blend = root / "SK_leaf_tree_01.blend"
+            source_blend.write_bytes(b"blend")
+            sidecar_dir = root / "texture"
+            sidecar_dir.mkdir()
+            sidecar = sidecar_dir / "SK_leaf_tree_01_01.json"
+            payload = self._sidecar_payload("SK_leaf_tree_01_01")
+            payload["materials"] = payload["materials"][:2]
+            sidecar.write_text(json.dumps(payload), encoding="utf-8")
+            contract = {
+                "mesh_name": "SK_leaf_tree_01_01",
+                "sidecar": file_fingerprint(sidecar),
+                "slots": [
+                    {
+                        "index": 0,
+                        "slot_name": "M_bark_tree_01",
+                        "material_instance_name": "MI_bark_tree_01",
+                    },
+                    {
+                        "index": 1,
+                        "slot_name": "M_leaf_tree_01_001",
+                        "material_instance_name": "MI_leaf_tree_01_001",
+                    },
+                ],
+            }
+            manifest = {"parts": [{
+                "prototype_id": "leaf",
+                "asset_name": "SK_leaf_tree_01_01",
+                "external_source": {
+                    "kind": "send_to_unreal_normalized_skeletal_part",
+                    "source_blend": {"path": str(source_blend)},
+                    "material_contract": contract,
+                },
+            }]}
+            mesh = Mesh([
+                Slot("M_bark_tree_01", "MI_bark_tree_01"),
+                Slot("M_leaf_tree_01_001", "MI_leaf_tree_01_001"),
+                Slot("M_leaf_tree_01_001", "MI_leaf_tree_01_001"),
+            ])
+            unreal = SimpleNamespace(SkeletalMesh=Mesh)
+
+            with self.assertRaisesRegex(
+                ClusterAssemblyBuildError,
+                "material slots changed during reimport",
+            ):
+                validate_unreal_part_material_contracts(
+                    unreal,
+                    manifest,
+                    {"leaf": mesh},
+                )
 
 
 class AssemblyBaseRoleExclusionTests(unittest.TestCase):
@@ -1394,6 +1564,25 @@ class ContentDecisionTests(unittest.TestCase):
                     "preserved": [],
                 },
             })
+
+    def test_speculative_provider_expansion_may_match_zero_components(self):
+        claims = _validate_role_component_claims({
+            "leaf:stale_candidate": {
+                "matched": {},
+                "preserved": [{"polygon_count": 32}],
+                "speculative_provider_expansion": True,
+            },
+            "leaf:actual_provider": {
+                "matched": {
+                    "signature": {
+                        "instances": [{"polygons": [4, 5]}],
+                    },
+                },
+                "preserved": [],
+            },
+        })
+
+        self.assertEqual({polygon for _target, polygon in claims}, {4, 5})
 
     def test_ready_is_automatic_content_driven_build(self):
         self.assertEqual(content_build_decision(ready_handoff()), "build")

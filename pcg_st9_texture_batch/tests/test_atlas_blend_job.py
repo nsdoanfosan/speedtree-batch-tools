@@ -42,6 +42,10 @@ class AtlasBlendJobTests(unittest.TestCase):
 
         self.assertEqual(targets[0]["source_material_names"], ["M_leaf_test_01"])
         self.assertEqual(targets[0]["source_material_ids"], [4])
+        self.assertEqual(
+            targets[0]["generator_variant_policy"],
+            "ensure_all_material_cutouts",
+        )
 
     def test_target_map_rejects_late_unlocatable_generator_work(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -69,38 +73,51 @@ class AtlasBlendJobTests(unittest.TestCase):
                 "generator_connection": {"requested": True, "complete": False},
             }), encoding="utf-8")
 
-            speedtree = types.ModuleType("atlas_leaf_mesh_builder.speedtree")
             def export_target(
-                    _props, _target, *, atlas_asset_name=None,
+                    _props, staged_target, *, atlas_asset_name=None,
                     source_material_names=None, source_material_ids=None,
-                    allow_create=False):
-                return (None, manifest_path, [], "updated", "1", [], [], {})
-            speedtree.export_or_update_speedtree_spm_path = export_target
-            package = types.ModuleType("atlas_leaf_mesh_builder")
-            package.__path__ = []
+                    generator_variant_policy=None,
+                    allow_create=False, production_target_spm=None):
+                return (
+                    staged_target, manifest_path, [], "updated", "1", [], [], {}
+                )
+
+            validate_targets = mock.Mock(return_value={})
+            cleanup_transactions = mock.Mock()
+
+            def execute(targets, build, validate, *, allow_create=False):
+                staged = root / "stage" / "SK_test.spm"
+                result = build(staged, targets[0])
+                validate([staged], [{}])
+                return [result]
+
+            operations = {
+                "export_or_update_speedtree_spm_path_impl": export_target,
+                "validate_staged_speedtree_targets": validate_targets,
+                "cleanup_pending_transaction_roots": cleanup_transactions,
+                "execute_atomic_target_update": execute,
+            }
             target = {
                 "spm": str(root / "SK_test.spm"),
                 "source_material_names": ["M_leaf_test"],
                 "source_material_ids": [4],
                 "generator_bindings": [],
+                "generator_variant_policy": "ensure_all_material_cutouts",
             }
-            with mock.patch.dict(sys.modules, {
-                "atlas_leaf_mesh_builder": package,
-                "atlas_leaf_mesh_builder.speedtree": speedtree,
-            }):
-                runtime = mock.Mock()
-                runtime.operation.return_value = export_target
-                with self.assertRaisesRegex(RuntimeError, "Generator 연결 검증 실패"):
-                    self.job.apply_mapped_targets(
-                        object(),
-                        [target],
-                        "M_leaf_test_atlas_01",
-                        runtime,
-                    )
-                runtime.operation.assert_called_once_with(
-                    "atlas_leaf_mesh_builder",
-                    "export_or_update_speedtree_spm_path",
+            runtime = mock.Mock()
+            runtime.operation.side_effect = (
+                lambda addon_id, name: operations[name]
+                if addon_id == "atlas_leaf_mesh_builder"
+                else None
+            )
+            with self.assertRaisesRegex(RuntimeError, "Generator 연결 검증 실패"):
+                self.job.apply_mapped_targets(
+                    object(),
+                    [target],
+                    "M_leaf_test_atlas_01",
+                    runtime,
                 )
+            cleanup_transactions.assert_called_once()
 
     def test_assets_only_refresh_stages_one_exact_path_without_props_registry(self):
         with tempfile.TemporaryDirectory() as folder:

@@ -95,6 +95,21 @@ class MaterialNormalizationPlanTests(unittest.TestCase):
                 ],
             )
 
+    def test_duplicate_reimported_part_slots_fail_closed(self):
+        duplicate = slot("M_leaf", "/Game/MI/MI_leaf")
+        with self.assertRaisesRegex(
+            NaniteAssemblyMaterialError,
+            "duplicate material identity after reimport",
+        ):
+            plan_nanite_assembly_material_normalization(
+                [duplicate],
+                [{
+                    "mesh": "/Game/Tree/SK_leaf.SK_leaf",
+                    "remap": [0, 0],
+                    "slots": [duplicate, dict(duplicate)],
+                }],
+            )
+
 
 class ProtectedRemapTextTests(unittest.TestCase):
     TEXT = (

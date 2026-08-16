@@ -3784,6 +3784,25 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                     "spm_only_provider_candidate"
                 ]
             )
+            self.assertTrue(
+                dependencies["SK_branch_elm_02"][
+                    "rendered_provider_expansion_covered"
+                ]
+            )
+            handoff_roles = {
+                row["name"]: row
+                for row in contract["handoff"]["roles"]
+            }
+            self.assertIn("SK_branch_elm_02", handoff_roles)
+            self.assertEqual(
+                handoff_roles["SK_branch_elm_02"]["decision"],
+                "reference_only",
+            )
+            self.assertTrue(
+                handoff_roles["SK_branch_elm_02"][
+                    "rendered_provider_expansion_covered"
+                ]
+            )
 
             with mock.patch(
                 "pcg_cluster_assembly_contract._atlas_normalized_variants",

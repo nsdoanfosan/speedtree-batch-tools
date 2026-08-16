@@ -746,7 +746,24 @@ def rebind_managed_graph_source_inputs(
             )
 
         occupied.discard(old_name.casefold())
-        new_name = _source_resource_identifier(input_path, slot, occupied)
+        source_stem = re.sub(
+            r"[^A-Za-z0-9_]+",
+            "_",
+            input_path.stem,
+        ).strip("_") or "source"
+        old_name_folded = old_name.casefold()
+        source_stem_folded = source_stem.casefold()
+        if (
+            old_name_folded == source_stem_folded
+            or old_name_folded.startswith(source_stem_folded + "_")
+        ):
+            # Existing source-named identifiers can include a slot suffix to
+            # disambiguate channels that share one file stem.  Keep that
+            # stable identity instead of shortening it on every rebind.
+            new_name = old_name
+            occupied.add(old_name_folded)
+        else:
+            new_name = _source_resource_identifier(input_path, slot, occupied)
         identifier_changed = new_name != old_name
         if identifier_changed:
             resource.find("identifier").set("v", new_name)
@@ -1812,8 +1829,90 @@ def graph_external_input_fingerprint(sbs_path, graph_names):
     return hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest()
 
 
+_PACKAGE_RESOURCE_REF_RE = re.compile(r'pkg:///Resources/([^?"<]+)')
+_PACKAGE_DEPENDENCY_REF_RE = re.compile(r'[?&]dependency=([0-9]+)')
+
+
+def _prune_unreferenced_isolated_cook_content(root):
+    """Drop package baggage that cannot be reached by the isolated graphs.
+
+    Authoring packages can retain hundreds of bitmap resources and package
+    dependencies after old graphs are removed.  SBSCooker still scans that
+    baggage, so a two-graph package can otherwise spend tens of minutes in
+    compilation.  This only mutates the disposable isolated-cook XML tree.
+    """
+    content = root.find("content")
+    if content is None:
+        return {"resources": 0, "dependencies": 0}
+
+    content_text = ET.tostring(content, encoding="unicode")
+    referenced_resources = set(_PACKAGE_RESOURCE_REF_RE.findall(content_text))
+    removed_resources = 0
+    resource_parent = root.find("./content/group/content")
+    if resource_parent is not None:
+        for resource in list(resource_parent.findall("resource")):
+            identifier = resource.find("identifier")
+            name = identifier.get("v", "") if identifier is not None else ""
+            if name and name not in referenced_resources:
+                resource_parent.remove(resource)
+                removed_resources += 1
+
+    content_text = ET.tostring(content, encoding="unicode")
+    referenced_dependencies = set(
+        _PACKAGE_DEPENDENCY_REF_RE.findall(content_text)
+    )
+    removed_dependencies = 0
+    dependencies = root.find("dependencies")
+    if dependencies is not None:
+        for dependency in list(dependencies.findall("dependency")):
+            filename = dependency.find("filename")
+            uid = dependency.find("uid")
+            filename_value = filename.get("v", "") if filename is not None else ""
+            uid_value = uid.get("v", "") if uid is not None else ""
+            if filename_value == "?himself" or uid_value in referenced_dependencies:
+                continue
+            dependencies.remove(dependency)
+            removed_dependencies += 1
+    return {
+        "resources": removed_resources,
+        "dependencies": removed_dependencies,
+    }
+
+
+def _set_isolated_cook_output_size(root, size_log2):
+    """Override absolute node sizes in a disposable isolated-cook tree."""
+    if size_log2 is None:
+        return 0
+    x_log2, y_log2 = normalize_size_log2(size_log2)
+    changed = 0
+    for parameter in root.iter("parameter"):
+        name = parameter.find("name")
+        if name is None or name.get("v", "").casefold() != "outputsize":
+            continue
+        value = parameter.find("./paramValue/constantValueInt2")
+        if value is None:
+            continue
+        target = f"{x_log2} {y_log2}"
+        if value.get("v") != target:
+            value.set("v", target)
+            changed += 1
+    for option in root.iter("option"):
+        name = option.find("name")
+        if name is None or name.get("v", "").casefold() != "defaultparentsize":
+            continue
+        value = option.find("value")
+        if value is None:
+            continue
+        target = f"{x_log2}x{y_log2}"
+        if value.get("v") != target:
+            value.set("v", target)
+            changed += 1
+    return changed
+
+
 def cook_sbs_graph_package(sbs_path, graph_names, cache_root, cfg=None,
-                           timeout=1800, force_recook=False):
+                           timeout=1800, force_recook=False,
+                           isolated_output_size_log2=None):
     """Cook only the requested graphs while retaining package resources/dependencies.
 
     Legacy SBS packages often contain unrelated broken graphs, so package-wide
@@ -1875,7 +1974,8 @@ def cook_sbs_graph_package(sbs_path, graph_names, cache_root, cfg=None,
     key = hashlib.sha1(
         (f"{sbs_path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|"
          + "|".join(name.lower() for name in requested)
-         + f"|inputs={input_fingerprint}").encode("utf-8")
+         + f"|inputs={input_fingerprint}"
+         + f"|isolated_size={isolated_output_size_log2}").encode("utf-8")
     ).hexdigest()[:16]
     if force_recook:
         # This is an explicit user action after Cluster_System changes.  Use a
@@ -1895,9 +1995,12 @@ def cook_sbs_graph_package(sbs_path, graph_names, cache_root, cfg=None,
             if name not in keep:
                 parent.remove(child)
 
+    _prune_unreferenced_isolated_cook_content(root)
+    _set_isolated_cook_output_size(root, isolated_output_size_log2)
+
     cache_dir.mkdir(parents=True, exist_ok=True)
     temp_sbs = sbs_path.with_name(
-        f"{sbs_path.stem}_pcgtex_isolated_{key}.sbs")
+        f".{sbs_path.stem}_isolated_cook_{key}.sbs")
     try:
         tree.write(temp_sbs, encoding="utf-8", xml_declaration=True)
         result = owned_run(
@@ -3075,9 +3178,10 @@ def _patch_m_graph_input_resource_legacy(sbs_path, graph_name, slot, input_path)
 def patch_m_graph_input_resource(sbs_path, graph_name, slot, input_path):
     """Point one managed graph slot at a file without mutating shared resources.
 
-    SBS package resources are global. The first patch clones the complete upstream
-    node branch and its bitmap resource for this slot; subsequent patches update
-    that explicitly isolated resource in place.
+    SBS package resources are global. A shared source clones the complete upstream
+    node branch and its bitmap resource for this slot. An already graph-local
+    source is updated in place. Cloned resource identifiers retain source-file
+    identity and never use a pcgtex/output-derived marker.
     """
     sbs_path = Path(sbs_path)
     input_path = Path(input_path)
@@ -3127,13 +3231,23 @@ def patch_m_graph_input_resource(sbs_path, graph_name, slot, input_path):
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     safe_slot = re.sub(r"[^A-Za-z0-9_]+", "_", slot)
-    isolated_base = f"{graph_name}_{safe_slot}__pcgtex_isolated"
     backup = sbs_path.with_name(
         f"{sbs_path.stem}.pcgtex_backup_before_set_{graph_name}_{safe_slot}_{stamp}.sbs")
     shutil.copy2(sbs_path, backup)
     try:
-        isolated = resource_name.lower().startswith(isolated_base.lower())
-        if not isolated:
+        graph_descendants = set(graph.iter())
+        resource_descendants = set(resource.iter())
+        reference_pattern = re.compile(
+            rf"(?i)pkg:///resources/{re.escape(resource_name)}(?=[?/#]|$)"
+        )
+        shared_outside_graph = any(
+            element not in graph_descendants
+            and element not in resource_descendants
+            and reference_pattern.search(str(element.get("v") or ""))
+            for element in root.iter()
+        )
+        isolated = False
+        if shared_outside_graph:
             used_uids = _collect_uids(root)
             branch_uids = set()
 
@@ -3169,17 +3283,17 @@ def patch_m_graph_input_resource(sbs_path, graph_name, slot, input_path):
                         if old_uid in uid_map:
                             element.set("v", uid_map[old_uid])
 
-            existing_names = {
-                identifier.get("v")
+            occupied_names = {
+                identifier.get("v").casefold()
                 for candidate in root.iter("resource")
                 for identifier in [candidate.find("identifier")]
                 if identifier is not None and identifier.get("v")
             }
-            isolated_name = isolated_base
-            suffix = 2
-            while isolated_name in existing_names:
-                isolated_name = f"{isolated_base}_{suffix}"
-                suffix += 1
+            isolated_name = _source_resource_identifier(
+                input_path,
+                slot,
+                occupied_names,
+            )
 
             resource_clone = copy.deepcopy(resource)
             resource_clone.find("identifier").set("v", isolated_name)

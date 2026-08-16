@@ -2292,6 +2292,10 @@ def step2_target_payload(job):
                 detail.get("source_material_ids") or []),
             "generator_bindings": list(
                 detail.get("generator_bindings") or []),
+            "generator_variant_policy": str(
+                detail.get("generator_variant_policy")
+                or "ensure_all_material_cutouts"
+            ),
         })
     return {"version": 1, "targets": targets}
 
@@ -2578,6 +2582,7 @@ def merge_step2_target_detail(job, target):
             "source_material_names": [],
             "source_material_ids": [],
             "generator_bindings": [],
+            "generator_variant_policy": "ensure_all_material_cutouts",
         }
         job["target_details"].append(detail)
         job["target_spms"].append(spm)
@@ -2589,6 +2594,15 @@ def merge_step2_target_detail(job, target):
         for value in values:
             if value not in detail[field]:
                 detail[field].append(value)
+    requested_policy = str(
+        target.get("generator_variant_policy")
+        or "ensure_all_material_cutouts"
+    )
+    if requested_policy != "ensure_all_material_cutouts":
+        raise RuntimeError(
+            "PCG cluster Generator variant policy must cover all material cutouts"
+        )
+    detail["generator_variant_policy"] = requested_policy
 
 
 def validate_step2_job_report(data, require_generator_connections=False):

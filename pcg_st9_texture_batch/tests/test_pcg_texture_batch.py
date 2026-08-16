@@ -4771,6 +4771,7 @@ class GuiLabelTests(unittest.TestCase):
             "source_material_names": ["M_leaf_parsley_02"],
             "source_material_ids": [4],
             "generator_bindings": [{"material_id": 4, "mesh_id": 6}],
+            "generator_variant_policy": "ensure_all_material_cutouts",
         }])
 
     def test_step2_preflight_reports_missing_source_before_blender(self):
@@ -5299,6 +5300,8 @@ class SafetyTests(unittest.TestCase):
             after = sbs_auto.parse_m_graph(copied, graph)["inputs"]
 
             self.assertTrue(result["isolated"])
+            self.assertNotIn("pcgtex", result["resource"].casefold())
+            self.assertTrue(result["resource"].casefold().startswith("generated_hbao"))
             self.assertEqual(after["Ambient_Occlusion"].resolve(), hbao.resolve())
             self.assertEqual(after["Height"].resolve(), before["Height"].resolve())
             self.assertEqual(after["Depth"].resolve(), before["Depth"].resolve())
@@ -5344,6 +5347,22 @@ class SafetyTests(unittest.TestCase):
                 Path(albedo).resolve(),
             )
             self.assertTrue(Path(result["backup"]).is_file())
+
+            replacement = root / "Replacement_Leaf_Albedo.png"
+            Image.new("RGBA", (4, 4), (120, 80, 40, 255)).save(replacement)
+            patch_result = sbs_auto.patch_m_graph_input_resource(
+                sbs,
+                "T_leaf_test_atlas_01",
+                "Base_Color",
+                replacement,
+            )
+            patched = sbs_auto.parse_m_graph(sbs, "T_leaf_test_atlas_01")
+            self.assertFalse(patch_result["isolated"])
+            self.assertNotIn("pcgtex", patch_result["resource"].casefold())
+            self.assertEqual(
+                patched["inputs"]["Base_Color"].resolve(),
+                replacement.resolve(),
+            )
 
     def test_source_rebind_removes_output_named_input_resources(self):
         with tempfile.TemporaryDirectory() as temp:

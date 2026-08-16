@@ -44,6 +44,12 @@ from nanite_assembly_materials import (
     NaniteAssemblyMaterialError,
     normalize_unreal_nanite_assembly_materials,
 )
+from na_base_provider_contamination import (
+    NaBaseProviderContaminationError,
+    rendered_provider_inventory,
+    validate_base_provider_contamination,
+)
+from pcg_st9_texture_batch.pcg_texture_audit import visible_material_names
 from spm_authored_placement import (
     AUTHORED_NODE_GLOBAL_ASSIGNMENT_TOLERANCE_METERS,
     SpmAuthoredPlacementError,
@@ -358,6 +364,108 @@ def validate_file_fingerprint(record, label):
         and str(actual.get("sha256") or "").casefold() == expected_sha256
     )
     return actual
+
+
+def _material_slot_key(value):
+    """Match Blender ``.001`` and handoff ``_001`` names without losing suffixes."""
+
+    return re.sub(r"[^a-z0-9]+", "_", str(value or "").casefold()).strip("_")
+
+
+def _material_instance_name(entry):
+    for field in (
+        "target_material_path",
+        "material_instance_path",
+        "unreal_material_path",
+    ):
+        value = str((entry or {}).get(field) or "").split(".", 1)[0]
+        if value:
+            return value.rsplit("/", 1)[-1]
+    base = str(
+        ((entry or {}).get("speedtree_intent") or {}).get(
+            "material_instance_base"
+        )
+        or ""
+    ).strip()
+    return ("MI_" + base.removeprefix("MI_")) if base else ""
+
+
+def _read_material_sidecar_contract(path, expected_mesh_name):
+    sidecar_path = Path(path)
+    if not sidecar_path.is_file():
+        raise ClusterAssemblyBuildError(
+            f"material sidecar is missing for {expected_mesh_name}: {sidecar_path}"
+        )
+    try:
+        payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ClusterAssemblyBuildError(
+            f"material sidecar is unreadable for {expected_mesh_name}: {sidecar_path}"
+        ) from exc
+    mesh_name = str(payload.get("mesh_name") or "").strip()
+    if mesh_name != str(expected_mesh_name or "").strip():
+        raise ClusterAssemblyBuildError(
+            "material sidecar mesh identity changed: "
+            f"expected={expected_mesh_name}, actual={mesh_name or '<empty>'}"
+        )
+    slots = []
+    seen = {}
+    for index, entry in enumerate(list(payload.get("materials") or [])):
+        slot_name = str(
+            entry.get("slot_name") or entry.get("name") or ""
+        ).strip()
+        key = _material_slot_key(slot_name)
+        if not key:
+            raise ClusterAssemblyBuildError(
+                f"material sidecar slot {index} has no name: {sidecar_path}"
+            )
+        if key in seen:
+            raise ClusterAssemblyBuildError(
+                "material sidecar contains duplicate slot identities: "
+                f"mesh={mesh_name}, slots={seen[key]},{index}, key={key}"
+            )
+        seen[key] = index
+        slots.append({
+            "index": index,
+            "slot_name": slot_name,
+            "material_instance_name": _material_instance_name(entry),
+        })
+    if not slots:
+        raise ClusterAssemblyBuildError(
+            f"material sidecar contains no slots: {sidecar_path}"
+        )
+    return {
+        "mesh_name": mesh_name,
+        "sidecar": file_fingerprint(sidecar_path),
+        "slots": slots,
+    }
+
+
+def _external_part_material_contract(source_blend, asset_name):
+    blend_path = str((source_blend or {}).get("path") or "").strip()
+    asset_name = str(asset_name or "").strip()
+    if not blend_path or not asset_name:
+        raise ClusterAssemblyBuildError(
+            "normalized external part material contract has no source identity"
+        )
+    sidecar_path = Path(blend_path).parent / "texture" / f"{asset_name}.json"
+    return _read_material_sidecar_contract(sidecar_path, asset_name)
+
+
+def _blender_material_slot_names(mesh_object):
+    slots = []
+    for index, material in enumerate(list(mesh_object.data.materials)):
+        name = str(getattr(material, "name", "") or "").strip()
+        if not name:
+            raise ClusterAssemblyBuildError(
+                f"generated Assembly base material slot {index} is empty"
+            )
+        slots.append(name)
+    if not slots:
+        raise ClusterAssemblyBuildError(
+            "generated Assembly base contains no material slots"
+        )
+    return slots
 
 
 def _normalized_contract_path(value):
@@ -1706,12 +1814,19 @@ def validate_manifest_artifacts(manifest):
             )
         external = part.get("external_source") or {}
         if external:
-            checked["parts"][prototype_id] = {
+            checked_part = {
                 "plan_fbx": validate_file_fingerprint(
                     external.get("plan_fbx"),
                     f"normalized plan FBX {prototype_id}",
                 ),
             }
+            material_contract = external.get("material_contract")
+            if isinstance(material_contract, dict):
+                checked_part["material_sidecar"] = validate_file_fingerprint(
+                    material_contract.get("sidecar"),
+                    f"normalized part material sidecar {prototype_id}",
+                )
+            checked["parts"][prototype_id] = checked_part
         else:
             checked["parts"][prototype_id] = validate_file_fingerprint(
                 part.get("fbx"), f"Assembly part FBX {prototype_id}"
@@ -4313,6 +4428,27 @@ def _base_role_polygon_indices(role_build_plans, roles, final_merged_mesh):
     })
 
 
+def _rendered_provider_inventory_from_handoff(handoff, spm_fingerprint):
+    """Load provider authority independently of reconciled role inputs."""
+    receipt_fingerprint = validate_file_fingerprint(
+        handoff.get("pcg_receipt"),
+        "PCG rendered-provider inventory receipt",
+    )
+    try:
+        receipt = json.loads(
+            Path(receipt_fingerprint["path"]).read_text(encoding="utf-8")
+        )
+        inventory = rendered_provider_inventory(
+            receipt,
+            visible_material_names(spm_fingerprint["path"]),
+        )
+    except (OSError, ValueError, NaBaseProviderContaminationError) as exc:
+        raise ClusterAssemblyBuildError(
+            "rendered-provider inventory is invalid: " + str(exc)
+        ) from exc
+    return inventory
+
+
 def _copy_base_without_role_polygons(bpy, source_obj, polygon_indices, name):
     import bmesh
 
@@ -5064,6 +5200,9 @@ def _role_material_polygons(
             "polygon_indices": polygons,
             "normalized_variants": deepcopy(row.get("normalized_variants")),
             "selection_basis": "material_identity",
+            "speculative_provider_expansion": (
+                row.get("speculative_provider_expansion") is True
+            ),
         }
 
     # BWR can legally consolidate the final rendered mesh onto a canonical
@@ -5116,6 +5255,9 @@ def _role_material_polygons(
                 "polygon_indices": list(topology_candidates),
                 "normalized_variants": normalized,
                 "selection_basis": "normalized_topology_fallback",
+                "speculative_provider_expansion": (
+                    row.get("speculative_provider_expansion") is True
+                ),
             }
             continue
         prepared_unused[provider_key] = {
@@ -5258,6 +5400,8 @@ def _validate_role_component_claims(role_build_plans):
         # is a broken Assembly contract.  Preserving its geometry in Base keeps
         # the tree intact, but must not turn a dropped provider into success.
         if matched_component_count == 0:
+            if plan.get("speculative_provider_expansion") is True:
+                continue
             unmatched_roles.append({
                 "provider_key": str(provider_key),
                 "preserved": deepcopy(plan.get("preserved") or []),
@@ -5400,6 +5544,8 @@ def build_blender_assembly_inputs(
     all_bindings = []
     role_build_plans = {}
     preserved_render_components = []
+    rendered_provider_material_inventory = None
+    base_provider_contamination = None
     authored_node_table = None
     authored_spm_fingerprint = None
     claimed_authored_node_guids = set()
@@ -5473,6 +5619,9 @@ def build_blender_assembly_inputs(
                 "target_object": target_object,
                 "matched": matched,
                 "preserved": preserved,
+                "speculative_provider_expansion": (
+                    role_row.get("speculative_provider_expansion") is True
+                ),
             }
             for row in preserved:
                 preserved_render_components.append({
@@ -5485,6 +5634,12 @@ def build_blender_assembly_inputs(
         authored_spm_fingerprint = validate_file_fingerprint(
             handoff.get("spm"),
             "target SPM authored Node placement",
+        )
+        rendered_provider_material_inventory = (
+            _rendered_provider_inventory_from_handoff(
+                handoff,
+                authored_spm_fingerprint,
+            )
         )
         try:
             authored_node_table = parse_spm_authored_placement(
@@ -5600,6 +5755,15 @@ def build_blender_assembly_inputs(
             excluded_polygons,
             base_export_stem,
         )
+        try:
+            base_provider_contamination = (
+                validate_base_provider_contamination(
+                    base_obj,
+                    rendered_provider_material_inventory,
+                )
+            )
+        except NaBaseProviderContaminationError as exc:
+            raise ClusterAssemblyBuildError(str(exc)) from exc
         base_armature = _copy_normalized_base_armature(
             bpy,
             final_armature,
@@ -6051,6 +6215,12 @@ def build_blender_assembly_inputs(
                                         or ""
                                     ),
                                 }
+                                external_source["material_contract"] = (
+                                    _external_part_material_contract(
+                                        normalized_contract["source_blend"],
+                                        subpart_asset,
+                                    )
+                                )
                                 if expected_normalized_bounds is not None:
                                     external_source["expected_normalized_bounds"] = (
                                         expected_normalized_bounds
@@ -6196,6 +6366,12 @@ def build_blender_assembly_inputs(
                             variant.get("pivot_contract") or ""
                         ),
                     }
+                    external_source["material_contract"] = (
+                        _external_part_material_contract(
+                            normalized_contract["source_blend"],
+                            part_asset_name,
+                        )
+                    )
                     expected_normalized_bounds = (
                         _expected_normalized_bounds_for_variant(
                             normalized_contract,
@@ -6450,7 +6626,11 @@ def build_blender_assembly_inputs(
                 "export_stem": base_export_stem,
                 "fbx": file_fingerprint(base_fbx),
                 "fbx_texture_contract": base_fbx_texture_contract,
+                "material_slots": _blender_material_slot_names(base_obj),
                 "excluded_role_polygon_count": len(excluded_polygons),
+                "rendered_provider_contamination": (
+                    base_provider_contamination
+                ),
                 "unmatched_role_components_removed_from_base": 0,
                 "final_armature": final_armature.name,
                 "weighted_bones": base_weighted_bones,
@@ -6480,6 +6660,15 @@ def build_blender_assembly_inputs(
                 "transform_space": "Local",
             },
             "role_contract": {
+                "ignored_speculative_provider_expansions": sorted(
+                    provider_key
+                    for provider_key, plan in role_build_plans.items()
+                    if plan.get("speculative_provider_expansion") is True
+                    and not any(
+                        list(match.get("instances") or [])
+                        for match in (plan.get("matched") or {}).values()
+                    )
+                ),
                 "role_material_identities": [
                     str(row.get("role_identity") or "")
                     for _role, row in sorted(registered_role_rows.items())
@@ -6712,7 +6901,12 @@ def _rewrite_command_asset_path(command_groups, source_path, target_path):
     return rewritten
 
 
-def _generated_material_sidecar(template_data, generated_mesh_name, output_dir):
+def _generated_material_sidecar(
+    template_data,
+    generated_mesh_name,
+    output_dir,
+    expected_material_slots=None,
+):
     source_value = str(template_data.get("_material_pipeline_json_path") or "")
     source_path = Path(source_value)
     if not source_value or not source_path.is_file():
@@ -6741,12 +6935,62 @@ def _generated_material_sidecar(template_data, generated_mesh_name, output_dir):
         raise ClusterAssemblyBuildError(
             "generated Assembly material sidecar requires a mesh identity"
         )
+    expected_material_slots = [
+        str(value or "").strip() for value in (expected_material_slots or [])
+    ]
+    if expected_material_slots:
+        materials = list(payload.get("materials") or [])
+        by_key = defaultdict(list)
+        for entry in materials:
+            slot_name = str(
+                entry.get("slot_name") or entry.get("name") or ""
+            ).strip()
+            by_key[_material_slot_key(slot_name)].append(entry)
+        selected = []
+        seen_expected = set()
+        for slot_index, slot_name in enumerate(expected_material_slots):
+            key = _material_slot_key(slot_name)
+            if not key or key in seen_expected:
+                raise ClusterAssemblyBuildError(
+                    "generated Assembly material-slot contract is empty or "
+                    f"duplicated: mesh={generated_mesh_name}, slot={slot_name!r}"
+                )
+            seen_expected.add(key)
+            matches = by_key.get(key) or []
+            if len(matches) != 1:
+                raise ClusterAssemblyBuildError(
+                    "generated Assembly material slot does not resolve exactly "
+                    "once in the Full sidecar: "
+                    f"mesh={generated_mesh_name}, slot={slot_name!r}, "
+                    f"matches={len(matches)}"
+                )
+            entry = deepcopy(matches[0])
+            entry["slot_index"] = slot_index
+            selected.append(entry)
+        payload["materials"] = selected
+        payload["generated_material_slot_contract"] = {
+            "authority": "generated_fbx_blender_material_slots",
+            "slot_names": expected_material_slots,
+            "slot_count": len(expected_material_slots),
+        }
     payload["mesh_name"] = generated_mesh_name
     descriptor["mesh_name"] = generated_mesh_name
     validation = payload.get("validation_children")
     if isinstance(validation, dict):
         validation["asset_unit"] = generated_mesh_name
         validation["json_name"] = generated_mesh_name
+        if expected_material_slots:
+            validation["material_slots"] = list(expected_material_slots)
+            validation["handoff_materials"] = list(expected_material_slots)
+    elif isinstance(validation, list):
+        for child in validation:
+            if not isinstance(child, dict):
+                continue
+            child["asset_unit"] = generated_mesh_name
+            child["json_name"] = generated_mesh_name
+            if expected_material_slots:
+                child["material_slots"] = list(expected_material_slots)
+                child["handoff_materials"] = list(expected_material_slots)
     target_dir = Path(output_dir) / "material_sidecars"
     target_dir.mkdir(parents=True, exist_ok=True)
     target_path = target_dir / f"{generated_mesh_name}.json"
@@ -7135,6 +7379,7 @@ def build_unreal_ingest_plan(manifest, full_manifest_asset, full_asset_path, unr
         export_stem,
         use_full_skeleton,
         prototype_id,
+        material_slots=None,
     ):
         source = Path(file_path)
         if not source.is_file():
@@ -7169,6 +7414,7 @@ def build_unreal_ingest_plan(manifest, full_manifest_asset, full_asset_path, unr
             template_data,
             asset_name,
             generated_output_dir,
+            expected_material_slots=material_slots,
         )
         source_sidecar = sidecar["source"]
         generated_sidecar = sidecar["generated"]
@@ -7223,6 +7469,7 @@ def build_unreal_ingest_plan(manifest, full_manifest_asset, full_asset_path, unr
         base_export_stem,
         True,
         "base",
+        base_contract.get("material_slots"),
     )]
     part_paths = {}
     external_assets = []
@@ -7283,6 +7530,7 @@ def build_unreal_ingest_plan(manifest, full_manifest_asset, full_asset_path, unr
                 part_export_stem,
                 False,
                 prototype_id,
+                part.get("material_slots"),
             )
         )
     asset_contract = {
@@ -7316,6 +7564,89 @@ def _unwrap_struct_result(result, expected_class):
     if isinstance(result, expected_class):
         return True, result
     return bool(result), None
+
+
+def validate_unreal_part_material_contracts(unreal, manifest, part_assets):
+    """Prove that reimport kept every external part in its sidecar slot domain."""
+
+    rows = []
+    for part in list((manifest or {}).get("parts") or []):
+        prototype_id = str(part.get("prototype_id") or "")
+        external = part.get("external_source") or {}
+        contract = external.get("material_contract")
+        if not isinstance(contract, dict):
+            rows.append({
+                "prototype_id": prototype_id,
+                "status": "legacy_contract_unavailable",
+            })
+            continue
+        mesh = (part_assets or {}).get(prototype_id)
+        if not isinstance(mesh, unreal.SkeletalMesh):
+            raise ClusterAssemblyBuildError(
+                f"normalized external part is not a SkeletalMesh: {prototype_id}"
+            )
+        sidecar_record = contract.get("sidecar") or {}
+        current_contract = _read_material_sidecar_contract(
+            sidecar_record.get("path"),
+            part.get("asset_name"),
+        )
+        expected_slots = list(contract.get("slots") or [])
+        if _canonical_json(expected_slots) != _canonical_json(
+            current_contract.get("slots") or []
+        ):
+            raise ClusterAssemblyBuildError(
+                "normalized external part material sidecar changed after the "
+                f"Assembly manifest was built: {prototype_id}"
+            )
+        actual_slots = []
+        for index, slot in enumerate(
+            list(mesh.get_editor_property("materials") or [])
+        ):
+            interface = slot.get_editor_property("material_interface")
+            actual_slots.append({
+                "index": index,
+                "slot_name": str(
+                    slot.get_editor_property("material_slot_name")
+                ),
+                "material_instance_name": (
+                    str(interface.get_name()) if interface is not None else ""
+                ),
+            })
+        expected_identity = [
+            (
+                _material_slot_key(row.get("slot_name")),
+                _material_slot_key(row.get("material_instance_name")),
+            )
+            for row in expected_slots
+        ]
+        actual_identity = [
+            (
+                _material_slot_key(row.get("slot_name")),
+                _material_slot_key(row.get("material_instance_name")),
+            )
+            for row in actual_slots
+        ]
+        if actual_identity != expected_identity:
+            raise ClusterAssemblyBuildError(
+                "normalized external part material slots changed during reimport: "
+                f"prototype={prototype_id}, expected={expected_slots}, "
+                f"actual={actual_slots}. Re-run the sidecar material post-process "
+                "before building the Nanite Assembly."
+            )
+        rows.append({
+            "prototype_id": prototype_id,
+            "status": "verified",
+            "sidecar": current_contract["sidecar"],
+            "slots": actual_slots,
+        })
+    return {
+        "status": (
+            "verified"
+            if rows and all(row["status"] == "verified" for row in rows)
+            else "legacy_contract_unavailable"
+        ),
+        "parts": rows,
+    }
 
 
 def _unreal_bone_names(unreal, mesh):
@@ -8004,6 +8335,11 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
     part_assets = {
         key: load_skeletal(value) for key, value in paths["parts"].items()
     }
+    part_material_preflight = validate_unreal_part_material_contracts(
+        unreal,
+        manifest,
+        part_assets,
+    )
     prototype_bounds_preflight = validate_unreal_normalized_prototype_bounds(
         unreal,
         manifest,
@@ -8273,6 +8609,7 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
         "base_weights_in_final_wind": True,
         "reference_pose_sync": reference_pose_sync,
         "prototype_bounds_preflight": prototype_bounds_preflight,
+        "part_material_preflight": part_material_preflight,
         "bounds_completion": bounds_completion,
         "material_normalization": material_normalization,
         "wind_json_sha256": wind_file_record.get("sha256"),
@@ -8305,6 +8642,7 @@ __all__ = [
     "validate_normalized_prototype_unit_contract",
     "validate_unreal_asset_contract",
     "validate_unreal_bounds_contract",
+    "validate_unreal_part_material_contracts",
     "validate_unreal_normalized_prototype_bounds",
     "validate_wind_json_against_skeleton",
 ]

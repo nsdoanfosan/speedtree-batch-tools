@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sys
 import tempfile
 import unittest
@@ -16,6 +17,59 @@ from exact_push import ExactPushError, build_exact_push_command  # noqa: E402
 
 
 class ExactPushCommandTests(unittest.TestCase):
+    def test_promotes_repair_live_material_contract_into_push_command(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            stale = root / "stale.json"
+            live = root / "live.json"
+            stale.write_text("{}", encoding="utf-8")
+            live.write_text('{"status":"ok"}', encoding="utf-8")
+            payload = live.read_bytes()
+            command = [
+                "blender.exe",
+                "--material-contract",
+                str(stale),
+            ]
+            outputs = {"material_contract": stale}
+
+            promoted = exact_push._promote_live_material_contract(
+                command,
+                outputs,
+                {
+                    "live_material_contract": {
+                        "canonical_path": str(live),
+                        "size": len(payload),
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                    }
+                },
+            )
+
+            self.assertEqual(promoted, live.resolve())
+            self.assertEqual(
+                command[command.index("--material-contract") + 1],
+                str(live.resolve()),
+            )
+            self.assertEqual(outputs["material_contract"], live.resolve())
+
+    def test_rejects_changed_repair_live_material_contract(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            live = root / "live.json"
+            live.write_text('{"status":"ok"}', encoding="utf-8")
+
+            with self.assertRaisesRegex(ExactPushError, "fingerprint changed"):
+                exact_push._promote_live_material_contract(
+                    ["blender.exe", "--material-contract", "stale.json"],
+                    {"material_contract": Path("stale.json")},
+                    {
+                        "live_material_contract": {
+                            "canonical_path": str(live),
+                            "size": live.stat().st_size,
+                            "sha256": "0" * 64,
+                        }
+                    },
+                )
+
     def test_builds_production_headless_push_from_latest_exact_evidence(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

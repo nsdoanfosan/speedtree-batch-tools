@@ -8,6 +8,7 @@ Assembly builder, Perforce checkout, DynamicWind import, and runtime probe.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import runpy
@@ -54,6 +55,48 @@ DEFAULT_RPC_TIMEOUT_MAX = 900
 
 class ExactPushError(RuntimeError):
     pass
+
+
+def _promote_live_material_contract(command, outputs, repair_report):
+    """Use the contract produced by the repair that immediately precedes Push.
+
+    Repair can regenerate the exact-target STMAT/FBX contract.  Continuing with
+    the wrapper captured before Repair makes the subsequent Push compare the
+    new source artifacts against stale fingerprints.
+    """
+    evidence = repair_report.get("live_material_contract") or {}
+    raw_path = evidence.get("canonical_path") or evidence.get("path")
+    if not raw_path:
+        raise ExactPushError(
+            "repair report did not publish its live material contract"
+        )
+    contract_path = Path(raw_path).expanduser().resolve()
+    if not contract_path.is_file():
+        raise ExactPushError(
+            "repair live material contract is missing: " + str(contract_path)
+        )
+    expected_size = evidence.get("size")
+    if expected_size is not None and contract_path.stat().st_size != int(expected_size):
+        raise ExactPushError(
+            "repair live material contract size changed: " + str(contract_path)
+        )
+    expected_sha256 = str(evidence.get("sha256") or "").strip().casefold()
+    if expected_sha256:
+        digest = hashlib.sha256(contract_path.read_bytes()).hexdigest()
+        if digest != expected_sha256:
+            raise ExactPushError(
+                "repair live material contract fingerprint changed: "
+                + str(contract_path)
+            )
+    try:
+        argument_index = command.index("--material-contract") + 1
+    except ValueError as exc:
+        raise ExactPushError(
+            "exact Push command is missing --material-contract"
+        ) from exc
+    command[argument_index] = str(contract_path)
+    outputs["material_contract"] = contract_path
+    return contract_path
 
 
 def _rpc_cli_args(unreal_project: Path | None) -> list[str]:
@@ -462,6 +505,22 @@ def main(argv=None):
             file=sys.stderr,
         )
         return 1
+    try:
+        live_material_contract = _promote_live_material_contract(
+            command,
+            outputs,
+            repair_report,
+        )
+    except ExactPushError as exc:
+        print(
+            "SK Exact Push repair material contract is invalid: " + str(exc),
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        "Using repair live material contract: " + str(live_material_contract),
+        flush=True,
+    )
     completed = owned_run(
         command,
         source="sk_batch.exact_push.blender_export",

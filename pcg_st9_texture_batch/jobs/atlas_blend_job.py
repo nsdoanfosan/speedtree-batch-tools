@@ -16,6 +16,7 @@ Leaf Mesh/Frond Generator의 Material/Mesh 슬롯까지 검증하며 연결한�
 import argparse
 import inspect
 import json
+import os
 import shutil
 import sys
 import traceback
@@ -86,6 +87,10 @@ def load_target_map(path):
             "source_material_names": names,
             "source_material_ids": list(row.get("source_material_ids") or []),
             "generator_bindings": list(row.get("generator_bindings") or []),
+            "generator_variant_policy": str(
+                row.get("generator_variant_policy")
+                or "ensure_all_material_cutouts"
+            ),
         })
     return targets
 
@@ -172,30 +177,63 @@ def validate_target_paths(cli_paths, mapped_targets):
 
 
 def apply_mapped_targets(props, targets, material_name, addon_runtime):
-    export_or_update_speedtree_spm_path = addon_runtime.operation(
+    export_target = addon_runtime.operation(
         "atlas_leaf_mesh_builder",
-        "export_or_update_speedtree_spm_path",
+        "export_or_update_speedtree_spm_path_impl",
+    )
+    validate_targets = addon_runtime.operation(
+        "atlas_leaf_mesh_builder",
+        "validate_staged_speedtree_targets",
+    )
+    cleanup_transactions = addon_runtime.operation(
+        "atlas_leaf_mesh_builder",
+        "cleanup_pending_transaction_roots",
+    )
+    execute_transaction = addon_runtime.operation(
+        "atlas_leaf_mesh_builder",
+        "execute_atomic_target_update",
     )
 
-    parameters = inspect.signature(export_or_update_speedtree_spm_path).parameters
+    parameters = inspect.signature(export_target).parameters
     required_parameters = {
         "atlas_asset_name", "source_material_names", "source_material_ids",
-        "allow_create",
+        "generator_variant_policy", "allow_create", "production_target_spm",
     }
     if not required_parameters.issubset(parameters):
         raise RuntimeError(
             "설치된 atlas_leaf_mesh_builder가 Generator 연결 API를 지원하지 않음")
 
-    results = []
-    for target in targets:
-        exported = export_or_update_speedtree_spm_path(
+    def target_key(path):
+        return os.path.normcase(
+            str(Path(path).resolve(strict=False))
+        ).casefold()
+
+    mapped_by_path = {target_key(row["spm"]): row for row in targets}
+    production_targets = [Path(row["spm"]).absolute() for row in targets]
+
+    def build_staged_target(staged_target, production_target):
+        target = mapped_by_path[target_key(production_target)]
+        return export_target(
             props,
-            target["spm"],
+            staged_target,
             atlas_asset_name=material_name,
             source_material_names=target["source_material_names"],
             source_material_ids=target["source_material_ids"],
+            generator_variant_policy=target["generator_variant_policy"],
             allow_create=False,
+            production_target_spm=production_target,
         )
+
+    staged_results = execute_transaction(
+        production_targets,
+        build_staged_target,
+        validate_targets,
+        allow_create=False,
+    )
+    cleanup_transactions()
+
+    results = []
+    for target, exported in zip(targets, staged_results):
         manifest_path = Path(exported[1])
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         connection = manifest.get("generator_connection") or {}
@@ -207,6 +245,7 @@ def apply_mapped_targets(props, targets, material_name, addon_runtime):
             "source_material_names": target["source_material_names"],
             "expected_source_material_ids": target["source_material_ids"],
             "expected_generator_bindings": target["generator_bindings"],
+            "generator_variant_policy": target["generator_variant_policy"],
             "manifest": str(manifest_path),
             "generator_connection": connection,
         })
