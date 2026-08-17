@@ -37,6 +37,7 @@ from sk_batch.sk_common import (
 
 REPO_DIR = Path(__file__).resolve().parent
 SK_BATCH_DIR = REPO_DIR / "sk_batch"
+COLLISION_CLI_ENV = "SPEEDTREE_COLLISION_CLI_EXE"
 
 
 class ClusterSourcePreparationError(RuntimeError):
@@ -61,6 +62,43 @@ class ClusterSourcePreparationError(RuntimeError):
         self.log_file = Path(log_file) if log_file else None
         self.report_file = Path(report_file) if report_file else None
         self.report = report if isinstance(report, dict) else {}
+
+
+def _material_preflight_export_executable():
+    """Resolve the collision-aware CLI required by the bundled FBX/XML export.
+
+    The material preflight intentionally shares the exact one-process
+    Collision/Prune bake used by BWR.  Passing SpeedTree_Modeler.exe directly
+    to BWR's export_bundle would send the custom secondary-export switches to
+    the stock Modeler, which can leave the XML side of the bundle missing.
+    Never silently fall back to that path.
+    """
+    configured = str(os.environ.get(COLLISION_CLI_ENV) or "").strip()
+    if configured:
+        executable = Path(configured).expanduser().resolve()
+        source = COLLISION_CLI_ENV
+    else:
+        executable = (
+            REPO_DIR
+            / "speedtree_collision_cli"
+            / "bin"
+            / "speedtree_collision_cli.exe"
+        ).resolve()
+        source = "repository collision CLI"
+
+    if executable.name.casefold() != "speedtree_collision_cli.exe":
+        raise ClusterSourcePreparationError(
+            "material_preflight",
+            f"{source} must point to speedtree_collision_cli.exe: {executable}",
+        )
+    if not executable.is_file():
+        raise ClusterSourcePreparationError(
+            "material_preflight",
+            "Collision-aware SpeedTree CLI is unavailable: "
+            f"{executable}. Launch SpeedTree_Batch_Tools.bat so build.ps1 "
+            "can build and verify the supported native CLI.",
+        )
+    return executable
 
 
 def _notify(callback, stage, message):
@@ -249,6 +287,7 @@ def _build_cluster_source(
             "material_preflight",
             f"SpeedTree export helper does not exist: {speedtree_cli}",
         )
+    material_export_exe = _material_preflight_export_executable()
 
     _notify(
         progress_callback,
@@ -267,7 +306,7 @@ def _build_cluster_source(
         "--canonical-spm",
         canonical_spm,
         "--speedtree-exe",
-        cfg["speedtree_exe"],
+        material_export_exe,
         "--fbx-ini",
         fbx_ini,
         "--xml-ini",
