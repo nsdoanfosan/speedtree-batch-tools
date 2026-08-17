@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -150,6 +151,8 @@ class ClusterSourcePrepareTests(unittest.TestCase):
             fbx_ini.write_text("ini", encoding="utf-8")
             speedtree_cli = fbx_ini.parents[2] / "speedtree_cli.py"
             speedtree_cli.write_text("# helper", encoding="utf-8")
+            collision_cli = root / "speedtree_collision_cli.exe"
+            collision_cli.write_bytes(b"collision cli")
             cfg = {
                 "fbx_ini": str(fbx_ini),
                 "speedtree_exe": str(root / "SpeedTree.exe"),
@@ -196,7 +199,11 @@ class ClusterSourcePrepareTests(unittest.TestCase):
                 )
                 return SimpleNamespace(returncode=0)
 
-            with mock.patch.object(
+            with mock.patch.dict(
+                os.environ,
+                {source_prepare.COLLISION_CLI_ENV: str(collision_cli)},
+                clear=False,
+            ), mock.patch.object(
                 source_prepare,
                 "blender_open_file_window_titles",
                 return_value=[],
@@ -229,6 +236,14 @@ class ClusterSourcePrepareTests(unittest.TestCase):
         )
         self.assertEqual(result["spm_bone_setup"]["status"], "already-ok")
         self.assertEqual(result["cluster_source_build"]["status"], "ok")
+        material_command = next(
+            command for stage, command in commands
+            if stage == "material_preflight"
+        )
+        self.assertEqual(
+            material_command[material_command.index("--speedtree-exe") + 1],
+            str(collision_cli.resolve()),
+        )
         cluster_command = next(
             command for stage, command in commands
             if stage == "cluster_source_build"
@@ -370,6 +385,8 @@ class ClusterSourcePrepareTests(unittest.TestCase):
             (fbx_ini.parents[2] / "speedtree_cli.py").write_text(
                 "# helper", encoding="utf-8"
             )
+            collision_cli = root / "speedtree_collision_cli.exe"
+            collision_cli.write_bytes(b"collision cli")
             cfg = {
                 "fbx_ini": str(fbx_ini),
                 "speedtree_exe": str(root / "SpeedTree.exe"),
@@ -418,7 +435,11 @@ class ClusterSourcePrepareTests(unittest.TestCase):
                 )
                 return SimpleNamespace(returncode=1)
 
-            with mock.patch.object(
+            with mock.patch.dict(
+                os.environ,
+                {source_prepare.COLLISION_CLI_ENV: str(collision_cli)},
+                clear=False,
+            ), mock.patch.object(
                 source_prepare,
                 "blender_open_file_window_titles",
                 return_value=[],
