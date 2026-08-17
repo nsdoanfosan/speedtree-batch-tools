@@ -236,6 +236,7 @@ def _build_cluster_source(
         ) from exc
 
     fbx_ini = Path(str(cfg.get("fbx_ini") or "")).resolve()
+    xml_ini = Path(str(cfg.get("xml_ini") or "")).resolve()
     try:
         speedtree_cli = fbx_ini.parents[2] / "speedtree_cli.py"
     except IndexError as exc:
@@ -269,6 +270,8 @@ def _build_cluster_source(
         cfg["speedtree_exe"],
         "--fbx-ini",
         fbx_ini,
+        "--xml-ini",
+        xml_ini,
         "--speedtree-cli",
         speedtree_cli,
         "--report",
