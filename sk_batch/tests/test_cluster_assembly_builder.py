@@ -43,6 +43,7 @@ from cluster_assembly_builder import (  # noqa: E402
     _component_signature,
     _current_unreal_skeleton_diagnostic,
     _expected_normalized_bounds_for_variant,
+    _exact_component_anchor_influences,
     _exact_source_bone_influences,
     _export_selected_fbx,
     _generated_material_sidecar,
@@ -350,6 +351,98 @@ class ExactSourceBoneInfluenceTests(unittest.TestCase):
                 "",
                 {"Bone_1_Start": object()},
                 "test variant",
+            )
+
+
+class ExactComponentAnchorInfluenceTests(unittest.TestCase):
+    @staticmethod
+    def _object(group_names, vertex_weights):
+        return SimpleNamespace(
+            vertex_groups=[SimpleNamespace(name=name) for name in group_names],
+            data=SimpleNamespace(
+                vertices=[
+                    SimpleNamespace(
+                        groups=[
+                            SimpleNamespace(group=group, weight=weight)
+                            for group, weight in weights
+                        ]
+                    )
+                    for weights in vertex_weights
+                ]
+            ),
+        )
+
+    def test_collapses_parent_and_child_weights_to_exact_authored_anchor(self):
+        snapshot = skeleton_snapshot()
+        skeleton_by_name = {
+            row["name"]: row for row in snapshot["bones"]
+        }
+        obj = self._object(
+            ["Branch_A", "Leaf_A"],
+            [[(0, 0.4), (1, 0.6)], [(0, 0.2), (1, 0.8)]],
+        )
+
+        influences, source = _exact_component_anchor_influences(
+            obj,
+            {"vertices": [0, 1]},
+            snapshot,
+            skeleton_by_name,
+            "test branch component",
+        )
+
+        self.assertEqual(influences, [{"bone": "Branch_A", "weight": 1.0}])
+        self.assertEqual(
+            source["policy"],
+            "exact_render_component_anchor_bone_name_v1",
+        )
+        self.assertEqual(
+            source["authored_component_bones"],
+            ["Leaf_A", "Branch_A"],
+        )
+
+    def test_rejects_component_bone_missing_from_final_skeleton(self):
+        snapshot = skeleton_snapshot()
+        skeleton_by_name = {
+            row["name"]: row for row in snapshot["bones"]
+        }
+        obj = self._object(["Branch_Missing"], [[(0, 1.0)]])
+
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "vertex-group bones missing from final skeleton: Branch_Missing",
+        ):
+            _exact_component_anchor_influences(
+                obj,
+                {"vertices": [0]},
+                snapshot,
+                skeleton_by_name,
+                "test branch component",
+            )
+
+    def test_rejects_sibling_weights_without_an_authored_common_anchor(self):
+        snapshot = skeleton_snapshot()
+        skeleton_by_name = {
+            row["name"]: row for row in snapshot["bones"]
+        }
+        skeleton_by_name["Branch_B"] = {
+            "name": "Branch_B",
+            "parent_name": "Trunk",
+        }
+        obj = self._object(
+            ["Branch_A", "Branch_B"],
+            [[(0, 0.5), (1, 0.5)]],
+        )
+
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "common ancestor Trunk is not authored on the component",
+        ):
+            _exact_component_anchor_influences(
+                obj,
+                {"vertices": [0]},
+                snapshot,
+                skeleton_by_name,
+                "test branch component",
             )
 
 
