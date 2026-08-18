@@ -420,6 +420,26 @@ class GeneratorSyncTests(unittest.TestCase):
             self.assertIn("2/2", progress[-1][0])
             self.assertTrue(any("Tree_elm" in stage for stage, _ in progress))
 
+    def test_exact_scan_never_expands_to_sibling_folders(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            selected = root / "Tree_selected"
+            unrelated = root / "Tree_unrelated"
+            selected.mkdir()
+            unrelated.mkdir()
+            write_spm(selected / "SK_Tree_selected_01.spm", make_master())
+            write_spm(
+                unrelated / "SK_Tree_unrelated_01.spm", make_master()
+            )
+
+            board = sync.scan_exact_folders(
+                [selected], sk_only=True, verify_physical=False
+            )
+
+            self.assertEqual(
+                [Path(row["folder"]) for row in board], [selected]
+            )
+
     def test_cloned_and_previously_wrong_leaf_material_ids_are_remapped_by_asset_name(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)
@@ -1389,6 +1409,50 @@ class GeneratorSyncTests(unittest.TestCase):
 
             self.assertIn(("stdout", "starting"), output)
             self.assertIn(("stderr", "fatal detail"), output)
+
+    def test_speedtree_verify_wraps_stock_modeler_with_shared_cli(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            spm = folder / "tree_02.spm"
+            modeler = folder / "SpeedTree_Modeler.exe"
+            collision_cli = folder / "speedtree_collision_cli.exe"
+            options = folder / "Options_HI_Xml.ini"
+            write_spm(spm, make_target())
+            modeler.write_bytes(b"modeler")
+            collision_cli.write_bytes(b"wrapper")
+            options.write_text(
+                "[Options]\nTextureSkipWriting=true\n",
+                encoding="utf-8",
+            )
+
+            def complete(command, **_kwargs):
+                Path(command[-1]).write_text(
+                    "<SpeedTree/>", encoding="utf-8"
+                )
+                return mock.Mock(
+                    returncode=0,
+                    stdout="",
+                    stderr="",
+                    stderr_omitted_chars=0,
+                    stdout_omitted_chars=0,
+                )
+
+            with mock.patch.dict(
+                sync.os.environ,
+                {"SPEEDTREE_COLLISION_CLI_EXE": str(collision_cli)},
+            ), mock.patch.object(
+                sync, "run_streaming_process", side_effect=complete
+            ) as run:
+                sync.verify_speedtree_export(spm, modeler, options)
+
+            command = run.call_args.args[0]
+            self.assertEqual(command[0], str(collision_cli.resolve()))
+            self.assertIn("--verification-only", command)
+            self.assertEqual(
+                command[command.index("--modeler") + 1],
+                str(modeler.resolve()),
+            )
+            self.assertIn("--", command)
 
     def test_auto_copy_verification_keeps_follower_extra_out_of_master_plan(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -3507,8 +3507,61 @@ class GuiLabelTests(unittest.TestCase):
         self.assertEqual(self.gui.blender_connection_rows(item), [])
         self.assertEqual(
             self.gui.blender_connection_overview(item),
-            "연결 계산 중…",
+            "선택 시 연결 확인",
         )
+
+    def test_cold_board_action_audits_only_checked_folders(self):
+        class ImmediateThread:
+            def __init__(self, *, target, daemon):
+                self.target = target
+                self.daemon = daemon
+
+            def start(self):
+                self.target()
+
+        app = self.gui.App.__new__(self.gui.App)
+        selected = {
+            "folder": r"D:\Trees\selected",
+            "name": "selected",
+            "status": "startup_pending",
+        }
+        app.cfg = {"tree_root": r"D:\Trees"}
+        app._checked_report_items = mock.Mock(return_value=[selected])
+        app.use_pcg_targets_var = mock.Mock()
+        app.use_pcg_targets_var.get.return_value = False
+        app._set_busy = mock.Mock()
+        app.status_var = mock.Mock()
+        app.root = mock.Mock()
+        app.root.after.side_effect = lambda _delay, callback: callback()
+        app.root.after_idle.side_effect = lambda callback: callback()
+        app._apply_step3_scope_report = mock.Mock()
+        app.populate = mock.Mock()
+        app._update_summary = mock.Mock()
+        continuation = mock.Mock()
+        report = {"items": [{
+            **selected,
+            "status": "ok",
+            "_gui_live_evidence": {"sha256": "current"},
+        }]}
+
+        with mock.patch.object(
+            self.gui.threading, "Thread", ImmediateThread
+        ), mock.patch.object(
+            self.gui, "make_report", return_value=report
+        ) as make_report, mock.patch.object(
+            self.gui, "cache_blender_connection_rows"
+        ):
+            ready = app._ensure_selected_live_scope(
+                continuation, "① 실행"
+            )
+
+        self.assertFalse(ready)
+        self.assertEqual(
+            make_report.call_args.kwargs["targets"],
+            [r"D:\Trees\selected"],
+        )
+        app._apply_step3_scope_report.assert_called_once_with(report)
+        continuation.assert_called_once_with()
 
     def test_initial_refresh_keeps_live_report_when_receipt_persistence_warns(self):
         report = {
@@ -4664,7 +4717,9 @@ class GuiLabelTests(unittest.TestCase):
         )])
         app.log.assert_called_once_with(
             "[① 변경 없음] tree_test: 이미 최신입니다.")
-        app._prepare_finished.assert_called_once_with(1, 0)
+        app._prepare_finished.assert_called_once_with(
+            1, 0, [r"D:\Trees\tree_test"]
+        )
         app._reaudit_and_seal_mutation_items.assert_called_once()
 
     def test_prepare_rows_drop_stale_audit_when_preview_is_up_to_date(self):

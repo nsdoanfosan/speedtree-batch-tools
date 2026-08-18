@@ -7,9 +7,12 @@ Atlas writes three operational copies of a target relationship:
 * ``speedtree_import_manifest.json`` (rolling global target record).
 
 They are considered in that order.  Coherent lower-precedence mirrors remain
-selected so a writer can update every current operational record.  Disjoint
-scope records may coexist because one target can consume multiple Atlas
-providers.  Any two operational records that overlap and disagree on source
+selected so a writer can update every current operational record.  A linked
+same-source mirror with an older claim set is shadowed by the final per-target
+receipt, including when its stale claims are disjoint.  Disjoint scope records
+from different providers may coexist because one target can consume multiple
+Atlas providers.  Any two remaining operational records that overlap and
+disagree on source
 identity, material ownership, material-group content, or a Generator binding
 fail closed.  Precedence never turns a disagreement into a last-writer win.
 
@@ -1333,6 +1336,43 @@ def resolve_atlas_manifests(
         ),
     ):
         claims = candidate["_claims"]
+        # A per-target receipt is the final publication for one Provider.
+        # Scope/global mirrors from the same Provider can outlive an earlier
+        # preparation pass and carry additional, now-stale Generator slots.
+        # Treating those disjoint slots as a second live Provider resurrects
+        # the preparation data next to the final result.  Keep semantically
+        # coherent mirrors available to writers, but let the final per-target
+        # receipt replace any same-source mirror whose complete claim set has
+        # changed (including purely added/removed claims).
+        superseded_same_source = next(
+            (
+                winner
+                for winner in selected
+                if winner.get("kind") == "exact_per_target"
+                and winner.get("precedence", 99)
+                < candidate.get("precedence", 99)
+                and winner.get("source_identity")
+                == candidate.get("source_identity")
+                and normalized_manifest_path(
+                    (candidate.get("payload") or {}).get(
+                        "target_manifest"
+                    ) or ""
+                )
+                == normalized_manifest_path(winner.get("path") or "")
+                and candidate["_claims"] != winner["_claims"]
+            ),
+            None,
+        )
+        if superseded_same_source is not None:
+            resolution["shadowed"].append({
+                "path": candidate["path"],
+                "kind": candidate["kind"],
+                "precedence": candidate["precedence"],
+                "reason": "superseded_same_source_mirror",
+                "superseded_by": superseded_same_source["path"],
+                "source_identity": candidate.get("source_identity"),
+            })
+            continue
         overlaps = [
             (key, winners[key]) for key in sorted(claims) if key in winners
         ]
@@ -1342,40 +1382,6 @@ def resolve_atlas_manifests(
             if claims[key] != winner["_claims"][key]
         ]
         if disagreements:
-            # The per-target record is the publication authority for this exact
-            # provider/scope.  Once a new target record exists, an older scope
-            # or rolling-global mirror from the same provider must not remain a
-            # second operational candidate and resurrect superseded Material /
-            # Mesh bindings.  Other providers remain independent candidates;
-            # this only shadows a lower-precedence mirror of the same source.
-            superseded_same_source = next(
-                (
-                    winner
-                    for _key, winner in disagreements
-                    if winner.get("kind") == "exact_per_target"
-                    and winner.get("precedence", 99)
-                    < candidate.get("precedence", 99)
-                    and winner.get("source_identity")
-                    == candidate.get("source_identity")
-                    and normalized_manifest_path(
-                        (candidate.get("payload") or {}).get(
-                            "target_manifest"
-                        ) or ""
-                    )
-                    == normalized_manifest_path(winner.get("path") or "")
-                ),
-                None,
-            )
-            if superseded_same_source is not None:
-                resolution["shadowed"].append({
-                    "path": candidate["path"],
-                    "kind": candidate["kind"],
-                    "precedence": candidate["precedence"],
-                    "reason": "superseded_same_source_mirror",
-                    "superseded_by": superseded_same_source["path"],
-                    "source_identity": candidate.get("source_identity"),
-                })
-                continue
             # A record written against the legacy unprefixed name loses to one
             # written against the canonical output name: the pair contract
             # makes the canonical name the production identity, so the legacy

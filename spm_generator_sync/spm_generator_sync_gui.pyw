@@ -1101,6 +1101,75 @@ class App:
             shared_queue=False,
         )
 
+    def refresh_folders(self, folders, reveal=None):
+        """Refresh only folders changed by the completed selected action."""
+        # Lightweight callers/tests that did not initialize the board still
+        # retain the legacy full-refresh fallback. A real App always has both
+        # fields and therefore uses the selected-folder path below.
+        if not hasattr(self, "sk_only_var") or not hasattr(self, "board"):
+            return self.refresh(reveal=reveal)
+        targets = sorted(
+            {Path(folder) for folder in folders},
+            key=lambda path: str(path).casefold(),
+        )
+        if not targets:
+            return None
+        sk_only = bool(self.sk_only_var.get())
+
+        def scan(report):
+            return engine.scan_exact_folders(
+                targets,
+                sk_only=sk_only,
+                verify_physical=False,
+                progress_callback=report,
+            )
+
+        def done(rows):
+            replacements = {
+                os.path.normcase(str(Path(row["folder"]).absolute())).casefold(): row
+                for row in rows
+            }
+            merged = []
+            replaced = set()
+            for row in self.board:
+                key = os.path.normcase(
+                    str(Path(row["folder"]).absolute())
+                ).casefold()
+                if key in replacements:
+                    merged.append(replacements[key])
+                    replaced.add(key)
+                else:
+                    merged.append(row)
+            merged.extend(
+                row for key, row in replacements.items() if key not in replaced
+            )
+            self.board = merged
+            self.render_board(fast=True)
+            self.status_var.set(
+                f"선택 폴더 {len(targets)}개 상태 갱신 완료"
+            )
+            if reveal:
+                reveal_folder, reveal_file = reveal
+                for iid, meta in self.item_meta.items():
+                    if (
+                        meta.get("kind") == "spm"
+                        and meta.get("folder") == Path(reveal_folder)
+                        and meta.get("file") == reveal_file
+                    ):
+                        self.tree.selection_set(iid)
+                        self.tree.focus(iid)
+                        self.tree.see(iid)
+                        self.update_details()
+                        break
+
+        return self._start_job(
+            "선택 폴더 상태 확인 중...",
+            scan,
+            done,
+            queue_label=f"선택 폴더 상태 확인 · {len(targets)}개",
+            shared_queue=False,
+        )
+
     def master_status(
         self,
         folder: Path,
@@ -1735,7 +1804,9 @@ class App:
                     promote_master=target.get("role") != "master",
                 )
             except Exception as exc:
-                self.refresh()
+                folders = {item.get("folder") for item in sources}
+                folders.add(target.get("folder"))
+                self.refresh_folders(folder for folder in folders if folder)
                 messagebox.showerror("자식 연결 실패", str(exc), parent=self.root)
         return "break"
 
@@ -1770,7 +1841,9 @@ class App:
             return engine.promote_master(folder, item["file"])
 
         def done(result):
-            self.refresh(reveal=(folder, item["file"]))
+            self.refresh_folders(
+                [folder], reveal=(folder, item["file"])
+            )
             self.status_var.set(
                 f"마스터 지정 완료 · {item['file']} · "
                 f"Base 색상 {result['color_updates']}개 적용"
@@ -1870,7 +1943,7 @@ class App:
             }
 
         def done(_result):
-            self.refresh()
+            self.refresh_folders([folder])
 
         self._start_job(
             "자식 관계 적용 중...",
@@ -1904,7 +1977,7 @@ class App:
         self._start_job(
             "독립 관계 적용 중...",
             apply,
-            lambda _result: self.refresh(),
+            lambda _result: self.refresh_folders(by_folder),
             queue_label=(
                 f"독립 관계 · SPM {sum(len(v) for v in by_folder.values())}개"
             ),
@@ -2085,7 +2158,6 @@ class App:
         job_config = dict(self.config)
         blend = Path(changes[0]["blend"])
         requested_blend_keys = set(blend_keys)
-        board_root = str(job_config.get("tree_root") or "")
         cluster_count = len(changes)
         if refresh_only:
             target_binding_count = sum(
@@ -2152,8 +2224,21 @@ class App:
                 # A shared queue turn may begin long after the click. Re-scan
                 # the registry/manifest contract now and refresh only blends
                 # that are still fully ON; never replay captured target paths.
-                runtime_board = engine.scan_tree_folders(
-                    Path(board_root),
+                runtime_folders = {
+                    Path(target).parent
+                    for row in changes
+                    for target in (
+                        list(row.get("on_target_spms") or ())
+                        + list(row.get("target_spms") or ())
+                    )
+                }
+                if not runtime_folders:
+                    runtime_folders = {
+                        Path(row["blend"]).parent.parent
+                        for row in changes
+                    }
+                runtime_board = engine.scan_exact_folders(
+                    runtime_folders,
                     sk_only=bool(job_config.get("sk_only", True)),
                     verify_physical=False,
                 )
@@ -2204,7 +2289,17 @@ class App:
             return result
 
         def done(result):
-            self.refresh()
+            affected_folders = {
+                Path(target).parent
+                for row in changes
+                for target in (
+                    list(row.get("on_target_spms") or ())
+                    + list(row.get("target_spms") or ())
+                )
+            }
+            if not affected_folders:
+                affected_folders = {blend.parent.parent}
+            self.refresh_folders(affected_folders)
             self.status_var.set(
                 (
                     f"Cluster 갱신 완료 · Cluster {cluster_count}개 · "
@@ -2281,7 +2376,7 @@ class App:
         self._start_job(
             "Base 매핑 적용 중...",
             apply,
-            lambda _result: self.refresh(),
+            lambda _result: self.refresh_folders([item["folder"]]),
             queue_label=f"Base 매핑 · {item['file']}",
         )
 
@@ -2312,7 +2407,7 @@ class App:
         self._start_job(
             "Base 분류 적용 중...",
             apply,
-            lambda _result: self.refresh(),
+            lambda _result: self.refresh_folders([item["folder"]]),
             queue_label=f"Base 분류 · {item['file']}",
         )
 
@@ -4365,7 +4460,7 @@ class App:
             )
 
         def done(result):
-            self.refresh()
+            self.refresh_folders([folder])
             changed = "\n".join(Path(path).name for path in result["changed_files"]) or "변경 없음"
             self._show_job_info(
                 "동기화 완료",
@@ -4374,7 +4469,7 @@ class App:
             )
 
         def cancelled(_exc):
-            self.refresh()
+            self.refresh_folders([folder])
 
         self._start_job(
             "SPM 동기화 및 검증 중...",

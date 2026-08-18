@@ -77,7 +77,7 @@ class ManualFullRerenderTests(unittest.TestCase):
         self.assertEqual(len(forced_jobs), 1)
         self.assertTrue(forced_jobs[0]["force_cluster_recook"])
 
-    def test_force_button_counts_unchecked_rows_across_the_whole_board(self):
+    def test_force_button_counts_only_checked_rows(self):
         state = self.gui.step3_force_selection_state({
             "tree_a": {
                 "checked": False,
@@ -90,7 +90,7 @@ class ManualFullRerenderTests(unittest.TestCase):
         })
 
         self.assertEqual(state, {
-            "text": "③ 전체 다시 뽑기 (2세트)",
+            "text": "③ 선택 항목 다시 뽑기 (1세트)",
             "state": "normal",
         })
 
@@ -113,11 +113,11 @@ class ManualFullRerenderTests(unittest.TestCase):
         }
         app.items = {
             "dogwood": {
-                "checked": False,
+                "checked": True,
                 "item": item,
             },
         }
-        app._all_texplan_rows = lambda: [(item, row)]
+        app._checked_texplan_rows = lambda: [(item, row)]
         app._step3_jobs = mock.Mock(return_value=([{
             "base": row["atlas_base"],
             "texture_base": row["texture_base"],
@@ -126,6 +126,10 @@ class ManualFullRerenderTests(unittest.TestCase):
         app._step3_unreal_name_skips = mock.Mock(return_value=[])
 
         plan = app._build_step3_force_execution_plan()
+
+        app._step3_jobs.assert_called_once_with(
+            force_rerender=True, all_rows=False
+        )
 
         self.assertEqual(
             {value.lower() for value in plan["exact_step3_spms"]},
