@@ -59,6 +59,7 @@ from atlas_manifest_resolver import (
 )
 from cluster_blend_sync import discover_cluster_blend_relations
 from speedtree_export_options_contract import require_texture_skip_writing
+from speedtree_cli_runtime import verification_export_command
 try:
     from .process_stream import ProcessCancelled, run_streaming_process
 except ImportError:  # direct script/GUI-engine loading puts TOOL_DIR on sys.path
@@ -3210,34 +3211,22 @@ def assign_follower(
     return manifest
 
 
-def scan_tree_folders(
-    root: Path,
+def scan_exact_folders(
+    scan_candidates,
     sk_only: bool = False,
     *,
     verify_physical: bool = True,
     progress_callback=None,
 ) -> list[dict]:
-    root = Path(root)
-    if not root.is_dir():
-        raise SyncError(f"나무 루트 폴더가 없습니다: {root}")
-    folders: list[dict] = []
-    skipped = {item.casefold() for item in SKIP_DIRS}
-    candidates = [root]
-    try:
-        candidates.extend(
-            path for path in root.iterdir()
-            if (
-                path.is_dir()
-                and path.name.casefold() not in skipped
-                and path.name.casefold() != "cluster"
-            )
-        )
-    except OSError as exc:
-        raise SyncError(f"나무 루트를 읽을 수 없습니다: {root}") from exc
+    """Scan only the explicitly supplied production folders."""
+    scan_candidates = [Path(path) for path in scan_candidates]
+    missing = [path for path in scan_candidates if not path.is_dir()]
+    if missing:
+        raise SyncError(f"나무 폴더가 없습니다: {missing[0]}")
     scan_candidates = sorted(
-        candidates,
-        key=lambda path: (path != root, path.name.casefold()),
+        dict.fromkeys(scan_candidates), key=lambda path: str(path).casefold()
     )
+    folders: list[dict] = []
     total_candidates = len(scan_candidates)
     for index, folder in enumerate(scan_candidates, start=1):
         if progress_callback:
@@ -3289,6 +3278,37 @@ def scan_tree_folders(
     return folders
 
 
+def scan_tree_folders(
+    root: Path,
+    sk_only: bool = False,
+    *,
+    verify_physical: bool = True,
+    progress_callback=None,
+) -> list[dict]:
+    root = Path(root)
+    if not root.is_dir():
+        raise SyncError(f"나무 루트 폴더가 없습니다: {root}")
+    skipped = {item.casefold() for item in SKIP_DIRS}
+    candidates = [root]
+    try:
+        candidates.extend(
+            path for path in root.iterdir()
+            if (
+                path.is_dir()
+                and path.name.casefold() not in skipped
+                and path.name.casefold() != "cluster"
+            )
+        )
+    except OSError as exc:
+        raise SyncError(f"나무 루트를 읽을 수 없습니다: {root}") from exc
+    return scan_exact_folders(
+        sorted(candidates, key=lambda path: (path != root, path.name.casefold())),
+        sk_only=sk_only,
+        verify_physical=verify_physical,
+        progress_callback=progress_callback,
+    )
+
+
 def find_group(manifest: dict, master: str) -> dict:
     group = next((item for item in manifest.get("groups", []) if item.get("master") == master), None)
     if group is None:
@@ -3317,11 +3337,12 @@ def verify_speedtree_export(
     )
     with tempfile.TemporaryDirectory(prefix="spm_generator_sync_verify_") as temp:
         output = Path(temp) / f"{spm_path.stem}_verify.xml"
-        cmd = [
-            str(speedtree_exe), str(spm_path),
-            "-export_options", str(xml_ini),
-            "-export", str(output),
-        ]
+        try:
+            cmd = verification_export_command(
+                speedtree_exe, spm_path, xml_ini, output
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            raise SyncError(str(exc)) from exc
         try:
             # Shared Modeler rule: PIPE is used only through process_stream's
             # drain-thread + owned-tree + bounded-EOF contract.  sk_batch's

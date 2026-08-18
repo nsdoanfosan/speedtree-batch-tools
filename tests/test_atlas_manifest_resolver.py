@@ -1176,6 +1176,59 @@ class AtlasManifestResolverTests(unittest.TestCase):
                         str(authority.resolve()),
                     )
 
+    def test_exact_target_drops_disjoint_stale_slots_from_same_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root, target, _blend, payload = self.fixture(temporary)
+            authority = self.write_candidate(
+                root,
+                target,
+                "exact_per_target",
+                payload,
+            )
+            payload["target_manifest"] = str(authority.resolve())
+            authority.write_text(
+                json.dumps(payload, sort_keys=True),
+                encoding="utf-8",
+            )
+
+            stale = copy.deepcopy(payload)
+            old_binding = copy.deepcopy(
+                stale["generator_connection"]["bindings"][0]
+            )
+            old_binding.update({
+                "generator_guid": "old-preparation-generator",
+                "slot_prefix": "Frond 13:Material:0",
+                "target_material_id": 91,
+                "target_mesh_id": -10,
+            })
+            stale["generator_connection"]["bindings"].append(old_binding)
+            stale_path = self.write_candidate(
+                root,
+                target,
+                "exact_target_scope",
+                stale,
+                name=f"initial-preparation__{target.stem}.json",
+            )
+
+            resolution = resolve_atlas_manifests(target)
+
+            self.assertEqual(
+                [row["path"] for row in resolution["selected"]],
+                [str(authority.resolve())],
+            )
+            shadow = next(
+                row for row in resolution["shadowed"]
+                if row["path"] == str(stale_path.resolve())
+            )
+            self.assertEqual(
+                shadow["reason"],
+                "superseded_same_source_mirror",
+            )
+            self.assertEqual(
+                shadow["superseded_by"],
+                str(authority.resolve()),
+            )
+
     def test_read_only_diagnostic_mode_keeps_deterministic_live_authority(self):
         with tempfile.TemporaryDirectory() as temporary:
             root, target, _blend, payload = self.fixture(temporary)

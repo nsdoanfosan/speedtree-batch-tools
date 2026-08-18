@@ -573,7 +573,7 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
         ) as refresh, mock.patch.object(
             GUI, "run_cluster_folder_relation_transaction"
         ) as normalize, mock.patch.object(
-            GUI.engine, "scan_tree_folders", return_value=[]
+            GUI.engine, "scan_exact_folders", return_value=[]
         ):
             app.refresh_selected_cluster_relation()
 
@@ -675,7 +675,7 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
         ) as refresh, mock.patch.object(
             GUI, "run_cluster_folder_relation_transaction"
         ) as normalize, mock.patch.object(
-            GUI.engine, "scan_tree_folders", return_value=[]
+            GUI.engine, "scan_exact_folders", return_value=[]
         ):
             app.refresh_selected_cluster_relation()
 

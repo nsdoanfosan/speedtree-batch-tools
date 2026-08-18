@@ -16,6 +16,10 @@ from datetime import datetime
 from pathlib import Path
 
 from process_lifecycle import owned_run
+from speedtree_cli_runtime import (
+    COLLISION_CLI_ENV,
+    require_collision_cli,
+)
 
 from cluster_normalization_sync import (
     ClusterSourceBuildRequiredError,
@@ -37,7 +41,6 @@ from sk_batch.sk_common import (
 
 REPO_DIR = Path(__file__).resolve().parent
 SK_BATCH_DIR = REPO_DIR / "sk_batch"
-COLLISION_CLI_ENV = "SPEEDTREE_COLLISION_CLI_EXE"
 
 
 class ClusterSourcePreparationError(RuntimeError):
@@ -73,32 +76,13 @@ def _material_preflight_export_executable():
     the stock Modeler, which can leave the XML side of the bundle missing.
     Never silently fall back to that path.
     """
-    configured = str(os.environ.get(COLLISION_CLI_ENV) or "").strip()
-    if configured:
-        executable = Path(configured).expanduser().resolve()
-        source = COLLISION_CLI_ENV
-    else:
-        executable = (
-            REPO_DIR
-            / "speedtree_collision_cli"
-            / "bin"
-            / "speedtree_collision_cli.exe"
-        ).resolve()
-        source = "repository collision CLI"
-
-    if executable.name.casefold() != "speedtree_collision_cli.exe":
+    try:
+        return require_collision_cli(REPO_DIR)
+    except (FileNotFoundError, ValueError) as exc:
         raise ClusterSourcePreparationError(
             "material_preflight",
-            f"{source} must point to speedtree_collision_cli.exe: {executable}",
-        )
-    if not executable.is_file():
-        raise ClusterSourcePreparationError(
-            "material_preflight",
-            "Collision-aware SpeedTree CLI is unavailable: "
-            f"{executable}. Launch SpeedTree_Batch_Tools.bat so build.ps1 "
-            "can build and verify the supported native CLI.",
-        )
-    return executable
+            str(exc),
+        ) from exc
 
 
 def _notify(callback, stage, message):

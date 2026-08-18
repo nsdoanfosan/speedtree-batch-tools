@@ -299,15 +299,15 @@ def step3_selection_state(entries):
 
 
 def step3_force_selection_state(entries):
-    """Return the explicit manual full-rerender action for the whole board."""
+    """Return the explicit manual rerender action for checked folders."""
     texture_sets = sum(
         step3_item_state(entry.get("item") or {})["sets"]
-        for entry in entries.values()
+        for entry in entries.values() if entry.get("checked")
     )
     if not texture_sets:
-        return {"text": "③ 전체 다시 뽑기 — 대상 없음", "state": "disabled"}
+        return {"text": "③ 선택 항목 다시 뽑기 — 대상 없음", "state": "disabled"}
     return {
-        "text": f"③ 전체 다시 뽑기 ({texture_sets}세트)",
+        "text": f"③ 선택 항목 다시 뽑기 ({texture_sets}세트)",
         "state": "normal",
     }
 
@@ -2146,7 +2146,7 @@ def blender_connection_summary(row):
 def blender_connection_overview(item):
     """Summarize active blend/SPM connections for the fourth board column."""
     if item.get("_gui_blender_connection_pending"):
-        return "연결 계산 중…"
+        return "선택 시 연결 확인"
     rows = blender_connection_rows(item)
     if not rows:
         return "blend 없음"
@@ -2979,14 +2979,14 @@ class App:
                                 "새 T_ 렌더가 성공하면 대응하는 기존 M_ 출력은 삭제합니다.")
         self.btn_step3_force = ttk.Button(
             actions2,
-            text="③ 전체 다시 뽑기 (선택 항목)",
+            text="③ 선택 항목 다시 뽑기",
             command=self.start_step3_force,
         )
         self.btn_step3_force.pack(side="left", padx=4)
         Tooltip(
             self.btn_step3_force,
-            "Cluster_System_01.sbsar를 수정한 뒤 수동으로 사용하는 전체 재추출입니다.\n"
-            "체크 여부와 무관하게 현재 표의 모든 세트를 세트당 T_ 6장씩 다시 렌더합니다.\n"
+            "Cluster_System_01.sbsar를 수정한 뒤 수동으로 사용하는 재추출입니다.\n"
+            "체크한 폴더의 세트만 세트당 T_ 6장씩 다시 렌더합니다.\n"
             "절차형 SBS 그래프도 기존 쿡 캐시를 재사용하지 않고 현재 Cluster_System을 다시 쿡합니다.\n"
             "모든 렌더가 성공하면 결과 전체를 모아 Unreal 동기화를 한 번만 실행합니다.\n"
             "성공한 세트는 루트 SK와 canonical Cluster SK까지 SPM 연결을 정규화합니다.\n"
@@ -3695,7 +3695,7 @@ class App:
         self._update_summary()
         self.status_var.set(
             f"생산 폴더 {len(items)}개 즉시 표시 · "
-            "상세 검사는 검사 버튼 또는 선택 실행 시 수행"
+            "파일 상태는 아직 읽지 않음 · 실행 시 체크한 폴더만 확인"
         )
 
     @staticmethod
@@ -3706,7 +3706,7 @@ class App:
             "folder": str(folder),
             "name": folder.name,
             "status": "startup_pending",
-            "actions": ["선택 실행 시 상세 검사"],
+            "actions": ["선택 실행 시 상태 확인"],
             "source_spms": [],
             "sk_spms": [],
             "cluster_items": [],
@@ -3948,7 +3948,7 @@ class App:
         self._set_busy(False)
         self._lock_mutation_controls()
         self.status_var.set(
-            "기본 live 검사 완료 · Blender 연결 계산 중… · 변경 작업 잠김"
+            "기본 파일 상태 확인 완료 · Blender 연결 확인 중…"
         )
 
         def relation_worker():
@@ -4641,7 +4641,7 @@ class App:
             complete = n - pending
             self.targets_info_var.set("")
             self.status_var.set(
-                f"생산 폴더 {n}개 표시 · 상세 검사 {complete}/{n} · "
+                f"생산 폴더 {n}개 표시 · 파일 상태 확인 {complete}/{n} · "
                 "변경 작업 잠김"
             )
             return
@@ -4988,7 +4988,7 @@ class App:
     # ---------------------------------------------------------- column texts
     def step1_text(self, item):
         if item.get("status") == "startup_pending":
-            return "상세 검사 대기"
+            return "선택 시 상태 확인"
         if item.get("duplicate_target_mesh_names") or item.get("duplicate_pcg_target_mesh_names"):
             return "⚠ 중복 매칭 확인"
         statuses = item.get("target_spm_statuses") or []
@@ -5018,7 +5018,7 @@ class App:
 
     def step2_text(self, item):
         if item.get("status") == "startup_pending":
-            return "상세 검사 대기"
+            return "선택 시 상태 확인"
         sources = item.get("leaf_mesh_sources") or []
         if not sources:
             inventory = item.get("leaf_atlas_inventory") or []
@@ -5096,7 +5096,7 @@ class App:
 
     def step3_text(self, item):
         if item.get("status") == "startup_pending":
-            return "상세 검사 대기"
+            return "선택 시 상태 확인"
         state = step3_item_state(item)
         if not state["sets"]:
             if state["connection_sets"]:
@@ -5165,17 +5165,14 @@ class App:
 
     def _require_live_mutation_items(self, items=None):
         selected = list(items if items is not None else self._checked_report_items())
-        if getattr(self, "_display_only_snapshot", False):
-            stale = selected or [self.selected_item()]
-        else:
-            stale = [
-                item for item in selected
-                if isinstance(item, dict)
-                and not (
-                    isinstance(item.get("_gui_live_evidence"), dict)
-                    and item["_gui_live_evidence"].get("sha256")
-                )
-            ]
+        stale = [
+            item for item in selected
+            if isinstance(item, dict)
+            and not (
+                isinstance(item.get("_gui_live_evidence"), dict)
+                and item["_gui_live_evidence"].get("sha256")
+            )
+        ]
         if not stale:
             return True
         names = [
@@ -5192,6 +5189,86 @@ class App:
         )
         self.status_var.set("변경 작업 차단 · current live 증거가 필요합니다")
         return False
+
+    def _ensure_selected_live_scope(self, continuation, action_label):
+        """Audit only checked folders before building a mutation preview."""
+        selected = self._checked_report_items()
+        if selected and all(
+            isinstance(item.get("_gui_live_evidence"), dict)
+            and item["_gui_live_evidence"].get("sha256")
+            for item in selected
+        ):
+            return True
+        folders = sorted({
+            str(item.get("folder"))
+            for item in selected
+            if str(item.get("folder") or "").strip()
+        }, key=os.path.normcase)
+        if not folders:
+            return True
+        if getattr(self, "_busy", False):
+            self.status_var.set("현재 작업이 끝난 뒤 다시 실행하세요")
+            return False
+
+        cfg = dict(self.cfg)
+        use_pcg_targets = bool(self.use_pcg_targets_var.get())
+        self._set_busy(True)
+        self.status_var.set(
+            f"{action_label} · 체크한 폴더 {len(folders)}개 상태 확인 중..."
+        )
+
+        def worker():
+            report = None
+            error = None
+            try:
+                session_evidence = {}
+                report = make_report(
+                    cfg,
+                    targets=folders,
+                    pcg_targets=(
+                        load_pcg_targets() if use_pcg_targets else None
+                    ),
+                    mutation_authority=True,
+                    session_evidence=session_evidence,
+                )
+                cache_blender_connection_rows(
+                    report,
+                    verify_physical=True,
+                    read_cache=False,
+                    session_evidence=session_evidence,
+                )
+            except Exception as exc:
+                error = exc
+            self.root.after(
+                0,
+                lambda result=report, failure=error:
+                self._selected_live_scope_done(
+                    result, failure, continuation, action_label
+                ),
+            )
+
+        self.worker = threading.Thread(target=worker, daemon=True)
+        self.worker.start()
+        return False
+
+    def _selected_live_scope_done(
+            self, report, error, continuation, action_label):
+        self.worker = None
+        if error is not None:
+            self._set_busy(False)
+            self.status_var.set(f"{action_label} · 선택 폴더 확인 실패")
+            messagebox.showerror(
+                "선택 폴더 확인 실패", str(error), parent=self.root
+            )
+            return
+        self._apply_step3_scope_report(report)
+        self.populate()
+        self._update_summary()
+        self._set_busy(False)
+        self.status_var.set(
+            f"{action_label} · 체크한 폴더 상태 확인 완료"
+        )
+        self.root.after_idle(continuation)
 
     @staticmethod
     def _validate_live_mutation_items(items):
@@ -5748,6 +5825,10 @@ class App:
                 "일반 식생 또는 Cluster의 canonical SK 자식 행을 체크하세요.",
             )
             return
+        if not self._ensure_selected_live_scope(
+            self.start_prepare, "① 실행"
+        ):
+            return
         if not self._require_live_mutation_items():
             return
         self.status_var.set("① 준비 상태 확인 중...")
@@ -5925,7 +6006,14 @@ class App:
             except Exception as exc:
                 failed += 1
                 self._ui(lambda lb=label, e=exc: self.log(f"[① 실패] {lb}: {e}"))
-        self._ui(lambda: self._prepare_finished(done, failed))
+        refresh_folders = sorted({
+            str(row.get("item", {}).get("folder") or "")
+            for row in rows
+            if str(row.get("item", {}).get("folder") or "").strip()
+        }, key=os.path.normcase)
+        self._ui(lambda: self._prepare_finished(
+            done, failed, refresh_folders
+        ))
         return {
             "shared_queue_success": failed == 0,
             "shared_queue_result": {
@@ -6135,7 +6223,14 @@ class App:
                 ),
             )
             if hasattr(self, "btn_step3_force"):
-                self.btn_step3_force.configure(state="disabled")
+                self.btn_step3_force.configure(
+                    text="③ 선택 항목만 검사 후 다시 뽑기",
+                    state=(
+                        "normal"
+                        if checked and not getattr(self, "_busy", False)
+                        else "disabled"
+                    ),
+                )
             return
         if getattr(self, "_sync_state_migrating", False):
             self.btn_step3.configure(
@@ -6171,10 +6266,12 @@ class App:
                 ),
             )
 
-    def _prepare_finished(self, done, failed):
+    def _prepare_finished(self, done, failed, refresh_folders=None):
         summary = f"① 완료: 처리 {done}개, 실패 {failed}개"
         self.log(f"{summary}. 표를 다시 검사합니다.")
-        self._start_completion_refresh(summary)
+        self._start_completion_refresh(
+            summary, targets=refresh_folders or ()
+        )
 
     # ------------------------------------------------------------- ②③ 공용
     def _scoped_texplan_rows(self, checked_only=True):
@@ -6332,6 +6429,10 @@ class App:
         if not self.report:
             self.refresh()
             self.status_var.set("검사가 끝난 뒤 ②를 다시 실행하세요.")
+            return
+        if not self._ensure_selected_live_scope(
+            self.start_step2, "② 실행"
+        ):
             return
         if not self._require_live_mutation_items():
             return
@@ -6602,7 +6703,16 @@ class App:
             except Exception as exc:
                 failed += 1
                 self._ui(lambda b=base, e=exc: self.log(f"[② 실패] {b}: {e}"))
-        self._ui(lambda: self._batch_finished("②", done, failed))
+        refresh_folders = sorted({
+            str(item.get("folder") or "")
+            for job in jobs
+            for item in (job.get("items") or [job.get("item")])
+            if isinstance(item, dict)
+            and str(item.get("folder") or "").strip()
+        }, key=os.path.normcase)
+        self._ui(lambda: self._batch_finished(
+            "②", done, failed, refresh_folders
+        ))
         return {
             "shared_queue_success": failed == 0,
             "shared_queue_result": {
@@ -6898,7 +7008,7 @@ class App:
     @staticmethod
     def _step3_exclusion_message(
             skipped, render_count, sync_file_count, *, force=False):
-        operation = "③ 전체 재추출" if force else "③ 실행"
+        operation = "③ 선택 항목 재추출" if force else "③ 실행"
         lines = [
             f"오류 항목 {len(skipped)}개를 제외하고 "
             f"나머지 {operation} 대상을 처리할 수 있습니다.",
@@ -7207,8 +7317,8 @@ class App:
         """Build the force-rerender plan after the shared FIFO grants it."""
 
         self._pending_step3_manifest_rows = []
-        selected_rows = self._all_texplan_rows()
-        jobs, skipped = self._step3_jobs(force_rerender=True, all_rows=True)
+        selected_rows = self._checked_texplan_rows()
+        jobs, skipped = self._step3_jobs(force_rerender=True, all_rows=False)
         excluded_row_keys = self._step3_exclusion_keys(skipped)
         if excluded_row_keys:
             jobs = self._step3_jobs_excluding(
@@ -7249,7 +7359,7 @@ class App:
                 key[0] for key in eligible_row_keys
             },
             selected_texture_rows=eligible_rows,
-            include_unchecked=True,
+            include_unchecked=False,
         )
         return {
             "jobs": jobs,
@@ -7269,23 +7379,31 @@ class App:
                 if str(item.get("folder") or "").strip()
             }, key=os.path.normcase),
             "require_all_renders_for_sync": True,
-            "operation_label": "PCG ③ 전체 재추출",
+            "operation_label": "PCG ③ 선택 항목 재추출",
         }
 
     def start_step3_force(self):
         if not self.report:
             self.refresh()
-            self.status_var.set("검사가 끝난 뒤 전체 재추출을 다시 실행하세요.")
+            self.status_var.set("폴더 목록이 표시된 뒤 다시 실행하세요.")
             return
         if getattr(self, "_busy", False):
             self.status_var.set(
-                "현재 작업이 끝난 뒤 전체 재추출을 다시 누르세요."
+                "현재 작업이 끝난 뒤 선택 항목 재추출을 다시 누르세요."
             )
             return
+        selected_folders = [
+            str(folder)
+            for folder, entry in self.items.items()
+            if entry.get("checked")
+        ]
+        if not selected_folders:
+            self.status_var.set("③ 다시 뽑을 폴더를 하나 이상 체크하세요")
+            return
         if not messagebox.askyesno(
-            "③ 전체 다시 뽑기",
+            "③ 선택 항목 다시 뽑기",
             (
-                "현재 표의 연결 텍스처를 실행 차례에 다시 검사한 뒤 "
+                "체크한 폴더의 연결 텍스처만 실행 차례에 검사한 뒤 "
                 "T_ 6장을 전부 재추출합니다.\n"
                 "오류 항목은 제외하고 정상 항목만 계속하며, 모든 렌더가 "
                 "성공하면 Unreal 동기화를 한 번 실행합니다.\n"
@@ -7297,10 +7415,11 @@ class App:
             return
         try:
             shared = self._enqueue_shared_execution(
-                "PCG ③ 전체 재추출",
+                "PCG ③ 선택 항목 재추출",
                 {
                     "operation": "step3_force",
                     "force_rerender": True,
+                    "selected_folders": selected_folders,
                 },
             )
         except Exception as exc:
@@ -7308,7 +7427,7 @@ class App:
             return
         self._set_busy(True)
         self.status_var.set(
-            "③ 전체 재추출 공용 대기열 등록 · 실행 차례에 재검사"
+            "③ 선택 항목 재추출 등록 · 실행 차례에 선택 폴더 확인"
         )
         self.root.update_idletasks()
         self.worker = threading.Thread(
@@ -7326,8 +7445,11 @@ class App:
             lease = self._wait_for_shared_execution(shared_record)
             self._ui(
                 lambda: self.status_var.set(
-                    "③ 전체 재추출 차례 도착 · 최신 대상 계획 계산 중..."
+                    "③ 선택 항목 재추출 차례 도착 · 대상 확인 중..."
                 )
+            )
+            self._active_step3_scope_folders = (
+                self._refresh_step3_execution_scope()
             )
             plan = self._build_step3_force_execution_plan()
             self._seal_step3_force_execution_plan(plan)
@@ -7339,17 +7461,16 @@ class App:
         )
 
     def _seal_step3_force_execution_plan(self, plan):
-        """Seal only the concrete render inputs for a manual full rerender.
+        """Seal concrete render inputs for a selected-scope rerender.
 
         The normal Step 3 path re-audits every affected folder and requires
         the newly derived semantic report to be byte-for-byte equivalent to
         the report currently displayed by the GUI.  That is appropriate for
-        SPM normalization, but it made the explicit "전체 다시 뽑기" action
+        SPM normalization, but it made the explicit rerender action
         fail before sbsrender was launched whenever unrelated audit evidence
-        changed.  A manual full rerender is already rebuilt from the current
-        board after its shared-queue turn, so seal its concrete SBS/bitmap,
-        output, configuration, and tool inputs directly without the redundant
-        affected-folder semantic gate.
+        changed.  The checked folders are already re-audited after their
+        shared-queue turn, so seal their concrete SBS/bitmap, output,
+        configuration, and tool inputs directly without another audit.
         """
         plan["pending_manifest_rows"] = list(
             (plan or {}).get("pending_manifest_rows")
@@ -8433,7 +8554,7 @@ class App:
         if require_all_renders_for_sync and failed and sync_candidates:
             self._ui(lambda count=failed: self.log(
                 f"[③ Unreal 동기화 건너뜀] 렌더 실패 {count}개 — "
-                "전체 재추출 성공 후 한 번에 동기화합니다."))
+                "선택 항목 재추출 성공 후 한 번에 동기화합니다."))
         if run_report is not None:
             if not self.cfg.get("unreal_texture_sync_enabled", True):
                 run_report["unreal_sync"] = {"status": "disabled"}
@@ -8742,10 +8863,13 @@ class App:
         else:
             self._start_completion_refresh(final_status)
 
-    def _batch_finished(self, label, done, failed):
+    def _batch_finished(
+            self, label, done, failed, refresh_folders=None):
         summary = f"{label} 완료: 성공 {done}개, 실패 {failed}개"
         self.log(f"{summary}. 표를 다시 검사합니다.")
-        self._start_completion_refresh(summary)
+        self._start_completion_refresh(
+            summary, targets=refresh_folders or ()
+        )
 
     # ---------------------------------------------------------- PCG + placed-level targets
     def refresh_pcg_targets(self):
