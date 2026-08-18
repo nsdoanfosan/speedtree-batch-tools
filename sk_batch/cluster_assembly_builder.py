@@ -4326,6 +4326,48 @@ def _exact_source_bone_influences(source_bone, skeleton_by_name, context):
     }
 
 
+def _exact_component_anchor_influences(
+    obj,
+    component,
+    skeleton_snapshot,
+    skeleton_by_name,
+    context,
+):
+    """Bind a rendered rigid part to one exact final-skeleton bone name.
+
+    A rendered component may contain weights for its attachment bone and
+    descendants. A Nanite Assembly part is rigid, so replaying those weights as
+    multiple part influences blends unrelated bone transforms. Resolve the
+    hierarchy anchor only when it is itself an exact vertex-group name on the
+    component. This fails closed instead of using spatial proximity.
+    """
+    weighted = _component_influences(obj, component)
+    names = [str(item["bone"]) for item in weighted]
+    missing = [name for name in names if name not in skeleton_by_name]
+    if missing:
+        raise ClusterAssemblyBuildError(
+            f"{context} contains vertex-group bones missing from final skeleton: "
+            + ", ".join(missing)
+        )
+    anchor = lowest_common_ancestor(
+        names,
+        skeleton_snapshot,
+        skeleton_by_name=skeleton_by_name,
+    )
+    if anchor not in names:
+        raise ClusterAssemblyBuildError(
+            f"{context} exact component bone names span sibling hierarchies; "
+            f"common ancestor {anchor} is not authored on the component"
+        )
+    return [
+        {"bone": anchor, "weight": 1.0},
+    ], {
+        "policy": "exact_render_component_anchor_bone_name_v1",
+        "anchor_bone": anchor,
+        "authored_component_bones": names,
+    }
+
+
 def _copy_component_as_rigid_part(bpy, source_obj, component, name):
     mesh = source_obj.data
     ordered_vertices = component["vertices"]
@@ -6130,6 +6172,22 @@ def build_blender_assembly_inputs(
                                     "deferred_exact_composite_source_bone_v1"
                                 ),
                             }
+                        elif (
+                            target_object is final_merged_mesh
+                            and role in {"branch", "cluster"}
+                        ):
+                            influences, influence_source = (
+                                _exact_component_anchor_influences(
+                                    target_object,
+                                    component,
+                                    snapshot,
+                                    skeleton_by_name,
+                                    (
+                                        "rendered Assembly component "
+                                        f"{part_asset_name}"
+                                    ),
+                                )
+                            )
                         elif target_object is final_merged_mesh:
                             influences = _component_influences(
                                 target_object,
