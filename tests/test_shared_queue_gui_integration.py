@@ -253,6 +253,9 @@ class SharedQueueGuiIntegrationTests(unittest.TestCase):
         app = PCG_GUI.App.__new__(PCG_GUI.App)
         app.shared_queue_runtime = FakeRuntime(events)
         app.report = {"items": []}
+        app.items = {
+            "D:/Tree": {"checked": True, "item": {"folder": "D:/Tree"}},
+        }
         app.root = Root()
         app.status_var = FakeVar()
         app._busy = False
