@@ -4022,7 +4022,7 @@ class CodexTestMaterialScopeTests(unittest.TestCase):
 
 
 class CurrentPassThroughAndCaptureDiagnosticsTests(unittest.TestCase):
-    def test_pass_through_preserves_current_build_manifest(self):
+    def test_pass_through_replaces_old_build_manifest_authority(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             assembly = root / "assembly"
@@ -4069,14 +4069,14 @@ class CurrentPassThroughAndCaptureDiagnosticsTests(unittest.TestCase):
                 "SK_tree_no_assembly_cluster_assembly_pass_through.json"
             )
             self.assertEqual(manifest["status"], "pass_through")
-            self.assertEqual(persisted, current_build)
-            self.assertTrue(sidecar.is_file())
+            self.assertEqual(persisted["content_decision"], "pass_through")
+            self.assertFalse(sidecar.is_file())
             self.assertEqual(
                 manifest["existing_assembly_assets_orphaned"]["status"],
-                "action_required",
+                "diagnostic_only",
             )
             self.assertEqual(
-                manifest["production_build_manifest_preserved"]["path"],
+                manifest["superseded_production_build_manifest"]["path"],
                 str(stale.resolve()),
             )
 

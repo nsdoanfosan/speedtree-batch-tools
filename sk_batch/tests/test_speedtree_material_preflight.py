@@ -32,6 +32,8 @@ def write_spm(
     referenced_external_mesh_indexes=(),
     material_external_mesh_indexes=(),
     managed_leaf=False,
+    leaf_hidden=False,
+    leaf_default_cutout=False,
 ):
     model = ET.Element("SpeedTreeModel")
     assets = ET.SubElement(model, "Assets")
@@ -89,13 +91,22 @@ def write_spm(
     ET.SubElement(prop, "Value").text = ""
 
     for generator_type, guid, property_name, material_id, mesh_id in (
-        ("Leaf Mesh", "leaf-guid", "Leaves:Type:0", 1, 11),
+        (
+            "Leaf Mesh",
+            "leaf-guid",
+            "Leaves:Type:0",
+            1,
+            -10 if leaf_default_cutout else 11,
+        ),
         ("Branch", "stem-guid", "Branches", 2, None),
     ):
         generator = ET.SubElement(model, "Generator", Type=generator_type)
         ET.SubElement(generator, "GUID").text = guid
         ET.SubElement(generator, "Name").text = guid
-        ET.SubElement(generator, "Hidden").text = "false"
+        ET.SubElement(generator, "Hidden").text = (
+            "true" if generator_type == "Leaf Mesh" and leaf_hidden
+            else "false"
+        )
         properties = ET.SubElement(generator, "Properties")
         values = [("Material", material_id)]
         if mesh_id is not None:
@@ -1341,7 +1352,39 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                 contract["atlas_consumer_integrity"]["mutation_blocking"]
             )
 
-    def test_final_managed_material_mesh_stays_a_blocking_reference(self):
+    def test_hidden_default_cutout_missing_mesh_does_not_block_export(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_hidden_default_cutout.spm"
+            report_path = root / "report.json"
+            write_spm(
+                spm,
+                mesh_filenames=("meshes/missing_hidden_plate.fbx",),
+                material_external_mesh_indexes=(0,),
+                managed_leaf=True,
+                leaf_hidden=True,
+                leaf_default_cutout=True,
+            )
+            write_stmat(
+                spm,
+                ["M_leaf_grass_dead_Mat", "M_stem_common_01_Mat"],
+            )
+
+            exited, export_mock = self.run_preflight(spm, report_path)
+
+            self.assertFalse(exited)
+            export_mock.assert_called_once()
+            contract = json.loads(
+                report_path.read_text(encoding="utf-8")
+            )["mesh_file_reference_contract"]
+            self.assertEqual(contract["status"], "orphan_missing_mesh_assets")
+            self.assertEqual(contract["missing"], [])
+            self.assertEqual(
+                [row["filename"] for row in contract["orphan_missing"]],
+                ["meshes/missing_hidden_plate.fbx"],
+            )
+
+    def test_unbound_final_managed_mesh_is_diagnostic_only(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             spm = root / "SK_final_managed_mesh.spm"
@@ -1377,12 +1420,15 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
 
             contract = inspect_spm_mesh_file_references(spm)
 
-            self.assertEqual(contract["status"], "missing_mesh_files")
+            self.assertEqual(contract["status"], "orphan_missing_mesh_assets")
             self.assertEqual(
-                [row["mesh_id"] for row in contract["missing"]],
+                [row["mesh_id"] for row in contract["orphan_missing"]],
                 [90],
             )
-            self.assertEqual(contract["missing"][0]["usage"], "active")
+            self.assertEqual(
+                contract["orphan_missing"][0]["usage"],
+                "managed_orphan",
+            )
 
     def test_existing_mesh_files_do_not_block_the_export(self):
         with tempfile.TemporaryDirectory() as temporary:

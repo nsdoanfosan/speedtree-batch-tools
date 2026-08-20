@@ -785,8 +785,8 @@ def _atlas_managed_material_node(material):
     )
 
 
-def _spm_mesh_reference_states(root):
-    """Separate live references from removable managed Atlas library residue."""
+def _spm_mesh_reference_states(root, generator_slots=()):
+    """Separate export-participating references from SPM library residue."""
     material_references = {}
     for material in root.iter("Material_v8"):
         mesh_ids = set()
@@ -811,7 +811,19 @@ def _spm_mesh_reference_states(root):
             )
     generator_references = set()
     default_cutout_materials = set()
+    admission_by_slot = {
+        (
+            str(row.get("generator_guid") or "").strip().casefold(),
+            str(row.get("slot_prefix") or "").strip().casefold(),
+        ): row.get("export_admission_relevant")
+        for row in generator_slots or ()
+        if isinstance(row, dict)
+    }
+    visible = _effective_visibility(root)
     for generator in root.iter("Generator"):
+        guid = _guid(generator)
+        if not visible(guid, _is_hidden(generator)):
+            continue
         properties = generator.find("Properties")
         if properties is None:
             continue
@@ -825,7 +837,12 @@ def _spm_mesh_reference_states(root):
         for name, material_id in values.items():
             if not name.endswith(":material"):
                 continue
-            mesh_id = values.get(name[:-len(":material")] + ":mesh")
+            slot_prefix = name[:-len(":material")]
+            if admission_by_slot.get(
+                (guid.casefold(), slot_prefix)
+            ) is False:
+                continue
+            mesh_id = values.get(slot_prefix + ":mesh")
             if mesh_id is not None and mesh_id >= 0:
                 generator_references.add(mesh_id)
             elif mesh_id == -10 and material_id is not None and material_id > 0:
@@ -833,9 +850,8 @@ def _spm_mesh_reference_states(root):
     live = set(generator_references)
     managed_orphans = set()
     for mesh_id, material_states in material_references.items():
-        removable_from_all_materials = all(
-            managed and mesh_count > 1
-            for managed, mesh_count, _material_id in material_states
+        managed_by_all_materials = all(
+            managed for managed, _mesh_count, _material_id in material_states
         )
         default_cutout = any(
             material_id in default_cutout_materials
@@ -844,10 +860,9 @@ def _spm_mesh_reference_states(root):
         if (
             mesh_id in generator_references
             or default_cutout
-            or not removable_from_all_materials
         ):
             live.add(mesh_id)
-        else:
+        elif managed_by_all_materials:
             managed_orphans.add(mesh_id)
     return {
         "live": live,
@@ -881,16 +896,25 @@ def _mesh_file_references_cached(
     references = []
     missing = []
     orphan_missing = []
-    reference_states = _spm_mesh_reference_states(root)
     atlas_integrity = audit_atlas_consumer_integrity(path, root)
+    reference_states = _spm_mesh_reference_states(
+        root,
+        atlas_integrity.get("generator_slots") or (),
+    )
     integrity_usage = {}
     for row in atlas_integrity.get("managed_meshes") or []:
         classification = row["classification"]
-        if classification in {
+        if row["mesh_id"] in reference_states["live"]:
+            usage = "active"
+        elif classification in {
             "current_reachable",
             "current_default_cutout",
+            "current_preserved_unreferenced",
         }:
-            usage = "active"
+            # Current Atlas ownership is useful provenance, but only a live
+            # export-participating Generator can make an external FBX a
+            # blocking runtime dependency.
+            usage = "current_preserved_unreferenced"
         elif classification in {
             "superseded_with_proven_successor",
             "ambiguous",
@@ -941,14 +965,11 @@ def _mesh_file_references_cached(
                 else path.parent / filename
             )
             usage = integrity_usage.get(mesh_id)
-            if usage in {"protected_foreign", "protected_manual"}:
-                if mesh_id in reference_states["generator"]:
-                    usage = "active"
+            if mesh_id in reference_states["live"]:
+                usage = "active"
             elif usage is None:
                 usage = (
-                    "active"
-                    if mesh_id in reference_states["live"]
-                    else "managed_orphan"
+                    "managed_orphan"
                     if mesh_id in reference_states["managed_orphans"]
                     else "orphan"
                 )
@@ -969,15 +990,9 @@ def _mesh_file_references_cached(
             }
             references.append(row)
             if not row["exists"]:
-                if row["referenced"] or usage == (
-                    "current_preserved_unreferenced"
-                ):
-                    # A coherent current variant is allowed to be unselected,
-                    # but its authority still declares the external Mesh.  A
-                    # missing file remains a real preflight failure rather
-                    # than being hidden by the non-stale classification.
+                if row["referenced"]:
                     missing.append(row)
-                elif usage in {"managed_orphan", "orphan"}:
+                else:
                     orphan_missing.append(row)
     status = (
         "missing_mesh_files"

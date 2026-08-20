@@ -450,12 +450,13 @@ def select_cluster_assembly_build_handoff(
     inspected_handoff,
     current_manifest_handoff=None,
 ):
-    """Prefer current FBX evidence over a stale pass-through receipt.
+    """Prefer every conclusive current-FBX result over persisted fallbacks.
 
     The PCG receipt describes what was known before the final BWR FBX existed.
-    Once that FBX has been inspected, a ready handoff is the authoritative
-    content signal and must create Assembly inputs even when the older receipt
-    recorded ``pass_through``.
+    Once that FBX has been inspected, both ``ready`` and ``pass_through`` are
+    authoritative content decisions.  A production build manifest is only a
+    recovery source when current inspection produced no conclusive result; it
+    must never resurrect Assembly for a current pass-through FBX.
     """
     if (
         isinstance(inspected_handoff, dict)
@@ -463,15 +464,15 @@ def select_cluster_assembly_build_handoff(
     ):
         return "build", inspected_handoff
     if (
-        isinstance(current_manifest_handoff, dict)
-        and current_manifest_handoff.get("status") == "ready"
-    ):
-        return "build", current_manifest_handoff
-    if (
         isinstance(inspected_handoff, dict)
         and inspected_handoff.get("status") == "pass_through"
     ):
         return "pass_through", inspected_handoff
+    if (
+        isinstance(current_manifest_handoff, dict)
+        and current_manifest_handoff.get("status") == "ready"
+    ):
+        return "build", current_manifest_handoff
 
     receipt_handoff = {}
     if isinstance(receipt_contract, dict):
@@ -1287,7 +1288,8 @@ def main():
             preflight["status"] == "ok"
             and (
                 not isinstance(cluster_assembly_handoff, dict)
-                or cluster_assembly_handoff.get("status") != "ready"
+                or cluster_assembly_handoff.get("status")
+                not in {"ready", "pass_through"}
             )
             and pipeline_data is not None
             and merged_object is not None

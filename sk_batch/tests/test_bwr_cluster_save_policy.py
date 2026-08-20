@@ -95,7 +95,7 @@ class ClusterSavePolicyTests(unittest.TestCase):
         self.assertEqual(mode, "pass_through")
         self.assertIs(selected, inspected_handoff)
 
-    def test_current_manifest_overrides_legacy_inspected_pass_through(self):
+    def test_current_inspected_pass_through_overrides_old_build_manifest(self):
         helper = load_assembly_selection_helper()
         inspected_handoff = {"status": "pass_through", "source": "fbx"}
         current_handoff = {"status": "ready", "source": "manifest"}
@@ -105,6 +105,15 @@ class ClusterSavePolicyTests(unittest.TestCase):
             inspected_handoff,
             current_handoff,
         )
+
+        self.assertEqual(mode, "pass_through")
+        self.assertIs(selected, inspected_handoff)
+
+    def test_current_manifest_is_only_used_without_conclusive_inspection(self):
+        helper = load_assembly_selection_helper()
+        current_handoff = {"status": "ready", "source": "manifest"}
+
+        mode, selected = helper(None, None, current_handoff)
 
         self.assertEqual(mode, "build")
         self.assertIs(selected, current_handoff)

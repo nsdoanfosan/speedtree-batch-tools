@@ -134,6 +134,56 @@ class CurrentFbxRoleAuthorityTests(unittest.TestCase):
                 file_fingerprint(source_blend)["sha256"],
             )
 
+    def test_missing_normalized_artifact_disables_old_manifest_fallback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "Tree_01.spm"
+            full_fbx = root / "Tree_01.fbx"
+            assembly = root / "assembly"
+            provider = root / "Cluster"
+            assembly.mkdir()
+            provider.mkdir()
+            spm.write_bytes(b"spm-current")
+            full_fbx.write_bytes(b"fbx-current")
+            plan_fbx = provider / "branch_01.fbx"
+            plan_fbx.write_bytes(b"plan-current")
+            missing_manifest = provider / "deleted_scope.json"
+            stale_missing_record = {
+                "path": str(missing_manifest),
+                "exists": True,
+                "size": 123,
+                "mtime_ns": 1,
+                "sha256": "0" * 64,
+            }
+            (assembly / "Tree_01_cluster_assembly_bindings.json").write_text(
+                json.dumps({
+                    "kind": "sk_batch_cluster_nanite_assembly_inputs",
+                    "status": "ready",
+                    "content_decision": "build",
+                    "parts": [{"prototype_id": "branch_01"}],
+                    "handoff_evidence": {
+                        "roles": {
+                            "branch:branch_01": {
+                                "role": "branch",
+                                "polygon_indices": [0, 1],
+                                "normalized_variants": {
+                                    "manifest": stale_missing_record,
+                                    "variants": [{
+                                        "ordinal": 1,
+                                        "plan_fbx": file_fingerprint(plan_fbx),
+                                    }],
+                                },
+                            },
+                        },
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+            handoff = current_assembly_manifest_repair_handoff(spm, full_fbx)
+
+            self.assertIsNone(handoff)
+
     def test_current_manifest_recovers_omitted_spm_only_provider(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

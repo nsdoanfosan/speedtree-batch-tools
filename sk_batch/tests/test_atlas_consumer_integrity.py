@@ -869,7 +869,7 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
                 {2: "protected_foreign", 3: "protected_manual"},
             )
 
-    def test_missing_current_variant_still_blocks_as_missing_file(self):
+    def test_missing_current_but_unselected_variant_is_diagnostic_only(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             spm = root / "SK_missing_and_stale.spm"
@@ -892,9 +892,10 @@ class AtlasConsumerIntegrityTests(unittest.TestCase):
 
             report = inspect_spm_mesh_file_references(spm)
 
-            self.assertEqual(report["status"], "missing_mesh_files")
-            self.assertEqual(len(report["missing"]), 1)
-            self.assertEqual(report["orphan_missing"], [])
+            self.assertEqual(report["status"], "orphan_missing_mesh_assets")
+            self.assertEqual(report["missing"], [])
+            self.assertEqual(len(report["orphan_missing"]), 1)
+            self.assertFalse(report["orphan_missing"][0]["referenced"])
             self.assertFalse(report["atlas_consumer_integrity"]["blocking"])
 
     def test_preflight_reaches_export_for_current_unreferenced_variant(self):

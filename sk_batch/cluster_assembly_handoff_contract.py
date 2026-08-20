@@ -111,9 +111,27 @@ def _refresh_current_artifact_fingerprints(value):
         key in value for key in ("exists", "size", "mtime_ns", "sha256")
     ):
         current = file_fingerprint(path)
-        if current.get("exists"):
-            refreshed.update(current)
+        # Missing is also a current result.  Keeping the persisted
+        # ``exists=True`` row here made deleted normalized inputs look live
+        # and allowed an old production manifest to regain build authority.
+        refreshed.update(current)
     return refreshed
+
+
+def _normalized_variant_artifacts_available(normalized):
+    """Whether a persisted normalized provider still has build inputs."""
+    if not isinstance(normalized, dict):
+        return False
+    manifest = normalized.get("manifest") or {}
+    variants = list(normalized.get("variants") or [])
+    return bool(
+        manifest.get("exists") is True
+        and variants
+        and all(
+            ((row or {}).get("plan_fbx") or {}).get("exists") is True
+            for row in variants
+        )
+    )
 
 
 def _current_dependency_normalized_variants(spm, dependency, persisted):
@@ -215,11 +233,9 @@ def current_assembly_manifest_repair_handoff(spm_path, full_fbx_path):
         return None
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise ValueError(
-            "current production Assembly manifest is unreadable: "
-            + str(manifest_path)
-        ) from exc
+    except (OSError, ValueError):
+        # This file is an optional recovery source, never a required gate.
+        return None
     if (
         manifest.get("kind") != CURRENT_ASSEMBLY_MANIFEST_KIND
         or manifest.get("status") != "ready"
@@ -230,24 +246,22 @@ def current_assembly_manifest_repair_handoff(spm_path, full_fbx_path):
     evidence = manifest.get("handoff_evidence") or {}
     roles = evidence.get("roles") or {}
     if not isinstance(roles, dict) or not roles:
-        raise ValueError(
-            "current production Assembly manifest has no persisted role inputs"
-        )
+        return None
     part_builder_inputs = []
     for provider_key, saved_role in sorted(roles.items()):
         if not isinstance(saved_role, dict):
-            raise ValueError(
-                "current production Assembly manifest has an invalid role: "
-                + str(provider_key)
-            )
+            return None
         role = _refresh_current_artifact_fingerprints(saved_role)
         polygons = list(role.get("polygon_indices") or [])
         normalized = role.get("normalized_variants") or {}
-        if not polygons or not list(normalized.get("variants") or []):
-            raise ValueError(
-                "current production Assembly role is incomplete: "
-                + str(provider_key)
-            )
+        if (
+            not polygons
+            or not _normalized_variant_artifacts_available(normalized)
+        ):
+            # A stale fallback cannot block a current Repair.  Missing plan
+            # artifacts make the whole fallback unavailable instead of
+            # deferring the failure to Blender's Assembly builder.
+            return None
         role["provider_key"] = str(
             role.get("provider_key") or provider_key
         )
@@ -276,11 +290,10 @@ def current_assembly_manifest_repair_handoff(spm_path, full_fbx_path):
                 receipt_payload,
                 spm,
             )
-        except (OSError, ValueError) as exc:
-            raise ValueError(
-                "current production Assembly PCG receipt is unreadable: "
-                + str(receipt_path)
-            ) from exc
+        except (OSError, ValueError):
+            # Provider expansion is optional recovery metadata.  Persisted
+            # concrete roles above remain usable without it.
+            receipt_contract = {}
         existing_provider_keys = {
             str(row.get("provider_key") or "").casefold()
             for row in part_builder_inputs
@@ -302,7 +315,7 @@ def current_assembly_manifest_repair_handoff(spm_path, full_fbx_path):
                 role_name not in ROLE_ORDER
                 or provider_key.casefold() in existing_provider_keys
                 or dependency.get("spm_only_provider_candidate") is not True
-                or not list(normalized.get("variants") or [])
+                or not _normalized_variant_artifacts_available(normalized)
                 or not target_material_names
             ):
                 continue

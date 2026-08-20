@@ -5535,7 +5535,7 @@ def build_blender_assembly_inputs(
         production_manifest_path = (
             output / f"{stem}_cluster_assembly_bindings.json"
         )
-        preserved_build_manifest = None
+        superseded_build_manifest = None
         if production_manifest_path.is_file():
             try:
                 candidate = json.loads(
@@ -5551,30 +5551,32 @@ def build_blender_assembly_inputs(
                 and candidate.get("full_asset_stem") == stem
                 and list(candidate.get("parts") or [])
             ):
-                preserved_build_manifest = file_fingerprint(
+                superseded_build_manifest = file_fingerprint(
                     production_manifest_path
                 )
         manifest_path = production_manifest_path
-        if preserved_build_manifest is not None:
-            manifest_path = (
-                output / f"{stem}_cluster_assembly_pass_through.json"
-            )
-            manifest["production_build_manifest_preserved"] = deepcopy(
-                preserved_build_manifest
+        if superseded_build_manifest is not None:
+            # The canonical manifest is current-state authority.  Keeping an
+            # old build manifest at that path while writing pass-through to a
+            # sidecar let unrelated consumers revive obsolete Assembly data.
+            # Preserve only its fingerprint as diagnostics and replace the
+            # canonical file with the current pass-through decision.
+            manifest["superseded_production_build_manifest"] = deepcopy(
+                superseded_build_manifest
             )
             manifest["existing_assembly_assets_orphaned"] = {
-                "status": "action_required",
+                "status": "diagnostic_only",
                 "reason": "current_receipt_changed_to_pass_through",
                 "previous_build_manifest": deepcopy(
-                    preserved_build_manifest
+                    superseded_build_manifest
                 ),
                 "asset_names": [
                     _public_base_name(stem),
                     f"{stem}_NaniteAssembly",
                 ],
                 "remediation": (
-                    "refresh the exact target receipt and rebuild the existing "
-                    "Assembly, or retire both Assembly assets deliberately"
+                    "The current Full-SK asset remains authoritative; retire "
+                    "the unused Assembly assets separately when convenient"
                 ),
             }
         manifest_path.write_text(
