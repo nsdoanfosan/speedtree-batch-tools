@@ -66,6 +66,7 @@ MAX_SPEEDTREE_RENDER_FACE_MULTIPLICITY = 2
 # and ambiguous in the next.
 MIN_FBX_COORDINATE_TOLERANCE_METERS = 1.0e-6
 PASS_THROUGH_PROVENANCE_SCHEMA_VERSION = 1
+ASSEMBLY_BUILD_CACHE_VERSION = 2
 PASS_THROUGH_PROVENANCE_REASON = (
     "selected_target_contract_handoff_pass_through"
 )
@@ -358,6 +359,129 @@ def validate_file_fingerprint(record, label):
         and str(actual.get("sha256") or "").casefold() == expected_sha256
     )
     return actual
+
+
+def _artifact_cache_identity(record):
+    if not isinstance(record, dict):
+        return None
+    try:
+        content_key = artifact_record_content_key(record)
+    except (TypeError, ValueError):
+        content_key = None
+    if content_key is not None:
+        return {"content_key": content_key}
+    return {
+        "path": str(record.get("path") or ""),
+        "size": record.get("size"),
+    }
+
+
+def _assembly_build_input_signature(handoff, full_fbx, wind_json):
+    role_rows = []
+    for row in (handoff.get("assembly") or {}).get(
+        "part_builder_inputs"
+    ) or ():
+        if not isinstance(row, dict):
+            continue
+        normalized = row.get("normalized_variants") or {}
+        role_rows.append({
+            "provider_key": str(row.get("provider_key") or ""),
+            "role": str(row.get("role") or ""),
+            "role_identity": str(row.get("role_identity") or ""),
+            "manifest": _artifact_cache_identity(
+                normalized.get("manifest")
+            ),
+            "source_blend": _artifact_cache_identity(
+                normalized.get("source_blend")
+            ),
+        })
+    payload = {
+        "cache_version": ASSEMBLY_BUILD_CACHE_VERSION,
+        # Blender's FBX writer does not produce byte-identical files for an
+        # unchanged scene.  Assembly is derived from the in-memory repaired
+        # mesh; its stable source assets below are the cache authority.  The
+        # generated Full FBX is still required to exist, but its changing byte
+        # hash must not force a complete Assembly rebuild on every retry.
+        "full_fbx_path": str((full_fbx or {}).get("path") or ""),
+        "wind_json": _artifact_cache_identity(wind_json),
+        "spm": _artifact_cache_identity(handoff.get("spm")),
+        "actual_fbx": _artifact_cache_identity(handoff.get("actual_fbx")),
+        "roles": sorted(
+            role_rows,
+            key=lambda item: (item["role"], item["provider_key"]),
+        ),
+    }
+    return {
+        "schema_version": ASSEMBLY_BUILD_CACHE_VERSION,
+        "sha256": _sha256_bytes(_canonical_json(payload).encode("utf-8")),
+    }
+
+
+def _recorded_file_is_current(record):
+    if not isinstance(record, dict) or not record.get("path"):
+        return False
+    actual = file_fingerprint(record["path"])
+    return bool(
+        actual.get("exists") is True
+        and int(actual.get("size") or -1) == int(record.get("size") or -2)
+        and str(actual.get("sha256") or "").casefold()
+        == str(record.get("sha256") or "").casefold()
+    )
+
+
+def _recorded_file_exists(record):
+    if not isinstance(record, dict) or not record.get("path"):
+        return False
+    return Path(record["path"]).is_file()
+
+
+def _load_reusable_assembly_manifest(
+    manifest_path,
+    input_signature,
+    _current_full_fbx,
+):
+    """Return an exact artifact cache hit; every miss simply rebuilds."""
+
+    try:
+        path = Path(manifest_path)
+        if not path.is_file():
+            return None
+        candidate = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(candidate, dict)
+            or candidate.get("kind") != MANIFEST_KIND
+            or candidate.get("status") != "ready"
+            or candidate.get("content_decision") != "build"
+            or (candidate.get("build_cache") or {}).get("sha256")
+            != input_signature["sha256"]
+            or not list(candidate.get("parts") or ())
+        ):
+            return None
+        generated_records = [
+            (candidate.get("base") or {}).get("fbx"),
+            candidate.get("assembly_source_blend"),
+        ]
+        external_records = [
+            (candidate.get("wind_contract") or {}).get("wind_json"),
+        ]
+        for part in candidate.get("parts") or ():
+            external = (part or {}).get("external_source") or {}
+            if external:
+                external_records.append(external.get("plan_fbx"))
+            else:
+                generated_records.append((part or {}).get("fbx"))
+        if not all(
+            _recorded_file_is_current(record)
+            for record in generated_records
+        ):
+            return None
+        if not all(_recorded_file_exists(record) for record in external_records):
+            return None
+        candidate["manifest"] = file_fingerprint(path)
+        candidate["cache_reused"] = True
+        return candidate
+    except (OSError, TypeError, ValueError, KeyError):
+        return None
 
 
 def _material_slot_key(value):
@@ -3214,18 +3338,25 @@ def _uv_vertex_candidates(obj, component):
     }
 
 
-def _coincident_candidate_groups(obj, component, candidates):
+def _coincident_candidate_groups(
+    obj,
+    component,
+    candidates,
+    *,
+    tolerance=None,
+):
     coordinates = {
         int(index): tuple(
             float(value) for value in obj.data.vertices[int(index)].co
         )
         for index in candidates
     }
-    component_coordinates = [
-        tuple(float(value) for value in obj.data.vertices[index].co)
-        for index in component["vertices"]
-    ]
-    tolerance = _fbx_coordinate_tolerance(component_coordinates)
+    if tolerance is None:
+        component_coordinates = [
+            tuple(float(value) for value in obj.data.vertices[index].co)
+            for index in component["vertices"]
+        ]
+        tolerance = _fbx_coordinate_tolerance(component_coordinates)
     groups = []
     for index in sorted(candidates):
         group = next((
@@ -3246,6 +3377,31 @@ def _coincident_candidate_groups(obj, component, candidates):
     for group in groups:
         group["representative"] = min(group["indices"])
     return groups
+
+
+def _prepare_uv_correspondence(obj, component):
+    """Build immutable UV/topology groups once for one mesh component."""
+
+    candidates = _uv_vertex_candidates(obj, component)
+    if candidates is None:
+        return None
+    component_coordinates = [
+        tuple(float(value) for value in obj.data.vertices[index].co)
+        for index in component["vertices"]
+    ]
+    tolerance = _fbx_coordinate_tolerance(component_coordinates)
+    return {
+        "candidates": candidates,
+        "groups": {
+            key: _coincident_candidate_groups(
+                obj,
+                component,
+                by_index,
+                tolerance=tolerance,
+            )
+            for key, by_index in candidates.items()
+        },
+    }
 
 
 def _counter_subset(left, right):
@@ -3280,13 +3436,18 @@ def _match_uv_candidate_groups(
     key,
     source_candidates,
     target_candidates,
+    *,
+    source_groups=None,
+    target_groups=None,
 ):
-    source_groups = _coincident_candidate_groups(
-        source_obj, source_component, source_candidates
-    )
-    target_groups = _coincident_candidate_groups(
-        target_obj, target_component, target_candidates
-    )
+    if source_groups is None:
+        source_groups = _coincident_candidate_groups(
+            source_obj, source_component, source_candidates
+        )
+    if target_groups is None:
+        target_groups = _coincident_candidate_groups(
+            target_obj, target_component, target_candidates
+        )
     if len(target_groups) > len(source_groups):
         raise ClusterAssemblyBuildError(
             "normalized plan duplicate UV has fewer source positions than "
@@ -4034,18 +4195,20 @@ def _ordered_cross_object_correspondence(
     target_obj,
     target_component,
     include_evidence=False,
+    source_prepared=None,
+    target_prepared=None,
 ):
     source_uv = source_obj.data.uv_layers.active
     target_uv = target_obj.data.uv_layers.active
     if source_uv is not None and target_uv is not None:
-        source_by_uv = _uv_vertex_candidates(
-            source_obj,
-            source_component,
+        source_prepared = source_prepared or _prepare_uv_correspondence(
+            source_obj, source_component
         )
-        target_by_uv = _uv_vertex_candidates(
-            target_obj,
-            target_component,
+        target_prepared = target_prepared or _prepare_uv_correspondence(
+            target_obj, target_component
         )
+        source_by_uv = source_prepared["candidates"]
+        target_by_uv = target_prepared["candidates"]
         missing = sorted(set(target_by_uv) - set(source_by_uv))
         if missing:
             raise ClusterAssemblyBuildError(
@@ -4064,6 +4227,8 @@ def _ordered_cross_object_correspondence(
                 key,
                 source_by_uv[key],
                 target_by_uv[key],
+                source_groups=source_prepared["groups"][key],
+                target_groups=target_prepared["groups"][key],
             )
             source_indices.extend(pair[0] for pair in pairs)
             target_indices.extend(pair[1] for pair in pairs)
@@ -5433,6 +5598,27 @@ def build_blender_assembly_inputs(
     full_fingerprint_before = file_fingerprint(full_fbx_path)
     if not full_fingerprint_before["exists"]:
         raise ClusterAssemblyBuildError(f"existing Full SK FBX is missing: {full_fbx_path}")
+    output = Path(output_dir)
+    stem = Path(
+        str((handoff.get("spm") or {}).get("path") or full_fbx_path)
+    ).stem
+    base_asset_name = _public_base_name(stem)
+    base_export_stem = base_asset_name
+    base_fbx = output / f"{base_export_stem}.fbx"
+    manifest_path = output / f"{stem}_cluster_assembly_bindings.json"
+    assembly_source_blend = output / f"{stem}_NaniteAssemblySource.blend"
+    build_input_signature = _assembly_build_input_signature(
+        handoff,
+        full_fingerprint_before,
+        file_fingerprint(wind_json_path),
+    )
+    reusable_manifest = _load_reusable_assembly_manifest(
+        manifest_path,
+        build_input_signature,
+        full_fingerprint_before,
+    )
+    if reusable_manifest is not None:
+        return reusable_manifest
     snapshot = snapshot_blender_armature(final_armature)
     checked_snapshot, skeleton_by_name = _skeleton_maps(snapshot)
     snapshot = checked_snapshot
@@ -5460,13 +5646,6 @@ def build_blender_assembly_inputs(
             "the Blender Assembly build: "
             + _canonical_json(details)
         )
-    output = Path(output_dir)
-    stem = Path(str((handoff.get("spm") or {}).get("path") or full_fbx_path)).stem
-    base_asset_name = _public_base_name(stem)
-    base_export_stem = base_asset_name
-    base_fbx = output / f"{base_export_stem}.fbx"
-    manifest_path = output / f"{stem}_cluster_assembly_bindings.json"
-    assembly_source_blend = output / f"{stem}_NaniteAssemblySource.blend"
     created_objects = []
     parts = []
     all_bindings = []
@@ -5479,6 +5658,7 @@ def build_blender_assembly_inputs(
     degraded_authored_binding_count = 0
     legacy_fallback_binding_count = 0
     authored_component_cache = {}
+    source_correspondence_cache = {}
     authored_assignment_report = None
     base_obj = None
     base_armature = None
@@ -5767,6 +5947,22 @@ def build_blender_assembly_inputs(
                     composite_parts = list(
                         variant.get("composite_parts") or []
                     )
+                    source_correspondence_key = (
+                        id(source_obj.data),
+                        tuple(source_component["polygons"]),
+                    )
+                    if source_correspondence_key not in (
+                        source_correspondence_cache
+                    ):
+                        source_correspondence_cache[
+                            source_correspondence_key
+                        ] = _prepare_uv_correspondence(
+                            source_obj,
+                            source_component,
+                        )
+                    source_prepared = source_correspondence_cache[
+                        source_correspondence_key
+                    ]
                     bindings = []
                     for instance_index, component in enumerate(instances):
                         component_id = (
@@ -5864,6 +6060,7 @@ def build_blender_assembly_inputs(
                                 target_object,
                                 component,
                                 include_evidence=True,
+                                source_prepared=source_prepared,
                             )
                             source_world = _world_points(
                                 source_obj,
@@ -6604,6 +6801,7 @@ def build_blender_assembly_inputs(
                 "prepared_unused_roles": prepared_unused_roles,
                 "preserved_render_components": preserved_render_components,
             },
+            "build_cache": build_input_signature,
         }
         _validate_public_export_names(manifest)
         manifest["assembly_source_blend"] = _write_assembly_source_blend(

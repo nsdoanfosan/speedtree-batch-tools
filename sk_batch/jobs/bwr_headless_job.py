@@ -133,6 +133,71 @@ def record_stage_duration(report, name, started):
     )
 
 
+def compact_cluster_assembly_handoff(handoff):
+    """Keep routing facts in reports and leave geometry evidence at its source."""
+
+    if not isinstance(handoff, dict):
+        return None
+    summary = {
+        key: copy.deepcopy(handoff[key])
+        for key in (
+            "schema_version",
+            "kind",
+            "status",
+            "content_decision",
+            "pcg_receipt",
+            "spm",
+            "actual_fbx",
+            "role_demotions",
+        )
+        if key in handoff
+    }
+    assembly = handoff.get("assembly") or {}
+    part_inputs = list(assembly.get("part_builder_inputs") or ())
+    summary["assembly_summary"] = {
+        "part_builder_input_count": len(part_inputs),
+        "provider_keys": sorted({
+            str(row.get("provider_key") or "")
+            for row in part_inputs
+            if isinstance(row, dict) and row.get("provider_key")
+        }),
+    }
+    return summary
+
+
+def compact_cluster_assembly_manifest(manifest):
+    """Reference the authoritative bindings file instead of nesting it twice."""
+
+    if not isinstance(manifest, dict):
+        return None
+    summary = {
+        key: copy.deepcopy(manifest[key])
+        for key in (
+            "schema_version",
+            "kind",
+            "status",
+            "content_decision",
+            "full_asset_stem",
+            "manifest",
+            "production_build_manifest_preserved",
+            "existing_assembly_assets_orphaned",
+            "cache_reused",
+        )
+        if key in manifest
+    }
+    parts = list(manifest.get("parts") or ())
+    summary["part_count"] = len(parts)
+    summary["binding_count"] = sum(
+        len((part or {}).get("bindings") or ())
+        for part in parts
+        if isinstance(part, dict)
+    )
+    summary["registered_variant_count"] = len(
+        list(manifest.get("registered_variants") or ())
+    )
+    return summary
+
+
 def reusable_preflight_spm_contracts(material_preflight, current_fbx_export):
     """Reuse leaf/material inspection only for the exact exported artifacts."""
     if not isinstance(material_preflight, dict):
@@ -542,6 +607,7 @@ def main():
         record_stage_duration(report, "blend_open", blend_open_started)
 
         cluster_assembly_handoff = None
+        cluster_assembly_handoff_summary = None
         cluster_assembly_source_resolution = None
         cluster_receipt_path, cluster_receipt_resolution = resolve_cluster_receipt_path(
             speedtree_spm,
@@ -816,7 +882,12 @@ def main():
                 speedtree_spm,
                 Path(source_fbx_value),
             )
-            report["cluster_assembly_handoff"] = cluster_assembly_handoff
+            cluster_assembly_handoff_summary = (
+                compact_cluster_assembly_handoff(cluster_assembly_handoff)
+            )
+            report["cluster_assembly_handoff"] = (
+                cluster_assembly_handoff_summary
+            )
             require_cluster_assembly_handoff_ready(
                 cluster_assembly_handoff
             )
@@ -828,6 +899,10 @@ def main():
         settings.name_stem = canonical_spm.stem
         repair_settings = settings.as_dict()
         repair_settings["cluster_source_skin_contract"] = is_cluster_source
+        # This job appends the final handoff/Assembly summary and writes the
+        # authoritative report once.  The add-on must not write an incomplete
+        # intermediate copy immediately before that final write.
+        repair_settings["defer_pipeline_report_write"] = True
         # A Cluster source is parked outside Send2UE only when this invocation
         # is the raw producer for the downstream Cluster Normalizer. Standalone
         # Cluster assets have no later stage that can create ordinal Export
@@ -941,7 +1016,11 @@ def main():
             }
         )
         pipeline_path = Path(report["pipeline_report"])
-        pipeline_data = None
+        # run_import_and_repair already returns the authoritative pipeline
+        # payload.  Keep it in memory so the batch job can append its final
+        # handoff data and write the report once, without requiring an
+        # incomplete intermediate report on disk.
+        pipeline_data = result if isinstance(result, dict) else None
         merged_object = None
         texture_normalization = {}
         empty_material_slots = []
@@ -984,8 +1063,9 @@ def main():
         material_export_blocked = material_export_contract.get("status") not in {
             "ok", "not_applicable",
         }
-        if pipeline_path.is_file():
+        if pipeline_data is None and pipeline_path.is_file():
             pipeline_data = json.loads(pipeline_path.read_text(encoding="utf-8"))
+        if pipeline_data is not None:
             pipeline_data["source_review_policy"] = source_review_policy
             pipeline_data["legacy_cluster_lineage"] = report[
                 "legacy_cluster_lineage"
@@ -1005,7 +1085,7 @@ def main():
                 ] = transient_export_reconciliation
             if cluster_assembly_handoff is not None:
                 pipeline_data["cluster_assembly_handoff"] = (
-                    cluster_assembly_handoff
+                    cluster_assembly_handoff_summary
                 )
             if material_preflight is not None:
                 pipeline_data["speedtree_pipeline_contract"] = (
@@ -1079,7 +1159,7 @@ def main():
 
         missing_outputs = [
             report[key]
-            for key in ("megaplant_json", "dynamic_wind_json", "pipeline_report")
+            for key in ("megaplant_json", "dynamic_wind_json")
             if not os.path.exists(report[key])
         ]
         for path in missing_outputs:
@@ -1107,7 +1187,7 @@ def main():
             "vertex_payload_contract": vertex_payload_contract,
             "leaf_reference_contract": leaf_reference_contract,
             "material_export": material_export_contract,
-            "cluster_assembly_handoff": cluster_assembly_handoff,
+            "cluster_assembly_handoff": cluster_assembly_handoff_summary,
             "missing_materials": material_export_contract.get(
                 "missing_materials", []
             ),
@@ -1159,6 +1239,7 @@ def main():
         report["source_review_required"] = False
         report["unreal_push_ready"] = handoff_status == "ok"
         assembly_manifest = None
+        assembly_manifest_summary = None
         assembly_mode, selected_assembly_handoff = (
             select_cluster_assembly_build_handoff(
                 cluster_assembly_contract,
@@ -1189,6 +1270,7 @@ def main():
             # contract. Without this manifest, Push falls back to historical
             # target registries and can falsely dependency-orchestrate an
             # otherwise ordinary Full-SK asset.
+            assembly_started = perf_counter()
             assembly_manifest = build_blender_assembly_inputs(
                 selected_assembly_handoff,
                 None,
@@ -1200,7 +1282,13 @@ def main():
                 pass_through_target_contract=cluster_assembly_contract,
                 pass_through_target_spm=speedtree_spm,
             )
-            report["cluster_assembly_manifest"] = assembly_manifest
+            record_stage_duration(
+                report, "cluster_assembly_build", assembly_started
+            )
+            assembly_manifest_summary = compact_cluster_assembly_manifest(
+                assembly_manifest
+            )
+            report["cluster_assembly_manifest"] = assembly_manifest_summary
         elif (
             preflight["status"] == "ok"
             and assembly_mode == "build"
@@ -1219,6 +1307,7 @@ def main():
                 raise RuntimeError(
                     "Cluster Assembly builder found no final Full SK FBX path"
                 )
+            assembly_started = perf_counter()
             assembly_manifest = build_blender_assembly_inputs(
                 selected_assembly_handoff,
                 final_armature,
@@ -1227,7 +1316,13 @@ def main():
                 full_fbx_path,
                 report["dynamic_wind_json"],
             )
-            report["cluster_assembly_manifest"] = assembly_manifest
+            record_stage_duration(
+                report, "cluster_assembly_build", assembly_started
+            )
+            assembly_manifest_summary = compact_cluster_assembly_manifest(
+                assembly_manifest
+            )
+            report["cluster_assembly_manifest"] = assembly_manifest_summary
         if (
             bark_normalization_manifest is not None
             and preflight["status"] != "blocked"
@@ -1273,10 +1368,18 @@ def main():
                     "blend_save_policy"
                 ]
             if assembly_manifest is not None:
-                pipeline_data["cluster_assembly_manifest"] = assembly_manifest
+                pipeline_data["cluster_assembly_manifest"] = (
+                    assembly_manifest_summary
+                )
             if preflight["status"] == "ok":
+                export_postcondition_started = perf_counter()
                 pipeline_data["repair_push_export_postcondition"] = (
                     export_object_postcondition(bpy.data)
+                )
+                record_stage_duration(
+                    report,
+                    "export_object_postcondition",
+                    export_postcondition_started,
                 )
             pipeline_report_started = perf_counter()
             write_report(pipeline_path, pipeline_data)

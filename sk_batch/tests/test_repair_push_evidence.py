@@ -63,6 +63,14 @@ class ExportPostconditionTests(unittest.TestCase):
         )
         self.assertEqual(first["empty_material_slots"], [])
         self.assertEqual(len(first["content_sha256"]), 64)
+        mesh = first["objects"][0]["mesh"]
+        self.assertNotIn("polygon_layout_sha256", mesh)
+        self.assertNotIn("uv_layers", mesh)
+        self.assertNotIn("color_attributes", mesh)
+        self.assertEqual(
+            mesh["material_index_counts"],
+            [{"material_index": 0, "polygon_count": 1}],
+        )
 
     def test_missing_export_collection_is_a_repair_error(self):
         scene = types.SimpleNamespace(collections={})

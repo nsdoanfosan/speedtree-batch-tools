@@ -370,6 +370,49 @@ class SkCommonOptimizationTests(unittest.TestCase):
                 )
                 self.assertEqual(persisted, loaded)
 
+    def test_state_load_and_save_drop_nested_artifact_report_copies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / "sk_batch_state.json"
+            live = root / "SK_live.spm"
+            live.write_bytes(b"live")
+            state = {
+                str(live): {
+                    "blend_status_error": {
+                        "message": "assembly failed",
+                        "failure_report": {
+                            "status": "failed",
+                            "error": "assembly failed",
+                            "reason_token": "assembly_failed",
+                            "cluster_assembly_handoff": {
+                                "assembly": {"huge": [1, 2, 3]},
+                            },
+                            "cluster_assembly_manifest": {
+                                "bindings": [1, 2, 3],
+                            },
+                        },
+                    },
+                },
+            }
+
+            with mock.patch.object(sk_common, "STATE_PATH", state_path):
+                sk_common.save_state(state)
+                stored = json.loads(state_path.read_text(encoding="utf-8"))
+                failure = stored[str(live)]["blend_status_error"][
+                    "failure_report"
+                ]
+                self.assertEqual(failure, {
+                    "status": "failed",
+                    "error": "assembly failed",
+                    "reason_token": "assembly_failed",
+                })
+
+                loaded = sk_common.load_state()
+                self.assertEqual(
+                    loaded[str(live)]["blend_status_error"]["failure_report"],
+                    failure,
+                )
+
     def test_state_save_publishes_only_pending_unreal_references(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

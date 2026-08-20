@@ -441,14 +441,53 @@ def _state_entry_is_persistable(key):
         return True
 
 
+_DURABLE_FAILURE_REPORT_KEYS = {
+    "status",
+    "error",
+    "error_type",
+    "traceback",
+    "reason_token",
+    "evidence",
+    "issues",
+    "repair_disposition",
+    "reason_ko",
+    "action_ko",
+    "stage",
+    "stage_timings_seconds",
+    "pipeline_report",
+    "unreal_push_ready",
+    "final_handoff_status",
+}
+
+
+def _compact_persisted_failure_reports(value):
+    """Discard nested artifact bodies left by older GUI failure records."""
+
+    if isinstance(value, dict):
+        for key, child in list(value.items()):
+            if key == "failure_report" and isinstance(child, dict):
+                value[key] = {
+                    report_key: report_value
+                    for report_key, report_value in child.items()
+                    if report_key in _DURABLE_FAILURE_REPORT_KEYS
+                }
+                continue
+            _compact_persisted_failure_reports(child)
+    elif isinstance(value, list):
+        for child in value:
+            _compact_persisted_failure_reports(child)
+
+
 def _prune_state_entries(state):
     if not isinstance(state, dict):
         raise ValueError("SK Batch state root must be a JSON object")
-    return {
-        key: value
-        for key, value in state.items()
-        if _state_entry_is_persistable(key)
-    }
+    pruned = {}
+    for key, value in state.items():
+        if not _state_entry_is_persistable(key):
+            continue
+        _compact_persisted_failure_reports(value)
+        pruned[key] = value
+    return pruned
 
 
 def _unreal_wait_reference_path():

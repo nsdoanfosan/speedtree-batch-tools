@@ -341,6 +341,36 @@ CLUSTER_LIVE_AUDIT_RECEIPT_DONE_MARKER = (
 CLUSTER_LIVE_AUDIT_FAILED_MARKER = "SK_BATCH_CLUSTER_LIVE_AUDIT_FAILED"
 CLUSTER_LIVE_AUDIT_DONE_MARKER = "SK_BATCH_CLUSTER_LIVE_AUDIT_DONE"
 
+_DURABLE_FAILURE_REPORT_KEYS = (
+    "status",
+    "error",
+    "error_type",
+    "traceback",
+    "reason_token",
+    "evidence",
+    "issues",
+    "repair_disposition",
+    "reason_ko",
+    "action_ko",
+    "stage",
+    "stage_timings_seconds",
+    "pipeline_report",
+    "unreal_push_ready",
+    "final_handoff_status",
+)
+
+
+def compact_durable_failure_report(report):
+    """Persist the failure decision, never a second copy of artifact payloads."""
+
+    if not isinstance(report, dict):
+        return {}
+    return {
+        key: copy.deepcopy(report[key])
+        for key in _DURABLE_FAILURE_REPORT_KEYS
+        if key in report
+    }
+
 
 def material_preflight_mesh_reference_block(spm):
     """Return a read-only early block for a referenced missing external mesh."""
@@ -10815,7 +10845,7 @@ class App:
                     details["log"] = str(exc.log_file)
                 if getattr(exc, "report_file", None):
                     details["report"] = str(exc.report_file)
-                exception_report = copy.deepcopy(
+                exception_report = compact_durable_failure_report(
                     getattr(exc, "report", {}) or {}
                 )
                 if exception_report:

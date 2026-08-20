@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from array import array
 from collections import Counter
 
 
@@ -36,39 +37,19 @@ def _value_tuple(value):
         return str(value)
 
 
-def _sequence_digest(values):
-    digest = hashlib.sha256()
-    for value in values:
-        encoded = json.dumps(
-            value,
-            sort_keys=True,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        digest.update(len(encoded).to_bytes(8, "big"))
-        digest.update(encoded)
-    return digest.hexdigest()
+def _material_index_counts(polygons):
+    """Read one integer per face without materializing Blender polygons."""
 
-
-def _mesh_channel_rows(channels, value_names):
-    rows = []
-    for channel in channels or ():
-        values = []
-        for item in getattr(channel, "data", ()) or ():
-            selected = None
-            for name in value_names:
-                if hasattr(item, name):
-                    selected = getattr(item, name)
-                    break
-            values.append(_value_tuple(selected))
-        rows.append({
-            "name": str(getattr(channel, "name", "")),
-            "domain": str(getattr(channel, "domain", "")),
-            "data_type": str(getattr(channel, "data_type", "")),
-            "value_count": len(values),
-            "values_sha256": _sequence_digest(values),
-        })
-    return sorted(rows, key=lambda row: row["name"].casefold())
+    count = len(polygons)
+    foreach_get = getattr(polygons, "foreach_get", None)
+    if callable(foreach_get):
+        values = array("i", [0]) * count
+        foreach_get("material_index", values)
+        return Counter(values)
+    return Counter(
+        int(getattr(polygon, "material_index", 0))
+        for polygon in polygons
+    )
 
 
 def _material_descriptor(material):
@@ -185,11 +166,8 @@ def export_object_postcondition(blender_data):
                         "object": str(obj.name),
                         "slot": index,
                     })
-            polygons = list(getattr(data, "polygons", ()) or ())
-            material_index_counts = Counter(
-                int(getattr(polygon, "material_index", 0))
-                for polygon in polygons
-            )
+            polygons = getattr(data, "polygons", ()) or ()
+            material_index_counts = _material_index_counts(polygons)
             row["mesh"] = {
                 "vertex_count": len(getattr(data, "vertices", ()) or ()),
                 "edge_count": len(getattr(data, "edges", ()) or ()),
@@ -203,27 +181,7 @@ def export_object_postcondition(blender_data):
                         material_index_counts.items()
                     )
                 ],
-                "polygon_layout_sha256": _sequence_digest(
-                    {
-                        "vertices": [
-                            int(value)
-                            for value in getattr(polygon, "vertices", ())
-                        ],
-                        "material_index": int(
-                            getattr(polygon, "material_index", 0)
-                        ),
-                    }
-                    for polygon in polygons
-                ),
                 "materials": materials,
-                "uv_layers": _mesh_channel_rows(
-                    getattr(data, "uv_layers", ()),
-                    ("uv",),
-                ),
-                "color_attributes": _mesh_channel_rows(
-                    getattr(data, "color_attributes", ()),
-                    ("color", "color_srgb", "value"),
-                ),
             }
         elif obj.type == "ARMATURE" and data is not None:
             row["armature"] = {

@@ -35,6 +35,7 @@ from cluster_assembly_builder import (  # noqa: E402
     _validate_base_export_parent_chain,
     _attachment_point_correspondence,
     _assembly_fit_summary,
+    _load_reusable_assembly_manifest,
     _base_weighted_bone_manifest_diagnostic,
     _base_role_polygon_indices,
     _build_unreal_assembly_provenance_payload,
@@ -65,6 +66,105 @@ from cluster_assembly_builder import (  # noqa: E402
     validate_wind_json_against_skeleton,
     validate_persisted_residual_gate,
 )
+
+
+class AssemblyBuildCacheTests(unittest.TestCase):
+    def test_exact_artifact_hit_reuses_and_drift_falls_back_to_rebuild(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            files = {
+                name: root / name
+                for name in ("full.fbx", "base.fbx", "part.fbx", "wind.json", "source.blend")
+            }
+            for name, path in files.items():
+                path.write_bytes(name.encode("utf-8"))
+            signature = {"schema_version": 1, "sha256": "cache-key"}
+            manifest_path = root / "assembly.json"
+            manifest = {
+                "schema_version": 1,
+                "kind": "sk_batch_cluster_nanite_assembly_inputs",
+                "status": "ready",
+                "content_decision": "build",
+                "build_cache": signature,
+                "full_fbx": file_fingerprint(files["full.fbx"]),
+                "base": {"fbx": file_fingerprint(files["base.fbx"])},
+                "wind_contract": {
+                    "wind_json": file_fingerprint(files["wind.json"]),
+                },
+                "assembly_source_blend": file_fingerprint(
+                    files["source.blend"]
+                ),
+                "parts": [{
+                    "prototype_id": "leaf_01",
+                    "fbx": file_fingerprint(files["part.fbx"]),
+                }],
+            }
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            reused = _load_reusable_assembly_manifest(
+                manifest_path,
+                signature,
+                manifest["full_fbx"],
+            )
+            self.assertTrue(reused["cache_reused"])
+            self.assertEqual(reused["manifest"]["path"], str(manifest_path))
+
+            files["full.fbx"].write_bytes(b"same-scene-new-fbx-encoding")
+            reused = _load_reusable_assembly_manifest(
+                manifest_path,
+                signature,
+                file_fingerprint(files["full.fbx"]),
+            )
+            self.assertTrue(reused["cache_reused"])
+
+            files["base.fbx"].write_bytes(b"changed")
+            self.assertIsNone(_load_reusable_assembly_manifest(
+                manifest_path,
+                signature,
+                manifest["full_fbx"],
+            ))
+
+    def test_external_plan_drift_does_not_rebuild_assembly_bindings(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            files = {
+                name: root / name
+                for name in ("full.fbx", "base.fbx", "plan.fbx", "wind.json", "source.blend")
+            }
+            for name, path in files.items():
+                path.write_bytes(name.encode("utf-8"))
+            signature = {"schema_version": 2, "sha256": "cache-key"}
+            manifest_path = root / "assembly.json"
+            manifest = {
+                "schema_version": 1,
+                "kind": "sk_batch_cluster_nanite_assembly_inputs",
+                "status": "ready",
+                "content_decision": "build",
+                "build_cache": signature,
+                "full_fbx": file_fingerprint(files["full.fbx"]),
+                "base": {"fbx": file_fingerprint(files["base.fbx"])},
+                "wind_contract": {
+                    "wind_json": file_fingerprint(files["wind.json"]),
+                },
+                "assembly_source_blend": file_fingerprint(
+                    files["source.blend"]
+                ),
+                "parts": [{
+                    "prototype_id": "leaf_01",
+                    "external_source": {
+                        "plan_fbx": file_fingerprint(files["plan.fbx"]),
+                    },
+                }],
+            }
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            files["plan.fbx"].write_bytes(b"refreshed-external-plan")
+
+            reused = _load_reusable_assembly_manifest(
+                manifest_path,
+                signature,
+                file_fingerprint(files["full.fbx"]),
+            )
+            self.assertTrue(reused["cache_reused"])
 
 
 class GeneratedMaterialSlotContractTests(unittest.TestCase):

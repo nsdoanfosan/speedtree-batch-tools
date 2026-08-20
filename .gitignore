@@ -12,6 +12,7 @@ pcg_st9_texture_batch/pcg_targets.json
 sk_batch/sk_batch_config.json
 sk_batch/sk_batch_state.json
 sk_batch/sk_batch_state.unreadable-*.json
+sk_batch/.sk_batch_state.json.*.tmp
 sk_batch/unreal_wait_references.json
 spm_generator_sync/spm_generator_sync_config.json
 spm_generator_sync/spm_generator_sync_state.json

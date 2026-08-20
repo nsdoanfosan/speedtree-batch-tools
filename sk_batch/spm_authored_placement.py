@@ -395,6 +395,10 @@ def assign_authored_nodes_to_components(
             "position_meters": position,
         })
     mesh_ids_by_generator = (table or {}).get("generator_mesh_ids") or {}
+    mesh_id_sets_by_generator = {
+        generator_guid: set(mesh_ids or ())
+        for generator_guid, mesh_ids in mesh_ids_by_generator.items()
+    }
     active_candidates = sorted(
         (
             record for record in (table or {}).get("nodes") or []
@@ -402,27 +406,32 @@ def assign_authored_nodes_to_components(
         ),
         key=lambda record: str(record.get("node_guid") or ""),
     )
-    candidates = sorted(
-        (
-            record for record in active_candidates
-            if any(
-                row["target_mesh_id"]
-                in set(mesh_ids_by_generator.get(record.get("generator_guid"), ()))
-                for row in rows
-            )
-        ),
-        key=lambda record: str(record.get("node_guid") or ""),
-    )
+    requested_mesh_ids = {row["target_mesh_id"] for row in rows}
+    candidates_by_mesh_id = defaultdict(list)
+    candidates = []
+    for record in active_candidates:
+        mesh_ids = mesh_id_sets_by_generator.get(
+            record.get("generator_guid"), set()
+        )
+        if not requested_mesh_ids.intersection(mesh_ids):
+            continue
+        candidates.append(record)
+        for mesh_id in mesh_ids:
+            if mesh_id in requested_mesh_ids:
+                candidates_by_mesh_id[mesh_id].append(record)
+    candidates.sort(key=lambda record: str(record.get("node_guid") or ""))
+    for mesh_id in candidates_by_mesh_id:
+        candidates_by_mesh_id[mesh_id].sort(
+            key=lambda record: str(record.get("node_guid") or "")
+        )
     edges = []
     compatible_edges = defaultdict(list)
     compatible_edge_records = {}
     nearest_by_component = {}
     for row in rows:
-        for record in candidates:
-            if row["target_mesh_id"] not in set(
-                mesh_ids_by_generator.get(record.get("generator_guid"), ())
-            ):
-                continue
+        for record in candidates_by_mesh_id.get(
+            row["target_mesh_id"], ()
+        ):
             distance = math.dist(
                 row["position_meters"], record["position_meters"]
             )
