@@ -1522,6 +1522,12 @@ def launch_limited(
             handle.close()
         raise
     proc.sk_log_handle = handle  # caller closes after wait (see GUI _run_limited)
+    # Stop can be requested by the Tk owner while the worker is polling the
+    # same process.  Serialize exact Job Object termination so both paths can
+    # request cleanup without racing or falling back to a parent-only kill.
+    proc.sk_tree_termination_lock = threading.RLock()
+    proc.sk_tree_termination_done = False
+    proc.sk_tree_termination_result = None
     attach_process_kill_job(proc)
     try:
         if affinity:
@@ -1542,30 +1548,56 @@ def terminate_process_tree(proc, wait_seconds=5.0):
     gone). A direct-process kill remains as a last resort, but returns False
     because descendants could not be confirmed terminated.
     """
-    if getattr(proc, "speedtree_lifecycle_launch_id", None) is not None:
-        try:
-            terminate_owned_process(
-                proc,
-                reason="sk_stop",
-                terminate_grace=min(1.0, max(0.0, float(wait_seconds))),
-                kill_grace=max(0.1, float(wait_seconds)),
-            )
-            return proc.poll() is not None
-        except ProcessLifecycleError:
-            return False
+    lock = getattr(proc, "sk_tree_termination_lock", None)
+    if not isinstance(lock, type(threading.RLock())):
+        # Injected test doubles and legacy callers do not pass through
+        # launch_limited().  Retain exact-handle behavior for them while still
+        # making repeated stop requests idempotent.
+        lock = threading.RLock()
+        proc.sk_tree_termination_lock = lock
+        proc.sk_tree_termination_done = False
+        proc.sk_tree_termination_result = None
 
-    # Fail closed for legacy/injected process objects: signal only the exact
-    # retained handle and never discover or kill descendants by PID/name.
-    if proc.poll() is not None:
-        return True
-    try:
-        proc.terminate()
-        proc.wait(timeout=max(0.1, float(wait_seconds)))
-    except (OSError, subprocess.TimeoutExpired):
-        if proc.poll() is None:
+    with lock:
+        if getattr(proc, "sk_tree_termination_done", False):
+            return bool(getattr(proc, "sk_tree_termination_result", False))
+
+        if getattr(proc, "speedtree_lifecycle_launch_id", None) is not None:
             try:
-                proc.kill()
-                proc.wait(timeout=max(0.1, float(wait_seconds)))
-            except (OSError, subprocess.SubprocessError):
-                pass
-    return False
+                terminate_owned_process(
+                    proc,
+                    reason="sk_stop",
+                    terminate_grace=min(1.0, max(0.0, float(wait_seconds))),
+                    kill_grace=max(0.1, float(wait_seconds)),
+                )
+                result = proc.poll() is not None
+            except ProcessLifecycleError:
+                result = False
+            proc.sk_tree_termination_result = result
+            proc.sk_tree_termination_done = result
+            return result
+
+        # Fail closed for legacy/injected process objects: signal only the
+        # exact retained handle and never discover or kill descendants by
+        # PID/name.
+        if proc.poll() is not None:
+            proc.sk_tree_termination_result = True
+            proc.sk_tree_termination_done = True
+            return True
+        parent_gone = False
+        try:
+            proc.terminate()
+            proc.wait(timeout=max(0.1, float(wait_seconds)))
+            parent_gone = True
+        except (OSError, subprocess.TimeoutExpired):
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=max(0.1, float(wait_seconds)))
+                    parent_gone = True
+                except (OSError, subprocess.SubprocessError):
+                    pass
+        # A legacy exact-parent fallback cannot prove descendant cleanup.
+        proc.sk_tree_termination_result = False
+        proc.sk_tree_termination_done = parent_gone
+        return False

@@ -548,21 +548,32 @@ class IntegratedLauncherTests(unittest.TestCase):
         owner.apps = {0: async_app, 1: sync_app}
         owner.find_dialog = None
 
-        owner.close()
+        with mock.patch.object(
+            self.launcher,
+            "shutdown_process_supervisor",
+            return_value={"survivors": []},
+        ) as supervisor_shutdown:
+            owner.close()
 
-        self.assertEqual(root.withdraw_calls, 1)
-        self.assertEqual(root.destroy_calls, 0)
-        self.assertIsNotNone(async_app.callback)
-        self.assertEqual(sync_app.shutdown_calls, 1)
-        self.assertEqual(async_app.persist_calls, 0)
-        self.assertEqual(sync_app.persist_calls, 0)
+            self.assertEqual(root.withdraw_calls, 1)
+            self.assertEqual(root.destroy_calls, 0)
+            self.assertIsNotNone(async_app.callback)
+            self.assertEqual(sync_app.shutdown_calls, 1)
+            self.assertEqual(async_app.persist_calls, 0)
+            self.assertEqual(sync_app.persist_calls, 0)
+            supervisor_shutdown.assert_not_called()
 
-        async_app.callback()
-        self.assertEqual(root.destroy_calls, 1)
-        self.assertEqual(async_app.persist_calls, 1)
-        self.assertEqual(sync_app.persist_calls, 1)
+            async_app.callback()
+            supervisor_shutdown.assert_called_once_with(
+                "integrated_gui_close",
+                terminate_grace=1.0,
+                kill_grace=5.0,
+            )
+            self.assertEqual(root.destroy_calls, 1)
+            self.assertEqual(async_app.persist_calls, 1)
+            self.assertEqual(sync_app.persist_calls, 1)
 
-        owner.close()
+            owner.close()
         self.assertEqual(root.destroy_calls, 1)
 
     def test_integrated_close_fails_closed_when_tool_shutdown_cannot_start(self):

@@ -340,6 +340,23 @@ class FullPipelineScopeTests(unittest.TestCase):
         self.assertFalse(app.pending_batch_jobs)
         self.assertIn("대기 작업 2개 취소", app.log.call_args.args[0])
 
+    def test_stop_immediately_reaps_the_exact_active_process_tree(self):
+        gui = load_gui_module()
+        app, _checked, _unchecked = self.make_start_app(gui)
+        process = mock.Mock()
+        process.poll.return_value = None
+        app.active_procs = {process}
+        app.procs_lock = threading.Lock()
+
+        with mock.patch.object(
+            gui, "terminate_process_tree", return_value=True
+        ) as terminate:
+            app.stop_batch()
+            app._active_process_cleanup_worker.join(timeout=2)
+
+        terminate.assert_called_once_with(process)
+        self.assertFalse(app._active_process_cleanup_worker.is_alive())
+
     def test_window_shutdown_records_operator_close_before_stopping(self):
         gui = load_gui_module()
         app, _checked, _unchecked = self.make_start_app(gui)

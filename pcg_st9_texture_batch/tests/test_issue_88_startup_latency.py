@@ -405,6 +405,46 @@ class ContentIdentityCacheTests(unittest.TestCase):
             self.assertEqual(first["material_names"], ["M_one"])
             self.assertEqual(second["material_names"], ["M_two"])
 
+    def test_display_fast_reuses_unchanged_persistent_spm_without_reading_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "SK_tree.spm"
+            write_minimal_spm(source, marker="cached")
+            old_persistent = audit._PERSISTENT_SPM_ANALYSIS
+            old_dirty = audit._PERSISTENT_SPM_ANALYSIS_DIRTY
+            audit._SPM_ANALYSIS_CACHE.clear()
+            audit._PERSISTENT_SPM_ANALYSIS = {}
+            audit._PERSISTENT_SPM_ANALYSIS_DIRTY = False
+            try:
+                cold_result = audit._spm_analysis(source)
+                audit._SPM_ANALYSIS_CACHE.clear()
+                token = audit._REPORT_SCAN_CACHE.set(
+                    audit._new_report_scan_cache(display_fast=True)
+                )
+                try:
+                    pending, metrics = audit._seed_display_spm_content_keys(
+                        [source]
+                    )
+                    with mock.patch.object(
+                        audit, "_read_stable_spm_bytes",
+                        wraps=audit._read_stable_spm_bytes,
+                    ) as read_bytes, mock.patch.object(
+                        audit, "read_maybe_gzip_text",
+                        wraps=audit.read_maybe_gzip_text,
+                    ) as decode:
+                        result = audit._spm_analysis(source)
+                finally:
+                    audit._REPORT_SCAN_CACHE.reset(token)
+            finally:
+                audit._PERSISTENT_SPM_ANALYSIS = old_persistent
+                audit._PERSISTENT_SPM_ANALYSIS_DIRTY = old_dirty
+                audit._SPM_ANALYSIS_CACHE.clear()
+
+            self.assertEqual(pending, [])
+            self.assertEqual(metrics["stat_reuse_hits"], 1)
+            self.assertEqual(result, cold_result)
+            read_bytes.assert_not_called()
+            decode.assert_not_called()
+
     def test_spm_semantic_cache_detects_tamper_between_sample_windows(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -958,6 +998,57 @@ class RelationAndAuthorityTests(unittest.TestCase):
             invalidated_item = self.item()
             GUI.cache_blender_connection_rows({"items": [invalidated_item]})
             self.assertEqual(calculate.call_count, 2)
+
+    def test_display_relation_reuses_same_refresh_stat_evidence_without_read(self):
+        stat = self.spm.stat()
+        evidence = {
+            "schema_version": 1,
+            "kind": "pcg_refresh_exact_content_evidence",
+            "display_fast": True,
+            "exact_content_rows": {
+                GUI.startup_path_key(self.spm): {
+                    "path": str(self.spm),
+                    "size": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                    "fingerprint": hashlib.sha256(
+                        self.spm.read_bytes()
+                    ).hexdigest(),
+                    "fingerprint_algorithm": "sha256-full-v1",
+                    "observation": "display_stat_reuse",
+                },
+            },
+        }
+        with mock.patch.object(
+            GUI, "BLENDER_RELATION_CACHE_PATH", self.cache_path
+        ), mock.patch.object(
+            GUI, "blender_connection_rows", return_value=[]
+        ) as calculate:
+            first_metrics = {}
+            GUI.cache_blender_connection_rows(
+                {"items": [self.item()]},
+                verify_physical=False,
+                metrics=first_metrics,
+            )
+            second_metrics = {}
+            GUI.cache_blender_connection_rows(
+                {"items": [self.item()]},
+                verify_physical=False,
+                session_evidence=evidence,
+                reuse_display_stat_evidence=True,
+                metrics=second_metrics,
+            )
+
+        self.assertEqual(calculate.call_count, 1)
+        self.assertGreater(
+            first_metrics["first_pass_physical_content_reads"], 0
+        )
+        self.assertEqual(second_metrics["cache_hits"], 1)
+        self.assertEqual(
+            second_metrics["first_pass_physical_content_reads"], 0
+        )
+        self.assertEqual(
+            second_metrics["reused_display_stat_content_file_count"], 1
+        )
 
     def test_mutation_relation_pass_bypasses_checksum_valid_poisoned_rows(self):
         poisoned = [{"blend": "C:/spoof.blend", "spms": []}]
@@ -1757,6 +1848,15 @@ class RelationAndAuthorityTests(unittest.TestCase):
             "name": "tree_elm",
             "status": "ready",
         }
+        pending_folder = self.folder.parent / "tree_oak"
+        app.report = {
+            "items": [
+                GUI.App._initial_inventory_item(self.folder),
+                GUI.App._initial_inventory_item(pending_folder),
+            ],
+            "pcg_targets": {"mesh_count": 0},
+            "inventory_pending": True,
+        }
 
         app._initial_partial_live_item(
             item,
@@ -1765,6 +1865,12 @@ class RelationAndAuthorityTests(unittest.TestCase):
         )
 
         self.assertTrue(app.report["partial_live_audit"])
+        self.assertEqual(len(app.report["items"]), 2)
+        self.assertEqual(app.report["items"][0]["status"], "ready")
+        self.assertEqual(
+            app.report["items"][1]["status"], "startup_pending"
+        )
+        self.assertTrue(app.report["inventory_pending"])
         self.assertTrue(app._display_only_snapshot)
         app.populate.assert_called_once_with()
         app._set_busy.assert_called_once_with(False)
@@ -2739,8 +2845,8 @@ class ProductionShapedLatencyFixtureTests(unittest.TestCase):
             self.assertEqual(warm["summary"]["total"], 55)
             self.assertEqual(
                 base_legacy_call_count,
-                1194,
-                "each refresh must inspect current legacy evidence once per SPM",
+                0,
+                "receipt-free SPMs must skip the redundant legacy helper",
             )
             self.assertLess(
                 cold_elapsed,
@@ -3015,10 +3121,13 @@ class Issue290RedundantAuditTests(unittest.TestCase):
         def set(self, value):
             self.value = value
 
-    def test_constructor_does_not_schedule_automatic_full_audit(self):
+    def test_constructor_schedules_one_status_audit_after_first_paint(self):
         source = inspect.getsource(GUI.App.__init__)
-        self.assertNotIn("_start_initial_refresh", source)
         self.assertIn("_load_initial_folder_inventory", source)
+        self.assertIn(
+            "self.root.after(0, self._start_initial_refresh)", source
+        )
+        self.assertEqual(source.count("_start_initial_refresh"), 1)
 
     def test_cold_inventory_uses_folder_discovery_without_make_report(self):
         app = GUI.App.__new__(GUI.App)

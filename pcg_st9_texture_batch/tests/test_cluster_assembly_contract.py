@@ -1191,7 +1191,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             self.assertTrue(
                 dependencies["SK_branch_elm_01"]["current_live_pair_covered"]
             )
-            self.assertIn(
+            self.assertNotIn(
                 "NORMALIZED_VARIANTS_REQUIRED",
                 [row["code"] for row in contract["handoff"]["issues"]],
             )
@@ -3835,7 +3835,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 stale_contract["handoff"]["status"],
                 "ready",
             )
-            self.assertIn(
+            self.assertNotIn(
                 "NORMALIZED_VARIANTS_REQUIRED",
                 [
                     row["code"]
@@ -3876,7 +3876,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
                 conflict_contract["handoff"]["status"],
                 "ready",
             )
-            self.assertIn(
+            self.assertNotIn(
                 "NORMALIZED_VARIANTS_REQUIRED",
                 [
                     row["code"]

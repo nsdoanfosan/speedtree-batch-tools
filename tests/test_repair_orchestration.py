@@ -29,6 +29,7 @@ from repair_orchestration import (
     compact_success_message,
     final_failure_filter,
     fresh_repair_receipt_authoritative,
+    has_repair_contract_evidence,
     repair_progress_payload,
     repair_ui_decision,
 )
@@ -338,7 +339,7 @@ class RepairOrchestrationTests(unittest.TestCase):
         )
         self.assertEqual(plan.stages[0]["producer_spm"], str(self.cluster))
 
-    def test_missing_normalized_variant_routes_to_exact_cluster_refresh(self):
+    def test_missing_normalized_variant_does_not_schedule_cluster_refresh(self):
         evidence = {
             "issues": [{
                 "code": "NORMALIZED_VARIANTS_REQUIRED",
@@ -348,12 +349,12 @@ class RepairOrchestrationTests(unittest.TestCase):
         decision = repair_ui_decision(evidence)
         plan = self.plan(evidence)
 
-        self.assertEqual(decision["status"], REPAIR_UI_AUTOMATIC)
-        self.assertIn("필수 정규화 Cluster variant", decision["reason"])
-        self.assertTrue(plan.supported)
-        self.assertEqual(plan.stages[0]["repair_action"], CLUSTER_REFRESH)
+        self.assertEqual(decision["status"], REPAIR_UI_BLOCKED)
+        self.assertFalse(has_repair_contract_evidence(evidence))
+        self.assertFalse(plan.supported)
+        self.assertEqual(plan.stages, ())
 
-    def test_sealed_provider_relations_refresh_the_owner_not_provider_paths(self):
+    def test_legacy_variant_relations_do_not_resurrect_owner_refresh(self):
         second = self.cluster.with_name("SK_cluster_second.spm")
         second.write_bytes(b"second-cluster")
         self.inventory.append(second)
@@ -375,13 +376,8 @@ class RepairOrchestrationTests(unittest.TestCase):
             "cluster_provider_relations": relations,
         })
 
-        self.assertTrue(plan.supported)
-        self.assertEqual(plan.stages[0]["repair_action"], CLUSTER_REFRESH)
-        self.assertEqual(plan.stages[0]["target_spms"], [str(self.target)])
-        self.assertEqual(
-            plan.stages[0]["cluster_provider_relations"],
-            relations,
-        )
+        self.assertFalse(plan.supported)
+        self.assertEqual(plan.stages, ())
 
     def test_lineage_reason_still_routes_cluster_refresh(self):
         evidence = {"reason_code": "lineage_unproven"}

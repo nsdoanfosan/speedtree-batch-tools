@@ -4557,7 +4557,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             ["NORMALIZED_VARIANTS_REQUIRED"],
         )
 
-    def test_cluster_normalization_stage_partitions_producer_owned_work(
+    def test_cluster_normalization_stage_drops_legacy_variant_work(
         self,
     ):
         gui = load_gui_module()
@@ -4644,22 +4644,10 @@ class BlendLiveStatusTests(unittest.TestCase):
             owner_resolution["policy"],
             "live_audit_authoritative",
         )
-        self.assertEqual(resolution_a["status"], "normalization_required")
-        self.assertEqual(resolution_b["status"], "normalization_required")
-        self.assertEqual(
-            {
-                row["spm"]
-                for row in resolution_a["owned_work_items"]
-            },
-            {str(producer_a)},
-        )
-        self.assertEqual(
-            {
-                row["spm"]
-                for row in resolution_b["owned_work_items"]
-            },
-            {str(producer_b)},
-        )
+        self.assertEqual(resolution_a["status"], "current")
+        self.assertEqual(resolution_b["status"], "current")
+        self.assertEqual(resolution_a["owned_work_items"], [])
+        self.assertEqual(resolution_b["owned_work_items"], [])
 
     def test_cluster_live_audit_bookkeeping_error_releases_waiter(self):
         gui = load_gui_module()
@@ -5018,7 +5006,7 @@ class BlendLiveStatusTests(unittest.TestCase):
 
             return app, resolution, producer
 
-    def test_normalization_stage_owns_exact_producer_work(self):
+    def test_legacy_variant_issue_does_not_create_producer_work(self):
         gui = load_gui_module()
         app, resolution, producer = (
             self._run_producer_normalization_stage(
@@ -5027,18 +5015,12 @@ class BlendLiveStatusTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(
-            resolution["status"],
-            "normalization_required",
-        )
+        self.assertEqual(resolution["status"], "current")
         self.assertEqual(
             Path(resolution["producer_spm"]),
             producer.resolve(),
         )
-        self.assertEqual(
-            [row["code"] for row in resolution["owned_work_items"]],
-            ["NORMALIZED_VARIANTS_REQUIRED"],
-        )
+        self.assertEqual(resolution["owned_work_items"], [])
 
     def test_normalization_stage_nonzero_audit_is_internal_error(self):
         gui = load_gui_module()
@@ -5074,17 +5056,16 @@ class BlendLiveStatusTests(unittest.TestCase):
         )
         self.assertIn("missing.tga", str(raised.exception))
 
-    def test_normalization_stage_rejects_issue_outside_contract(self):
+    def test_legacy_variant_issue_for_other_provider_is_ignored(self):
         gui = load_gui_module()
-        with self.assertRaises(gui.BatchItemError) as raised:
-            self._run_producer_normalization_stage(
-                gui,
-                exit_code=0,
-                issue_spm_kind="other",
-            )
+        _app, resolution, _producer = self._run_producer_normalization_stage(
+            gui,
+            exit_code=0,
+            issue_spm_kind="other",
+        )
 
-        self.assertEqual(raised.exception.kind, "data_error")
-        self.assertIn("필수 정규화 Cluster variant", str(raised.exception))
+        self.assertEqual(resolution["status"], "current")
+        self.assertEqual(resolution["owned_work_items"], [])
 
     def test_receipt_ambiguity_after_clean_audit_uses_live_contract(self):
         gui = load_gui_module()

@@ -3401,6 +3401,7 @@ class GuiLabelTests(unittest.TestCase):
                 item_callback=mock.ANY,
                 cancel_check=mock.ANY,
                 session_evidence={},
+                display_fast=True,
             )
             save_config.assert_called_once_with({"tree_root": "new"})
             self.assertIsNone(app.report)
@@ -3507,8 +3508,23 @@ class GuiLabelTests(unittest.TestCase):
         self.assertEqual(self.gui.blender_connection_rows(item), [])
         self.assertEqual(
             self.gui.blender_connection_overview(item),
-            "선택 시 연결 확인",
+            "연결 상태 미확인",
         )
+
+    def test_cold_inventory_labels_show_automatic_status_progress(self):
+        app = self.gui.App.__new__(self.gui.App)
+        item = self.gui.App._initial_inventory_item(
+            Path(r"D:\Trees\tree_oak")
+        )
+
+        self.assertEqual(app.step1_text(item), "상태 확인 중…")
+        self.assertEqual(app.step2_text(item), "상태 확인 중…")
+        self.assertEqual(app.step3_text(item), "상태 확인 중…")
+        self.assertEqual(
+            self.gui.blender_connection_overview(item),
+            "상태 확인 중…",
+        )
+        self.assertEqual(item["actions"], ["자동 상태 확인 중"])
 
     def test_cold_board_action_audits_only_checked_folders(self):
         class ImmediateThread:
@@ -3550,7 +3566,7 @@ class GuiLabelTests(unittest.TestCase):
             self.gui, "make_report", return_value=report
         ) as make_report, mock.patch.object(
             self.gui, "cache_blender_connection_rows"
-        ):
+        ) as relation_audit:
             ready = app._ensure_selected_live_scope(
                 continuation, "① 실행"
             )
@@ -3560,6 +3576,13 @@ class GuiLabelTests(unittest.TestCase):
             make_report.call_args.kwargs["targets"],
             [r"D:\Trees\selected"],
         )
+        self.assertTrue(
+            make_report.call_args.kwargs["mutation_authority"]
+        )
+        self.assertTrue(
+            relation_audit.call_args.kwargs["verify_physical"]
+        )
+        self.assertFalse(relation_audit.call_args.kwargs["read_cache"])
         app._apply_step3_scope_report.assert_called_once_with(report)
         continuation.assert_called_once_with()
 
@@ -3706,6 +3729,7 @@ class GuiLabelTests(unittest.TestCase):
                 progress_callback=mock.ANY,
                 cancel_check=mock.ANY,
                 session_evidence={},
+                display_fast=True,
             )
             write_snapshot.assert_called_once_with(
                 report,

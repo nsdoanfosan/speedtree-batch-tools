@@ -284,7 +284,12 @@ class LiveAuditGateAdmissionTests(AppHarness, unittest.TestCase):
                 "role": "cluster",
                 "spm": str(provider),
             })
-        return target, {"dependencies": dependencies}, issues
+        return target, {
+            "tree_source_identities": [{
+                "target_spm": {"path": str(target)},
+            }],
+            "dependencies": dependencies,
+        }, issues
 
     def test_live_audit_gate_admits_a_registered_target_block(self):
         gui = load_gui_module()
@@ -337,7 +342,7 @@ class LiveAuditGateAdmissionTests(AppHarness, unittest.TestCase):
         self.assertNotIn("자동 복구 대상", str(caught.exception))
 
 
-    def test_missing_variants_restore_only_rendered_explicit_off_relations(self):
+    def test_missing_variants_do_not_restore_explicit_off_relations(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as folder:
@@ -348,33 +353,20 @@ class LiveAuditGateAdmissionTests(AppHarness, unittest.TestCase):
                 count=2,
             )
 
-            with self.assertRaises(
-                gui.TargetPlannedExclusionError
-            ) as caught:
-                self.evaluate(
-                    app,
-                    contract,
-                    issues,
-                    target=target,
-                )
+            result = self.evaluate(
+                app,
+                contract,
+                issues,
+                target=target,
+            )
 
-        exclusion = caught.exception
-        relations = exclusion.evidence["cluster_provider_relations"]
-        self.assertEqual(len(relations), 2)
+        self.assertEqual(result["policy"], "live_audit_authoritative")
         self.assertEqual(
-            {row["relation_status"] for row in relations},
-            {"explicit_off"},
-        )
-        self.assertTrue(all(
-            row["live_pair_proof"]["current_live_pair_covered"]
-            for row in relations
-        ))
-        self.assertEqual(
-            exclusion.reason_token,
-            "normalized_variants_required",
+            [row["code"] for row in result["nonblocking_maintenance_issues"]],
+            ["NORMALIZED_VARIANTS_REQUIRED"] * 2,
         )
 
-    def test_explicit_off_without_live_pair_proof_remains_terminal(self):
+    def test_missing_variants_without_live_pair_proof_are_still_nonblocking(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as folder:
@@ -384,18 +376,14 @@ class LiveAuditGateAdmissionTests(AppHarness, unittest.TestCase):
                 rendered=False,
             )
 
-            with self.assertRaises(gui.BatchItemError) as caught:
-                self.evaluate(
-                    app,
-                    contract,
-                    issues,
-                    target=target,
-                )
+            result = self.evaluate(
+                app,
+                contract,
+                issues,
+                target=target,
+            )
 
-        self.assertNotIsInstance(
-            caught.exception,
-            gui.TargetPlannedExclusionError,
-        )
+        self.assertEqual(result["policy"], "live_audit_authoritative")
 
 
 class DirectRunRecoveryTests(AppHarness, unittest.TestCase):
@@ -463,7 +451,7 @@ class PlannedExclusionLabelTests(AppHarness, unittest.TestCase):
     def record(self, gui, app, evidence):
         error = gui.TargetPlannedExclusionError(
             "blocked",
-            reason_token="normalized_variants_required",
+            reason_token="normalized_generator_delivery_incomplete",
             target_spm=TARGET,
             producer_spm=PROVIDER,
             evidence=evidence,

@@ -176,18 +176,17 @@ class ReasonRegistryCoverageTests(unittest.TestCase):
             REPAIRABLE,
         )
 
-    def test_role_handoff_wrapper_defers_to_inner_repairable_reason(self):
+    def test_legacy_variant_reason_is_informational_not_repairable(self):
         evidence = {
             "issues": [{
                 "code": "CLUSTER_ROLE_HANDOFF_BLOCKED",
                 "reason": "normalized_variants_required",
             }],
         }
-        decision = orchestration.repair_ui_decision(evidence)
-        self.assertEqual(decision["status"], orchestration.REPAIR_UI_AUTOMATIC)
+        self.assertFalse(orchestration.has_repair_contract_evidence(evidence))
         self.assertEqual(
-            decision["reason_codes"],
-            ("cluster_role_handoff_blocked", "normalized_variants_required"),
+            disposition_of("normalized_variants_required"),
+            INFORMATIONAL,
         )
         self.assertEqual(
             disposition_of("cluster_role_handoff_blocked"),

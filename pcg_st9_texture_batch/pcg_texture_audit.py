@@ -127,6 +127,7 @@ if __package__ in (None, ""):
     from pcg_startup_cache import (
         ContentAddressedJsonCache,
         bounded_recursive_files,
+        canonical_json_sha256,
         content_identity,
         path_key as startup_path_key,
     )
@@ -147,6 +148,7 @@ else:
     from .pcg_startup_cache import (
         ContentAddressedJsonCache,
         bounded_recursive_files,
+        canonical_json_sha256,
         content_identity,
         path_key as startup_path_key,
     )
@@ -337,6 +339,8 @@ class _SessionCacheMetrics:
         self._lock = threading.RLock()
         self._counts = {}
         self._paths = {}
+        self._local = threading.local()
+        self._thread_counts = []
 
     def record(self, name, *, path=None, amount=1):
         name = str(name)
@@ -347,9 +351,23 @@ class _SessionCacheMetrics:
                     startup_path_key(path)
                 )
 
+    def record_fast(self, name, *, amount=1):
+        """Count a hot-path event without one lock acquisition per call."""
+        counts = getattr(self._local, "counts", None)
+        if counts is None:
+            counts = {}
+            self._local.counts = counts
+            with self._lock:
+                self._thread_counts.append(counts)
+        name = str(name)
+        counts[name] = counts.get(name, 0) + int(amount)
+
     def snapshot(self):
         with self._lock:
             result = dict(self._counts)
+            for counts in self._thread_counts:
+                for name, amount in counts.items():
+                    result[name] = result.get(name, 0) + amount
             for name, paths in self._paths.items():
                 result[f"{name}_unique_files"] = len(paths)
             return result
@@ -364,13 +382,14 @@ def _new_report_scan_cache(
         *, content_snapshots=None, spm_content_keys=None,
         session_metrics=None, cluster_origin_receipts=None,
         physical_receipts=None, file_sha256_memo=None,
-        mutation_authority=False):
+        path_is_files=None, mutation_authority=False, display_fast=False):
     return {
         "file_cache_keys": {},
         "root_spms": {},
         "spm_mesh_indexes": {},
         "spm_analysis_results": {},
         "path_exists": {},
+        "path_is_file": path_is_files if path_is_files is not None else {},
         "content_snapshots": (
             content_snapshots if content_snapshots is not None else {}
         ),
@@ -382,6 +401,7 @@ def _new_report_scan_cache(
             else _SessionCacheMetrics()
         ),
         "legacy_cluster_states": {},
+        "legacy_snapshot_peeks": set(),
         "cluster_origin_receipts": (
             cluster_origin_receipts
             if cluster_origin_receipts is not None else {}
@@ -402,6 +422,9 @@ def _new_report_scan_cache(
         # Mutation workers must derive semantic projections from current
         # bytes. Persisted caches remain a startup/display optimization only.
         "mutation_authority": (["enabled"] if mutation_authority else []),
+        "display_fast": (
+            ["enabled"] if display_fast and not mutation_authority else []
+        ),
     }
 
 
@@ -422,12 +445,12 @@ def report_file_sha256_cache():
 
 
 def report_reuses_stable_exact_evidence():
-    """Whether one read-only report may reuse its first stable exact read.
+    """Whether one read-only report may reuse its report-local digest row.
 
-    The memo is born with the report and never survives its boundary.  Its
-    first value is still a stat-bracketed full digest; reuse only removes
-    duplicate consumers of those same bytes during one immutable audit pass.
-    Mutation-authority passes keep re-reading every authority boundary.
+    Normal reports seed it from a stat-bracketed full digest. Display-fast
+    reports may seed an unchanged size/mtime row from the persistent semantic
+    cache; those reports are explicitly display-only. Mutation-authority
+    passes never enable that shortcut and re-read every authority boundary.
     """
     report_cache = _REPORT_SCAN_CACHE.get()
     return bool(
@@ -437,12 +460,12 @@ def report_reuses_stable_exact_evidence():
 
 
 def _publish_report_session_evidence(report_cache, destination):
-    """Export compact exact rows for the immediately following relation pass.
+    """Export compact rows for the immediately following display relation pass.
 
-    Raw SPM bytes and semantic report payloads never escape the audit.  This
-    handoff contains only exact digest rows already computed during the same
-    refresh and is caller-owned, in-memory, and never serialized into reports
-    or the display snapshot.
+    Raw SPM bytes and semantic report payloads never escape the audit. Rows
+    identify whether their digest was read now or reused after a current stat
+    match. The handoff is caller-owned, in-memory, and never serialized into
+    reports or the display snapshot.
     """
     if destination is None:
         return
@@ -456,6 +479,10 @@ def _publish_report_session_evidence(report_cache, destination):
             "mtime_ns": int(row.get("mtime_ns") or 0),
             "fingerprint": str(row["sha256"]),
             "fingerprint_algorithm": SHA256_ALGORITHM,
+            "observation": (
+                "display_stat_reuse"
+                if row.get("display_stat_reused") else "exact_current"
+            ),
         }
     digest_memo = report_cache.get("file_sha256_memo")
     digest_items = (
@@ -468,12 +495,20 @@ def _publish_report_session_evidence(report_cache, destination):
             continue
         path_text, size, mtime_ns = key
         path_key = startup_path_key(path_text)
+        existing = exact_rows.get(path_key)
+        if (
+            existing is not None
+            and existing.get("observation") == "display_stat_reuse"
+            and existing.get("fingerprint") == str(digest)
+        ):
+            continue
         exact_rows[path_key] = {
             "path": path_key,
             "size": int(size),
             "mtime_ns": int(mtime_ns),
             "fingerprint": str(digest),
             "fingerprint_algorithm": SHA256_ALGORITHM,
+            "observation": "exact_current",
         }
     semantic_rows = {}
     with _PERSISTENT_CACHE_LOCK:
@@ -514,6 +549,7 @@ def _publish_report_session_evidence(report_cache, destination):
             and callable(getattr(digest_memo, "metrics", None))
             else {}
         ),
+        "display_fast": bool(report_cache.get("display_fast")),
     })
 
 
@@ -595,12 +631,22 @@ def _record_session_cache_metric(name, *, path=None, amount=1):
         metrics.record(name, path=path, amount=amount)
 
 
+def _record_session_cache_metric_fast(name, *, amount=1):
+    report_cache = _REPORT_SCAN_CACHE.get()
+    if report_cache is None:
+        return
+    metrics = report_cache.get("session_metrics")
+    if metrics is not None:
+        metrics.record_fast(name, amount=amount)
+
+
 def _report_scan_cached(func):
     """Give one report a stable, thread-safe snapshot of repeated filesystem reads."""
     @functools.wraps(func)
     def wrapped(*args, **kwargs):
         token = _REPORT_SCAN_CACHE.set(_new_report_scan_cache(
             mutation_authority=bool(kwargs.get("mutation_authority", False)),
+            display_fast=bool(kwargs.get("display_fast", False)),
         ))
         try:
             return func(*args, **kwargs)
@@ -785,6 +831,86 @@ def _prefetch_spm_content_keys(paths, *, cancel_check=None, workers=8):
         "bytes_read": total_bytes,
         "workers": worker_count,
         "identity_algorithm": SPM_CONTENT_IDENTITY_ALGORITHM,
+    }
+
+
+def _seed_display_spm_content_keys(paths, *, cancel_check=None):
+    """Reuse unchanged persistent SPM rows for the read-only status board.
+
+    A size/mtime match is intentionally only display authority.  It avoids
+    reopening hundreds of unchanged OneDrive files during startup; mutation
+    passes never enable this mode and still full-hash their selected scope.
+    """
+    candidate_paths = list(paths or ())
+    report_cache = _REPORT_SCAN_CACHE.get()
+    if (
+        report_cache is None
+        or not report_cache.get("display_fast")
+        or report_cache.get("mutation_authority")
+    ):
+        return candidate_paths, {
+            "stat_reuse_hits": 0,
+            "stat_reuse_misses": len(candidate_paths),
+        }
+    unique_paths = {
+        startup_path_key(path): Path(path).absolute()
+        for path in candidate_paths
+    }
+    with _PERSISTENT_CACHE_LOCK:
+        persistent = dict(_persistent_spm_analysis())
+    misses = []
+    reused_bytes = 0
+    for path_key in sorted(unique_paths):
+        if cancel_check is not None and cancel_check():
+            raise RuntimeError("PCG startup audit cancelled")
+        candidate = unique_paths[path_key]
+        try:
+            stat = candidate.stat()
+        except OSError:
+            misses.append(candidate)
+            continue
+        entry = persistent.get(path_key)
+        reusable = bool(
+            isinstance(entry, dict)
+            and entry.get("size") == stat.st_size
+            and entry.get("mtime_ns") == stat.st_mtime_ns
+            and entry.get("content_identity_sha256")
+            and entry.get("content_identity_algorithm")
+            == SPM_CONTENT_IDENTITY_ALGORITHM
+            and entry.get("leaf_binding_schema") == 6
+        )
+        if not reusable:
+            misses.append(candidate)
+            continue
+        report_cache["spm_content_keys"][path_key] = {
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "sha256": entry["content_identity_sha256"],
+            "display_stat_reused": True,
+        }
+        digest_memo = report_cache.get("file_sha256_memo")
+        if digest_memo is not None and callable(
+            getattr(digest_memo, "seed", None)
+        ):
+            digest_memo.seed(
+                (path_key, stat.st_size, stat.st_mtime_ns),
+                entry["content_identity_sha256"],
+            )
+        report_cache["file_cache_keys"][str(candidate).lower()] = (
+            str(candidate).lower(), stat.st_size, stat.st_mtime_ns
+        )
+        reused_bytes += stat.st_size
+        _record_session_cache_metric(
+            "spm_display_stat_reuse_hits", path=candidate
+        )
+    for candidate in misses:
+        _record_session_cache_metric(
+            "spm_display_stat_reuse_misses", path=candidate
+        )
+    return misses, {
+        "stat_reuse_hits": len(unique_paths) - len(misses),
+        "stat_reuse_misses": len(misses),
+        "stat_reused_bytes": reused_bytes,
     }
 
 
@@ -1669,7 +1795,7 @@ def _spm_analysis(path, *, include_decoded_handoff=False):
     long-lived analysis cache never owns the decoded document.
     """
     global _PERSISTENT_SPM_ANALYSIS_DIRTY
-    _record_session_cache_metric("spm_analysis_calls", path=path)
+    _record_session_cache_metric_fast("spm_analysis_calls")
     report_cache = _REPORT_SCAN_CACHE.get()
     report_key = startup_path_key(path)
     report_results = (
@@ -1681,7 +1807,12 @@ def _spm_analysis(path, *, include_decoded_handoff=False):
         if report_results is not None else None
     )
     if report_entry is not None:
-        _record_session_cache_metric("spm_report_hits", path=path)
+        _record_session_cache_metric_fast("spm_report_hits")
+        if not report_entry.get("report_hit_metric_recorded"):
+            _record_session_cache_metric(
+                "spm_report_hits", path=report_key, amount=0
+            )
+            report_entry["report_hit_metric_recorded"] = True
         cache_key = report_entry["cache_key"]
         _PENDING_RAW_SPM_HANDOFF.set(None)
         analysis = report_entry["analysis"]
@@ -1689,6 +1820,9 @@ def _spm_analysis(path, *, include_decoded_handoff=False):
             return analysis, _take_pending_decoded_handoff(path, cache_key)
         return analysis
 
+    _record_session_cache_metric(
+        "spm_analysis_calls", path=report_key, amount=0
+    )
     cache_key = _spm_analysis_cache_key(path)
 
     def remember(analysis):
@@ -2106,7 +2240,7 @@ def root_spms(folder):
             return list(cached)
     paths = sorted(
         p for p in Path(folder).glob("*.spm")
-        if p.is_file() and not is_backup_path(p)
+        if path_is_file(p) and not is_backup_path(p)
     )
     if report_cache is not None:
         report_cache["root_spms"][folder_key] = tuple(paths)
@@ -2257,10 +2391,22 @@ def leaf_generator_bindings(path, visible_only=False):
         raise RuntimeError(
             f"{reason}: {json.dumps(evidence, sort_keys=True)}"
         )
-    if snapshot is None:
+    report_cache = _REPORT_SCAN_CACHE.get()
+    peek_key = startup_path_key(path)
+    peeked = (
+        report_cache is not None
+        and peek_key in report_cache["legacy_snapshot_peeks"]
+    )
+    if (
+        snapshot is None
+        and legacy_state.get("receipt_valid")
+        and not peeked
+    ):
         # If the legacy audit above actually scanned (only happens when the
         # SPM holds a valid receipt), backfill so it is never read again.
         computed = peek_generator_foregrounds(path)
+        if report_cache is not None:
+            report_cache["legacy_snapshot_peeks"].add(peek_key)
         if computed is not None:
             analysis["generator_foregrounds_snapshot"] = computed
             _backfill_generator_foregrounds_cache(cache_key, computed)
@@ -2308,22 +2454,51 @@ def _report_legacy_cluster_state(
             decoded_handoff=decoded_handoff,
         )
     spm = Path(path)
+    cache = report_cache["legacy_cluster_states"]
+    report_path_key = ("report_path", startup_path_key(spm))
+    cached = cache.get(report_path_key)
+    if cached is not None:
+        return copy.deepcopy(cached)
     cache_key = (
         _file_cache_key(spm),
         _file_cache_key(marker_receipt_path(spm)),
         _file_cache_key(problem_marker_receipt_path(spm)),
     )
-    cache = report_cache["legacy_cluster_states"]
     cached = cache.get(cache_key)
     if cached is not None:
+        cache[report_path_key] = cached
         return copy.deepcopy(cached)
     _record_session_cache_metric("legacy_receipt_inspection_calls", path=spm)
-    result = inspect_legacy_cluster_state(
-        spm,
-        foregrounds_snapshot=foregrounds_snapshot,
-        decoded_handoff=decoded_handoff,
-    )
+    if cache_key[1][1:] == (0, 0):
+        # No receipt means no legacy lineage can exist.  Avoid asking the
+        # legacy helper to resolve/stat the SPM and both absent receipts again.
+        result = {
+            "spm": str(spm),
+            "receipt": str(marker_receipt_path(spm)),
+            "receipt_valid": False,
+            "receipt_path_rebound": False,
+            "classified_generator_guids": [],
+            "receipt_generator_guids": [],
+            "current_marker_guids": [],
+            "ambiguous_marker_guids": [],
+            "problem_marker_guids": [],
+            "marker_drift_guids": [],
+            "missing_generator_guids": [],
+            "duplicate_generator_guids": [],
+            "errors": [],
+            "reason_tokens": [],
+            "handoff_evidence": {},
+            "failure_evidence": {},
+            "evidence_by_guid": {},
+        }
+    else:
+        result = inspect_legacy_cluster_state(
+            spm,
+            foregrounds_snapshot=foregrounds_snapshot,
+            decoded_handoff=decoded_handoff,
+        )
     cache[cache_key] = copy.deepcopy(result)
+    cache[report_path_key] = cache[cache_key]
     return result
 
 
@@ -2462,6 +2637,21 @@ def path_exists(path):
         result = False
     if report_cache is not None:
         report_cache["path_exists"][path_key] = result
+    return result
+
+
+def path_is_file(path):
+    """Report-local file membership probe shared by repeated audit consumers."""
+    path_key = startup_path_key(path)
+    report_cache = _REPORT_SCAN_CACHE.get()
+    if report_cache is not None and path_key in report_cache["path_is_file"]:
+        return report_cache["path_is_file"][path_key]
+    try:
+        result = Path(path).is_file()
+    except (OSError, ValueError):
+        result = False
+    if report_cache is not None:
+        report_cache["path_is_file"][path_key] = result
     return result
 
 
@@ -3640,7 +3830,7 @@ def cluster_dependency_spms(target_spms):
         assembly_source_spm = target_spm
         if target_spm.name.lower().startswith("sk_"):
             source_spm = target_spm.with_name(target_spm.name[3:])
-            if source_spm.is_file():
+            if path_is_file(source_spm):
                 if source_spm not in dependencies:
                     dependencies.append(source_spm)
         if assembly_source_spm not in assembly_sources:
@@ -3929,7 +4119,7 @@ def resolve_leaf_atlas_lineage(folder, cfg, target_spms, clusters):
         authoritative = spm
         if spm.name.lower().startswith("sk_"):
             source = Path(folder) / spm.name[3:]
-            if source.is_file():
+            if path_is_file(source):
                 authoritative = source
         target_materials = {}
         active_target_materials = {}
@@ -5349,7 +5539,7 @@ def _source_material_ref_entries(folder, sk_spm):
     tail = sk_spm.stem[3:] if sk_spm.name.lower().startswith("sk_") else sk_spm.stem
     sm_expected = folder / f"SM_{tail}.spm"
     candidates = unique(
-        [path for path in (sm_expected, expected) if path and path.is_file()]
+        [path for path in (sm_expected, expected) if path and path_is_file(path)]
         + source_spms(folder)
     )
     result = {}
@@ -5912,7 +6102,7 @@ def preserved_cluster_materials(folder, definitions=None):
         exact_source = folder / sk_spm.name[3:]
         exact_definitions = (
             cluster_render_definitions_from_spm(folder, exact_source)
-            if exact_source.is_file() else {})
+            if path_is_file(exact_source) else {})
         referenced_ids = active_material_ids(sk_spm)
         visible_ids = visible_material_ids(sk_spm)
         for row in extract_material_image_refs(sk_spm):
@@ -8052,7 +8242,7 @@ def resolve_shared_atlas_entries(items, cfg):
     return sorted(changed)
 
 
-def _provider_inventory(root, scope_folders=None):
+def _provider_inventory(root, scope_folders=None, *, display_fast=False):
     """Capture every production SPM that can affect provider connectivity."""
     if scope_folders is None:
         folders = list(production_spm_folders(root) or ())
@@ -8084,21 +8274,55 @@ def _provider_inventory(root, scope_folders=None):
             path for path in candidates
             if path.suffix.casefold() == ".spm" and is_live_spm(path)
         )
-    report_cache = _REPORT_SCAN_CACHE.get()
-    memo = (
-        report_cache.get("content_snapshots")
-        if report_cache is not None else None
-    )
-    identity = content_identity(
-        paths,
-        membership=(startup_path_key(path) for path in paths),
-        memo=memo,
-        max_files=10_000,
-    )
+    if display_fast:
+        rows = []
+        for path in sorted(paths, key=lambda value: str(value).casefold()):
+            stat = path.stat()
+            rows.append({
+                "path": startup_path_key(path),
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "fingerprint": f"{stat.st_size}:{stat.st_mtime_ns}",
+                "fingerprint_algorithm": "size-mtime-display-v1",
+            })
+        membership = [row["path"] for row in rows]
+        identity = {
+            "algorithm": "sha256-of-size-mtime-display-keys-v1",
+            "sha256": canonical_json_sha256({
+                "files": [
+                    {
+                        "path": row["path"],
+                        "size": row["size"],
+                        "mtime_ns": row["mtime_ns"],
+                    }
+                    for row in rows
+                ],
+                "membership": membership,
+            }),
+            "file_count": len(rows),
+            "files": rows,
+            "membership": membership,
+        }
+    else:
+        report_cache = _REPORT_SCAN_CACHE.get()
+        memo = (
+            report_cache.get("content_snapshots")
+            if report_cache is not None else None
+        )
+        identity = content_identity(
+            paths,
+            membership=(startup_path_key(path) for path in paths),
+            memo=memo,
+            max_files=10_000,
+        )
     identity["_source_paths"] = [
         str(path.absolute())
         for path in sorted(paths, key=lambda path: str(path).casefold())
     ]
+    report_cache = _REPORT_SCAN_CACHE.get()
+    if report_cache is not None:
+        for path in paths:
+            report_cache["path_is_file"][startup_path_key(path)] = True
     return identity
 
 
@@ -8129,9 +8353,13 @@ def _validated_cached_provider_map(value, inventory):
 
 def canonical_cluster_provider_map(
         root, metrics=None, inventory_paths=None, scope_folders=None,
-        *, read_cache=True):
+        *, read_cache=True, display_fast=False):
     """Map canonical provider candidates through a content-validated cache."""
-    inventory = _provider_inventory(root, scope_folders=scope_folders)
+    inventory = _provider_inventory(
+        root,
+        scope_folders=scope_folders,
+        display_fast=display_fast,
+    )
     if inventory_paths is not None:
         inventory_paths.extend(
             Path(path) for path in inventory.get("_source_paths") or ()
@@ -8140,6 +8368,8 @@ def canonical_cluster_provider_map(
         startup_path_key(folder) for folder in scope_folders or ()
     })
     namespace = startup_path_key(root)
+    if display_fast:
+        namespace += "|display-stat-v1"
     if scope_folders is not None:
         namespace += "|scope:" + hashlib.sha256(
             json.dumps(
@@ -8163,6 +8393,7 @@ def canonical_cluster_provider_map(
             metrics.update({
                 "cache_hit": True,
                 "discovery_strategy": "content_identity_cache",
+                "inventory_identity": inventory.get("algorithm"),
                 "inventory_file_count": inventory["file_count"],
                 "provider_count": sum(len(rows) for rows in validated.values()),
                 "scope_folder_count": len(scope_keys),
@@ -8206,6 +8437,7 @@ def canonical_cluster_provider_map(
         metrics.update({
             "cache_hit": False,
             "discovery_strategy": "bounded_canonical_pair_inventory",
+            "inventory_identity": inventory.get("algorithm"),
             "inventory_file_count": inventory["file_count"],
             "provider_count": sum(len(rows) for rows in result.values()),
             "scope_folder_count": len(scope_keys),
@@ -8339,7 +8571,8 @@ def _audit_one_with_handoff_scope(
         audit_one, folder, *, content_snapshots=None,
         spm_content_keys=None, session_metrics=None,
         cluster_origin_receipts=None, physical_receipts=None,
-        file_sha256_memo=None, mutation_authority=False):
+        file_sha256_memo=None, mutation_authority=False,
+        display_fast=False, path_is_files=None):
     """Bound decoded handoff and repeated filesystem reads to one folder."""
     report_token = _REPORT_SCAN_CACHE.set(_new_report_scan_cache(
         content_snapshots=content_snapshots,
@@ -8348,7 +8581,9 @@ def _audit_one_with_handoff_scope(
         cluster_origin_receipts=cluster_origin_receipts,
         physical_receipts=physical_receipts,
         file_sha256_memo=file_sha256_memo,
+        path_is_files=path_is_files,
         mutation_authority=mutation_authority,
+        display_fast=display_fast,
     ))
     _PENDING_DECODED_HANDOFF.set(None)
     _PENDING_RAW_SPM_HANDOFF.set(None)
@@ -8404,6 +8639,14 @@ def _audit_report_folders(
         report_cache is not None
         and report_cache.get("mutation_authority")
     )
+    path_is_files = (
+        report_cache.get("path_is_file")
+        if report_cache is not None else None
+    )
+    display_fast = bool(
+        report_cache is not None
+        and report_cache.get("display_fast")
+    )
     if total_folders <= 1:
         for folder in folders:
             if cancel_check is not None and cancel_check():
@@ -8418,6 +8661,8 @@ def _audit_report_folders(
                 physical_receipts=physical_receipts,
                 file_sha256_memo=file_sha256_memo,
                 mutation_authority=mutation_authority,
+                display_fast=display_fast,
+                path_is_files=path_is_files,
             )
             items.append(item)
             if item_callback is not None:
@@ -8446,6 +8691,8 @@ def _audit_report_folders(
                 physical_receipts=physical_receipts,
                 file_sha256_memo=file_sha256_memo,
                 mutation_authority=mutation_authority,
+                display_fast=display_fast,
+                path_is_files=path_is_files,
             ): (index, folder)
             for index, folder in enumerate(folders)
         }
@@ -8470,7 +8717,8 @@ def make_report(
         cfg, targets=None, include_refs=False, pcg_targets=None,
         target_mesh_names=None, progress_callback=None, item_callback=None,
         cancel_check=None, session_evidence=None, mutation_authority=False,
-        cluster_assembly_only=False):
+        cluster_assembly_only=False, display_fast=False):
+    display_fast = bool(display_fast and not mutation_authority)
     startup_started = time.perf_counter()
     phase_started = startup_started
     startup_phases = []
@@ -8521,16 +8769,25 @@ def make_report(
             inventory_paths=provider_inventory_paths,
             scope_folders=folders,
             read_cache=not mutation_authority,
+            display_fast=display_fast,
         )
         if cfg.get("tree_root")
         else {}
     )
     finish_phase("provider_discovery", **provider_metrics)
     require_not_cancelled()
+    prefetch_paths = provider_inventory_paths
+    display_seed_metrics = {}
+    if display_fast:
+        prefetch_paths, display_seed_metrics = _seed_display_spm_content_keys(
+            provider_inventory_paths,
+            cancel_check=cancel_check,
+        )
     spm_prefetch_metrics = _prefetch_spm_content_keys(
-        provider_inventory_paths,
+        prefetch_paths,
         cancel_check=cancel_check,
     )
+    spm_prefetch_metrics.update(display_seed_metrics)
     finish_phase("spm_content_identity_prefetch", **spm_prefetch_metrics)
     require_not_cancelled()
     # An explicit --target-mesh is the run's mutation/audit boundary.  PCG
@@ -8853,6 +9110,8 @@ def make_report(
             "cluster_assembly_only"
             if cluster_assembly_only else "full_pcg_texture"
         ),
+        "display_fast": display_fast,
+        "mutation_authority": bool(mutation_authority),
         "config": cfg,
         "startup_timing": {
             "schema_version": 1,

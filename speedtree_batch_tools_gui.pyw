@@ -22,7 +22,11 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from process_lifecycle import external_handoff_popen, external_handoff_startfile
+from process_lifecycle import (
+    external_handoff_popen,
+    external_handoff_startfile,
+    shutdown_process_supervisor,
+)
 from speedtree_error_log import ERROR_LOG, record_exception
 
 
@@ -948,6 +952,21 @@ class IntegratedApp:
         def finalize():
             nonlocal finalized
             if finalized:
+                return
+            try:
+                receipt = shutdown_process_supervisor(
+                    "integrated_gui_close",
+                    terminate_grace=1.0,
+                    kill_grace=5.0,
+                ) or {}
+                survivors = list(receipt.get("survivors") or ())
+                if survivors:
+                    raise RuntimeError(
+                        "관리 프로세스 트리 종료 후 survivor가 남았습니다: "
+                        + ", ".join(str(value) for value in survivors)
+                    )
+            except Exception as exc:
+                shutdown_failed("process_supervisor", exc)
                 return
             finalized = True
             for app in apps:

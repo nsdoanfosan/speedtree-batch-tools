@@ -3687,7 +3687,7 @@ def _atlas_normalized_variants(
             # A normalized receipt is a cache of a previously validated
             # delivery.  Staleness cannot decide the current content
             # contract; ignore it here and let the live SPM/FBX role audit
-            # determine pass-through vs normalized_variants_required.
+            # determine pass-through vs normalization-applicability metadata.
             stale.append(str(manifest_path))
             continue
         target_registry = None
@@ -4944,6 +4944,10 @@ def build_cluster_assembly_contract(
         rendered_provider_expansion_covered = bool(
             spm_only_provider_candidate
         )
+        # Legacy field name: `required` means only that the optional
+        # normalizer can produce a part for this role.  It is report metadata,
+        # never a runtime requirement, admission gate, or repair trigger.  See
+        # the handoff issue policy below before changing this interpretation.
         normalized_variants_required = decision == "normalize_part"
         normalized_variants_missing = bool(
             normalized_variants_required and not normalized_variants
@@ -5210,13 +5214,13 @@ def build_cluster_assembly_contract(
         handoff_status = "pass_through"
     issues = []
     for dependency in actual_dependencies:
-        if dependency.get("normalized_variants_missing"):
-            issues.append({
-                "code": "NORMALIZED_VARIANTS_REQUIRED",
-                "role": dependency["role"],
-                "spm": str(dependency["spm"]),
-                "reason": "current_live_pair_requires_assembly_part",
-            })
+        # POLICY: normalized variants are an optional Assembly optimization,
+        # not a runtime admission contract.  The rendered BWR mesh remains
+        # authoritative and unmatched topology is preserved in Base.  Keep
+        # normalized_variants_missing as report metadata, but do not turn it
+        # into a handoff issue, repair request, or blocking error.  Re-adding
+        # NORMALIZED_VARIANTS_REQUIRED here recreates the legacy gate that
+        # rejected already-built trees such as Lauraceae 11/12.
         tga_validation = dependency.get("tga_basename_validation") or {}
         if _concrete_texture_reference_missing(tga_validation):
             issues.append({

@@ -1785,8 +1785,13 @@ def cache_blender_connection_rows(
     *,
     verify_physical=True,
     read_cache=True,
+    reuse_display_stat_evidence=False,
 ):
-    """Resolve or content-validate relation rows off the Tk main thread."""
+    """Resolve or content-validate relation rows off the Tk main thread.
+
+    ``reuse_display_stat_evidence`` is restricted to a read-only board pass.
+    Mutation/scoped authority callers keep the default and hash current bytes.
+    """
     items = list((report or {}).get("items") or [])
     if not items:
         if metrics is not None:
@@ -1822,11 +1827,12 @@ def cache_blender_connection_rows(
         and row.get("fingerprint_algorithm") == "sha256-full-v1"
         and row.get("fingerprint")
     }
-    # Session evidence is a same-refresh acceleration candidate, never
-    # current-content authority.  Cache hits must hash the current bytes too,
-    # including same-size/restored-mtime tampering after the primary audit.
+    # Session evidence is never mutation authority. The default path hashes
+    # current bytes, including same-size/restored-mtime tampering. Only the
+    # explicitly display-only path may accept a current stat match here.
     first_pass_content_memo = {}
     reused_exact_content_file_count = 0
+    reused_display_stat_content_file_count = 0
     first_pass_directory_memo = {}
     first_pass_json_memo = {}
     final_pass_content_memo = {}
@@ -1835,6 +1841,7 @@ def cache_blender_connection_rows(
 
     def prepare_inventories(
             target_items, content_memo, directory_memo, json_memo):
+        nonlocal reused_display_stat_content_file_count
         prepared = {}
         union_paths = {}
         for target_item in target_items:
@@ -1852,6 +1859,33 @@ def cache_blender_connection_rows(
             prepared[id(target_item)] = inventory
             for path in inventory[0].values():
                 union_paths[startup_path_key(path)] = path
+        if (
+            reuse_display_stat_evidence
+            and not verify_physical
+            and content_memo is first_pass_content_memo
+        ):
+            for path_key, path in union_paths.items():
+                candidate = session_exact_candidates.get(path_key)
+                if candidate is None:
+                    continue
+                try:
+                    stat = Path(path).stat()
+                except OSError:
+                    continue
+                if (
+                    int(candidate.get("size") or -1) != stat.st_size
+                    or int(candidate.get("mtime_ns") or -1)
+                    != stat.st_mtime_ns
+                ):
+                    continue
+                content_memo[path_key] = {
+                    "path": path_key,
+                    "size": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                    "fingerprint": candidate["fingerprint"],
+                    "fingerprint_algorithm": "sha256-full-v1",
+                }
+                reused_display_stat_content_file_count += 1
         # Hash the generation-wide dependency union once. Per-item identity
         # assembly below is then a deterministic in-memory projection instead
         # of creating 55 executor pools and reopening shared files.
@@ -1913,9 +1947,13 @@ def cache_blender_connection_rows(
             "changed_during_scan": changed_during_scan,
             "first_pass_physical_content_reads": len(
                 first_pass_content_memo
-            ) - reused_exact_content_file_count,
+            ) - reused_exact_content_file_count \
+                - reused_display_stat_content_file_count,
             "reused_exact_content_file_count": (
                 reused_exact_content_file_count
+            ),
+            "reused_display_stat_content_file_count": (
+                reused_display_stat_content_file_count
             ),
             "session_exact_candidate_count": len(
                 session_exact_candidates
@@ -1951,6 +1989,9 @@ def cache_blender_connection_rows(
             ),
             "physical_validation": (
                 "full" if verify_physical else "deferred"
+            ),
+            "display_stat_evidence_reuse": bool(
+                reuse_display_stat_evidence and not verify_physical
             ),
             "persisted_cache_policy": (
                 "read_write" if read_cache else "fresh_projection"
@@ -2145,8 +2186,10 @@ def blender_connection_summary(row):
 
 def blender_connection_overview(item):
     """Summarize active blend/SPM connections for the fourth board column."""
+    if item.get("status") == "startup_pending":
+        return "상태 확인 중…"
     if item.get("_gui_blender_connection_pending"):
-        return "선택 시 연결 확인"
+        return "연결 상태 미확인"
     rows = blender_connection_rows(item)
     if not rows:
         return "blend 없음"
@@ -2813,6 +2856,10 @@ class App:
             self.sync_state = {"entries": {}}
         self._set_busy(False)
         self._update_step3_button()
+        # The first paint is immediate (saved board or cheap folder inventory),
+        # then exactly one cached, parallel read-only audit makes every folder
+        # status current without using execution selection as a display gate.
+        self.root.after(0, self._start_initial_refresh)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -3668,7 +3715,7 @@ class App:
     def _load_initial_folder_inventory(self):
         """Open a cold board from cheap folder discovery only.
 
-        Detailed SPM/SBS/Blender inspection is intentionally user-triggered.
+        The existing cached read-only audit fills these rows in the background.
         """
         try:
             folders = candidate_folders(
@@ -3695,7 +3742,7 @@ class App:
         self._update_summary()
         self.status_var.set(
             f"생산 폴더 {len(items)}개 즉시 표시 · "
-            "파일 상태는 아직 읽지 않음 · 실행 시 체크한 폴더만 확인"
+            "폴더별 파일 상태 자동 확인 대기"
         )
 
     @staticmethod
@@ -3706,7 +3753,7 @@ class App:
             "folder": str(folder),
             "name": folder.name,
             "status": "startup_pending",
-            "actions": ["선택 실행 시 상태 확인"],
+            "actions": ["자동 상태 확인 중"],
             "source_spms": [],
             "sk_spms": [],
             "cluster_items": [],
@@ -3733,7 +3780,7 @@ class App:
         generation,
         cancel_event,
     ):
-        """Paint the first cold live row while the remaining fleet continues."""
+        """Paint the first cold live row without hiding pending folders."""
         if not self._refresh_generation_is_current(generation, cancel_event):
             return
         if getattr(self, "_had_initial_snapshot", False):
@@ -3747,23 +3794,48 @@ class App:
         item.setdefault("level_placements", [])
         item.setdefault("pcg_target_meshes", [])
         mark_blender_connection_rows_pending({"items": [item]})
-        self.report = {
+        current = dict(getattr(self, "report", None) or {})
+        current_items = list(current.get("items") or ())
+        live_key = startup_path_key(item.get("folder") or "")
+        replaced = False
+        for index, existing in enumerate(current_items):
+            if startup_path_key(existing.get("folder") or "") == live_key:
+                current_items[index] = item
+                replaced = True
+                break
+        if not replaced:
+            current_items.append(item)
+        by_status = {}
+        for current_item in current_items:
+            status = current_item.get("status", "unknown")
+            by_status[status] = by_status.get(status, 0) + 1
+        current.update({
             "generated_at": datetime.now().isoformat(timespec="seconds"),
-            "pcg_targets": {"mesh_count": 0},
+            "pcg_targets": current.get("pcg_targets") or {"mesh_count": 0},
             "summary": {
-                "total": 1,
-                "by_status": {item.get("status", "unknown"): 1},
+                "total": len(current_items),
+                "by_status": by_status,
             },
-            "items": [item],
+            "items": current_items,
+            "inventory_pending": any(
+                current_item.get("status") == "startup_pending"
+                for current_item in current_items
+            ),
             "partial_live_audit": True,
-        }
+        })
+        self.report = current
         self._display_only_snapshot = True
         self.populate()
         self._update_summary()
         self._set_busy(False)
         self._lock_mutation_controls()
+        complete = sum(
+            current_item.get("status") != "startup_pending"
+            for current_item in current_items
+        )
         self.status_var.set(
-            "첫 live 행 표시 · 나머지 폴더 검사 중… · 변경 작업 잠김"
+            f"폴더별 상태 확인 {complete}/{len(current_items)} · "
+            "나머지 폴더 확인 중… · 변경 작업 잠김"
         )
 
     def _start_initial_refresh(self):
@@ -3835,6 +3907,7 @@ class App:
                     item_callback=first_live_item,
                     cancel_check=cancel_event.is_set,
                     session_evidence=session_evidence,
+                    display_fast=True,
                 )
             except Exception as exc:
                 error = exc
@@ -3905,7 +3978,7 @@ class App:
             )
         primary_view_started = time.perf_counter()
         self.report = report
-        self._display_only_snapshot = False
+        self._display_only_snapshot = bool(report.get("display_fast"))
         self.texplan_cache.clear()
         if not hasattr(self, "texplan_errors"):
             self.texplan_errors = {}
@@ -4041,6 +4114,7 @@ class App:
                     metrics=relation_metrics,
                     session_evidence=session_evidence,
                     verify_physical=False,
+                    reuse_display_stat_evidence=True,
                 )
                 tracker = getattr(self, "startup_latency", None)
                 if tracker is not None:
@@ -4162,7 +4236,7 @@ class App:
         else:
             relation_view_started = time.perf_counter()
             self.report = report
-            self._display_only_snapshot = False
+            self._display_only_snapshot = bool(report.get("display_fast"))
             persistence = (
                 report.get("cluster_assembly_receipt_persistence") or {}
             )
@@ -4191,11 +4265,13 @@ class App:
                     },
                 )
                 tracker.milestone(
-                    "mutation_usable_ready",
+                    "display_status_ready",
                     counts={
                         "folder_count": len(report.get("items") or ()),
                     },
-                    details={"live_relation_evidence": True},
+                    details={
+                        "selected_mutation_scope_requires_exact_audit": True,
+                    },
                 )
         if stage == "relation" and pending_sync is not None:
             self._pending_initial_sync_result = None
@@ -4450,6 +4526,7 @@ class App:
                     progress_callback=progress,
                     cancel_check=cancel_event.is_set,
                     session_evidence=session_evidence,
+                    display_fast=True,
                 )
                 publication_allowed = (
                     lambda: self._refresh_generation_is_current(
@@ -4483,6 +4560,8 @@ class App:
                     progress_callback=relation_progress,
                     cancel_check=cancel_event.is_set,
                     session_evidence=session_evidence,
+                    verify_physical=False,
+                    reuse_display_stat_evidence=True,
                 )
                 sync_state = load_sync_state(migrate=False)
             except Exception as exc:
@@ -4531,6 +4610,7 @@ class App:
             self._set_busy(False)
         else:
             self.report = report
+            self._display_only_snapshot = bool(report.get("display_fast"))
             self.sync_state = sync_state
             persistence = (
                 report.get("cluster_assembly_receipt_persistence") or {}
@@ -4988,7 +5068,7 @@ class App:
     # ---------------------------------------------------------- column texts
     def step1_text(self, item):
         if item.get("status") == "startup_pending":
-            return "선택 시 상태 확인"
+            return "상태 확인 중…"
         if item.get("duplicate_target_mesh_names") or item.get("duplicate_pcg_target_mesh_names"):
             return "⚠ 중복 매칭 확인"
         statuses = item.get("target_spm_statuses") or []
@@ -5018,7 +5098,7 @@ class App:
 
     def step2_text(self, item):
         if item.get("status") == "startup_pending":
-            return "선택 시 상태 확인"
+            return "상태 확인 중…"
         sources = item.get("leaf_mesh_sources") or []
         if not sources:
             inventory = item.get("leaf_atlas_inventory") or []
@@ -5096,7 +5176,7 @@ class App:
 
     def step3_text(self, item):
         if item.get("status") == "startup_pending":
-            return "선택 시 상태 확인"
+            return "상태 확인 중…"
         state = step3_item_state(item)
         if not state["sets"]:
             if state["connection_sets"]:
@@ -5196,6 +5276,9 @@ class App:
         if selected and all(
             isinstance(item.get("_gui_live_evidence"), dict)
             and item["_gui_live_evidence"].get("sha256")
+            and item["_gui_live_evidence"].get(
+                "relation_validation_mode"
+            ) == "physical"
             for item in selected
         ):
             return True

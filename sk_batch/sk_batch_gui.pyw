@@ -46,7 +46,7 @@ REPO_DIR = TOOL_DIR.parent
 sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(TOOL_DIR))
 
-from process_lifecycle import owned_run
+from process_lifecycle import owned_run, shutdown_process_supervisor
 
 from code_compile_gate import (
     CODE_REVISION_RESTART_ROUTE,
@@ -1183,238 +1183,16 @@ def cluster_live_audit_target_block(contract, target_spm):
     return None, None
 
 
-_NORMALIZED_PROVIDER_REFRESH_CODES = frozenset({
+_LEGACY_NONBLOCKING_NORMALIZATION_CODES = frozenset({
     "NORMALIZED_VARIANTS_REQUIRED",
+    "NORMALIZED_VARIANTS_STALE",
 })
 
-
-def _cluster_provider_relation_evidence(
-    dependency,
-    target_spm,
-    *,
-    snapshot_cache,
-):
-    """Seal one live provider/target relation for exact repair.
-
-    An external Atlas registry is normally the ON selector.  The Assembly
-    audit can also discover a provider that is already rendered by the exact
-    Tree even while that derived registry row is OFF.  In that case the live
-    SPM and Full FBX pairs are stronger positive placement evidence.  Seal all
-    files that established that result so a queued repair may add only this
-    exact relation, and only while the evidence remains unchanged.
-    """
-
-    target = Path(target_spm).resolve(strict=False)
-    target_key = normalized_folder_key(target)
-    relation = dependency.get("target_relation") or {}
-    status = str(relation.get("status") or "")
-    matched_targets = {
-        normalized_folder_key(value)
-        for value in relation.get("matched_target_spms") or ()
-        if value
-    }
-    explicitly_on = bool(
-        status == "explicit_on"
-        and relation.get("allowed") is True
-        and target_key in matched_targets
-    )
-
-    target_rows = [
-        row for row in dependency.get("targets") or ()
-        if (
-            isinstance(row, dict)
-            and row.get("spm")
-            and normalized_folder_key(row["spm"]) == target_key
-        )
-    ]
-    if len(target_rows) != 1:
-        return None
-    target_row = target_rows[0]
-    spm_pair = target_row.get("spm_material_mesh_pair") or {}
-    fbx_pair = target_row.get("fbx_material_mesh_pair") or {}
-    explicitly_off_but_rendered = bool(
-        status == "explicit_off"
-        and relation.get("allowed") is False
-        and dependency.get("current_live_pair_covered") is True
-        and spm_pair.get("status") == "complete_pair"
-        and fbx_pair.get("status") == "complete_pair"
-        and fbx_pair.get("decision") == "normalize_part"
-    )
-    if not (explicitly_on or explicitly_off_but_rendered):
-        return None
-
-    provider_value = next(
-        (
-            dependency.get(field)
-            for field in ("spm", "output_spm", "authoring_spm", "source_spm")
-            if dependency.get(field)
-        ),
-        None,
-    )
-    if not provider_value:
-        return None
-    provider = Path(provider_value).resolve(strict=False)
-    blend = Path(
-        relation.get("source_blend") or provider.with_suffix(".blend")
-    ).resolve(strict=False)
-    if (
-        not target.is_file()
-        or not provider.is_file()
-        or not blend.is_file()
-        or blend != provider.with_suffix(".blend")
-        or provider.parent.name.casefold() != "cluster"
-        or target.parent != provider.parent.parent
-    ):
-        return None
-
-    fbx_record = copy.deepcopy(
-        ((target_row.get("export_bundle") or {}).get("fbx") or {})
-    )
-    fbx_path = Path(fbx_record.get("path") or "").resolve(strict=False)
-    if (
-        not fbx_path.is_file()
-        or not (
-            fbx_record.get("sha256")
-            or fbx_record.get("fingerprint")
-        )
-    ):
-        return None
-    registry_record = copy.deepcopy(relation.get("registry") or {})
-    registry_path = Path(
-        registry_record.get("path") or blend.with_suffix(
-            ".atlas_leaf_targets.json"
-        )
-    ).resolve(strict=False)
-    if (
-        not registry_path.is_file()
-        or not (
-            registry_record.get("sha256")
-            or registry_record.get("fingerprint")
-        )
-    ):
-        return None
-
-    def exact_snapshot(path):
-        key = ("exact", normalized_folder_key(path))
-        if key not in snapshot_cache:
-            snapshot_cache[key] = {
-                "path": str(path),
-                "fingerprint_algorithm": "blake2b-128-full-v1",
-                **file_content_snapshot(path),
-            }
-        return copy.deepcopy(snapshot_cache[key])
-
-    def sampled_snapshot(path):
-        key = ("sampled", normalized_folder_key(path))
-        if key not in snapshot_cache:
-            snapshot_cache[key] = {
-                "path": str(path),
-                **sampled_file_content_snapshot(path),
-            }
-        return copy.deepcopy(snapshot_cache[key])
-
-    return {
-        "schema_version": 1,
-        "target_spm": str(target),
-        "provider_spm": str(provider),
-        "provider_blend": str(blend),
-        "relation_status": status,
-        "relation_allowed": relation.get("allowed"),
-        "live_pair_proof": {
-            "current_live_pair_covered": bool(
-                dependency.get("current_live_pair_covered")
-            ),
-            "spm_pair_status": str(spm_pair.get("status") or ""),
-            "fbx_pair_status": str(fbx_pair.get("status") or ""),
-            "fbx_pair_decision": str(fbx_pair.get("decision") or ""),
-        },
-        "artifacts": {
-            "target_spm": exact_snapshot(target),
-            "provider_spm": exact_snapshot(provider),
-            "provider_blend": sampled_snapshot(blend),
-            "target_fbx": fbx_record,
-            "target_registry": {
-                **registry_record,
-                "path": str(registry_path),
-            },
-        },
-    }
-
-
-def cluster_live_audit_provider_refresh_block(contract, target_spm, issues):
-    """Admit exact live-provider receipt refreshes from an owner audit.
-
-    Missing normalized metadata has no ``delivery_blocked_targets`` payload, so
-    the ordinary target-delivery admission cannot see it.  An explicit ON row
-    is safe to refresh.  An explicit OFF row is also repairable only when the
-    same live audit proves a complete exact SPM pair and Full-FBX pair; the
-    returned sealed relation lets the executor restore that derived registry
-    row without widening to any sibling target or provider.
-    """
-
-    target = Path(target_spm).resolve(strict=False)
-    provider_paths = {}
-    provider_relations = {}
-    issue_codes = set()
-    snapshot_cache = {}
-    issue_rows = [row for row in issues or () if isinstance(row, dict)]
-    if not issue_rows:
-        return None, None
-
-    for issue in issue_rows:
-        code = str(issue.get("code") or "").strip().upper()
-        if code not in _NORMALIZED_PROVIDER_REFRESH_CODES:
-            return None, None
-        issue_spm = issue.get("spm")
-        dependency = (
-            cluster_contract_dependency_for_spm(contract, issue_spm)
-            if issue_spm
-            else None
-        )
-        if not isinstance(dependency, dict):
-            return None, None
-        try:
-            relation_evidence = _cluster_provider_relation_evidence(
-                dependency,
-                target,
-                snapshot_cache=snapshot_cache,
-            )
-        except (OSError, RuntimeError, ValueError):
-            return None, None
-        if relation_evidence is None:
-            return None, None
-        producer = relation_evidence["provider_spm"]
-        provider_key = normalized_folder_key(producer)
-        provider_paths.setdefault(provider_key, str(producer))
-        provider_relations.setdefault(
-            provider_key,
-            relation_evidence,
-        )
-        issue_codes.add(code)
-
-    ordered_providers = [
-        provider_paths[key] for key in sorted(provider_paths)
-    ]
-    if not ordered_providers:
-        return None, None
-    reason_token = "normalized_variants_required"
-    return Path(ordered_providers[0]), {
-        "reason_token": reason_token,
-        "target_spm": str(target),
-        "target_name": target.name,
-        "delivery_mode": "exact_on_provider_receipt_refresh",
-        "delivery_errors": sorted(issue_codes),
-        "delivery_remedy": (
-            "Refresh the exact registered Cluster relationship and re-audit "
-            "the owner Tree"
-        ),
-        "stale_node_table_target_mesh_ids": [],
-        "live_node_table": {},
-        "provider_spms": ordered_providers,
-        "cluster_provider_relations": [
-            provider_relations[key] for key in sorted(provider_relations)
-        ],
-    }
+# POLICY: these tokens exist only in old saved receipts.  A missing or stale
+# optional normalized variant is not a delivery failure, must never schedule a
+# provider refresh, and must never participate in target admission.  Current
+# producers no longer emit these rows; this quarantine remains solely so an
+# old receipt cannot resurrect the deleted gate after an application restart.
 
 
 def cluster_contract_issues(contract):
@@ -1598,6 +1376,9 @@ def cluster_stale_node_table_recovery_scope(
     for dependency in dependencies:
         if not isinstance(dependency, dict):
             return unavailable("target_recovery_dependency_invalid")
+        # This legacy-named metadata may only narrow an already-authorized
+        # stale-node-table recovery scope.  It never initiates normalization,
+        # repair, admission, or failure by itself.
         if dependency.get("normalized_variants_required") is not True:
             continue
         required_dependency_count += 1
@@ -2644,6 +2425,11 @@ class App:
         self._stale_node_table_modeler_session = None
         self.active_procs = set()          # all running child procs (serial or parallel)
         self.procs_lock = threading.Lock()
+        self._active_process_cleanup_lock = threading.Lock()
+        self._active_process_cleanup_worker = None
+        self._shutdown_callbacks = []
+        self._shutdown_poll_scheduled = False
+        self._shutdown_complete = False
         self.state_lock = threading.RLock()  # guards self.state writes across worker threads
         self._reset_cluster_receipt_refresh_memo()
         self._scan_generation = 0
@@ -10158,6 +9944,65 @@ class App:
             or excluded_ids
         )
 
+    def _start_active_process_cleanup(self):
+        """Immediately reap every exact process tree owned by the active batch.
+
+        Worker polling remains the normal completion path, but the Tk Stop
+        handler must not wait for a long Python stage to return to that poll.
+        ``terminate_process_tree`` is serialized per retained process handle,
+        so this cleanup can safely race the worker's own finally block without
+        ever broadening termination by executable name or PID discovery.
+        """
+
+        lock = getattr(self, "_active_process_cleanup_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._active_process_cleanup_lock = lock
+        with lock:
+            current = getattr(self, "_active_process_cleanup_worker", None)
+            if current is not None and current.is_alive():
+                return current
+
+            procs_lock = getattr(self, "procs_lock", None)
+            if procs_lock is None:
+                procs_lock = threading.Lock()
+                self.procs_lock = procs_lock
+            if not hasattr(self, "active_procs"):
+                self.active_procs = set()
+
+            def cleanup():
+                failures = 0
+                with procs_lock:
+                    processes = list(self.active_procs)
+                for process in processes:
+                    try:
+                        if process.poll() is None and not terminate_process_tree(
+                            process
+                        ):
+                            failures += 1
+                    except Exception:
+                        failures += 1
+                if processes:
+                    if failures:
+                        self.log(
+                            "중지 정리: 관리 프로세스 트리 "
+                            f"{len(processes)}개 중 {failures}개 종료 확인 실패"
+                        )
+                    else:
+                        self.log(
+                            "중지 정리 완료: 관리 프로세스 트리 "
+                            f"{len(processes)}개 회수"
+                        )
+
+            worker = threading.Thread(
+                target=cleanup,
+                name="sk-batch-process-cleanup",
+                daemon=True,
+            )
+            self._active_process_cleanup_worker = worker
+            worker.start()
+            return worker
+
     def stop_batch(self):
         self._ensure_batch_queue_state()
         pending_jobs = list(self.pending_batch_jobs)
@@ -10192,6 +10037,7 @@ class App:
         with self._recovery_commit_lock:
             resume_commit = copy.deepcopy(self._recovery_resume_commit)
             self.stop_flag.set()
+        self._start_active_process_cleanup()
         planning_tracker = getattr(self, "_active_retry_progress", None)
         if planning_tracker is not None:
             planning = planning_tracker.snapshot(evaluate=False).get(
@@ -10237,7 +10083,16 @@ class App:
                 + suffix
             )
 
-    def shutdown_shared_queue(self):
+    def shutdown_shared_queue(self, *, on_complete=None):
+        if callable(on_complete):
+            if getattr(self, "_shutdown_complete", False):
+                self.root.after_idle(on_complete)
+                return
+            callbacks = getattr(self, "_shutdown_callbacks", None)
+            if callbacks is None:
+                callbacks = []
+                self._shutdown_callbacks = callbacks
+            callbacks.append(on_complete)
         runtime = getattr(self, "shared_queue_runtime", None)
         if runtime is not None:
             # Persist the operator-close event before the GUI process can
@@ -10260,6 +10115,39 @@ class App:
                     "operator closed the SK Batch window; shutdown requested"
                 )
             self.stop_batch()
+        if callable(on_complete):
+            self._schedule_shutdown_completion_poll()
+
+    def _schedule_shutdown_completion_poll(self):
+        if (
+            getattr(self, "_shutdown_complete", False)
+            or getattr(self, "_shutdown_poll_scheduled", False)
+        ):
+            return
+        self._shutdown_poll_scheduled = True
+        self.root.after(50, self._poll_shutdown_completion)
+
+    def _poll_shutdown_completion(self):
+        self._shutdown_poll_scheduled = False
+        cleanup = getattr(self, "_active_process_cleanup_worker", None)
+        if cleanup is not None and cleanup.is_alive():
+            self._schedule_shutdown_completion_poll()
+            return
+        with self.procs_lock:
+            live_processes = [
+                process
+                for process in self.active_procs
+                if process.poll() is None
+            ]
+        if live_processes:
+            self._start_active_process_cleanup()
+            self._schedule_shutdown_completion_poll()
+            return
+        self._shutdown_complete = True
+        callbacks = list(getattr(self, "_shutdown_callbacks", ()))
+        self._shutdown_callbacks.clear()
+        for callback in callbacks:
+            callback()
 
     def _record_phase_status(
         self, iid, column, status_text, kind, reason, details=None, persist=True
@@ -14169,14 +14057,6 @@ class App:
                 selected if isinstance(selected, dict) else {},
                 spm,
             )
-            if not audit_block:
-                audit_producer, audit_block = (
-                    cluster_live_audit_provider_refresh_block(
-                        selected if isinstance(selected, dict) else {},
-                        spm,
-                        live_issues,
-                    )
-                )
             if (
                 audit_block
                 and audit_producer is not None
@@ -14225,7 +14105,7 @@ class App:
                 issue
                 for issue in live_issues
                 if str(issue.get("code") or "").strip().upper()
-                not in _NORMALIZED_PROVIDER_REFRESH_CODES
+                not in _LEGACY_NONBLOCKING_NORMALIZATION_CODES
             ]
             if terminal_issues:
                 terminal_summary = cluster_issue_summary(terminal_issues)
@@ -14246,12 +14126,8 @@ class App:
                     log_file=log_file,
                     report_file=audit_report,
                 )
-            # A legacy provider can remain visible in the final Full FBX while
-            # its old Atlas normalization receipt has been retired.  When no
-            # exact provider refresh can be planned, this is maintenance
-            # metadata rather than an owner-asset failure.  Let Blender reuse
-            # the current production Assembly manifest instead of terminating
-            # an asset that already has a successful build.
+            # Preserve old rows for diagnostics only.  They are intentionally
+            # excluded before admission and cannot trigger repair or failure.
             raw_audit["nonblocking_maintenance_issues"] = copy.deepcopy(
                 live_issues
             )
@@ -14306,6 +14182,9 @@ class App:
                     "live_audit_report": str(audit_report),
                     "live_audit_payload": copy.deepcopy(payload),
                     "selected_contract": copy.deepcopy(live_contract),
+                    "nonblocking_maintenance_issues": copy.deepcopy(
+                        raw_audit.get("nonblocking_maintenance_issues") or []
+                    ),
                     "persisted_receipt": None,
                     "current_candidates": [],
                     "superseded_current_receipts": [],
@@ -14349,6 +14228,9 @@ class App:
             "live_audit_report": str(audit_report),
             "live_audit_payload": copy.deepcopy(payload),
             "selected_contract": copy.deepcopy(live_contract),
+            "nonblocking_maintenance_issues": copy.deepcopy(
+                raw_audit.get("nonblocking_maintenance_issues") or []
+            ),
             "persisted_receipt": (
                 (persisted_resolution or {}).get("selected_receipt")
             ),
@@ -14422,6 +14304,12 @@ class App:
             if value
         }
         for issue in cluster_contract_issues(contract):
+            issue_code = str(issue.get("code") or "").strip().upper()
+            if issue_code in _LEGACY_NONBLOCKING_NORMALIZATION_CODES:
+                # Deleted policy: old receipts may still contain these rows,
+                # but they are not producer work and must not become
+                # `normalization_required` after restart or cache recovery.
+                continue
             issue_spm = issue.get("spm")
             if not issue_spm:
                 global_issues.append(issue)
@@ -14433,19 +14321,7 @@ class App:
             elif normalized_folder_key(issue_spm) not in dependency_keys:
                 global_issues.append(issue)
 
-        normalizable_codes = {
-            "NORMALIZED_VARIANTS_REQUIRED",
-            "NORMALIZED_VARIANTS_STALE",
-        }
-        unexpected_owned = [
-            issue
-            for issue in owned_issues
-            if str(issue.get("code") or "") not in normalizable_codes
-        ]
-        # Historical normalization rows are maintenance evidence. They do not
-        # override the fresh live handoff or turn a completed repair attempt
-        # into an asset failure. Only other current, scoped issues remain.
-        blocking = global_issues + unexpected_owned
+        blocking = global_issues + owned_issues
         if blocking:
             target_block = cluster_target_delivery_block(
                 contract,
@@ -14458,11 +14334,8 @@ class App:
                 if isinstance(issue, dict)
             }
             # Admission is the registry's call, not a per-gate allowlist.
-            # The old `blocking_codes <= {two codes}` guard meant every new
-            # repairable reason -- canonical_bark_normalization_required,
-            # normalized_variants_required, normalized_variants_stale --
-            # printed 자동 복구 대상 and then terminated the target, because
-            # nobody remembered to widen this set (#160).
+            # The old per-gate allowlist meant new repairable reasons printed
+            # 자동 복구 대상 and then terminated the target (#160).
             # `not global_issues` stays: target-local isolation (#16).
             # Disposition authority stays with build_exact_target_repair_plan(),
             # which returns unsupported for anything it cannot act on, and the
@@ -18085,8 +17958,32 @@ def main():
     app = App(root)
 
     def close():
-        app.shutdown_shared_queue()
-        root.destroy()
+        if getattr(app, "_standalone_close_requested", False):
+            return
+        app._standalone_close_requested = True
+        root.withdraw()
+
+        def finalize():
+            try:
+                receipt = shutdown_process_supervisor(
+                    "sk_batch_gui_close",
+                    terminate_grace=1.0,
+                    kill_grace=5.0,
+                ) or {}
+                survivors = list(receipt.get("survivors") or ())
+                if survivors:
+                    raise RuntimeError(
+                        "관리 프로세스 트리 종료 후 survivor가 남았습니다: "
+                        + ", ".join(str(value) for value in survivors)
+                    )
+            except Exception as exc:
+                app._standalone_close_requested = False
+                messagebox.showerror("종료 정리 실패", str(exc), parent=root)
+                root.deiconify()
+                return
+            root.destroy()
+
+        app.shutdown_shared_queue(on_complete=finalize)
 
     root.protocol("WM_DELETE_WINDOW", close)
     root.mainloop()

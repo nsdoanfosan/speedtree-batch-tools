@@ -191,7 +191,7 @@ def _sealed_cluster_relation_rows(
                 "source_spm": provider,
                 "canonical_spm": provider,
                 "registry_path": registry,
-                "refresh_reasons": ["normalized_variants_required"],
+                "refresh_reasons": ["explicit_target_relation_off"],
                 "refresh_reason_categories": ["derived_relation_registry"],
             }
         row["blend"] = blend

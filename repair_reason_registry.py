@@ -219,12 +219,6 @@ POLICY_CONTRACTS = {
         "일부 Atlas asset의 current producer 계보가 증명되지 않았습니다.",
         "exact Cluster 관계를 갱신해 Material/Mesh lineage를 다시 증명한 뒤 검사합니다.",
     ),
-    "cluster_refresh_variants_required": _automatic(
-        CLUSTER_REFRESH_ACTION,
-        (EXACT_INVENTORY_SPM, EXACT_CLUSTER_RELATION),
-        "필수 정규화 Cluster variant가 아직 생성되지 않았습니다.",
-        "exact Cluster 관계를 갱신해 필요한 normalized variant만 생성한 뒤 검사합니다.",
-    ),
     "cluster_refresh_recipe": _automatic(
         CLUSTER_REFRESH_ACTION,
         (EXACT_INVENTORY_SPM, EXACT_CLUSTER_RELATION,
@@ -1158,15 +1152,18 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
         "modeler_node_table",
     ),
+    # Tombstones for old persisted receipts only.  These codes are deliberately
+    # informational and have no repair action; making either REPAIRABLE revives
+    # the deleted normalized-variant runtime gate.
     "normalized_variants_required": ReasonRow(
-        REPAIRABLE,
+        INFORMATIONAL,
         "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
-        "cluster_refresh",
+        "cluster_handoff_diagnostic",
     ),
     "normalized_variants_stale": ReasonRow(
-        REPAIRABLE,
+        INFORMATIONAL,
         "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
-        "cluster_refresh",
+        "cluster_handoff_diagnostic",
     ),
     "normalized_variants_metadata_missing_nonblocking": ReasonRow(
         INFORMATIONAL,
@@ -2295,10 +2292,6 @@ _classify(
     "managed_live_slot_prefix_missing",
 )
 _classify(REPAIRABLE, "cluster_refresh_lineage", "lineage_unproven")
-_classify(
-    REPAIRABLE, "cluster_refresh_variants_required",
-    "normalized_variants_required",
-)
 _seeded_unclassified = {
     code for code, row in _REASON_SEEDS.items()
     if row.disposition == UNCLASSIFIED

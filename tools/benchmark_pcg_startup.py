@@ -144,14 +144,14 @@ def run_benchmark(
         cold_evidence = {}
         cold_report, cold_primary = _measure(
             lambda: audit.make_report(
-                cfg, session_evidence=cold_evidence
+                cfg, session_evidence=cold_evidence, display_fast=True
             )
         )
         audit.save_spm_analysis_cache()
         warm_evidence = {}
         warm_report, warm_primary = _measure(
             lambda: audit.make_report(
-                cfg, session_evidence=warm_evidence
+                cfg, session_evidence=warm_evidence, display_fast=True
             )
         )
 
@@ -162,6 +162,7 @@ def run_benchmark(
                 metrics=relation_cold_metrics,
                 session_evidence=cold_evidence,
                 verify_physical=False,
+                reuse_display_stat_evidence=True,
             )
         )
         relation_warm_metrics = {}
@@ -171,6 +172,7 @@ def run_benchmark(
                 metrics=relation_warm_metrics,
                 session_evidence=warm_evidence,
                 verify_physical=False,
+                reuse_display_stat_evidence=True,
             )
         )
 
@@ -199,6 +201,10 @@ def run_benchmark(
             cached_board_paint + warm_primary + warm_global_sbs
             + warm_relations + warm_migration
         )
+        warm_prefetch = next(
+            phase for phase in warm_report["startup_timing"]["phases"]
+            if phase["phase"] == "spm_content_identity_prefetch"
+        )["counts"]
         budgets = latency.PRODUCTION_FIXTURE_LATENCY_BUDGET_SECONDS
         assertions = {
             "cached_board_paint": cached_board_paint
@@ -215,8 +221,21 @@ def run_benchmark(
                 warm_report["startup_timing"]["provider_metrics"]["cache_hit"]
                 is True
             ),
+            "warm_spm_bytes_not_reopened": (
+                warm_prefetch.get("file_count") == 0
+                and warm_prefetch.get("stat_reuse_hits")
+                == max(folder_count, int(spm_count or folder_count))
+            ),
             "warm_relation_cache_hit": (
                 relation_warm_metrics.get("cache_hits") == folder_count
+            ),
+            "warm_relation_bytes_not_reopened": (
+                relation_warm_metrics.get(
+                    "first_pass_physical_content_reads"
+                ) == 0
+                and relation_warm_metrics.get(
+                    "final_pass_physical_content_reads"
+                ) == 0
             ),
             "warm_global_sbs_cache_hit": (
                 global_sbs_warm_metrics.get("cache_hits") == folder_count
