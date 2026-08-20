@@ -53,6 +53,7 @@ def _production_sources():
                 path == LIFECYCLE
                 or "tests" in relative.parts
                 or relative.parts[0] == "work"
+                or relative.parts[:2] == (".claude", "worktrees")
             ):
                 continue
             yield path
@@ -129,6 +130,8 @@ class ProcessLaunchAuditTests(unittest.TestCase):
                 self.assertIn("SPEEDTREE_BATCH_LAUNCH_SOURCE", text)
                 self.assertIn("launch_guard.pyw", text)
                 self.assertRegex(text, r"(?im)^\s*start\s+\"\"")
+                self.assertNotIn("%ComSpec%", text)
+                self.assertNotRegex(text, r"(?im)^\s*start\s+\"\"\s+/min")
                 self.assertNotRegex(text, r"(?i)taskkill")
 
 

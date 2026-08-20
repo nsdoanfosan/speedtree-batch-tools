@@ -15,6 +15,7 @@ lookup or ``taskkill`` call is used anywhere in this contract.
 from __future__ import annotations
 
 import atexit
+import copy
 import hashlib
 import json
 import os
@@ -32,6 +33,8 @@ WINDOWS_DETACHED_PROCESS = 0x00000008
 WINDOWS_CREATE_NEW_CONSOLE = 0x00000010
 WINDOWS_CREATE_NO_WINDOW = 0x08000000
 WINDOWS_CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+WINDOWS_STARTF_USESHOWWINDOW = 0x00000001
+WINDOWS_SW_HIDE = 0
 DEFAULT_GRACE_SECONDS = 1.0
 DEFAULT_KILL_GRACE_SECONDS = 3.0
 DEFAULT_DESCENDANT_GRACE_SECONDS = 0.2
@@ -227,6 +230,26 @@ class _WindowsJob:
             | WINDOWS_CREATE_SUSPENDED
             | WINDOWS_CREATE_NO_WINDOW
         )
+
+    @staticmethod
+    def startupinfo(requested=None):
+        """Hide the first top-level window without mutating caller state.
+
+        ``CREATE_NO_WINDOW`` prevents console allocation for console-subsystem
+        executables.  Some of our background tools are GUI-subsystem programs,
+        though, and can still show/activate their first window.  Supplying
+        ``SW_HIDE`` closes that gap while manual/user-owned handoffs continue
+        to use the separate external launch path unchanged.
+        """
+
+        startupinfo = (
+            copy.copy(requested)
+            if requested is not None
+            else subprocess.STARTUPINFO()
+        )
+        startupinfo.dwFlags |= WINDOWS_STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = WINDOWS_SW_HIDE
+        return startupinfo
 
     def assign(self, process):
         with self._handle_lock:
@@ -744,6 +767,9 @@ class ProcessSupervisor:
             tree_job = _WindowsJob()
             kwargs["creationflags"] = _WindowsJob.creationflags(
                 kwargs.get("creationflags", 0)
+            )
+            kwargs["startupinfo"] = _WindowsJob.startupinfo(
+                kwargs.get("startupinfo")
             )
         try:
             process = popen_factory(args, **kwargs)

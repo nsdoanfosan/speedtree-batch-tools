@@ -2362,17 +2362,33 @@ def visible_material_names(path):
     )
 
 
-def leaf_generator_bindings(path, visible_only=False):
+def leaf_generator_bindings(
+    path,
+    visible_only=False,
+    *,
+    inspect_legacy=True,
+):
     """Semantic Frond/Leaf Mesh Material+Mesh connections in one SPM."""
     cache_key = _file_cache_key(path)
     analysis, decoded_handoff = _spm_analysis(
         path, include_decoded_handoff=True)
     bindings = analysis["leaf_generator_bindings"]
     snapshot = analysis.get("generator_foregrounds_snapshot")
-    legacy_state = _report_legacy_cluster_state(
-        path,
-        foregrounds_snapshot=snapshot,
-        decoded_handoff=decoded_handoff,
+    legacy_state = (
+        _report_legacy_cluster_state(
+            path,
+            foregrounds_snapshot=snapshot,
+            decoded_handoff=decoded_handoff,
+        )
+        if inspect_legacy else {
+            "reason_tokens": [],
+            "handoff_evidence": {},
+            "failure_evidence": {},
+            "receipt_valid": False,
+            "classified_generator_guids": [],
+            "marker_drift_guids": [],
+            "evidence_by_guid": {},
+        }
     )
     fatal_reasons = [
         reason for reason in legacy_state.get("reason_tokens", [])
@@ -2502,10 +2518,18 @@ def _report_legacy_cluster_state(
     return result
 
 
-def leaf_generator_material_ids(path, visible_only=False):
+def leaf_generator_material_ids(
+    path,
+    visible_only=False,
+    *,
+    inspect_legacy=True,
+):
     return {
         row.get("material_id") for row in leaf_generator_bindings(
-            path, visible_only=visible_only)
+            path,
+            visible_only=visible_only,
+            inspect_legacy=inspect_legacy,
+        )
         if row.get("material_id") not in {None, "", "-1"}
     }
 
@@ -2664,7 +2688,14 @@ def source_family_name(path):
     return stem.strip("_-") or Path(path).stem
 
 
-def leaf_sources_from_spm(spm, source_kind, excluded_albedo_stems=None, active_only=True):
+def leaf_sources_from_spm(
+    spm,
+    source_kind,
+    excluded_albedo_stems=None,
+    active_only=True,
+    *,
+    inspect_legacy=True,
+):
     """Find coherent leaf albedo/alpha pairs used by one SPM material.
 
     A material qualifies only when a semantic ``Frond``/``Leaf Mesh``
@@ -2676,7 +2707,11 @@ def leaf_sources_from_spm(spm, source_kind, excluded_albedo_stems=None, active_o
     # Hidden authoring generators are still valid provenance and may be
     # re-enabled later; the existing audit's ``active`` contract deliberately
     # retains them. Semantic Generator Type/ID, not eye state, is the gate.
-    semantic_ids = leaf_generator_material_ids(spm, visible_only=False)
+    semantic_ids = leaf_generator_material_ids(
+        spm,
+        visible_only=False,
+        inspect_legacy=inspect_legacy,
+    )
     if not semantic_ids:
         return results
     for row in extract_material_image_refs(spm):
@@ -2832,10 +2867,19 @@ def canonicalize_leaf_sources(sources, candidates, cfg, folder):
     return sources
 
 
-def merge_leaf_mesh_sources(sources, cfg, folder):
+def merge_leaf_mesh_sources(
+    sources,
+    cfg,
+    folder,
+    *,
+    provisional_declarations=None,
+    annotate_connections=True,
+):
     """Deduplicate by source atlas pair and merge final-SK application targets."""
-    provisional_declarations = atlas_provisional_source_declarations(
-        folder
+    provisional_declarations = (
+        atlas_provisional_source_declarations(folder)
+        if provisional_declarations is None
+        else provisional_declarations
     )
     grouped = {}
     for source in sources:
@@ -2948,7 +2992,8 @@ def merge_leaf_mesh_sources(sources, cfg, folder):
         entry["atlas_blends"] = find_atlas_blends(
             cfg["atlas_root"], folder, entry["atlas_base"],
             source_images=(entry.get("albedo"),), aliases=material_names)
-    annotate_leaf_generator_connections(results)
+    if annotate_connections:
+        annotate_leaf_generator_connections(results)
     return results
 
 
@@ -2988,7 +3033,13 @@ def _atlas_source_pair_key(albedo, alpha):
     )
 
 
-def _existing_atlas_registry(atlas_root, folder, target_spms=None):
+def _existing_atlas_registry(
+    atlas_root,
+    folder,
+    target_spms=None,
+    *,
+    include_manifests=True,
+):
     """Index live blends, Blender backups, and scoped source manifests.
 
     ``.blend1`` is never considered runnable output, but its base remains
@@ -3041,22 +3092,23 @@ def _existing_atlas_registry(atlas_root, folder, target_spms=None):
             if target and Path(target).suffix.casefold() == ".spm"
         )
     )
-    for target in manifest_targets:
-        resolution = _atlas_manifest_resolution(target)
-        for selected in resolution["selected"]:
-            manifest_path = Path(selected["path"])
-            key = os.path.normcase(str(manifest_path)).casefold()
-            if key in seen_manifests:
-                continue
-            seen_manifests.add(key)
-            manifest_records.append((
-                manifest_path,
-                selected["payload"],
-                Path(resolution["target_spm"]).parent,
-            ))
+    if include_manifests:
+        for target in manifest_targets:
+            resolution = _atlas_manifest_resolution(target)
+            for selected in resolution["selected"]:
+                manifest_path = Path(selected["path"])
+                key = os.path.normcase(str(manifest_path)).casefold()
+                if key in seen_manifests:
+                    continue
+                seen_manifests.add(key)
+                manifest_records.append((
+                    manifest_path,
+                    selected["payload"],
+                    Path(resolution["target_spm"]).parent,
+                ))
 
     scopes = Path(folder) / ".atlas_leaf_speedtree_scopes"
-    if scopes.is_dir():
+    if include_manifests and scopes.is_dir():
         for manifest_path in scopes.glob("*.json"):
             if "__" in manifest_path.stem:
                 continue
@@ -3199,6 +3251,8 @@ def assign_leaf_atlas_bases(sources, folder, atlas_root=None):
     available.  Cluster internals commonly expose only ``Material`` names, so
     those sources receive the asset fallback and a stable per-source index.
     """
+    if not sources:
+        return sources
     exact_target_spms = unique(
         [
             target.get("spm")
@@ -3680,10 +3734,23 @@ def annotate_leaf_generator_connections(sources):
     return sources
 
 
-def _legacy_only_export_material_ids(spm, bindings=None):
+def _legacy_only_export_material_ids(
+    spm,
+    bindings=None,
+    *,
+    inspect_legacy=True,
+):
     """Material IDs whose current export slots are all receipt-owned legacy."""
     grouped = {}
-    for binding in bindings or leaf_generator_bindings(spm):
+    source_bindings = (
+        bindings
+        if bindings is not None
+        else leaf_generator_bindings(
+            spm,
+            inspect_legacy=inspect_legacy,
+        )
+    )
+    for binding in source_bindings:
         if not binding.get("export_participates"):
             continue
         material_id = str(binding.get("material_id") or "").strip()
@@ -3697,7 +3764,13 @@ def _legacy_only_export_material_ids(spm, bindings=None):
     }
 
 
-def cluster_material_usage(target_spms, clusters):
+def cluster_material_usage(
+    target_spms,
+    clusters,
+    *,
+    follow_source_refs=True,
+    inspect_legacy=True,
+):
     """Export-participating final-SPM materials using each Cluster render.
 
     Receipt-owned legacy Generators deliberately keep their original Cluster
@@ -3720,10 +3793,15 @@ def cluster_material_usage(target_spms, clusters):
     for spm in target_spms:
         referenced_ids = active_material_ids(spm)
         active_ids = visible_material_ids(spm)
-        legacy_only_ids = _legacy_only_export_material_ids(spm)
+        legacy_only_ids = _legacy_only_export_material_ids(
+            spm,
+            inspect_legacy=inspect_legacy,
+        )
         original_refs = (
             _source_material_ref_map(Path(spm).parent, Path(spm))
-            if Path(spm).name.lower().startswith("sk_") else {}
+            if follow_source_refs
+            and Path(spm).name.lower().startswith("sk_")
+            else {}
         )
         for material in extract_material_image_refs(spm):
             if (referenced_ids
@@ -3741,13 +3819,14 @@ def cluster_material_usage(target_spms, clusters):
             if material.get("managed_leaf_output"):
                 continue
             refs = material["refs"]
-            canonical = canonical_material_name(material.get("material_name")).lower()
-            # A converted SK often no longer contains the Cluster render path,
-            # even though its exact non-SK source does.  Follow the authoritative
-            # source slot before deciding whether a Cluster SPM is referenced;
-            # otherwise the trace stops at leaf_x.tga and never reaches the
-            # single-leaf atlas used to produce that render.
-            if _refs_are_only_managed_outputs(refs) and original_refs.get(canonical):
+            canonical = canonical_material_name(
+                material.get("material_name")
+            ).lower()
+            if (
+                follow_source_refs
+                and _refs_are_only_managed_outputs(refs)
+                and original_refs.get(canonical)
+            ):
                 refs = original_refs[canonical]
             matched = {
                 str(by_stem[Path(ref).stem.lower()][0]).casefold():
@@ -3940,7 +4019,14 @@ def _current_leaf_atlas_base(material_name, registry):
     return (candidates[0] if candidates else canonical), []
 
 
-def current_leaf_atlas_inventory(folder, cfg, target_spms):
+def current_leaf_atlas_inventory(
+    folder,
+    cfg,
+    target_spms,
+    *,
+    include_manifests=True,
+    inspect_legacy=True,
+):
     """Inventory atlases already used by current semantic Generator slots.
 
     This is deliberately independent from source-provenance matching. A final
@@ -3958,6 +4044,7 @@ def current_leaf_atlas_inventory(folder, cfg, target_spms):
                 cfg.get("atlas_root"),
                 folder,
                 target_spms=target_spms,
+                include_manifests=include_manifests,
             )
         return registry
 
@@ -3969,7 +4056,11 @@ def current_leaf_atlas_inventory(folder, cfg, target_spms):
             for row in rows if row.get("material_id") not in {None, ""}
         }
         actual_mesh_ids = mesh_asset_ids(spm)
-        for binding in leaf_generator_bindings(spm, visible_only=False):
+        for binding in leaf_generator_bindings(
+            spm,
+            visible_only=False,
+            inspect_legacy=inspect_legacy,
+        ):
             material_id = str(binding.get("material_id") or "")
             material = by_id.get(material_id)
             if not material:
@@ -4083,9 +4174,22 @@ def current_leaf_atlas_inventory(folder, cfg, target_spms):
     return sorted(results, key=lambda row: row["atlas_base"].lower())
 
 
-def resolve_leaf_atlas_lineage(folder, cfg, target_spms, clusters):
+def resolve_leaf_atlas_lineage(
+    folder,
+    cfg,
+    target_spms,
+    clusters,
+    *,
+    follow_source_refs=True,
+):
     """Resolve source provenance, current atlas state, and safe actions once."""
-    current_atlases = current_leaf_atlas_inventory(folder, cfg, target_spms)
+    current_atlases = current_leaf_atlas_inventory(
+        folder,
+        cfg,
+        target_spms,
+        include_manifests=follow_source_refs,
+        inspect_legacy=follow_source_refs,
+    )
     complete_material_ids_by_spm = {}
     for atlas in current_atlases:
         if not atlas.get("atlas_blends"):
@@ -4099,7 +4203,12 @@ def resolve_leaf_atlas_lineage(folder, cfg, target_spms, clusters):
                 for value in target.get("material_ids") or []
                 if str(value or "").strip()
             )
-    cluster_usage = cluster_material_usage(target_spms, clusters)
+    cluster_usage = cluster_material_usage(
+        target_spms,
+        clusters,
+        follow_source_refs=follow_source_refs,
+        inspect_legacy=follow_source_refs,
+    )
     referenced = {
         key: sorted(usage["spms"])
         for key, usage in cluster_usage.items()
@@ -4109,15 +4218,25 @@ def resolve_leaf_atlas_lineage(folder, cfg, target_spms, clusters):
     target_resolutions = []
     candidates = []
     direct_target_ids = {}
+    # The board describes only current production targets.  Mutation authority
+    # still needs sibling authoring SPMs as provenance, but the fast status
+    # path must not turn them into extra audit targets or open future SK files.
     candidate_spms = list(target_spms)
-    candidate_spms.extend(
-        spm for spm in source_spms(folder) if spm not in candidate_spms)
+    if follow_source_refs:
+        candidate_spms.extend(
+            spm for spm in source_spms(folder)
+            if spm not in candidate_spms
+        )
     for candidate_spm in candidate_spms:
         candidates.extend(leaf_sources_from_spm(
-            candidate_spm, "direct", active_only=False))
+            candidate_spm,
+            "direct",
+            active_only=False,
+            inspect_legacy=follow_source_refs,
+        ))
     for spm in target_spms:
         authoritative = spm
-        if spm.name.lower().startswith("sk_"):
+        if follow_source_refs and spm.name.lower().startswith("sk_"):
             source = Path(folder) / spm.name[3:]
             if path_is_file(source):
                 authoritative = source
@@ -4128,7 +4247,10 @@ def resolve_leaf_atlas_lineage(folder, cfg, target_spms, clusters):
         # authoring/legacy Generators and is provenance-only.
         target_referenced = active_material_ids(spm)
         target_active = visible_material_ids(spm)
-        all_bindings = leaf_generator_bindings(spm)
+        all_bindings = leaf_generator_bindings(
+            spm,
+            inspect_legacy=follow_source_refs,
+        )
         legacy_bindings = [
             binding for binding in all_bindings
             if binding.get("legacy_cluster_origin")
@@ -4141,7 +4263,13 @@ def resolve_leaf_atlas_lineage(folder, cfg, target_spms, clusters):
             guid = str(binding.get("generator_guid") or "")
             if material_id and guid:
                 legacy_material_guids.setdefault(material_id, set()).add(guid)
-        legacy_state = _report_legacy_cluster_state(spm)
+        legacy_state = (
+            _report_legacy_cluster_state(spm)
+            if follow_source_refs else {
+                "classified_generator_guids": [],
+                "marker_drift_guids": [],
+            }
+        )
         for row in extract_material_image_refs(spm):
             key = canonical_material_name(row.get("material_name")).lower()
             target_materials.setdefault(key, []).append(row)
@@ -4149,13 +4277,21 @@ def resolve_leaf_atlas_lineage(folder, cfg, target_spms, clusters):
                     or row.get("material_id") in target_active):
                 active_target_materials.setdefault(key, []).append(row)
         direct_sources = leaf_sources_from_spm(
-            authoritative, "direct", active_only=False)
+            authoritative,
+            "direct",
+            active_only=False,
+            inspect_legacy=follow_source_refs,
+        )
         # Some authoring SPMs are binary containers that this lightweight
         # audit cannot parse, while the current SK exposes normalized T_* slots.
         # The untagged SK source material remains authoritative for mesh work.
         if not direct_sources and Path(authoritative) != Path(spm):
             direct_sources = leaf_sources_from_spm(
-                spm, "direct", active_only=False)
+                spm,
+                "direct",
+                active_only=False,
+                inspect_legacy=follow_source_refs,
+            )
         resolution = {
             "target_spm": str(spm),
             "authoritative_spm": str(authoritative),
@@ -4252,8 +4388,16 @@ def resolve_leaf_atlas_lineage(folder, cfg, target_spms, clusters):
         if str(cluster).lower() not in referenced:
             continue
         candidates.extend(leaf_sources_from_spm(
-            cluster, "cluster", active_only=False))
-        for source in leaf_sources_from_spm(cluster, "cluster"):
+            cluster,
+            "cluster",
+            active_only=False,
+            inspect_legacy=follow_source_refs,
+        ))
+        for source in leaf_sources_from_spm(
+            cluster,
+            "cluster",
+            inspect_legacy=follow_source_refs,
+        ):
             final_spms = referenced[str(cluster).lower()]
             for final_spm in final_spms:
                 usage = cluster_usage[str(cluster).lower()]
@@ -4292,22 +4436,35 @@ def resolve_leaf_atlas_lineage(folder, cfg, target_spms, clusters):
         sources + preserved_sources, candidates, cfg, folder)
     return {
         "schema_version": LEAF_ATLAS_LINEAGE_SCHEMA_VERSION,
-        "actionable_sources": merge_leaf_mesh_sources(sources, cfg, folder),
+        "actionable_sources": merge_leaf_mesh_sources(
+            sources,
+            cfg,
+            folder,
+            provisional_declarations=(
+                None if follow_source_refs else {}
+            ),
+            annotate_connections=follow_source_refs,
+        ),
         "source_provenance": _merge_leaf_source_provenance(
             preserved_sources),
         "current_atlases": current_atlases,
         "target_resolutions": target_resolutions,
-        "legacy_cluster_states": [
-            {
-                "spm": str(spm),
-                **{
-                    key: value
-                    for key, value in _report_legacy_cluster_state(spm).items()
-                    if key not in {"spm", "evidence_by_guid"}
-                },
-            }
-            for spm in target_spms
-        ],
+        "legacy_cluster_states": (
+            [
+                {
+                    "spm": str(spm),
+                    **{
+                        key: value
+                        for key, value in _report_legacy_cluster_state(
+                            spm
+                        ).items()
+                        if key not in {"spm", "evidence_by_guid"}
+                    },
+                }
+                for spm in target_spms
+            ]
+            if follow_source_refs else []
+        ),
         "referenced_clusters": referenced,
     }
 
@@ -4516,7 +4673,10 @@ def target_spm_status(folder, mesh_name):
     folder = Path(folder)
     source = find_source_spm_for_mesh(folder, mesh_name)
     sk = find_sk_spm_for_mesh(folder, mesh_name)
-    target = sk or source
+    # A missing SK is the expected input to step 1, not a reason to parse the
+    # source as if it were already the production target.  Cluster pair rows
+    # retain their dedicated source/canonical handling below.
+    target = (sk or source) if folder.name.casefold() == "cluster" else sk
     materials = visible_material_names(target) if target else []
     missing_m = [
         m for m in materials
@@ -6206,9 +6366,17 @@ def material_texture_items(
     preserved_definitions=None,
     leaf_mesh_sources=None,
     provider_spms=None,
+    owner_spms=None,
+    recover_source_refs=True,
+    validate_origin_receipts=True,
+    provisional_declarations=None,
 ):
     """One managed texture-set job for every material used by a Generator."""
-    owner_spms = preferred_sk_spms(folder) or source_spms(folder)
+    owner_spms = (
+        list(owner_spms)
+        if owner_spms is not None
+        else (preferred_sk_spms(folder) or source_spms(folder))
+    )
     spms = unique(list(owner_spms) + list(provider_spms or []))
     preserved_definitions = preserved_definitions if preserved_definitions is not None \
         else cluster_render_source_definitions(folder)
@@ -6218,8 +6386,10 @@ def material_texture_items(
         for path in (provider_spms or [])
     }
     blend_stems = atlas_blend_stems(cfg)
-    provisional_declarations = atlas_provisional_source_declarations(
-        folder
+    provisional_declarations = (
+        atlas_provisional_source_declarations(folder)
+        if provisional_declarations is None
+        else provisional_declarations
     )
     records = []
     preserved_provider_items = []
@@ -6232,7 +6402,9 @@ def material_texture_items(
         visible_ids = visible_material_ids(spm)
         original_ref_entries = (
             _source_material_ref_entries(folder, spm)
-            if spm.name.lower().startswith("sk_") else {}
+            if recover_source_refs
+            and spm.name.lower().startswith("sk_")
+            else {}
         )
         for row in extract_material_image_refs(spm):
             # No Generator material properties means a mesh/material asset and
@@ -6289,15 +6461,13 @@ def material_texture_items(
                 original_entry = original_ref_entries[canonical]
                 refs = list(original_entry["refs"])
                 source_ref_spm = Path(original_entry["spm"])
-                # Recovered source refs may identify the same atlas that the
-                # current managed T_* slots could not identify by themselves.
-                # Resolve it now so managed and not-yet-managed SK variants
-                # share one provenance/signature.
                 leaf_source = _leaf_source_for_active_material(
                     source_ref_spm, refs, leaf_mesh_sources or [])
                 if leaf_source:
                     refs = list(leaf_source.get("source_refs") or [
-                        leaf_source.get("albedo"), leaf_source.get("alpha")])
+                        leaf_source.get("albedo"),
+                        leaf_source.get("alpha"),
+                    ])
                     refs = [str(ref) for ref in refs if ref]
                     source_ref_spm = Path(
                         leaf_source.get("target_spm") or source_ref_spm
@@ -6310,7 +6480,7 @@ def material_texture_items(
                     material_id=row.get("material_id"),
                     material_name=row.get("material_name"),
                 )
-                if spm_is_provider
+                if validate_origin_receipts and spm_is_provider
                 else {}
             )
             if spm_is_provider and provider_origin_receipt:
@@ -6365,7 +6535,7 @@ def material_texture_items(
                 continue
             # A cluster-folder image is already a derived SpeedTree cluster
             # render, not an input set to process through Substance again.
-            if cluster_render_origin_receipt(
+            if validate_origin_receipts and cluster_render_origin_receipt(
                 folder,
                 spm,
                 refs,
@@ -7491,18 +7661,20 @@ def audit_folder(
     include_refs=False,
     target_mesh_names=None,
     provider_spms=None,
+    mutation_authority=True,
 ):
     folder = Path(folder)
     preferred = preferred_sk_spms(folder)
     loose = loose_sk_spms(folder)
     sources = source_spms(folder)
     chosen = preferred[0] if preferred else (loose[0] if loose else (sources[0] if sources else None))
-    materials = visible_material_names(chosen) if chosen else []
+    current_spm = preferred[0] if preferred else (loose[0] if loose else None)
+    materials = visible_material_names(current_spm) if current_spm else []
     missing_m = [
         m for m in materials
         if m and not m.startswith("M_")
     ]
-    renames_needed = material_rename_plan(chosen) if chosen else []
+    renames_needed = material_rename_plan(current_spm) if current_spm else []
     sbs_files = active_sbs_files(folder)
     texture_dir = sbs_files[0].parent if sbs_files else (folder / "texture")
     tex_dirs = texture_dir_candidates(folder, sbs_files) or [texture_dir]
@@ -7514,66 +7686,50 @@ def audit_folder(
     )
     target_spms = []
     for mesh_name in target_mesh_names or []:
-        target = (find_sk_spm_for_mesh(folder, mesh_name)
-                  or find_source_spm_for_mesh(folder, mesh_name))
+        # A source-only variant means step 1 has work to do.  Do not feed that
+        # source (or a synthesized future SK path) into Atlas/Cluster analysis.
+        target = find_sk_spm_for_mesh(folder, mesh_name)
         if target and target not in target_spms:
             target_spms.append(target)
     # A folder row without an explicit PCG mesh is represented by its chosen
     # SPM, not every sibling variant. Explicit PCG targets can still request
     # multiple exact variants through target_mesh_names.
-    if not target_spms and chosen:
+    if not target_spms and chosen and chosen in (preferred + loose):
         target_spms = [chosen]
     leaf_lineage = resolve_leaf_atlas_lineage(
-        folder, cfg, target_spms, clusters)
-    leaf_mesh_sources = leaf_lineage["actionable_sources"]
-    referenced_clusters = leaf_lineage["referenced_clusters"]
-    try:
-        from pcg_cluster_assembly_contract import (
-            build_cluster_assembly_contract,
-        )
-    except ImportError:
-        from .pcg_cluster_assembly_contract import (
-            build_cluster_assembly_contract,
-        )
-    assembly_dependency_spms, assembly_source_spms = cluster_dependency_spms(
-        target_spms
-    )
-    assembly_cluster_usage = cluster_material_usage(
-        assembly_dependency_spms, clusters)
-    cluster_assembly = build_cluster_assembly_contract(
         folder,
+        cfg,
         target_spms,
         clusters,
-        cluster_usage=assembly_cluster_usage,
-        assembly_source_spms=assembly_source_spms,
-        # Reuse this report's strict-vs-diagnostic resolver and cache.  A
-        # read-only live audit keeps deterministic current Atlas authorities;
-        # mutation-authority reports remain strict.
-        atlas_resolution_reader=_atlas_manifest_resolution,
+        follow_source_refs=mutation_authority,
     )
-    cluster_sources = cluster_connection_rows(
-        folder,
-        target_spms=target_spms,
-        clusters=clusters,
-        cluster_usage=assembly_cluster_usage,
-        assembly_contract=cluster_assembly,
-    )
+    leaf_mesh_sources = leaf_lineage["actionable_sources"]
+    referenced_clusters = leaf_lineage["referenced_clusters"]
+    # Assembly is an SK Batch/export handoff contract, not a PCG Texture board
+    # state.  Its dedicated audit_cluster_assembly_folder() path remains the
+    # sole reader.  Running it here used to rescan the dependency graph for
+    # every folder and could even try to open a future SK file that step 1 was
+    # expected to create.
     # ③은 아틀라스 파일 개수가 아니라 실제 Generator가 사용하는 모든
     # M_ 머티리얼을 기준으로 한 행씩 만든다. Cluster SPM의 미사용 테스트
     # 머티리얼은 이 목록에 들어오지 않는다.
-    cluster_definitions = cluster_render_source_definitions(folder)
+    cluster_definitions = (
+        cluster_render_source_definitions(folder)
+        if mutation_authority else {}
+    )
     cluster_items = material_texture_items(
         folder, cfg, tex_dirs, folder_graphs,
         preserved_definitions=cluster_definitions,
         leaf_mesh_sources=leaf_mesh_sources,
-        provider_spms=clusters,
+        provider_spms=[Path(path) for path in referenced_clusters],
+        owner_spms=target_spms,
+        recover_source_refs=mutation_authority,
+        validate_origin_receipts=mutation_authority,
+        provisional_declarations=(None if mutation_authority else {}),
     )
     referenced_cluster_keys = {
         str(path).lower() for path in referenced_clusters
     }
-    referenced_cluster_keys.update(
-        str(path).lower() for path in assembly_cluster_usage
-    )
     ignored_cluster_spms = [
         str(cluster) for cluster in clusters
         if str(cluster).lower() not in referenced_cluster_keys
@@ -7601,18 +7757,25 @@ def audit_folder(
         "texture_dirs": [str(d) for d in tex_dirs],
         "m_graph_names": {low: list(pair) for low, pair in folder_graphs.items()},
         "cluster_items": cluster_items,
-        "preserved_cluster_materials": preserved_cluster_materials(
-            folder, definitions=cluster_definitions),
+        "preserved_cluster_materials": (
+            preserved_cluster_materials(
+                folder, definitions=cluster_definitions
+            )
+            if mutation_authority else []
+        ),
         "leaf_mesh_sources": leaf_mesh_sources,
         "leaf_atlas_lineage": leaf_lineage,
         "leaf_source_provenance": leaf_lineage["source_provenance"],
         "leaf_atlas_inventory": leaf_lineage["current_atlases"],
         "legacy_cluster_states": leaf_lineage["legacy_cluster_states"],
         "leaf_mesh_target_spms": [str(path) for path in target_spms],
-        "managed_leaf_outputs": managed_leaf_outputs(target_spms),
-        "cluster_assembly": cluster_assembly,
-        "cluster_hierarchy": cluster_assembly["hierarchy"],
-        "cluster_source_rows": cluster_sources,
+        "managed_leaf_outputs": (
+            managed_leaf_outputs(target_spms)
+            if mutation_authority else []
+        ),
+        "cluster_assembly": {},
+        "cluster_hierarchy": {},
+        "cluster_source_rows": [],
         "ignored_cluster_spms": ignored_cluster_spms,
         "source_refs": all_refs[:40],
         "normal_convention": infer_normal_convention(all_refs),
@@ -7752,19 +7915,18 @@ def derive_status_actions(item):
         actions.append("Blender 잎 매쉬 Generator 연결 필요")
     if any(c["missing_export_maps"] for c in local_entries):
         actions.append("Substance에서 출력 텍스처 저장 필요")
-    current_handoff_status = (
-        ((item.get("cluster_assembly") or {}).get("handoff") or {}).get("status")
+    cluster_assembly = item.get("cluster_assembly") or {}
+    handoff_status = (
+        (cluster_assembly.get("handoff") or {}).get("status")
     )
     if (
         any(c.get("connection_update_needed") for c in item["cluster_items"])
-        and current_handoff_status not in {"ready", "pass_through"}
+        and handoff_status not in {"ready", "pass_through"}
     ):
         actions.append("SpeedTree 연결 텍스처 정리 필요")
-    cluster_assembly = item.get("cluster_assembly") or {}
     bark_status = (cluster_assembly.get("canonical_bark") or {}).get("status")
     if bark_status == "replacement_required":
         actions.append("Cluster bark를 canonical material로 정규화 필요")
-    handoff_status = (cluster_assembly.get("handoff") or {}).get("status")
     if handoff_status == "blocked":
         if status == "ready":
             status = "needs_texture_work"
@@ -7774,9 +7936,6 @@ def derive_status_actions(item):
     if local_entries and not item["sbs_files"]:
         actions.append("Substance SBS 파일 확인 필요")
     if status == "ready" and handoff_status in {"ready", "pass_through"}:
-        # A complete current delivery is already actionable. Historical Atlas,
-        # Substance, or normalization maintenance is not a Push task and does
-        # not need to become user-facing warning noise in this state.
         actions = []
     item["status"] = status
     item["actions"] = unique(actions)
@@ -8808,16 +8967,24 @@ def make_report(
                 audit_cluster_assembly_folder
                 if cluster_assembly_only else audit_folder
             )
-            return audit_reader(
-                folder, cfg, include_refs=include_refs,
-                target_mesh_names=folder_target_mesh_names(
-                    folder, report_target_mesh_names)
-                    if report_target_mesh_names
-                    else local_target_mesh_names(folder),
-                provider_spms=provider_map.get(
+            audit_kwargs = {
+                "include_refs": include_refs,
+                "target_mesh_names": folder_target_mesh_names(
+                    folder, report_target_mesh_names
+                ) if report_target_mesh_names else local_target_mesh_names(
+                    folder
+                ),
+                "provider_spms": provider_map.get(
                     str(Path(folder).resolve()).casefold(),
                     [],
                 ),
+            }
+            if not cluster_assembly_only:
+                audit_kwargs["mutation_authority"] = mutation_authority
+            return audit_reader(
+                folder,
+                cfg,
+                **audit_kwargs,
             )
 
     buffered_progress = []
@@ -8834,7 +9001,13 @@ def make_report(
     )
     finish_phase("primary_folder_audit", folder_count=len(folders))
     require_not_cancelled()
-    pending = blend_source_session.pending_requests()
+    # Embedded .blend image recovery is mutation preflight evidence.  The
+    # status board must not build that index and then audit the same folders a
+    # second time merely to prove historical source provenance.
+    pending = (
+        blend_source_session.pending_requests()
+        if mutation_authority else []
+    )
     revalidated_folder_count = 0
     blend_index_metrics = {}
     if pending:
@@ -8903,7 +9076,7 @@ def make_report(
         for args in buffered_progress:
             progress_callback(*args)
     sbs_metrics = {"cache_hits": 0, "cache_misses": 0}
-    if not cluster_assembly_only:
+    if not cluster_assembly_only and mutation_authority:
         attach_global_m_graphs(
             items,
             cfg,
@@ -8914,14 +9087,19 @@ def make_report(
         )
     else:
         sbs_metrics.update({
-            "status": "skipped_cluster_assembly_only",
+            "status": (
+                "skipped_cluster_assembly_only"
+                if cluster_assembly_only
+                else "skipped_status_board_mutation_preflight"
+            ),
             "directory_count": 0,
             "file_count": 0,
         })
     finish_phase("global_sbs_discovery", **sbs_metrics)
     if not cluster_assembly_only:
         resolve_shared_atlas_entries(items, cfg)
-        refresh_texture_output_contract_states(items, cfg)
+        if mutation_authority:
+            refresh_texture_output_contract_states(items, cfg)
     finish_phase("primary_postprocess", item_count=len(items))
     target_mesh_map = target_mesh_map_from_pcg_targets(pcg_targets)
     target_source_map = target_mesh_source_map(pcg_targets)

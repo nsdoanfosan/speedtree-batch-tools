@@ -53,6 +53,13 @@ SPEEDTREE_SESSION_TARGETS = {
     (REPO_DIR / "speedtree_batch_tools_gui.pyw").resolve(),
     (REPO_DIR / "sk_batch" / "sk_batch_gui.pyw").resolve(),
 }
+COLLISION_DIR = REPO_DIR / "speedtree_collision_cli"
+COLLISION_BUILD_SCRIPT = COLLISION_DIR / "build.ps1"
+COLLISION_CLI = COLLISION_DIR / "bin" / "speedtree_collision_cli.exe"
+COLLISION_HOOK = COLLISION_DIR / "bin" / "speedtree_collision_hook.dll"
+COLLISION_CLI_CONTRACT = (
+    "SPEEDTREE_COLLISION_CLI_CONTRACT=native-bundle-single-bake-v2"
+)
 SPEEDTREE_SESSION_START_ATTEMPTS = 3
 SPEEDTREE_SESSION_RETRY_DELAY_SECONDS = 0.75
 
@@ -165,6 +172,70 @@ def run_code_compile_gate(target):
 def run_startup_retention():
     """Enforce the shared age/capacity policy before any producer starts."""
     return enforce_retention(phase="startup")
+
+
+def run_collision_cli_preflight(target):
+    """Build and validate the native CLI inside the hidden owned-process path."""
+
+    if target.resolve() not in SPEEDTREE_SESSION_TARGETS or os.name != "nt":
+        return None
+    build = owned_run(
+        [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(COLLISION_BUILD_SCRIPT),
+            "-IfNeeded",
+        ],
+        source="launch_guard:collision_cli_build",
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=180,
+        check=False,
+    )
+    if build.returncode != 0:
+        detail = (build.stderr or build.stdout or "")[-2000:]
+        raise RuntimeError(
+            "SpeedTree post-collision CLI build failed"
+            + (f": {detail}" if detail else "")
+        )
+    diagnose = owned_run(
+        [str(COLLISION_CLI), "--diagnose"],
+        source="launch_guard:collision_cli_diagnose",
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+    lines = {
+        line.strip()
+        for line in (diagnose.stdout or "").splitlines()
+        if line.strip()
+    }
+    if diagnose.returncode != 0 or COLLISION_CLI_CONTRACT not in lines:
+        detail = (diagnose.stderr or diagnose.stdout or "")[-2000:]
+        raise RuntimeError(
+            "The installed SpeedTree version is not supported by the collision CLI"
+            + (f": {detail}" if detail else "")
+        )
+    os.environ["SPEEDTREE_COLLISION_CLI_EXE"] = str(COLLISION_CLI)
+    os.environ["SPEEDTREE_COLLISION_HOOK_DLL"] = str(COLLISION_HOOK)
+    os.environ["SPEEDTREE_COLLISION_NATIVE_CLI"] = "1"
+    os.environ.setdefault("SPEEDTREE_COLLISION_PERSISTENT", "0")
+    return {
+        "cli": str(COLLISION_CLI),
+        "contract": COLLISION_CLI_CONTRACT,
+    }
 
 
 def _start_speedtree_session_host_once(target):
@@ -409,6 +480,7 @@ def main(argv):
     result = 1
     session_host = None
     try:
+        run_collision_cli_preflight(target)
         session_host = start_speedtree_session_host(target)
         result = _run_main(argv)
     except BaseException as exc:  # noqa: BLE001 - guard its own last boundary

@@ -221,6 +221,8 @@ class IntegratedLauncherTests(unittest.TestCase):
         text = (REPO_DIR / "SpeedTree_Batch_Tools.bat").read_text(encoding="utf-8")
         self.assertIn("speedtree_batch_tools_gui.pyw", text)
         self.assertNotIn("call \"SK_Batch.bat\"", text)
+        self.assertNotIn("%ComSpec%", text)
+        self.assertNotRegex(text, r'(?im)^start "" /min')
 
     def test_integrated_app_icon_assets_exist(self):
         self.assertTrue(self.launcher.ICON_PNG.is_file())

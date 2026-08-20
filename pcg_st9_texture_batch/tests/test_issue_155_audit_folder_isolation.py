@@ -429,7 +429,7 @@ class AuditFolderIsolationTests(unittest.TestCase):
             ), mock.patch.object(
                 audit, "local_target_mesh_names", return_value=[]
             ):
-                report = audit.make_report(cfg)
+                report = audit.make_report(cfg, mutation_authority=True)
 
         self.assertEqual(report["status"], "failed")
         self.assertEqual(report["summary"]["failed_folder_count"], 2)
@@ -516,7 +516,7 @@ class AuditFolderIsolationTests(unittest.TestCase):
             ), mock.patch.object(
                 audit, "local_target_mesh_names", return_value=[]
             ):
-                report = audit.make_report(cfg)
+                report = audit.make_report(cfg, mutation_authority=True)
 
         self.assertEqual(calls, [folder, folder])
         self.assertEqual(report["status"], "failed")

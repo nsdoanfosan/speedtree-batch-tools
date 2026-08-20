@@ -42,7 +42,7 @@ def _wait_for_json(path, timeout=10.0):
     while time.monotonic() < deadline:
         try:
             return json.loads(Path(path).read_text(encoding="utf-8"))
-        except (FileNotFoundError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError):
             time.sleep(0.02)
     raise AssertionError(f"timed out waiting for JSON: {path}")
 
@@ -465,6 +465,19 @@ class ProcessLifecycleWindowsTests(unittest.TestCase):
             process_lifecycle._WindowsJob.creationflags(requested),
             requested | WINDOWS_CREATE_SUSPENDED | WINDOWS_CREATE_NO_WINDOW,
         )
+
+        caller_info = subprocess.STARTUPINFO()
+        caller_info.dwFlags = 0x00000100
+        caller_info.wShowWindow = 5
+        hidden_info = process_lifecycle._WindowsJob.startupinfo(caller_info)
+        self.assertIsNot(hidden_info, caller_info)
+        self.assertEqual(caller_info.dwFlags, 0x00000100)
+        self.assertEqual(caller_info.wShowWindow, 5)
+        self.assertEqual(
+            hidden_info.dwFlags & process_lifecycle.WINDOWS_STARTF_USESHOWWINDOW,
+            process_lifecycle.WINDOWS_STARTF_USESHOWWINDOW,
+        )
+        self.assertEqual(hidden_info.wShowWindow, process_lifecycle.WINDOWS_SW_HIDE)
 
     def test_owned_windows_launches_forbid_visible_or_detached_consoles(self):
         for requested in (0x00000008, 0x00000010):

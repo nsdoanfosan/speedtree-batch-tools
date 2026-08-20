@@ -741,7 +741,7 @@ class ProviderAndAuditTests(unittest.TestCase):
             self.assertEqual(current[owner_key], [provider.resolve()])
             self.assertFalse(metrics["cache_hit"])
 
-    def test_blend_index_miss_reaudits_only_affected_folder(self):
+    def test_status_board_does_not_reaudit_for_blend_source_recovery(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             folders = [root / "tree_a", root / "tree_b"]
@@ -804,7 +804,7 @@ class ProviderAndAuditTests(unittest.TestCase):
                 audit, "audit_folder", side_effect=audit_folder
             ), mock.patch.object(
                 audit, "ensure_blend_source_index", side_effect=install
-            ), mock.patch.object(
+            ) as ensure_index, mock.patch.object(
                 audit, "attach_global_m_graphs", return_value={}
             ), mock.patch.object(
                 audit, "resolve_shared_atlas_entries", return_value=[]
@@ -814,15 +814,61 @@ class ProviderAndAuditTests(unittest.TestCase):
             ):
                 report = audit.make_report(cfg)
 
-            self.assertEqual(calls.count("tree_a"), 2)
+            self.assertEqual(calls.count("tree_a"), 1)
             self.assertEqual(calls.count("tree_b"), 1)
+            ensure_index.assert_not_called()
             timing = report["startup_timing"]
-            self.assertEqual(timing["revalidated_folder_count"], 1)
+            self.assertEqual(timing["revalidated_folder_count"], 0)
             bounded = next(
                 row for row in timing["phases"]
                 if row["phase"] == "bounded_folder_revalidation"
             )
             self.assertFalse(bounded["counts"]["full_fleet_repeat"])
+
+    def test_missing_sk_is_status_not_a_file_read_or_assembly_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "Tree"
+            folder = root / "tree_fixture"
+            folder.mkdir(parents=True)
+            source = folder / "tree_fixture_02.spm"
+            source.write_text(
+                '<?xml version="1.0"?><SpeedTree><Materials>'
+                '<Material_v8 ID="1" Name="Material" />'
+                '</Materials><Generators></Generators><Nodes></Nodes>'
+                '</SpeedTree>',
+                encoding="utf-8",
+            )
+            future_sk = folder / "SK_tree_fixture_02.spm"
+            original_read = audit._read_stable_spm_bytes
+
+            def reject_future_sk(path):
+                if Path(path) == future_sk:
+                    raise AssertionError("future SK must not be opened")
+                return original_read(path)
+
+            cfg = {
+                "tree_root": str(root),
+                "atlas_root": str(root / "atlas"),
+                "source_texture_roots": [],
+                "required_export_maps": [],
+                "pcg_focus_data_assets": [],
+            }
+            with mock.patch.object(
+                audit,
+                "_read_stable_spm_bytes",
+                side_effect=reject_future_sk,
+            ):
+                report = audit.make_report(
+                    cfg,
+                    targets=[folder],
+                    target_mesh_names=["tree_fixture_02"],
+                    display_fast=True,
+                )
+
+            statuses = report["items"][0]["target_spm_statuses"]
+            self.assertEqual(len(statuses), 1)
+            self.assertEqual(statuses[0]["status"], "needs_sk")
+            self.assertFalse(future_sk.exists())
 
     def test_blend_index_child_is_terminated_when_generation_is_canceled(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2567,8 +2613,7 @@ class MutationOperationBoundaryTests(unittest.TestCase):
 
 
 class ProductionShapedLatencyFixtureTests(unittest.TestCase):
-    def test_known_per_spm_manifest_amplification_fails_total_call_guard(self):
-        """The unmodified fixture resolves zero; injection gives the rule teeth."""
+    def test_status_board_does_not_expand_manifest_targets_per_spm(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "Tree"
             cache = Path(temporary) / "cache"
@@ -2597,14 +2642,9 @@ class ProductionShapedLatencyFixtureTests(unittest.TestCase):
                 ],
             }
 
-            # Negative control for the exact PR #61 integration regression:
-            # a manifest-free folder used to send every sibling SPM through
-            # resolve_atlas_manifests().  The fixture is deliberately tiny,
-            # but preserves the per-SPM amplification while the report-local
-            # resolver cache correctly collapses duplicate scope visits.  The
-            # unmodified 597-SPM fixture below has no Atlas carrier and records
-            # zero resolver calls, so this injection is the load-bearing proof
-            # that the manifest rule catches more than the trivial 0 <= 55.
+            # Even if a legacy manifest enumerator offers every sibling SPM,
+            # the current-state board must not consume mutation-preflight
+            # manifests.  Selected mutation reports still use the strict path.
             def legacy_per_spm_manifest_targets(folder):
                 return sorted(Path(folder).glob("*.spm"))
 
@@ -2632,27 +2672,11 @@ class ProductionShapedLatencyFixtureTests(unittest.TestCase):
             self.assertEqual(
                 metrics.get("spm_decode_misses_unique_files"), 4
             )
-            self.assertEqual(
-                metrics.get("legacy_receipt_inspection_calls_unique_files"),
-                4,
+            self.assertIsNone(
+                metrics.get("legacy_receipt_inspection_calls_unique_files")
             )
-            self.assertEqual(
-                metrics.get("atlas_manifest_resolution_calls"), 4
-            )
-            self.assertEqual(guard["status"], "failed")
-            self.assertEqual(
-                guard["rules"]["atlas_manifest_resolution_calls"]["limit"],
-                2,
-            )
-            with self.assertRaisesRegex(
-                StartupAmplificationError,
-                r"atlas_manifest_resolution_calls=4 > 2",
-            ):
-                require_startup_total_invocation_guard(
-                    metrics,
-                    audit_scope_count=2,
-                    spm_count=4,
-                )
+            self.assertIsNone(metrics.get("atlas_manifest_resolution_calls"))
+            self.assertEqual(guard["status"], "ok")
 
     def test_597x_per_spm_negative_control_fails_with_unique_files_clean(self):
         """An in-memory 597-calls/SPM shape fails without I/O or unique drift."""
@@ -2733,7 +2757,7 @@ class ProductionShapedLatencyFixtureTests(unittest.TestCase):
         )
 
     def test_55_folder_597_spm_primary_paint_and_usable_latency_budgets(self):
-        """Reproduce 18,837 analysis calls and zero manifest resolutions."""
+        """Keep the 55-folder board free of mutation-preflight inspections."""
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "Tree"
             cache = Path(temporary) / "cache"
@@ -2932,10 +2956,10 @@ class ProductionShapedLatencyFixtureTests(unittest.TestCase):
                 28656,
             )
             self.assertEqual(
-                cold_cache.get("legacy_receipt_inspection_calls"), 597
+                cold_cache.get("legacy_receipt_inspection_calls", 0), 0
             )
             self.assertEqual(
-                warm_cache.get("legacy_receipt_inspection_calls"), 597
+                warm_cache.get("legacy_receipt_inspection_calls", 0), 0
             )
             self.assertEqual(
                 cold_cache.get("atlas_manifest_resolution_calls", 0), 0

@@ -97,6 +97,39 @@ def _record_error_process(
 
 
 class LaunchGuardTests(unittest.TestCase):
+    def test_collision_cli_preflight_builds_and_diagnoses_without_a_console(self):
+        module = load_guard_module()
+        target = REPO_DIR / "sk_batch" / "sk_batch_gui.pyw"
+        completed = [
+            subprocess.CompletedProcess(["powershell.exe"], 0, "built", ""),
+            subprocess.CompletedProcess(
+                [str(module["COLLISION_CLI"]), "--diagnose"],
+                0,
+                module["COLLISION_CLI_CONTRACT"] + "\n",
+                "",
+            ),
+        ]
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append((list(command), dict(kwargs)))
+            return completed.pop(0)
+
+        with mock.patch.dict(
+            module["run_collision_cli_preflight"].__globals__,
+            {"owned_run": run},
+        ), mock.patch.dict(os.environ, {}, clear=False):
+            result = module["run_collision_cli_preflight"](target)
+            observed_cli = os.environ["SPEEDTREE_COLLISION_CLI_EXE"]
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][0][0], "powershell.exe")
+        self.assertIn("-WindowStyle", calls[0][0])
+        self.assertIn("Hidden", calls[0][0])
+        self.assertEqual(calls[1][0], [str(module["COLLISION_CLI"]), "--diagnose"])
+        self.assertEqual(result["contract"], module["COLLISION_CLI_CONTRACT"])
+        self.assertEqual(observed_cli, str(module["COLLISION_CLI"]))
+
     def test_persistent_session_host_retries_early_exit_then_succeeds(self):
         module = load_guard_module()
         target = REPO_DIR / "sk_batch" / "sk_batch_gui.pyw"
@@ -409,15 +442,23 @@ class LaunchGuardTests(unittest.TestCase):
                     module["runpy"], "run_path", side_effect=fake_run_path
                 ), mock.patch.dict(
                     module["main"].__globals__,
-                    {"run_startup_retention": lambda: calls.append(("retention", "ran"))},
+                    {
+                        "run_collision_cli_preflight": lambda selected: calls.append(
+                            ("collision", Path(selected).name)
+                        ),
+                        "run_startup_retention": lambda: calls.append(
+                            ("retention", "ran")
+                        ),
+                    },
                 ):
                     result = module["main"](["launch_guard.pyw", str(target)])
 
                 self.assertEqual(result, 0)
-                self.assertEqual(calls[0], ("retention", "ran"))
-                self.assertEqual(calls[1][0], module["CODE_COMPILE_GATE"])
-                self.assertEqual(calls[2], ("gate", "ran"))
-                self.assertEqual(calls[3][0], target)
+                self.assertEqual(calls[0], ("collision", target.name))
+                self.assertEqual(calls[1], ("retention", "ran"))
+                self.assertEqual(calls[2][0], module["CODE_COMPILE_GATE"])
+                self.assertEqual(calls[3], ("gate", "ran"))
+                self.assertEqual(calls[4][0], target)
 
     def test_non_sk_batch_gui_skips_compile_gate(self):
         module = load_guard_module()
@@ -444,6 +485,7 @@ class LaunchGuardTests(unittest.TestCase):
             module["main"].__globals__,
             {
                 "report": (reporter := mock.Mock()),
+                "run_collision_cli_preflight": mock.Mock(),
                 "run_startup_retention": mock.Mock(),
             },
         ):
@@ -461,6 +503,7 @@ class LaunchGuardTests(unittest.TestCase):
         with mock.patch.object(module["runpy"], "run_path") as run, mock.patch.dict(
             module["main"].__globals__,
             {
+                "run_collision_cli_preflight": mock.Mock(),
                 "run_startup_retention": mock.Mock(side_effect=failure),
                 "report": (reporter := mock.Mock()),
             },

@@ -9,6 +9,7 @@ INTEGRATED_BAT = REPO / "SpeedTree_Batch_Tools.bat"
 SK_BATCH_BAT = REPO / "sk_batch" / "SK_Batch.bat"
 SK_EXACT_PUSH_BAT = REPO / "sk_batch" / "SK_Exact_Push.bat"
 BUILD_SCRIPT = REPO / "speedtree_collision_cli" / "build.ps1"
+LAUNCH_GUARD = REPO / "launch_guard.pyw"
 
 
 class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
@@ -34,7 +35,18 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
             self.assertIn('set "SPEEDTREE_COLLISION_NATIVE_CLI=1"', source)
             self.assertIn('set "SPEEDTREE_COLLISION_PERSISTENT=0"', source)
             self.assertNotIn("SPEEDTREE_COLLISION_SESSION_ANCHOR", source)
-            self.assertIn('build.ps1" -IfNeeded', source)
+        guard = LAUNCH_GUARD.read_text(encoding="utf-8")
+        for launcher in (INTEGRATED_BAT, SK_BATCH_BAT):
+            source = launcher.read_text(encoding="utf-8")
+            self.assertNotIn("powershell.exe", source)
+            self.assertNotIn("findstr.exe", source)
+        self.assertIn("run_collision_cli_preflight", guard)
+        self.assertIn('"-WindowStyle",', guard)
+        self.assertIn('"Hidden",', guard)
+        self.assertIn('"-IfNeeded",', guard)
+        self.assertIn('build.ps1" -IfNeeded', SK_EXACT_PUSH_BAT.read_text(
+            encoding="utf-8"
+        ))
 
     def test_build_freshness_covers_every_cli_source_input(self):
         source = BUILD_SCRIPT.read_text(encoding="utf-8")
@@ -55,10 +67,14 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         )
 
         self.assertIn(contract, launcher)
-        for batch_launcher in (INTEGRATED_BAT, SK_BATCH_BAT, SK_EXACT_PUSH_BAT):
+        guard = LAUNCH_GUARD.read_text(encoding="utf-8")
+        self.assertIn(contract, guard)
+        for batch_launcher in (INTEGRATED_BAT, SK_BATCH_BAT):
             source = batch_launcher.read_text(encoding="utf-8")
-            self.assertIn(contract, source)
-            self.assertIn("findstr.exe /x", source)
+            self.assertNotIn("findstr.exe", source)
+        exact = SK_EXACT_PUSH_BAT.read_text(encoding="utf-8")
+        self.assertIn(contract, exact)
+        self.assertIn("findstr.exe /x", exact)
 
     def test_disappeared_persistent_pipe_starts_a_replacement(self):
         source = LAUNCHER_SOURCE.read_text(encoding="utf-8")
