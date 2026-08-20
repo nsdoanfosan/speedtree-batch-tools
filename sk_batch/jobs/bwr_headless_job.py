@@ -65,6 +65,7 @@ from spm_leaf_handoff_contract import (
 )
 from speedtree_pipeline_contract import (
     refresh_preflight_report_after_exact_export,
+    reuse_preflight_report_after_unchanged_export,
     source_identity,
     validate_preflight_report,
 )
@@ -81,7 +82,6 @@ from cluster_assembly_handoff_contract import (
 )
 from cluster_assembly_builder import build_blender_assembly_inputs
 from spm_audit import is_cluster_normalization_spm
-from speedtree_legacy_cluster_contract import inspect_legacy_cluster_state
 from job_report_contract import mark_job_failed
 from repair_runtime_contract import REPAIR_OUTPUT_CONTRACT_VERSION
 from cluster_export_handoff_contract import (
@@ -501,30 +501,20 @@ def main():
     # Cluster rows reach this job under their canonical SK_ output identity.
     # ``--speedtree-spm`` can additionally point at an immutable isolated copy
     # when the Assembly receipt requires canonical bark before Atlas capture.
-    # Legacy receipt lineage remains report-only.
-    legacy_state = inspect_legacy_cluster_state(speedtree_spm)
-    legacy_cluster_origin = bool(
-        legacy_state.get("receipt_valid")
-        and legacy_state.get("classified_generator_guids")
-    )
+    # Legacy lineage never affects repair, so do not spend tens of seconds
+    # parsing a large SPM solely to populate historical diagnostics.
     source_review_policy = "diagnostic_only"
     report["source_review_policy"] = source_review_policy
     report["legacy_cluster_lineage"] = {
-        "status": "recognized" if legacy_cluster_origin else "not_applicable",
-        "receipt": legacy_state.get("receipt", ""),
-        "receipt_valid": bool(legacy_state.get("receipt_valid")),
-        "generator_count": len(
-            legacy_state.get("classified_generator_guids") or []
-        ),
-        "generator_guids": legacy_state.get("classified_generator_guids") or [],
-        "marker_drift_guids": legacy_state.get("marker_drift_guids") or [],
-        "errors": legacy_state.get("errors") or [],
+        "status": "diagnostic_not_run",
+        "reason": "legacy_lineage_is_not_a_repair_or_export_input",
+        "receipt": "",
+        "receipt_valid": False,
+        "generator_count": 0,
+        "generator_guids": [],
+        "marker_drift_guids": [],
+        "errors": [],
     }
-    if report["legacy_cluster_lineage"]["marker_drift_guids"]:
-        report.setdefault("warnings", []).append(
-            "Legacy Cluster foreground marker drift is diagnostic only; "
-            "the GUID receipt does not relax source validation."
-        )
     try:
         preflight_started = perf_counter()
         bark_normalization_manifest = None
@@ -605,15 +595,38 @@ def main():
         else:
             bpy.ops.wm.read_homefile(use_empty=True)
         record_stage_duration(report, "blend_open", blend_open_started)
+        is_cluster_source = is_cluster_normalization_spm(canonical_spm)
+        if args.cluster_source_build_only and not is_cluster_source:
+            raise RuntimeError(
+                "--cluster-source-build-only is valid only for a canonical "
+                "Cluster SPM"
+            )
 
         cluster_assembly_handoff = None
         cluster_assembly_handoff_summary = None
         cluster_assembly_source_resolution = None
-        cluster_receipt_path, cluster_receipt_resolution = resolve_cluster_receipt_path(
-            speedtree_spm,
-            args.material_contract or None,
-            include_resolution=True,
-        )
+        if args.cluster_source_build_only:
+            # This SPM is a raw provider consumed by another owner's
+            # Normalizer transaction. It cannot own a content-driven Assembly
+            # receipt under its own path, so scanning historical receipt
+            # candidates is pure delay and previously cost 10-20 seconds.
+            cluster_receipt_path = None
+            cluster_receipt_resolution = {
+                "policy": "cluster_source_provider_no_owner_receipt",
+                "requested_spm": str(speedtree_spm),
+                "selected_receipt": None,
+                "current_candidates": [],
+                "superseded_current_receipts": [],
+                "ignored_stale_candidates": [],
+            }
+        else:
+            cluster_receipt_path, cluster_receipt_resolution = (
+                resolve_cluster_receipt_path(
+                    speedtree_spm,
+                    args.material_contract or None,
+                    include_resolution=True,
+                )
+            )
         report["cluster_assembly_receipt_resolution"] = (
             cluster_receipt_resolution
         )
@@ -658,12 +671,6 @@ def main():
         settings.wind_preset = "WEED" if args.wind == "GRASS" else args.wind
         settings.write_unreal_json = True
         settings.write_dynamic_wind_json = True
-        is_cluster_source = is_cluster_normalization_spm(canonical_spm)
-        if args.cluster_source_build_only and not is_cluster_source:
-            raise RuntimeError(
-                "--cluster-source-build-only is valid only for a canonical "
-                "Cluster SPM"
-            )
         report["cluster_source_skin_contract"] = {
             "requested": is_cluster_source,
             "policy": (
@@ -841,14 +848,36 @@ def main():
                 )
 
         # Bind the runtime material input to the exact producer output. The
-        # refresh constructs the live contract; rereading it through a second
-        # validator would only add another authority for the same fact.
+        # preflight immediately before Blender already produced the same
+        # collision/pruning-aware FBX+STMAT bundle in the common cache-hit
+        # case, so reuse its content-addressed contract instead of parsing the
+        # unchanged SPM three more times. Metadata drift falls back to the
+        # existing full refresh and never becomes a separate gate.
         if args.material_contract:
-            live_stmat_path = Path(fbx_export["path"]).with_suffix(".stmat")
-            material_preflight = refresh_preflight_report_after_exact_export(
-                material_preflight,
-                speedtree_spm,
-                live_stmat_path,
+            material_contract_refresh_started = perf_counter()
+            reused_material_preflight = (
+                reuse_preflight_report_after_unchanged_export(
+                    material_preflight,
+                    fbx_export,
+                )
+            )
+            if reused_material_preflight is not None:
+                material_preflight = reused_material_preflight
+            else:
+                live_stmat_path = Path(fbx_export["path"]).with_suffix(
+                    ".stmat"
+                )
+                material_preflight = (
+                    refresh_preflight_report_after_exact_export(
+                        material_preflight,
+                        speedtree_spm,
+                        live_stmat_path,
+                    )
+                )
+            record_stage_duration(
+                report,
+                "material_contract_refresh",
+                material_contract_refresh_started,
             )
             live_material_contract_path = Path(args.report).with_name(
                 Path(args.report).stem + "_live_material_contract.json"
@@ -864,7 +893,11 @@ def main():
             report["live_material_contract"] = source_identity(
                 live_material_contract_path
             )
-            report["speedtree_pipeline_contract_refreshed_after_export"] = True
+            report["speedtree_pipeline_contract_refreshed_after_export"] = (
+                material_preflight["exact_target_export_contract_refresh"]
+                .get("status")
+                == "refreshed"
+            )
 
         if (
             cluster_assembly_contract is not None
@@ -1338,9 +1371,14 @@ def main():
             )
         if pipeline_data is not None:
             blend_fingerprint_started = perf_counter()
-            pipeline_data["source_blend_identity"] = file_fingerprint(
-                Path(blend_path)
+            source_blend_identity = file_fingerprint(
+                Path(blend_path),
+                hash_content=False,
             )
+            source_blend_identity["fingerprint_policy"] = (
+                "path_size_mtime_v1"
+            )
+            pipeline_data["source_blend_identity"] = source_blend_identity
             record_stage_duration(
                 report,
                 "blend_identity_fingerprint",

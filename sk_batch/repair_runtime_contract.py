@@ -521,11 +521,27 @@ def _validate_blend_identity(identity, expected_blend=None):
         identity.get("mtime_ns"), "committed Blend mtime_ns"
     )
     recorded_digest = str(identity.get("sha256") or "").casefold()
+    fingerprint_policy = str(
+        identity.get("fingerprint_policy") or "content_sha256_v1"
+    )
+    digest_invalid = (
+        fingerprint_policy != "path_size_mtime_v1"
+        and (
+            len(recorded_digest) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in recorded_digest
+            )
+        )
+    )
     if (
         recorded_size != stat.st_size
         or recorded_mtime != stat.st_mtime_ns
-        or len(recorded_digest) != 64
-        or any(character not in "0123456789abcdef" for character in recorded_digest)
+        or fingerprint_policy not in {
+            "content_sha256_v1",
+            "path_size_mtime_v1",
+        }
+        or digest_invalid
     ):
         raise RepairPipelineEvidenceError(
             "committed Blend fingerprint does not match the saved file"

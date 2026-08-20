@@ -103,15 +103,16 @@ class SourceReviewPolicyTests(unittest.TestCase):
     def test_legacy_receipt_lineage_does_not_create_a_source_gate(self):
         source = JOB_PATH.read_text(encoding="utf-8")
         self.assertNotIn("source_review_allowed", source)
-        self.assertIn("Legacy receipt lineage remains report-only", source)
-
-    def test_marker_drift_is_diagnostic_not_a_validation_waiver(self):
-        source = JOB_PATH.read_text(encoding="utf-8")
-        self.assertNotIn("marker_drift_non_blocking", source)
+        self.assertNotIn("inspect_legacy_cluster_state", source)
         self.assertIn(
-            "the GUID receipt does not relax source validation",
+            "legacy_lineage_is_not_a_repair_or_export_input",
             source,
         )
+
+    def test_legacy_marker_drift_scan_is_not_on_the_repair_hot_path(self):
+        source = JOB_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("marker_drift_non_blocking", source)
+        self.assertIn('"marker_drift_guids": []', source)
 
     def test_the_two_spm_identities_are_still_plumbed_separately(self):
         """The pair contract can still hand the job two different files."""

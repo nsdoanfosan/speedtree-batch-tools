@@ -410,8 +410,9 @@ class ExactComponentAnchorInfluenceTests(unittest.TestCase):
         self.assertEqual(influences, [{"bone": "Branch_A", "weight": 1.0}])
         self.assertEqual(
             source["policy"],
-            "exact_render_component_anchor_bone_name_v1",
+            "exact_render_component_skeleton_lca_v2",
         )
+        self.assertTrue(source["anchor_authored_on_component"])
         self.assertEqual(
             source["authored_component_bones"],
             ["Leaf_A", "Branch_A"],
@@ -436,7 +437,7 @@ class ExactComponentAnchorInfluenceTests(unittest.TestCase):
                 "test branch component",
             )
 
-    def test_rejects_sibling_weights_without_an_authored_common_anchor(self):
+    def test_uses_exact_skeleton_lca_for_sibling_component_weights(self):
         snapshot = skeleton_snapshot()
         skeleton_by_name = {
             row["name"]: row for row in snapshot["bones"]
@@ -450,17 +451,24 @@ class ExactComponentAnchorInfluenceTests(unittest.TestCase):
             [[(0, 0.5), (1, 0.5)]],
         )
 
-        with self.assertRaisesRegex(
-            ClusterAssemblyBuildError,
-            "common ancestor Trunk is not authored on the component",
-        ):
-            _exact_component_anchor_influences(
-                obj,
-                {"vertices": [0]},
-                snapshot,
-                skeleton_by_name,
-                "test branch component",
-            )
+        influences, source = _exact_component_anchor_influences(
+            obj,
+            {"vertices": [0]},
+            snapshot,
+            skeleton_by_name,
+            "test branch component",
+        )
+
+        self.assertEqual(influences, [{"bone": "Trunk", "weight": 1.0}])
+        self.assertEqual(
+            source["policy"],
+            "exact_render_component_skeleton_lca_v2",
+        )
+        self.assertFalse(source["anchor_authored_on_component"])
+        self.assertEqual(
+            source["authored_component_bones"],
+            ["Branch_A", "Branch_B"],
+        )
 
 
 class BaseExportParentChainTests(unittest.TestCase):

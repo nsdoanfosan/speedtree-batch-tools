@@ -4409,9 +4409,10 @@ def _exact_component_anchor_influences(
 
     A rendered component may contain weights for its attachment bone and
     descendants. A Nanite Assembly part is rigid, so replaying those weights as
-    multiple part influences blends unrelated bone transforms. Resolve the
-    hierarchy anchor only when it is itself an exact vertex-group name on the
-    component. This fails closed instead of using spatial proximity.
+    multiple part influences blends unrelated bone transforms. The exact
+    final-skeleton lowest common ancestor is the rigid attachment anchor. It
+    does not need its own direct vertex weight: sibling branch weights often
+    meet at an unweighted parent/end bone by design.
     """
     weighted = _component_influences(obj, component)
     names = [str(item["bone"]) for item in weighted]
@@ -4426,16 +4427,12 @@ def _exact_component_anchor_influences(
         skeleton_snapshot,
         skeleton_by_name=skeleton_by_name,
     )
-    if anchor not in names:
-        raise ClusterAssemblyBuildError(
-            f"{context} exact component bone names span sibling hierarchies; "
-            f"common ancestor {anchor} is not authored on the component"
-        )
     return [
         {"bone": anchor, "weight": 1.0},
     ], {
-        "policy": "exact_render_component_anchor_bone_name_v1",
+        "policy": "exact_render_component_skeleton_lca_v2",
         "anchor_bone": anchor,
+        "anchor_authored_on_component": anchor in names,
         "authored_component_bones": names,
     }
 

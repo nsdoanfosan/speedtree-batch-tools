@@ -3,6 +3,11 @@
 from array import array
 import math
 
+try:
+    import numpy as _np
+except ImportError:  # Blender normally bundles NumPy; keep a portable fallback.
+    _np = None
+
 
 BYTE_EPSILON = 0.5 / 255.0
 SPARSE_GREEN_ZERO_RATIO = 0.90
@@ -100,7 +105,55 @@ def _write_uv(layer, values):
             item.uv = tuple(values[base : base + 2])
 
 
+def _numpy_values(values):
+    if _np is None:
+        return None
+    if isinstance(values, _np.ndarray):
+        return values
+    if isinstance(values, array) and values.typecode == "f":
+        return _np.frombuffer(values, dtype=_np.float32)
+    try:
+        return _np.asarray(values, dtype=_np.float64)
+    except (TypeError, ValueError):
+        return None
+
+
+def _all_finite(values):
+    numeric = _numpy_values(values)
+    if numeric is not None:
+        return bool(_np.isfinite(numeric).all())
+    return all(math.isfinite(float(value)) for value in values)
+
+
+def _outside_unit_interval(values):
+    numeric = _numpy_values(values)
+    if numeric is not None:
+        return bool(
+            (numeric < -BYTE_EPSILON).any()
+            or (numeric > 1.0 + BYTE_EPSILON).any()
+        )
+    return any(
+        float(value) < -BYTE_EPSILON
+        or float(value) > 1.0 + BYTE_EPSILON
+        for value in values
+    )
+
+
 def _max_delta(left, right):
+    left_numeric = _numpy_values(left)
+    right_numeric = _numpy_values(right)
+    if left_numeric is not None and right_numeric is not None:
+        if left_numeric.size != right_numeric.size:
+            raise ValueError("delta buffers must contain the same value count")
+        if left_numeric.size == 0:
+            return 0.0
+        return float(
+            _np.max(
+                _np.abs(
+                    left_numeric.reshape(-1) - right_numeric.reshape(-1)
+                )
+            )
+        )
     return max((abs(float(a) - float(b)) for a, b in zip(left, right)), default=0.0)
 
 
@@ -142,12 +195,9 @@ def pack_speedtree_vertex_payload(
         return _blocked_payload_report(obj, "color_attribute_loop_count_mismatch")
 
     rgba_before = _read_rgba(attribute)
-    if any(not math.isfinite(float(value)) for value in rgba_before):
+    if not _all_finite(rgba_before):
         return _blocked_payload_report(obj, "color_attribute_contains_non_finite_values")
-    if any(
-        float(value) < -BYTE_EPSILON or float(value) > 1.0 + BYTE_EPSILON
-        for value in rgba_before
-    ):
+    if _outside_unit_interval(rgba_before):
         return _blocked_payload_report(obj, "color_attribute_outside_zero_one")
 
     uv_layers = getattr(mesh, "uv_layers", None)
@@ -208,39 +258,68 @@ def pack_speedtree_vertex_payload(
         payload_before = _read_uv(target)
 
     ao_uv = _read_uv(source)
-    blend_values = array("f", ao_uv[0::2])
-    ao_values = array("f", ao_uv[1::2])
-    if any(not math.isfinite(float(value)) for value in blend_values):
+    if _np is not None:
+        ao_matrix = _np.frombuffer(ao_uv, dtype=_np.float32).reshape(
+            loop_count, 2
+        )
+        blend_values = ao_matrix[:, 0]
+        ao_values = ao_matrix[:, 1]
+    else:
+        blend_values = array("f", ao_uv[0::2])
+        ao_values = array("f", ao_uv[1::2])
+    if not _all_finite(blend_values):
         if target_created:
             uv_layers.remove(target)
         return _blocked_payload_report(obj, "blend_ao_u_contains_non_finite_values")
-    if any(float(value) < -BYTE_EPSILON or float(value) > 1.0 + BYTE_EPSILON for value in blend_values):
+    if _outside_unit_interval(blend_values):
         if target_created:
             uv_layers.remove(target)
         return _blocked_payload_report(
             obj,
             "blend_ao_u_outside_zero_one_nanite_fallback_unsafe",
         )
-    if any(not math.isfinite(float(value)) for value in ao_values):
+    if not _all_finite(ao_values):
         if target_created:
             uv_layers.remove(target)
         return _blocked_payload_report(obj, "ao_uv_contains_non_finite_values")
-    if any(float(value) < -BYTE_EPSILON or float(value) > 1.0 + BYTE_EPSILON for value in ao_values):
+    if _outside_unit_interval(ao_values):
         if target_created:
             uv_layers.remove(target)
         return _blocked_payload_report(obj, "ao_uv_outside_zero_one")
 
     rgba_after = array("f", rgba_before)
     payload = array("f", [0.0]) * (loop_count * 2) if mirror_to_nanite_uv else array("f")
-    for index, ao in enumerate(ao_values):
-        clamped_ao = min(1.0, max(0.0, float(ao)))
-        rgba_after[index * 4 + 3] = clamped_ao
+    if _np is not None:
+        rgba_before_matrix = _np.frombuffer(
+            rgba_before, dtype=_np.float32
+        ).reshape(loop_count, 4)
+        rgba_after_matrix = _np.frombuffer(
+            rgba_after, dtype=_np.float32
+        ).reshape(loop_count, 4)
+        clamped_ao = _np.clip(ao_values, 0.0, 1.0)
+        rgba_after_matrix[:, 3] = clamped_ao
         if mirror_to_nanite_uv:
-            payload[index * 2] = NANITE_VERTEX_PAYLOAD_GREEN_TAG + rgba_before[index * 4 + 1]
+            payload_matrix = _np.frombuffer(
+                payload, dtype=_np.float32
+            ).reshape(loop_count, 2)
+            payload_matrix[:, 0] = (
+                NANITE_VERTEX_PAYLOAD_GREEN_TAG
+                + rgba_before_matrix[:, 1]
+            )
             # Unreal's FBX skeletal importer applies V = 1 - V. Store the
             # transport inverse so UE UV2.V resolves back to the same AO held
             # in VertexColor.A.
-            payload[index * 2 + 1] = 1.0 - clamped_ao
+            payload_matrix[:, 1] = 1.0 - clamped_ao
+    else:
+        for index, ao in enumerate(ao_values):
+            clamped_ao = min(1.0, max(0.0, float(ao)))
+            rgba_after[index * 4 + 3] = clamped_ao
+            if mirror_to_nanite_uv:
+                payload[index * 2] = (
+                    NANITE_VERTEX_PAYLOAD_GREEN_TAG
+                    + rgba_before[index * 4 + 1]
+                )
+                payload[index * 2 + 1] = 1.0 - clamped_ao
 
     try:
         _write_rgba(attribute, rgba_after)
@@ -258,26 +337,36 @@ def pack_speedtree_vertex_payload(
         raise
 
     verified_rgba = _read_rgba(attribute)
-    rgb_before = array(
-        "f",
-        [
-            value
-            for base in range(0, len(rgba_before), 4)
-            for value in rgba_before[base : base + 3]
-        ],
-    )
-    rgb_after = array(
-        "f",
-        [
-            value
-            for base in range(0, len(verified_rgba), 4)
-            for value in verified_rgba[base : base + 3]
-        ],
-    )
-    verified_alpha = verified_rgba[3::4]
+    if _np is not None:
+        verified_rgba_matrix = _np.frombuffer(
+            verified_rgba, dtype=_np.float32
+        ).reshape(loop_count, 4)
+        rgb_before = rgba_before_matrix[:, :3]
+        rgb_after = verified_rgba_matrix[:, :3]
+        before_alpha = rgba_before_matrix[:, 3]
+        verified_alpha = verified_rgba_matrix[:, 3]
+    else:
+        rgb_before = array(
+            "f",
+            [
+                value
+                for base in range(0, len(rgba_before), 4)
+                for value in rgba_before[base : base + 3]
+            ],
+        )
+        rgb_after = array(
+            "f",
+            [
+                value
+                for base in range(0, len(verified_rgba), 4)
+                for value in verified_rgba[base : base + 3]
+            ],
+        )
+        before_alpha = rgba_before[3::4]
+        verified_alpha = verified_rgba[3::4]
     tolerance = BYTE_EPSILON + 1.0e-6
     changed = (
-        _max_delta(rgba_before[3::4], ao_values) > tolerance
+        _max_delta(before_alpha, ao_values) > tolerance
         or (mirror_to_nanite_uv and (
             target_created or _max_delta(payload_before, payload) > 1.0e-6
         ))
@@ -288,12 +377,28 @@ def pack_speedtree_vertex_payload(
     }
     if mirror_to_nanite_uv:
         verified_payload = _read_uv(target)
-        verified_g = verified_rgba[1::4]
-        payload_g = array(
-            "f",
-            [value - NANITE_VERTEX_PAYLOAD_GREEN_TAG for value in verified_payload[0::2]],
-        )
-        payload_a = array("f", [1.0 - value for value in verified_payload[1::2]])
+        if _np is not None:
+            verified_payload_matrix = _np.frombuffer(
+                verified_payload, dtype=_np.float32
+            ).reshape(loop_count, 2)
+            verified_g = verified_rgba_matrix[:, 1]
+            payload_g = (
+                verified_payload_matrix[:, 0]
+                - NANITE_VERTEX_PAYLOAD_GREEN_TAG
+            )
+            payload_a = 1.0 - verified_payload_matrix[:, 1]
+        else:
+            verified_g = verified_rgba[1::4]
+            payload_g = array(
+                "f",
+                [
+                    value - NANITE_VERTEX_PAYLOAD_GREEN_TAG
+                    for value in verified_payload[0::2]
+                ],
+            )
+            payload_a = array(
+                "f", [1.0 - value for value in verified_payload[1::2]]
+            )
         deltas.update(
             {
                 "payload_u_vs_green_max_delta": _max_delta(payload_g, verified_g),
@@ -331,6 +436,28 @@ def pack_speedtree_vertex_payload(
 
 
 def summarize_scalar(values, epsilon=BYTE_EPSILON):
+    numeric = _numpy_values(values)
+    if numeric is not None:
+        numeric = numeric.reshape(-1)
+        count = int(numeric.size)
+        finite_mask = _np.isfinite(numeric)
+        finite_count = int(_np.count_nonzero(finite_mask))
+        finite = numeric if finite_count == count else numeric[finite_mask]
+        return {
+            "count": count,
+            "finite_count": finite_count,
+            "min": float(_np.min(finite)) if finite_count else 0.0,
+            "max": float(_np.max(finite)) if finite_count else 0.0,
+            "mean": (
+                float(_np.sum(finite, dtype=_np.float64) / finite_count)
+                if finite_count
+                else 0.0
+            ),
+            "zero_count": int(_np.count_nonzero(finite <= epsilon)),
+            "one_count": int(
+                _np.count_nonzero(finite >= 1.0 - epsilon)
+            ),
+        }
     values = [float(value) for value in values]
     count = len(values)
     finite = [value for value in values if math.isfinite(value)]
@@ -350,6 +477,31 @@ def summarize_rgba(values, epsilon=BYTE_EPSILON):
         raise ValueError("RGBA buffer length must be divisible by four")
 
     count = len(values) // 4
+    numeric = _numpy_values(values)
+    if numeric is not None:
+        matrix = numeric.reshape(count, 4)
+        result = {}
+        for channel, name in enumerate("rgba"):
+            column = matrix[:, channel]
+            zero_count = int(_np.count_nonzero(column <= epsilon))
+            one_count = int(
+                _np.count_nonzero(column >= 1.0 - epsilon)
+            )
+            result[name] = {
+                "count": count,
+                "min": float(_np.min(column)) if count else 0.0,
+                "max": float(_np.max(column)) if count else 0.0,
+                "mean": (
+                    float(_np.sum(column, dtype=_np.float64) / count)
+                    if count
+                    else 0.0
+                ),
+                "zero_count": zero_count,
+                "zero_ratio": zero_count / count if count else 0.0,
+                "one_count": one_count,
+                "one_ratio": one_count / count if count else 0.0,
+            }
+        return result
     mins = [1.0, 1.0, 1.0, 1.0]
     maxs = [0.0, 0.0, 0.0, 0.0]
     sums = [0.0, 0.0, 0.0, 0.0]

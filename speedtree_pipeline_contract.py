@@ -1170,6 +1170,86 @@ def validate_preflight_envelope(envelope, spm_path, require_ok=True):
     return copy.deepcopy(envelope)
 
 
+def reuse_preflight_report_after_unchanged_export(report, export_record):
+    """Return an exact preflight copy when the exporter reused its artifacts.
+
+    Material preflight already runs the collision/pruning-aware bundled
+    FBX+STMAT export before Blender starts.  A subsequent exporter cache hit
+    reports the same input fingerprint and content-addressed artifact rows.
+    Rebuilding the SPM envelope in that case reparses the same multi-megabyte
+    source several times without changing any contract fact.
+
+    A metadata mismatch simply returns ``None`` so the existing full refresh
+    remains the fallback.  This helper never turns drift into a new failure.
+    """
+    if not isinstance(report, dict) or report.get("status") != "ok":
+        return None
+    previous_export = report.get("speedtree_export")
+    if not isinstance(previous_export, dict) or not isinstance(
+        export_record, dict
+    ):
+        return None
+    if export_record.get("exists") is not True:
+        return None
+
+    previous_path_value = str(previous_export.get("path") or "")
+    current_path_value = str(export_record.get("path") or "")
+    if not previous_path_value or not current_path_value:
+        return None
+    previous_path = canonical_path_key(previous_path_value)
+    current_path = canonical_path_key(current_path_value)
+    previous_input = str(
+        previous_export.get("input_fingerprint") or ""
+    ).casefold()
+    current_input = str(
+        export_record.get("input_fingerprint") or ""
+    ).casefold()
+    if (
+        not previous_path
+        or previous_path != current_path
+        or not previous_input
+        or previous_input != current_input
+    ):
+        return None
+
+    def artifact_rows(value):
+        rows = {}
+        for item in value.get("artifacts") or ():
+            if not isinstance(item, dict):
+                return None
+            relative_path = str(item.get("relative_path") or "").casefold()
+            digest = str(item.get("sha256") or "").casefold()
+            if not relative_path or len(digest) != 64:
+                return None
+            try:
+                rows[relative_path] = (
+                    int(item.get("size", -1)),
+                    int(item.get("mtime_ns", -1)),
+                    digest,
+                )
+            except (TypeError, ValueError):
+                return None
+        return rows or None
+
+    previous_artifacts = artifact_rows(previous_export)
+    current_artifacts = artifact_rows(export_record)
+    if (
+        previous_artifacts is None
+        or previous_artifacts != current_artifacts
+    ):
+        return None
+
+    payload = copy.deepcopy(report)
+    payload["exact_target_export_contract_refresh"] = {
+        "status": "reused",
+        "refresh_cause": "exact_export_artifacts_unchanged",
+        "input_fingerprint": current_input,
+        "artifacts": copy.deepcopy(export_record.get("artifacts") or []),
+        "asset_failure": False,
+    }
+    return payload
+
+
 def refresh_preflight_report_after_exact_export(
     report,
     spm_path,
@@ -1405,6 +1485,7 @@ __all__ = [
     "spm_file_structural_semantic_fingerprint",
     "spm_authoring_graph_fingerprint",
     "spm_structural_semantic_fingerprint",
+    "reuse_preflight_report_after_unchanged_export",
     "refresh_preflight_report_after_exact_export",
     "validate_preflight_envelope",
     "validate_preflight_report",

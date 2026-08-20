@@ -1627,6 +1627,30 @@ class BlendLiveStatusTests(unittest.TestCase):
         with self.assertRaises(RepairPipelineEvidenceError):
             validate_unassigned_geometry_cleanup_evidence(payload)
 
+    def test_saved_blend_stat_identity_does_not_require_content_rehash(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "Tree.spm"
+            blend = root / "Tree.blend"
+            write_empty_spm(spm)
+            blend.write_bytes(b"blend")
+            payload = self._cleanup_contract_evidence(spm, blend=blend)
+            payload["source_blend_identity"].update(
+                {
+                    "sha256": None,
+                    "fingerprint_policy": "path_size_mtime_v1",
+                }
+            )
+
+            result = repair_pipeline_output_contract(
+                payload,
+                spm=spm,
+                source_fbx=spm.with_suffix(".fbx"),
+                blend=blend,
+            )
+
+            self.assertEqual(result, REPAIR_OUTPUT_CONTRACT_VERSION)
+
     def test_v2_pipeline_rejects_incomplete_export_material_assignments(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

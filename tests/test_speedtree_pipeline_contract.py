@@ -33,6 +33,7 @@ from speedtree_pipeline_contract import (
     read_spm_text,
     read_tree_instance_profile,
     refresh_preflight_report_after_exact_export,
+    reuse_preflight_report_after_unchanged_export,
     shared_contract_api,
     source_set_fingerprint,
     speedtree_generator_guid,
@@ -582,6 +583,73 @@ class SpeedTreePipelineContractTests(unittest.TestCase):
                 ]
             )
             validate_preflight_envelope(live, spm)
+
+    def test_exact_export_reuses_content_addressed_preflight_artifacts(self):
+        export = {
+            "path": r"C:\Trees\fbx\SK_tree.fbx",
+            "exists": True,
+            "input_fingerprint": "a" * 64,
+            "artifacts": [
+                {
+                    "relative_path": "SK_tree.fbx",
+                    "size": 100,
+                    "mtime_ns": 200,
+                    "sha256": "b" * 64,
+                },
+                {
+                    "relative_path": "SK_tree.stmat",
+                    "size": 10,
+                    "mtime_ns": 201,
+                    "sha256": "c" * 64,
+                },
+            ],
+        }
+        report = {
+            "status": "ok",
+            "speedtree_export": export,
+            "speedtree_pipeline_contract": {"marker": "preserved"},
+        }
+
+        reused = reuse_preflight_report_after_unchanged_export(
+            report,
+            {**export, "cache_hit": True},
+        )
+
+        self.assertIsNotNone(reused)
+        self.assertIsNot(reused, report)
+        self.assertEqual(
+            reused["exact_target_export_contract_refresh"]["status"],
+            "reused",
+        )
+        self.assertEqual(
+            reused["speedtree_pipeline_contract"],
+            {"marker": "preserved"},
+        )
+
+    def test_exact_export_reuse_falls_back_on_artifact_drift(self):
+        export = {
+            "path": r"C:\Trees\fbx\SK_tree.fbx",
+            "exists": True,
+            "input_fingerprint": "a" * 64,
+            "artifacts": [
+                {
+                    "relative_path": "SK_tree.stmat",
+                    "size": 10,
+                    "mtime_ns": 201,
+                    "sha256": "c" * 64,
+                },
+            ],
+        }
+        report = {"status": "ok", "speedtree_export": export}
+        changed = json.loads(json.dumps(export))
+        changed["artifacts"][0]["sha256"] = "d" * 64
+
+        self.assertIsNone(
+            reuse_preflight_report_after_unchanged_export(
+                report,
+                changed,
+            )
+        )
 
     def test_exact_export_refresh_rebinds_live_material_reorder(self):
         with tempfile.TemporaryDirectory() as temporary:
