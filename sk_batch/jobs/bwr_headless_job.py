@@ -507,7 +507,7 @@ def main():
     report["source_review_policy"] = source_review_policy
     report["legacy_cluster_lineage"] = {
         "status": "diagnostic_not_run",
-        "reason": "legacy_lineage_is_not_a_repair_or_export_input",
+        "policy": "legacy_lineage_is_not_a_repair_or_export_input",
         "receipt": "",
         "receipt_valid": False,
         "generator_count": 0,

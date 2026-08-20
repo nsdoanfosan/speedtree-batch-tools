@@ -66,7 +66,7 @@ MAX_SPEEDTREE_RENDER_FACE_MULTIPLICITY = 2
 # and ambiguous in the next.
 MIN_FBX_COORDINATE_TOLERANCE_METERS = 1.0e-6
 PASS_THROUGH_PROVENANCE_SCHEMA_VERSION = 1
-ASSEMBLY_BUILD_CACHE_VERSION = 2
+ASSEMBLY_BUILD_CACHE_VERSION = 3
 PASS_THROUGH_PROVENANCE_REASON = (
     "selected_target_contract_handoff_pass_through"
 )
@@ -390,9 +390,6 @@ def _assembly_build_input_signature(handoff, full_fbx, wind_json):
             "role_identity": str(row.get("role_identity") or ""),
             "manifest": _artifact_cache_identity(
                 normalized.get("manifest")
-            ),
-            "source_blend": _artifact_cache_identity(
-                normalized.get("source_blend")
             ),
         })
     payload = {
@@ -5692,10 +5689,12 @@ def build_blender_assembly_inputs(
                 normalized_contract.get("manifest"),
                 f"Atlas normalized variant manifest for {role}",
             )
-            validate_file_fingerprint(
-                normalized_contract.get("source_blend"),
-                f"Send to Unreal normalized source blend for {role}",
-            )
+            # Assembly consumes the normalized plan FBXs below.  The original
+            # source .blend is lineage metadata only: reading and hashing it
+            # here used to stream hundreds of MB (often several GB across one
+            # tree) even though no object is loaded from that file.  The plan
+            # manifest and each imported plan FBX remain the actual cache and
+            # build inputs.
             prototypes, imported_objects = _import_normalized_plan_prototypes(
                 bpy,
                 normalized_contract,

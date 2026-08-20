@@ -35,6 +35,7 @@ from cluster_assembly_builder import (  # noqa: E402
     _validate_base_export_parent_chain,
     _attachment_point_correspondence,
     _assembly_fit_summary,
+    _assembly_build_input_signature,
     _load_reusable_assembly_manifest,
     _base_weighted_bone_manifest_diagnostic,
     _base_role_polygon_indices,
@@ -69,6 +70,46 @@ from cluster_assembly_builder import (  # noqa: E402
 
 
 class AssemblyBuildCacheTests(unittest.TestCase):
+    def test_signature_ignores_lineage_only_source_blend(self):
+        handoff = {
+            "spm": {"path": "C:/tree.spm", "sha256": "a" * 64},
+            "actual_fbx": {"path": "C:/tree.fbx", "sha256": "b" * 64},
+            "assembly": {
+                "part_builder_inputs": [{
+                    "provider_key": "leaf:1",
+                    "role": "leaf",
+                    "role_identity": "leaf_01",
+                    "normalized_variants": {
+                        "manifest": {
+                            "path": "C:/plan.json",
+                            "sha256": "c" * 64,
+                        },
+                        "source_blend": {
+                            "path": "C:/large-source.blend",
+                            "sha256": "d" * 64,
+                        },
+                    },
+                }],
+            },
+        }
+        full_fbx = {"path": "C:/full.fbx", "sha256": "e" * 64}
+        wind = {"path": "C:/wind.json", "sha256": "f" * 64}
+
+        first = _assembly_build_input_signature(handoff, full_fbx, wind)
+        handoff["assembly"]["part_builder_inputs"][0][
+            "normalized_variants"
+        ]["source_blend"]["sha256"] = "0" * 64
+        second = _assembly_build_input_signature(handoff, full_fbx, wind)
+        self.assertEqual(first, second)
+
+        handoff["assembly"]["part_builder_inputs"][0][
+            "normalized_variants"
+        ]["manifest"]["sha256"] = "1" * 64
+        self.assertNotEqual(
+            first,
+            _assembly_build_input_signature(handoff, full_fbx, wind),
+        )
+
     def test_exact_artifact_hit_reuses_and_drift_falls_back_to_rebuild(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
