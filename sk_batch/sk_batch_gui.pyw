@@ -14152,7 +14152,6 @@ class App:
         actual_failure = cluster_issue_summary(live_issues)
 
         if actual_failure:
-            decision = repair_ui_decision({"issues": live_issues})
             # This gate used to print 자동 복구 대상 and then terminate the
             # target without ever consulting the planner (#160).  A block the
             # registry can act on now leaves through the same typed exclusion
@@ -14222,21 +14221,39 @@ class App:
                     log_file=log_file,
                     report_file=audit_report,
                 )
-            raise BatchItemError(
-                f"최종 차단: {spm.name} Cluster Assembly 데이터 검사 · "
-                f"원인: {decision['reason']} · 조치: {decision['action']}",
-                kind="data_error",
-                report={
-                    "stage": "cluster_assembly_live_audit",
-                    "spm": str(spm),
-                    "repair_disposition": decision["status"],
-                    "reason_ko": decision["reason"],
-                    "action_ko": decision["action"],
-                    "issues": copy.deepcopy(live_issues),
-                    "internal_summary": actual_failure,
-                },
-                log_file=log_file,
-                report_file=audit_report,
+            terminal_issues = [
+                issue
+                for issue in live_issues
+                if str(issue.get("code") or "").strip().upper()
+                not in _NORMALIZED_PROVIDER_REFRESH_CODES
+            ]
+            if terminal_issues:
+                terminal_summary = cluster_issue_summary(terminal_issues)
+                decision = repair_ui_decision({"issues": terminal_issues})
+                raise BatchItemError(
+                    f"최종 차단: {spm.name} Cluster Assembly 데이터 검사 · "
+                    f"원인: {decision['reason']} · 조치: {decision['action']}",
+                    kind="data_error",
+                    report={
+                        "stage": "cluster_assembly_live_audit",
+                        "spm": str(spm),
+                        "repair_disposition": decision["status"],
+                        "reason_ko": decision["reason"],
+                        "action_ko": decision["action"],
+                        "issues": copy.deepcopy(terminal_issues),
+                        "internal_summary": terminal_summary,
+                    },
+                    log_file=log_file,
+                    report_file=audit_report,
+                )
+            # A legacy provider can remain visible in the final Full FBX while
+            # its old Atlas normalization receipt has been retired.  When no
+            # exact provider refresh can be planned, this is maintenance
+            # metadata rather than an owner-asset failure.  Let Blender reuse
+            # the current production Assembly manifest instead of terminating
+            # an asset that already has a successful build.
+            raw_audit["nonblocking_maintenance_issues"] = copy.deepcopy(
+                live_issues
             )
 
         live_contract = copy.deepcopy(raw_audit.get("selected_contract"))

@@ -445,7 +445,11 @@ def require_cluster_assembly_handoff_ready(handoff):
     )
 
 
-def select_cluster_assembly_build_handoff(receipt_contract, inspected_handoff):
+def select_cluster_assembly_build_handoff(
+    receipt_contract,
+    inspected_handoff,
+    current_manifest_handoff=None,
+):
     """Prefer current FBX evidence over a stale pass-through receipt.
 
     The PCG receipt describes what was known before the final BWR FBX existed.
@@ -458,6 +462,11 @@ def select_cluster_assembly_build_handoff(receipt_contract, inspected_handoff):
         and inspected_handoff.get("status") == "ready"
     ):
         return "build", inspected_handoff
+    if (
+        isinstance(current_manifest_handoff, dict)
+        and current_manifest_handoff.get("status") == "ready"
+    ):
+        return "build", current_manifest_handoff
     if (
         isinstance(inspected_handoff, dict)
         and inspected_handoff.get("status") == "pass_through"
@@ -1273,15 +1282,13 @@ def main():
         report["unreal_push_ready"] = handoff_status == "ok"
         assembly_manifest = None
         assembly_manifest_summary = None
-        assembly_mode, selected_assembly_handoff = (
-            select_cluster_assembly_build_handoff(
-                cluster_assembly_contract,
-                cluster_assembly_handoff,
-            )
-        )
+        current_handoff = None
         if (
             preflight["status"] == "ok"
-            and assembly_mode is None
+            and (
+                not isinstance(cluster_assembly_handoff, dict)
+                or cluster_assembly_handoff.get("status") != "ready"
+            )
             and pipeline_data is not None
             and merged_object is not None
         ):
@@ -1293,11 +1300,16 @@ def main():
                 current_full_fbx,
             )
             if current_handoff is not None:
-                assembly_mode = "build"
-                selected_assembly_handoff = current_handoff
                 report["cluster_assembly_current_manifest_authority"] = (
                     current_handoff["current_manifest_authority"]
                 )
+        assembly_mode, selected_assembly_handoff = (
+            select_cluster_assembly_build_handoff(
+                cluster_assembly_contract,
+                cluster_assembly_handoff,
+                current_handoff,
+            )
+        )
         if preflight["status"] == "ok" and assembly_mode == "pass_through":
             # Persist "no content-driven Assembly" as a positive current
             # contract. Without this manifest, Push falls back to historical

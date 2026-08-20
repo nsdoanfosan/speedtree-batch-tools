@@ -4462,7 +4462,7 @@ class BlendLiveStatusTests(unittest.TestCase):
 
         self.assertEqual(len(resolutions), 2)
 
-    def test_cluster_live_audit_single_flight_is_strict_for_every_caller(
+    def test_cluster_live_audit_single_flight_reuses_legacy_ready_asset(
         self,
     ):
         gui = load_gui_module()
@@ -4543,16 +4543,19 @@ class BlendLiveStatusTests(unittest.TestCase):
                 )
                 self.assertTrue(waiter_started.wait(5))
                 release.set()
-                with self.assertRaises(gui.BatchItemError) as first_raised:
-                    first_future.result(timeout=5)
-                with self.assertRaises(gui.BatchItemError) as second_raised:
-                    second_future.result(timeout=5)
+                first = first_future.result(timeout=5)
+                second = second_future.result(timeout=5)
 
         self.assertEqual(app._run_limited.call_count, 1)
-        self.assertEqual(first_raised.exception.kind, "data_error")
-        self.assertEqual(second_raised.exception.kind, "data_error")
-        self.assertIn("필수 정규화 Cluster variant", str(first_raised.exception))
-        self.assertIn("필수 정규화 Cluster variant", str(second_raised.exception))
+        self.assertEqual(first["policy"], "live_audit_authoritative")
+        self.assertEqual(second["policy"], "live_audit_authoritative")
+        self.assertEqual(
+            [
+                row["code"]
+                for row in first["selected_contract"]["handoff"]["errors"]
+            ],
+            ["NORMALIZED_VARIANTS_REQUIRED"],
+        )
 
     def test_cluster_normalization_stage_partitions_producer_owned_work(
         self,
@@ -4631,13 +4634,16 @@ class BlendLiveStatusTests(unittest.TestCase):
                         require_normalized=False,
                     )
                 )
-                with self.assertRaises(gui.BatchItemError) as raised:
-                    app._refresh_stale_cluster_receipt(
-                        spm,
-                        "20260729_036103",
-                    )
+                owner_resolution = app._refresh_stale_cluster_receipt(
+                    spm,
+                    "20260729_036103",
+                )
 
         self.assertEqual(app._run_limited.call_count, 3)
+        self.assertEqual(
+            owner_resolution["policy"],
+            "live_audit_authoritative",
+        )
         self.assertEqual(resolution_a["status"], "normalization_required")
         self.assertEqual(resolution_b["status"], "normalization_required")
         self.assertEqual(
@@ -4654,7 +4660,6 @@ class BlendLiveStatusTests(unittest.TestCase):
             },
             {str(producer_b)},
         )
-        self.assertEqual(raised.exception.kind, "data_error")
 
     def test_cluster_live_audit_bookkeeping_error_releases_waiter(self):
         gui = load_gui_module()
