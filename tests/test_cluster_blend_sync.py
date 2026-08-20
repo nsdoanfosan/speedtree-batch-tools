@@ -1216,6 +1216,12 @@ class ClusterBlendSyncTests(unittest.TestCase):
             ) as normalize, mock.patch(
                 "cluster_blend_sync.subprocess.run"
             ) as worker:
+                current_state = (
+                    cluster_sync.inspect_cluster_relation_current_state(
+                        blend,
+                        [target],
+                    )
+                )
                 result = run_cluster_relation_transaction(
                     blend,
                     [target],
@@ -1225,6 +1231,8 @@ class ClusterBlendSyncTests(unittest.TestCase):
 
             normalize.assert_not_called()
             worker.assert_not_called()
+            self.assertTrue(current_state["current"])
+            self.assertTrue(current_state["registered"])
             self.assertTrue(result["no_change"])
             self.assertTrue(result["already_on"])
             self.assertEqual(

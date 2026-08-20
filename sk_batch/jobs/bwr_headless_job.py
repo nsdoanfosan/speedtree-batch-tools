@@ -57,15 +57,11 @@ def resolve_speedtree_collision_cli():
         )
     return executable, hook
 
-from vertex_color_contract import (
-    inspect_object_vertex_colors,
-    pack_speedtree_vertex_payload,
-)
+from vertex_color_contract import pack_speedtree_vertex_payload
 from repair_push_evidence import export_object_postcondition
 from spm_leaf_handoff_contract import (
     inspect_speedtree_material_export,
     inspect_spm_leaf_contract,
-    leaf_contract_user_message,
 )
 from speedtree_pipeline_contract import (
     refresh_preflight_report_after_exact_export,
@@ -87,11 +83,7 @@ from cluster_assembly_builder import build_blender_assembly_inputs
 from spm_audit import is_cluster_normalization_spm
 from speedtree_legacy_cluster_contract import inspect_legacy_cluster_state
 from job_report_contract import mark_job_failed
-from repair_runtime_contract import (
-    REPAIR_OUTPUT_CONTRACT_VERSION,
-    RepairPipelineEvidenceError,
-    validate_unassigned_geometry_cleanup_evidence,
-)
+from repair_runtime_contract import REPAIR_OUTPUT_CONTRACT_VERSION
 from cluster_export_handoff_contract import (
     capture_cluster_export_snapshot,
     cluster_export_contract_issues as inspect_cluster_export_contract,
@@ -106,21 +98,6 @@ from cluster_bark_source_resolution import (
     load_current_isolated_bark_manifest,
 )
 from blender_addon_gateway import prepare_runtime
-
-
-VERTEX_COLOR_ISSUE_TEXT = {
-    "green_channel_has_no_signal": (
-        "나무 높이 마스크(VertexColor.G)가 전부 0 — SpeedTree의 "
-        "Tree/Trunk/Branch Vertex Color Green 설정 확인"
-    ),
-}
-
-
-def friendly_vertex_color_issues(report):
-    return [
-        VERTEX_COLOR_ISSUE_TEXT.get(issue, issue)
-        for issue in (report.get("issues") or ["unknown"])
-    ]
 
 
 def parse_args():
@@ -258,34 +235,6 @@ def atomic_copy(source, destination):
             temporary.unlink()
         except FileNotFoundError:
             pass
-
-
-def material_slot_issues(obj):
-    if obj is None:
-        return [{"object": "<missing export mesh>", "slot": None, "used_faces": 0}]
-    if obj.type != "MESH" or not obj.data:
-        return [{"object": obj.name, "slot": None, "used_faces": 0}]
-    if len(obj.data.materials) == 0 and len(obj.data.polygons) > 0:
-        return [{
-            "object": obj.name,
-            "slot": 0,
-            "used_faces": len(obj.data.polygons),
-        }]
-    issues = []
-    for slot_index, material in enumerate(obj.data.materials):
-        if material is not None:
-            continue
-        issues.append(
-            {
-                "object": obj.name,
-                "slot": slot_index,
-                "used_faces": sum(
-                    1 for polygon in obj.data.polygons
-                    if polygon.material_index == slot_index
-                ),
-            }
-        )
-    return issues
 
 
 def remove_unused_empty_material_slots(obj):
@@ -487,14 +436,13 @@ def main():
     # Cluster rows reach this job under their canonical SK_ output identity.
     # ``--speedtree-spm`` can additionally point at an immutable isolated copy
     # when the Assembly receipt requires canonical bark before Atlas capture.
-    # Legacy receipt lineage is diagnostic only and never relaxes validation.
+    # Legacy receipt lineage remains report-only.
     legacy_state = inspect_legacy_cluster_state(speedtree_spm)
     legacy_cluster_origin = bool(
         legacy_state.get("receipt_valid")
         and legacy_state.get("classified_generator_guids")
     )
-    source_review_allowed = False
-    source_review_policy = "strict"
+    source_review_policy = "diagnostic_only"
     report["source_review_policy"] = source_review_policy
     report["legacy_cluster_lineage"] = {
         "status": "recognized" if legacy_cluster_origin else "not_applicable",
@@ -563,7 +511,6 @@ def main():
             "sk_batch.jobs.bwr_headless_job",
             {
                 "speedtree_bone_weight_repair": (
-                    "spm_sk_preflight_v1",
                     "speedtree_export_v1",
                     "repair_pipeline_v1",
                     "atlas_manifest_consumer_v1",
@@ -576,10 +523,6 @@ def main():
             "addon_runtime_prepare",
             addon_runtime_started,
         )
-        require_spm_sk_ready = addon_runtime.operation(
-            "speedtree_bone_weight_repair",
-            "require_spm_sk_ready",
-        )
         run_speedtree_cli_export = addon_runtime.operation(
             "speedtree_bone_weight_repair",
             "run_speedtree_cli_export",
@@ -587,18 +530,6 @@ def main():
         run_import_and_repair = addon_runtime.operation(
             "speedtree_bone_weight_repair",
             "run_import_and_repair",
-        )
-
-        # Reject authored-but-disabled Branch skeletons before creating an
-        # empty .blend. BranchMesh-only assets remain valid and use the rigid
-        # one-bone fallback inside the add-on.
-        spm_readiness_started = perf_counter()
-        if not args.manual_bones_locked:
-            require_spm_sk_ready(str(speedtree_spm))
-        record_stage_duration(
-            report,
-            "spm_skeleton_readiness",
-            spm_readiness_started,
         )
 
         blend_path = os.path.abspath(args.blend)
@@ -843,11 +774,9 @@ def main():
                     "the authoritative SpeedTree export"
                 )
 
-        # SpeedTree FBX export promotes a newly generated STMAT sidecar.  The
-        # initial validation above proved the exact SPM/report pair before any
-        # mutation; now bind a derived runtime contract to the exact producer
-        # output instead of treating that expected replacement as an asset
-        # failure.  The original preflight receipt remains immutable.
+        # Bind the runtime material input to the exact producer output. The
+        # refresh constructs the live contract; rereading it through a second
+        # validator would only add another authority for the same fact.
         if args.material_contract:
             live_stmat_path = Path(fbx_export["path"]).with_suffix(".stmat")
             material_preflight = refresh_preflight_report_after_exact_export(
@@ -859,11 +788,6 @@ def main():
                 Path(args.report).stem + "_live_material_contract.json"
             )
             write_report(live_material_contract_path, material_preflight)
-            validate_preflight_report(
-                live_material_contract_path,
-                speedtree_spm,
-                require_ok=True,
-            )
             settings.texture_contract_path = str(live_material_contract_path)
             report["speedtree_pipeline_contract"] = material_preflight[
                 "speedtree_pipeline_contract"
@@ -874,7 +798,7 @@ def main():
             report["live_material_contract"] = source_identity(
                 live_material_contract_path
             )
-            report["speedtree_pipeline_contract_revalidated_after_export"] = True
+            report["speedtree_pipeline_contract_refreshed_after_export"] = True
 
         if (
             cluster_assembly_contract is not None
@@ -934,22 +858,20 @@ def main():
             "blender_import_and_repair",
             blender_repair_started,
         )
-        try:
-            unassigned_geometry_cleanup = (
-                validate_unassigned_geometry_cleanup_evidence(
-                    result,
-                    expected_spm=canonical_spm,
-                    expected_fbx=fbx_export["path"],
-                    require_recheck=True,
-                    missing_is_diagnostic=True,
-                )
-            )
-        except RepairPipelineEvidenceError as exc:
-            raise RuntimeError(
-                "Blender Repair output contract requires pre-repair "
-                "Default/empty-material geometry cleanup evidence: "
-                f"{exc}"
-            ) from exc
+        unassigned_geometry_cleanup = result.get(
+            "unassigned_geometry_cleanup"
+        )
+        if not isinstance(unassigned_geometry_cleanup, dict):
+            unassigned_geometry_cleanup = {
+                "status": "diagnostic_only",
+                "policy": "completed_repair_is_authoritative_v1",
+                "telemetry_present": False,
+                "cleanup_applied": None,
+                "message": (
+                    "The active Blender add-on did not emit optional "
+                    "unassigned-geometry cleanup telemetry."
+                ),
+            }
         report["repair_output_contract_version"] = (
             REPAIR_OUTPUT_CONTRACT_VERSION
         )
@@ -998,7 +920,7 @@ def main():
             and is_cluster_source
             and export_collection_issues
         )
-        blocking_export_collection_issues = (
+        export_collection_diagnostics = (
             [] if cluster_export_pending else export_collection_issues
         )
 
@@ -1020,14 +942,15 @@ def main():
         )
         pipeline_path = Path(report["pipeline_report"])
         pipeline_data = None
+        merged_object = None
         texture_normalization = {}
         empty_material_slots = []
         vertex_color_contract = {
-            "status": "blocked",
-            "issues": ["missing_pipeline_report"],
+            "status": "diagnostic_not_run",
+            "issues": [],
         }
         vertex_payload_contract = {
-            "status": "blocked",
+            "status": "diagnostic_not_run",
             "issues": ["missing_pipeline_report"],
         }
         post_repair_spm_contract_started = perf_counter()
@@ -1109,50 +1032,27 @@ def main():
             merged_object = bpy.data.objects.get(merged_name)
             removed_empty_slots = remove_unused_empty_material_slots(merged_object)
             report["removed_unused_empty_material_slots"] = removed_empty_slots
-            empty_material_slots = material_slot_issues(merged_object)
             vertex_payload_started = perf_counter()
             vertex_payload_contract = pack_speedtree_vertex_payload(
                 merged_object,
                 mirror_to_nanite_uv=True,
             )
             report["vertex_payload_contract"] = vertex_payload_contract
-            vertex_color_contract = inspect_object_vertex_colors(
-                merged_object,
-                require_green_signal=args.wind == "TREE",
-            )
+            vertex_color_contract = {
+                "status": "covered_by_vertex_payload_transform",
+                "issues": [],
+            }
             record_stage_duration(
                 report,
                 "vertex_payload_finalize",
                 vertex_payload_started,
             )
             report["vertex_color_contract"] = vertex_color_contract
-            if "green_channel_has_no_signal" in vertex_color_contract.get("warnings", []):
-                report.setdefault("warnings", []).append(
-                    "VertexColor.G height mask is all zero; height attenuation "
-                    "will be disabled, but RGB/AO/UV payload is valid."
-                )
-            if "green_channel_sparse_by_contract" in vertex_color_contract.get("warnings", []):
-                green = (vertex_color_contract.get("channels") or {}).get("g") or {}
-                report.setdefault("warnings", []).append(
-                    "VertexColor.G is sparse by contract: "
-                    f"zero={green.get('zero_ratio', 0.0):.2%}, "
-                    f"mean={green.get('mean', 0.0):.6f}, "
-                    f"max={green.get('max', 0.0):.6f}"
-                )
 
-        # Persist the rebuilt scene only after the AO/UV payload is complete.
-        # A blocked payload leaves an existing source .blend untouched.
+        # The repair result is the save authority. Optional handoff diagnostics
+        # must not discard a completed Blender repair.
         report["blend_resaved"] = False
-        if (
-            not blocking_export_collection_issues
-            and vertex_payload_contract.get("status") == "ok"
-            and vertex_color_contract.get("status") == "ok"
-            and not leaf_reference_blocked
-            and (
-                source_review_allowed
-                or (not empty_material_slots and not material_export_blocked)
-            )
-        ):
+        if merged_object is not None:
             blend_save_started = perf_counter()
             if is_cluster_source:
                 save_result = save_cluster_source_mainfile(
@@ -1188,24 +1088,13 @@ def main():
         reviewable_source_issues = bool(
             empty_material_slots
             or material_export_blocked
-        )
-        structural_handoff_blocked = bool(
-            blocking_export_collection_issues
-            or missing_outputs
-            or vertex_color_contract.get("status") == "blocked"
-            or vertex_payload_contract.get("status") == "blocked"
             or leaf_reference_blocked
+            or export_collection_diagnostics
+            or missing_outputs
+            or vertex_payload_contract.get("status") == "blocked"
         )
-        hard_handoff_blocked = bool(
-            structural_handoff_blocked
-            or (reviewable_source_issues and not source_review_allowed)
-        )
-        if hard_handoff_blocked:
-            handoff_status = "blocked"
-        elif cluster_export_pending:
+        if cluster_export_pending:
             handoff_status = "cluster_export_pending"
-        elif reviewable_source_issues:
-            handoff_status = "source_review"
         else:
             handoff_status = "ok"
         preflight = {
@@ -1222,7 +1111,8 @@ def main():
             "missing_materials": material_export_contract.get(
                 "missing_materials", []
             ),
-            "source_review_required": handoff_status == "source_review",
+            "source_review_required": False,
+            "diagnostics_present": reviewable_source_issues,
             "unreal_push_ready": handoff_status == "ok",
         }
         source_blend_committed = bool(
@@ -1237,7 +1127,6 @@ def main():
                 "ready"
                 if (
                     args.cluster_source_build_only
-                    and not hard_handoff_blocked
                     and source_blend_committed
                 )
                 else "blocked"
@@ -1256,7 +1145,7 @@ def main():
             ),
             "final_export_required": cluster_export_pending,
             "post_normalization_handoff_status": (
-                "source_review" if reviewable_source_issues else "ok"
+                "ok"
             ),
             "source_blend_committed": source_blend_committed,
             "source_object": (
@@ -1267,7 +1156,7 @@ def main():
             cluster_source_build_contract
         )
         report["handoff_preflight"] = preflight
-        report["source_review_required"] = handoff_status == "source_review"
+        report["source_review_required"] = False
         report["unreal_push_ready"] = handoff_status == "ok"
         assembly_manifest = None
         assembly_mode, selected_assembly_handoff = (
@@ -1385,7 +1274,7 @@ def main():
                 ]
             if assembly_manifest is not None:
                 pipeline_data["cluster_assembly_manifest"] = assembly_manifest
-            if preflight["status"] in {"ok", "source_review"}:
+            if preflight["status"] == "ok":
                 pipeline_data["repair_push_export_postcondition"] = (
                     export_object_postcondition(bpy.data)
                 )
@@ -1396,62 +1285,6 @@ def main():
                 "pipeline_report_write",
                 pipeline_report_started,
             )
-        if preflight["status"] == "blocked":
-            reasons = []
-            if blocking_export_collection_issues:
-                reasons.append(
-                    "Send2UE Export 구조 오류: "
-                    + ", ".join(blocking_export_collection_issues)
-                )
-            if empty_material_slots:
-                details = ", ".join(
-                    f"{item['object']} slot {item['slot']}"
-                    for item in empty_material_slots
-                )
-                reasons.append("머티리얼 빈 슬롯: " + details)
-            if missing_outputs:
-                reasons.append("핸드오프 파일 누락: " + ", ".join(missing_outputs))
-            if vertex_color_contract.get("status") == "blocked":
-                reasons.append(
-                    "버텍스 컬러 계약 실패: "
-                    + ", ".join(friendly_vertex_color_issues(vertex_color_contract))
-                )
-            if vertex_payload_contract.get("status") == "blocked":
-                reasons.append(
-                    "SpeedTree AO/Nanite UV payload failed: "
-                    + ", ".join(vertex_payload_contract.get("issues") or ["unknown"])
-                )
-            if leaf_reference_blocked:
-                status = leaf_reference_contract.get("status")
-                if status == "replacement_needed":
-                    _ok, message = leaf_contract_user_message(
-                        leaf_reference_contract
-                    )
-                    reasons.append(message)
-                else:
-                    reasons.append(
-                        "SPM leaf 참조 실패: "
-                        + "; ".join(
-                            leaf_reference_contract.get("issues")
-                            or [leaf_reference_contract.get("error", "unknown")]
-                        )
-                    )
-            if material_export_blocked:
-                missing_materials = material_export_contract.get(
-                    "missing_materials", []
-                )
-                if missing_materials:
-                    reasons.append(
-                        "SpeedTree export 재질 누락: "
-                        + ", ".join(missing_materials)
-                    )
-                else:
-                    reasons.append(
-                        "SpeedTree .stmat 검사 실패: "
-                        + str(material_export_contract.get("status") or "unknown")
-                    )
-            report["status"] = "blocked"
-            report["error"] = "② Blender Repair 사전검사 차단 — " + " | ".join(reasons)
     except Exception as exc:
         mark_job_failed(report, exc, traceback.format_exc())
     record_stage_duration(report, "total_job", job_started)

@@ -735,7 +735,137 @@ def _source_binding_repairs(target_spm, material_record):
     return repairs
 
 
-def _resolve_target_role_material(target_spm, generated_material_name):
+def _provider_authored_source_material(
+    target_spm,
+    root,
+    output_record,
+    provider_blend,
+):
+    """Recover an exact source material behind a live generated output.
+
+    A refreshed Cluster output can already be live on many Generator slots.
+    In that state the output material is not its own authored source: the
+    provider's per-target receipt preserves the original source material and
+    exact GUID/slot handoff.  Use that lineage only when it seals the complete
+    current live slice and both endpoint materials still exist exactly.
+    """
+    if not provider_blend:
+        return None
+    resolution = resolve_atlas_manifests(
+        target_spm,
+        expected_blend=provider_blend,
+        diagnostic_only=True,
+    )
+    if resolution.get("mutation_authorized") is False:
+        return None
+    payload = selected_manifest_payload(resolution)
+    if not payload:
+        return None
+    output_id = output_record["material_id"]
+    output_mesh_ids = set(output_record.get("mesh_ids") or [])
+    groups = [
+        group
+        for group in payload.get("speedtree_material_groups") or []
+        if isinstance(group, dict)
+        and _integer_text(group.get("material_id")) == output_id
+        and set(
+            value
+            for value in (
+                _integer_text(item)
+                for item in group.get("mesh_ids") or []
+            )
+            if value is not None
+        )
+        == output_mesh_ids
+    ]
+    if len(groups) != 1:
+        return None
+    connection = payload.get("generator_connection") or {}
+    authored = connection.get("authored_bindings")
+    if authored is None:
+        authored = connection.get("bindings")
+    authored = [item for item in authored or [] if isinstance(item, dict)]
+    if not authored:
+        return None
+    authored_rows = [
+        item
+        for item in authored
+        if _integer_text(item.get("target_material_id")) == output_id
+        and _integer_text(item.get("target_mesh_id")) in output_mesh_ids
+    ]
+    if len(authored_rows) != len(authored):
+        return None
+    live_rows = [
+        pair
+        for pair in _generator_property_pairs(root)
+        if pair["material_id"] == output_id
+        and pair["mesh_id"] in output_mesh_ids
+        and pair["generator_guid"]
+    ]
+    live_keys = {
+        (
+            generator_guid_key(pair["generator_guid"]),
+            pair["slot_prefix"],
+            pair["material_id"],
+            pair["mesh_id"],
+        )
+        for pair in live_rows
+    }
+    authored_keys = {
+        (
+            generator_guid_key(item.get("generator_guid")),
+            str(item.get("slot_prefix") or "").strip(),
+            _integer_text(item.get("target_material_id")),
+            _integer_text(item.get("target_mesh_id")),
+        )
+        for item in authored_rows
+    }
+    if not live_keys or live_keys != authored_keys:
+        return None
+    sources = {
+        (
+            _integer_text(item.get("source_material_id")),
+            str(item.get("source_material_name") or "").strip(),
+        )
+        for item in authored_rows
+    }
+    if len(sources) != 1:
+        return None
+    source_id, source_name = next(iter(sources))
+    if source_id is None or not source_name:
+        return None
+    source_nodes = [
+        node
+        for node in root.findall(".//Material_v8")
+        if _integer_text(node.get("ID")) == source_id
+        and str(node.get("Name") or "") == source_name
+    ]
+    if len(source_nodes) != 1:
+        return None
+    source_record = _material_record(source_nodes[0], target_spm)
+    source_mesh_ids = set(source_record.get("mesh_ids") or [])
+    if any(
+        _integer_text(item.get("source_mesh_id")) not in (
+            source_mesh_ids | {-10}
+        )
+        for item in authored_rows
+    ):
+        return None
+    return {
+        "source": source_record,
+        "manifest": str(
+            (resolution.get("selected") or [{}])[0].get("path") or ""
+        ),
+        "binding_count": len(authored_rows),
+    }
+
+
+def _resolve_target_role_material(
+    target_spm,
+    generated_material_name,
+    *,
+    provider_blend=None,
+):
     """Resolve overwrite/adoption or a compatible source for material creation."""
     root = _read_spm_root(target_spm)
     materials = list(root.findall(".//Material_v8"))
@@ -791,6 +921,26 @@ def _resolve_target_role_material(target_spm, generated_material_name):
     if exact:
         record = _material_record(exact[0], target_spm)
         connect_generators = record["material_id"] in referenced_ids
+        authored_lineage = (
+            _provider_authored_source_material(
+                target_spm,
+                root,
+                record,
+                provider_blend,
+            )
+            if connect_generators
+            else None
+        )
+        source = (
+            authored_lineage["source"]
+            if authored_lineage is not None
+            else record
+        )
+        same_material_adoption = (
+            authored_lineage is not None
+            and source["material_id"] == record["material_id"]
+            and source["material_name"] == record["material_name"]
+        )
         resolved = {
             "target_spm": str(Path(target_spm).expanduser().absolute()),
             # SpeedTree name matching above is intentionally case-insensitive,
@@ -798,12 +948,23 @@ def _resolve_target_role_material(target_spm, generated_material_name):
             # material wins, its authored spelling is authoritative for both
             # the normalized Blender material and the target-local update.
             "generated_material_name": record["material_name"],
-            "source_material_name": record["material_name"],
-            "source_material_id": record["material_id"],
-            "adopt_source_material": connect_generators,
+            "source_material_name": source["material_name"],
+            "source_material_id": source["material_id"],
+            "adopt_source_material": (
+                connect_generators
+                and (
+                    authored_lineage is None
+                    or same_material_adoption
+                )
+            ),
             "connect_generators": connect_generators,
             "resolution": (
-                "overwrite_connected_output_material"
+                "refresh_connected_output_from_authored_lineage"
+                if (
+                    authored_lineage is not None
+                    and not same_material_adoption
+                )
+                else "overwrite_connected_output_material"
                 if connect_generators
                 else "update_output_assets_only"
             ),
@@ -818,6 +979,8 @@ def _resolve_target_role_material(target_spm, generated_material_name):
             resolved["legacy_managed_duplicate"] = (
                 legacy_managed_duplicate
             )
+        if authored_lineage is not None:
+            resolved["authored_source_lineage"] = authored_lineage
         return resolved
 
     family = _material_family_name(generated_material_name)
@@ -1357,7 +1520,11 @@ def resolve_normalization_recipe(
     )
     role = _role_contract(blend)
     target_material_bindings = [
-        _resolve_target_role_material(target, role["material_name"])
+        _resolve_target_role_material(
+            target,
+            role["material_name"],
+            provider_blend=blend,
+        )
         for target in targets
     ]
     if delivery_scope_intents is not None:

@@ -789,6 +789,116 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
             )
             self.assertTrue(recipe["adopt_source_material"])
 
+    def test_live_generated_output_recovers_exact_provider_source_lineage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            blend = root / "Cluster" / "SK_cluster_tree_07.blend"
+            blend.parent.mkdir()
+            blend.write_bytes(b"provider")
+            target = root / "SK_tree_22.spm"
+            target.write_text(
+                (
+                    "<SpeedTree><Assets>"
+                    '<Material_v8 ID="3" Name="M_leaf_source">'
+                    "<CutoutMeshID>2</CutoutMeshID></Material_v8>"
+                    '<Material_v8 ID="17" Name="M_cluster_tree_07">'
+                    "<CutoutMeshID>49</CutoutMeshID></Material_v8>"
+                    "</Assets><Generators><Generator Type=\"Leaf Mesh\">"
+                    "<GUID>stable-leaf-guid</GUID><Name>Leaf 10</Name>"
+                    "<Hidden>false</Hidden><Properties><Property>"
+                    "<Name>Leaves:Type:0:Material</Name><Value>17</Value>"
+                    "</Property><Property><Name>Leaves:Type:0:Mesh</Name>"
+                    "<Value>49</Value></Property></Properties></Generator>"
+                    "</Generators></SpeedTree>"
+                ),
+                encoding="utf-8",
+            )
+            payload = {
+                "speedtree_material_groups": [{
+                    "material": "M_cluster_tree_07",
+                    "material_id": 17,
+                    "mesh_ids": [49],
+                }],
+                "generator_connection": {
+                    "requested": False,
+                    "complete": False,
+                    "bindings": [],
+                    "authored_bindings": [{
+                        "generator_guid": "stable-leaf-guid",
+                        "slot_prefix": "Leaves:Type:0",
+                        "source_material_id": 3,
+                        "source_material_name": "M_leaf_source",
+                        "source_mesh_id": 2,
+                        "target_material_id": 17,
+                        "target_mesh_id": 49,
+                    }],
+                },
+            }
+            original_resolver = normalization_sync.resolve_atlas_manifests
+
+            def resolved(*_args, **_kwargs):
+                return {
+                    "mutation_authorized": True,
+                    "selected": [{
+                        "path": str(root / "provider-scope.json"),
+                        "payload": payload,
+                    }],
+                }
+
+            normalization_sync.resolve_atlas_manifests = resolved
+            try:
+                binding = normalization_sync._resolve_target_role_material(
+                    target,
+                    "M_cluster_tree_07",
+                    provider_blend=blend,
+                )
+                authored = payload["generator_connection"][
+                    "authored_bindings"
+                ][0]
+                authored["source_material_id"] = 17
+                authored["source_material_name"] = "M_cluster_tree_07"
+                authored["source_mesh_id"] = 49
+                adopted = normalization_sync._resolve_target_role_material(
+                    target,
+                    "M_cluster_tree_07",
+                    provider_blend=blend,
+                )
+                payload["generator_connection"]["authored_bindings"][0][
+                    "generator_guid"
+                ] = "different-guid"
+                unproven = normalization_sync._resolve_target_role_material(
+                    target,
+                    "M_cluster_tree_07",
+                    provider_blend=blend,
+                )
+            finally:
+                normalization_sync.resolve_atlas_manifests = original_resolver
+
+            self.assertEqual(binding["source_material_name"], "M_leaf_source")
+            self.assertEqual(binding["source_material_id"], 3)
+            self.assertFalse(binding["adopt_source_material"])
+            self.assertTrue(binding["connect_generators"])
+            self.assertEqual(
+                binding["resolution"],
+                "refresh_connected_output_from_authored_lineage",
+            )
+            self.assertEqual(
+                binding["authored_source_lineage"]["binding_count"],
+                1,
+            )
+            self.assertEqual(adopted["source_material_id"], 17)
+            self.assertTrue(adopted["adopt_source_material"])
+            self.assertEqual(
+                adopted["resolution"],
+                "overwrite_connected_output_material",
+            )
+            self.assertEqual(unproven["source_material_id"], 17)
+            self.assertTrue(unproven["adopt_source_material"])
+            self.assertEqual(
+                unproven["resolution"],
+                "overwrite_connected_output_material",
+            )
+
     def test_managed_unreferenced_same_name_duplicate_migrates_to_source(self):
         with tempfile.TemporaryDirectory() as temporary:
             blend, source, target, unit_probe = self.fixture(temporary)

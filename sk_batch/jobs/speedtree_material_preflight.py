@@ -1528,7 +1528,7 @@ def main():
                     )
                 else:
                     report["error"] = (
-                        "SpeedTree FBX 재질 사전검사 실패 — "
+                        "SpeedTree FBX 재질 데이터 준비 실패 — "
                         + str(material.get("status") or "unknown")
                     )
             else:

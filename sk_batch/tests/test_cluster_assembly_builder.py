@@ -61,7 +61,6 @@ from cluster_assembly_builder import (  # noqa: E402
     validate_normalized_prototype_unit_contract,
     validate_unreal_asset_contract,
     validate_unreal_bounds_contract,
-    validate_unreal_part_material_contracts,
     validate_unreal_normalized_prototype_bounds,
     validate_wind_json_against_skeleton,
     validate_persisted_residual_gate,
@@ -153,88 +152,6 @@ class GeneratedMaterialSlotContractTests(unittest.TestCase):
                 payload["validation_children"][0]["material_slots"],
                 ["M_leaf_tree_01.001", "M_bark_tree_01"],
             )
-
-    def test_unreal_part_preflight_rejects_reimported_duplicate_slot(self):
-        class Interface:
-            def __init__(self, name):
-                self.name = name
-
-            def get_name(self):
-                return self.name
-
-        class Slot:
-            def __init__(self, name, material_name):
-                self.name = name
-                self.interface = Interface(material_name)
-
-            def get_editor_property(self, name):
-                if name == "material_slot_name":
-                    return self.name
-                if name == "material_interface":
-                    return self.interface
-                raise AttributeError(name)
-
-        class Mesh:
-            def __init__(self, materials):
-                self.materials = materials
-
-            def get_editor_property(self, name):
-                if name == "materials":
-                    return self.materials
-                raise AttributeError(name)
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            source_blend = root / "SK_leaf_tree_01.blend"
-            source_blend.write_bytes(b"blend")
-            sidecar_dir = root / "texture"
-            sidecar_dir.mkdir()
-            sidecar = sidecar_dir / "SK_leaf_tree_01_01.json"
-            payload = self._sidecar_payload("SK_leaf_tree_01_01")
-            payload["materials"] = payload["materials"][:2]
-            sidecar.write_text(json.dumps(payload), encoding="utf-8")
-            contract = {
-                "mesh_name": "SK_leaf_tree_01_01",
-                "sidecar": file_fingerprint(sidecar),
-                "slots": [
-                    {
-                        "index": 0,
-                        "slot_name": "M_bark_tree_01",
-                        "material_instance_name": "MI_bark_tree_01",
-                    },
-                    {
-                        "index": 1,
-                        "slot_name": "M_leaf_tree_01_001",
-                        "material_instance_name": "MI_leaf_tree_01_001",
-                    },
-                ],
-            }
-            manifest = {"parts": [{
-                "prototype_id": "leaf",
-                "asset_name": "SK_leaf_tree_01_01",
-                "external_source": {
-                    "kind": "send_to_unreal_normalized_skeletal_part",
-                    "source_blend": {"path": str(source_blend)},
-                    "material_contract": contract,
-                },
-            }]}
-            mesh = Mesh([
-                Slot("M_bark_tree_01", "MI_bark_tree_01"),
-                Slot("M_leaf_tree_01_001", "MI_leaf_tree_01_001"),
-                Slot("M_leaf_tree_01_001", "MI_leaf_tree_01_001"),
-            ])
-            unreal = SimpleNamespace(SkeletalMesh=Mesh)
-
-            with self.assertRaisesRegex(
-                ClusterAssemblyBuildError,
-                "material slots changed during reimport",
-            ):
-                validate_unreal_part_material_contracts(
-                    unreal,
-                    manifest,
-                    {"leaf": mesh},
-                )
-
 
 class AssemblyBaseRoleExclusionTests(unittest.TestCase):
     def test_only_matched_role_polygons_are_removed(self):

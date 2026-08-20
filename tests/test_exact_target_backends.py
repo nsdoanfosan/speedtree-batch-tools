@@ -290,6 +290,52 @@ class ExactTargetBackendTests(unittest.TestCase):
             self.assertNotIn(other_cluster, rows[0]["on_target_spms"])
             self.assertEqual(canonical, [str(follower), str(cluster_target)])
 
+    def test_exact_provider_scope_skips_full_board_and_other_providers(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            owner = root / "asset"
+            cluster = owner / "cluster"
+            cluster.mkdir(parents=True)
+            target = owner / "SK_tree_exact.spm"
+            target.write_bytes(b"target")
+            selected = cluster / "SK_branch_exact.blend"
+            selected.write_bytes(b"blend")
+            selected.with_suffix(".spm").write_bytes(b"provider")
+            other = cluster / "SK_leaf_other.blend"
+            other.write_bytes(b"other")
+            other.with_suffix(".spm").write_bytes(b"other-provider")
+            save_target_registry(selected, [target])
+            save_target_registry(other, [target])
+
+            class Engine:
+                @staticmethod
+                def scan_tree_folders(*_args, **_kwargs):
+                    raise AssertionError("full board scan must be skipped")
+
+            module = SimpleNamespace(
+                engine=Engine(),
+                App=SimpleNamespace(),
+                load_config=lambda: {
+                    "tree_root": str(root),
+                    "sk_only": True,
+                },
+            )
+            with mock.patch.object(
+                generator_exact, "_load_gui_module", return_value=module
+            ):
+                _module, _cfg, _root, groups, rows, canonical = (
+                    generator_exact.exact_runtime_scope(
+                        [target],
+                        provider_blends=[selected],
+                    )
+                )
+
+            self.assertEqual(groups, [])
+            self.assertEqual(canonical, [str(target)])
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(Path(rows[0]["blend"]), selected)
+            self.assertEqual(rows[0]["on_target_spms"], [target])
+
     def test_generator_master_only_request_fails_instead_of_fanning_out(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -567,6 +613,86 @@ class ExactTargetBackendTests(unittest.TestCase):
             "identity",
             result["units"][0]["authorized_dependency_rebases"][0],
         )
+
+    def test_exact_current_cluster_scope_skips_heavy_identity_and_worker(self):
+        units = [
+            {"unit_id": "cluster:first", "stage": "cluster_refresh"},
+            {"unit_id": "cluster:second", "stage": "cluster_refresh"},
+        ]
+        rows = [
+            {
+                "blend": "C:/Tree/Cluster/SK_branch_01.blend",
+                "on_target_spms": ["C:/Tree/SK_tree_01.spm"],
+            },
+            {
+                "blend": "C:/Tree/Cluster/SK_leaf_01.blend",
+                "on_target_spms": ["C:/Tree/SK_tree_01.spm"],
+            },
+        ]
+
+        class App:
+            def _execute_connected_runtime_unit(self, *_args, **_kwargs):
+                raise AssertionError("current relations must not reach worker")
+
+            @staticmethod
+            def _connected_result_summary(result):
+                return copy.deepcopy(result)
+
+        module = SimpleNamespace(App=App)
+        current_state = {
+            "current": True,
+            "registered": True,
+            "verification": {"status": "ok"},
+            "targets": [{
+                "source_content_identity": {
+                    "status": "current",
+                    "current": True,
+                },
+            }],
+            "refresh_reasons": [],
+            "refresh_reason_categories": [],
+        }
+        request = {
+            "repair_action": generator_exact.CLUSTER_REFRESH,
+            "target_spms": ["C:/Tree/SK_tree_01.spm"],
+        }
+
+        with mock.patch.object(
+            generator_exact,
+            "build_exact_runtime_plan",
+            return_value=(
+                module,
+                {"verify_speedtree": True},
+                units,
+                rows,
+                {},
+                {"board_root": "C:/Tree"},
+                ["C:/Tree/SK_tree_01.spm"],
+            ),
+        ) as build, mock.patch.object(
+            generator_exact,
+            "inspect_cluster_relation_current_state",
+            return_value=current_state,
+        ) as inspect, mock.patch.object(
+            generator_exact,
+            "scope_dependency_identities",
+        ) as identities:
+            result = generator_exact.execute_exact_generator_request(
+                request,
+                progress=mock.Mock(),
+                cancel_event=SimpleNamespace(is_set=lambda: False),
+                lease=SimpleNamespace(
+                    renew_and_check_current=lambda: True
+                ),
+            )
+
+        build.assert_called_once_with(request, include_identities=False)
+        self.assertEqual(inspect.call_count, 2)
+        identities.assert_not_called()
+        self.assertTrue(result["shared_queue_success"])
+        self.assertTrue(result["fast_current_check"])
+        self.assertEqual(len(result["units"]), 2)
+        self.assertTrue(result["units"][0]["result"]["no_change"])
 
     def test_ownership_backend_plan_only_callable_never_applies(self):
         with tempfile.TemporaryDirectory() as folder:

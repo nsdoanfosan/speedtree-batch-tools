@@ -3283,6 +3283,20 @@ class PushQueueFlowTests(unittest.TestCase):
             'texture_normalization.get("missing")\n            or empty_material_slots',
             bwr_source,
         )
+        self.assertIn(
+            "disable_optional_send2ue_validations(scene_props)",
+            push_source,
+        )
+        self.assertNotIn("if blocked_vertex_payloads:", push_source)
+        self.assertNotIn("if empty_material_slots:", push_source)
+        self.assertIn(
+            'source_review_policy = "diagnostic_only"',
+            bwr_source,
+        )
+        self.assertNotIn(
+            'if preflight["status"] == "blocked":',
+            bwr_source,
+        )
         self.assertIn("resolve_cluster_spm_pair(spm_path)", push_source)
         self.assertIn(
             'parser.add_argument("--dependency-orchestrated", action="store_true")',
@@ -5407,6 +5421,7 @@ class PushQueueFlowTests(unittest.TestCase):
 
         self.assertEqual(len(jobs), 1)
         self.assertTrue(jobs[0]["force_rerun"])
+        self.assertFalse(jobs[0]["force_full_rebuild"])
         self.assertEqual(
             jobs[0]["retry_metadata"]["eligibility"]["items"][0][
                 "reason_code"
@@ -5928,6 +5943,7 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0]["mode"], "unreal_recovery")
         self.assertFalse(jobs[0]["force_rerun"])
+        self.assertFalse(jobs[0]["force_full_rebuild"])
         self.assertEqual(
             jobs[0]["retry_metadata"]["execution_path"],
             "immutable_unreal_only",
@@ -5966,6 +5982,7 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0]["mode"], "unreal_recovery")
         self.assertFalse(jobs[0]["force_rerun"])
+        self.assertFalse(jobs[0]["force_full_rebuild"])
         self.assertEqual(
             jobs[0]["retry_metadata"]["execution_path"],
             "immutable_unreal_only",
@@ -6055,6 +6072,7 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(jobs[0]["mode"], "pipeline")
         self.assertEqual(jobs[0]["terminal_phase"], "push")
         self.assertTrue(jobs[0]["force_rerun"])
+        self.assertFalse(jobs[0]["force_full_rebuild"])
         self.assertEqual(jobs[0]["push_transport"], "headless")
         self.assertEqual(
             jobs[0]["retry_metadata"]["execution_path"],
@@ -6078,6 +6096,7 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0]["mode"], "pipeline")
         self.assertTrue(jobs[0]["force_rerun"])
+        self.assertFalse(jobs[0]["force_full_rebuild"])
 
     def test_failed_results_retry_stale_blender_forces_full_pipeline(self):
         gui = load_gui_module()
@@ -6108,6 +6127,7 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0]["mode"], "pipeline")
         self.assertTrue(jobs[0]["force_rerun"])
+        self.assertFalse(jobs[0]["force_full_rebuild"])
         eligibility = jobs[0]["retry_metadata"]["eligibility"]
         self.assertEqual(
             eligibility["items"][0]["reason_code"],
@@ -6179,6 +6199,7 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0]["mode"], "pipeline")
         self.assertTrue(jobs[0]["force_rerun"])
+        self.assertTrue(jobs[0]["force_full_rebuild"])
         eligibility = jobs[0]["retry_metadata"]["eligibility"]
         self.assertEqual(
             eligibility["items"][0]["reason_code"],
@@ -6367,6 +6388,7 @@ class PushQueueFlowTests(unittest.TestCase):
 
         self.assertEqual([job["mode"] for job in jobs], ["pipeline"])
         self.assertTrue(jobs[0]["force_rerun"])
+        self.assertFalse(jobs[0]["force_full_rebuild"])
         self.assertEqual(
             jobs[0]["retry_metadata"]["eligibility"]["items"][0][
                 "reason_code"

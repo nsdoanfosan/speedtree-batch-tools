@@ -86,6 +86,22 @@ class ClusterRelationJobContractTests(unittest.TestCase):
             source,
         )
         self.assertIn(
+            'binding.get("adopt_source_material") not in {True, False}',
+            source,
+        )
+        self.assertIn(
+            'get("adopt_source_material") is True',
+            sync_source,
+        )
+        self.assertIn(
+            "adoption_targets=adoption_targets",
+            sync_source,
+        )
+        self.assertNotIn(
+            "adoption_targets=connection_targets",
+            sync_source,
+        )
+        self.assertIn(
             "execute_external_target_transaction(",
             sync_source,
         )

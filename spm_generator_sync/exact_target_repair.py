@@ -20,9 +20,14 @@ sys.path.insert(0, str(TOOL_DIR))
 from connected_run import (
     connected_settings,
     connected_unit_records,
-    dependency_identity,
     rebase_authorized_dependency_identities,
+    scope_dependency_identities,
 )
+from cluster_blend_sync import (
+    RelationValidationCache,
+    inspect_cluster_relation_current_state,
+)
+from atlas_target_registry import load_target_registry, registry_path_for_blend
 from exact_target_command import build_exact_target_request, run_exact_target_request
 from atlas_slot_ownership import (
     AtlasSlotOwnershipError,
@@ -204,6 +209,7 @@ def exact_runtime_scope(
     *,
     config=None,
     cluster_provider_relations=(),
+    provider_blends=(),
 ):
     """Read the current board and retain only exact matching unit selectors."""
 
@@ -219,12 +225,72 @@ def exact_runtime_scope(
         except ValueError as exc:
             raise ValueError("exact target is outside the configured inventory") from exc
 
-    board = module.engine.scan_tree_folders(
-        board_root,
-        sk_only=bool(cfg.get("sk_only", True)),
-        verify_physical=False,
-    )
-    scope = module.App._connected_scope_from_board(board)
+    direct_provider_blends = [
+        Path(value).expanduser().absolute()
+        for value in provider_blends or ()
+    ]
+    if direct_provider_blends:
+        direct_rows = []
+        seen_blends = set()
+        for blend in direct_provider_blends:
+            blend_key = _key(blend)
+            if blend_key in seen_blends:
+                continue
+            seen_blends.add(blend_key)
+            if not blend.is_file() or blend.suffix.casefold() != ".blend":
+                raise FileNotFoundError(
+                    f"exact Cluster provider blend does not exist: {blend}"
+                )
+            try:
+                blend.relative_to(board_root)
+            except ValueError as exc:
+                raise ValueError(
+                    "exact Cluster provider is outside the configured inventory"
+                ) from exc
+            owner = blend.parent.parent
+            registry = load_target_registry(blend)
+            registered_keys = {
+                _key(value)
+                for value in registry.get("target_spms") or ()
+            }
+            exact_targets = [
+                target
+                for target in requested
+                if target.parent == owner and _key(target) in registered_keys
+            ]
+            if not exact_targets:
+                raise RuntimeError(
+                    "exact Cluster provider has no ON relation to the requested "
+                    f"target: {blend}"
+                )
+            canonical = blend.with_suffix(".spm")
+            if not canonical.is_file():
+                raise FileNotFoundError(
+                    f"exact Cluster provider SPM does not exist: {canonical}"
+                )
+            direct_rows.append({
+                "kind": "cluster_normalized_blend",
+                "owner_folder": owner,
+                "cluster_folder": blend.parent,
+                "source_spm": canonical,
+                "canonical_spm": canonical,
+                "blend": blend,
+                "registry_path": registry_path_for_blend(blend),
+                "registry_managed": True,
+                "folder_relation": "on",
+                "on_target_spms": exact_targets,
+                "target_spms": exact_targets,
+                "refresh_reasons": [],
+                "refresh_reason_categories": [],
+            })
+        scope = {"groups": [], "cluster_rows": direct_rows}
+    else:
+        board = module.engine.scan_tree_folders(
+            board_root,
+            sk_only=bool(cfg.get("sk_only", True)),
+            verify_physical=False,
+        )
+        scope = module.App._connected_scope_from_board(board)
     sealed_cluster_rows = _sealed_cluster_relation_rows(
         scope,
         requested,
@@ -298,13 +364,21 @@ def exact_runtime_scope(
     return module, cfg, board_root, groups, cluster_rows, canonical
 
 
-def build_exact_runtime_plan(request: Mapping):
+def build_exact_runtime_plan(
+    request: Mapping,
+    *,
+    include_identities: bool = True,
+):
     module, cfg, board_root, groups, cluster_rows, canonical = exact_runtime_scope(
         request["target_spms"],
         cluster_provider_relations=(
             (request.get("provenance") or {}).get(
                 "cluster_provider_relations"
             )
+            or ()
+        ),
+        provider_blends=(
+            (request.get("provenance") or {}).get("provider_blends")
             or ()
         ),
     )
@@ -327,13 +401,57 @@ def build_exact_runtime_plan(request: Mapping):
         cfg,
         bool(cfg.get("verify_speedtree", True)),
         board_root,
-        include_cluster_producer=bool(cluster_rows),
+        include_cluster_producer=bool(cluster_rows) and include_identities,
     )
-    identities = {
-        unit["unit_id"]: dependency_identity(unit, settings)
-        for unit in units
-    }
+    identities = (
+        scope_dependency_identities(units, settings)
+        if include_identities
+        else {}
+    )
     return module, cfg, units, runtime_objects, identities, settings, canonical
+
+
+def _fast_current_cluster_result(row: Mapping, *, validation_cache=None):
+    """Return a pure selected-relation no-op result, or ``None`` if stale."""
+
+    blend = row.get("blend")
+    targets = list(row.get("on_target_spms") or ())
+    if not blend or not targets:
+        return None
+    state = inspect_cluster_relation_current_state(
+        blend,
+        targets,
+        validation_cache=validation_cache,
+    )
+    if not state.get("current"):
+        return None
+    return {
+        "status": "ok",
+        "mode": "sync",
+        "blend": str(Path(blend).expanduser().absolute()),
+        "target_spms": [
+            str(Path(target).expanduser().absolute()) for target in targets
+        ],
+        "folder_relation": "on",
+        "no_change": True,
+        "already_on": True,
+        "skip_reason": "already_on_up_to_date",
+        "fast_current_check": True,
+        "verification": state.get("verification"),
+        "planned_refresh_reasons": list(
+            row.get("refresh_reasons") or ()
+        ),
+        "planned_refresh_reason_categories": list(
+            row.get("refresh_reason_categories") or ()
+        ),
+        "refresh_reasons": [],
+        "refresh_reason_categories": [],
+        "source_content_identity": (
+            state["targets"][0].get("source_content_identity")
+            if state.get("targets")
+            else None
+        ),
+    }
 
 
 class _ProgressReport:
@@ -485,11 +603,70 @@ def execute_exact_generator_request(
         identities,
         settings,
         canonical,
-    ) = build_exact_runtime_plan(request)
+    ) = build_exact_runtime_plan(
+        request,
+        include_identities=(request.get("repair_action") != CLUSTER_REFRESH),
+    )
     app = module.App.__new__(module.App)
     report = _ProgressReport(progress, cancel_event, lease, len(units))
     results = []
     verify = bool(cfg.get("verify_speedtree", True))
+    if request.get("repair_action") == CLUSTER_REFRESH:
+        fast_results = []
+        validation_cache = RelationValidationCache()
+        for index, (unit, runtime_unit) in enumerate(
+            zip(units, runtime_objects),
+            1,
+        ):
+            report.current = index - 1
+            report.current_stage_code = str(unit["stage"])
+            report.raise_if_cancelled()
+            blend_name = Path(runtime_unit.get("blend") or "").name
+            progress(
+                f"선택 관계 확인 {index}/{len(units)} · {blend_name}",
+                completed=index - 1,
+                remaining=len(units) - index + 1,
+                unit_id=unit["unit_id"],
+                unit_stage=unit["stage"],
+            )
+            current_result = _fast_current_cluster_result(
+                runtime_unit,
+                validation_cache=validation_cache,
+            )
+            if current_result is None:
+                break
+            fast_results.append({
+                "unit_id": unit["unit_id"],
+                "stage": unit["stage"],
+                "result": module.App._connected_result_summary(
+                    current_result
+                ),
+            })
+            report.current = index
+            progress(
+                f"선택 관계 최신 상태 {index}/{len(units)}",
+                completed=index,
+                remaining=len(units) - index,
+                unit_id=unit["unit_id"],
+                unit_stage=unit["stage"],
+            )
+        if len(fast_results) == len(units):
+            return {
+                "status": "completed",
+                "outcome": "completed",
+                "shared_queue_success": True,
+                "exact_targets": canonical,
+                "units": fast_results,
+                "fast_current_check": True,
+            }
+        if not identities:
+            settings = connected_settings(
+                cfg,
+                verify,
+                settings.get("board_root"),
+                include_cluster_producer=True,
+            )
+            identities = scope_dependency_identities(units, settings)
     for index, (unit, runtime_unit) in enumerate(zip(units, runtime_objects), 1):
         report.current = index - 1
         report.current_stage_code = str(unit["stage"])
@@ -526,11 +703,15 @@ def execute_exact_generator_request(
                 "completed_units": len(results),
             }
         report.current = index
-        rebase_updates = rebase_authorized_dependency_identities(
-            unit,
-            units[index:],
-            identities,
-            settings,
+        rebase_updates = (
+            {}
+            if attempt["result"].get("no_change")
+            else rebase_authorized_dependency_identities(
+                unit,
+                units[index:],
+                identities,
+                settings,
+            )
         )
         rebase_receipts = []
         for unit_id, update in sorted(rebase_updates.items()):
@@ -583,6 +764,15 @@ def _parser():
         help="sealed Atlas slot ownership plan JSON (required for its action)",
     )
     parser.add_argument("--target-spm", action="append", required=True)
+    parser.add_argument(
+        "--provider-blend",
+        action="append",
+        default=[],
+        help=(
+            "exact Cluster provider blend; skips the full board inventory and "
+            "refreshes only this provider/target relation"
+        ),
+    )
     parser.add_argument("--parent-retry-id", required=True)
     parser.add_argument("--request-id", required=True)
     parser.add_argument("--receipt", required=True)
@@ -597,6 +787,10 @@ def main(argv=None) -> int:
         "source": "SPM_Generator_Sync.bat",
         "reason_codes": args.reason_code or ["public_exact_target_request"],
     }
+    if args.provider_blend:
+        if args.repair_action != CLUSTER_REFRESH:
+            parser.error("--provider-blend is supported by cluster-refresh only")
+        provenance["provider_blends"] = args.provider_blend
     if args.repair_action == ATLAS_SLOT_OWNERSHIP_RECONCILE:
         if not args.ownership_plan:
             parser.error("--ownership-plan is required for Atlas slot ownership")

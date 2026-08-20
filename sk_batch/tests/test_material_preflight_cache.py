@@ -338,6 +338,58 @@ class MaterialPreflightCacheTests(unittest.TestCase):
             app._run_limited.assert_not_called()
             load.assert_called_once()
 
+    def test_failed_stage_retry_reuses_successful_material_preflight(self):
+        gui = load_gui_module()
+        app = gui.App.__new__(gui.App)
+        app.force_rerun = True
+        app.force_full_rebuild = False
+        app.log = mock.Mock()
+        app._run_limited = mock.Mock(
+            side_effect=AssertionError("stage retry must reuse upstream cache")
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            addon = root / "addon"
+            fbx_ini = addon / "presets" / "speedtree_10_1" / "Options.ini"
+            fbx_ini.parent.mkdir(parents=True)
+            fbx_ini.write_text("options", encoding="utf-8")
+            (addon / "speedtree_cli.py").write_text("# cli", encoding="utf-8")
+            spm = root / "SK_tree_retry_01.spm"
+            spm.touch()
+            app.cfg = {
+                "fbx_ini": str(fbx_ini),
+                "speedtree_exe": str(root / "SpeedTree.exe"),
+            }
+            app._material_preflight_cache_context = mock.Mock(return_value={
+                "cache_dir": root / "cache",
+                "runtime_signature": "runtime-v1",
+            })
+            cached_report = root / "cached.material.json"
+            cached = {
+                "report": {"status": "ok"},
+                "report_path": cached_report,
+                "receipt_path": root / "cached.receipt.json",
+            }
+            with mock.patch.object(
+                gui,
+                "ADDON_ENTRY_DIR",
+                root / "missing-installed-addon",
+            ), mock.patch.object(
+                gui,
+                "load_material_preflight_cache",
+                return_value=cached,
+            ) as load:
+                result = app._execute_material_preflight(
+                    spm,
+                    spm,
+                    "20260807_030000",
+                )
+
+            self.assertTrue(result["cache_hit"])
+            self.assertEqual(result["report"], cached_report)
+            app._run_limited.assert_not_called()
+            load.assert_called_once()
+
     def test_gui_adopts_existing_success_report_before_launching_child(self):
         gui = load_gui_module()
         app = gui.App.__new__(gui.App)

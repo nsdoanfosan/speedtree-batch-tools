@@ -1,9 +1,9 @@
-"""BWR source validation has one strict policy.
+"""BWR source observations remain diagnostic after repair completes.
 
 Cluster rows are normalized to their canonical ``SK_`` name before the Blender
 job starts, so ``--spm`` and ``--speedtree-spm`` always name the same file.
-Legacy marker/GUID receipts remain useful lineage diagnostics but cannot waive
-source issues or authorize a weaker handoff.  These tests pin that strict gate.
+Legacy marker/GUID receipts and source issues remain reportable, but neither
+may discard a completed repair result.
 
 The job imports ``bpy``, so it is inspected as source rather than imported.
 """
@@ -91,7 +91,7 @@ class SourceReviewPolicyTests(unittest.TestCase):
 
     def test_only_reachable_policies_are_declared(self):
         policies = assigned_string_values(job_tree(), "source_review_policy")
-        self.assertEqual(policies, {"strict"})
+        self.assertEqual(policies, {"diagnostic_only"})
 
     def test_no_policy_keys_off_a_raw_unprefixed_cluster_name(self):
         source = JOB_PATH.read_text(encoding="utf-8")
@@ -100,22 +100,10 @@ class SourceReviewPolicyTests(unittest.TestCase):
         self.assertNotIn("cluster_pair_strict", source)
         self.assertNotIn("is_cluster_source_spm", source)
 
-    def test_legacy_receipt_lineage_never_relaxes_the_source_gate(self):
-        tree = job_tree()
-        gate = None
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Assign)
-                and any(
-                    isinstance(target, ast.Name)
-                    and target.id == "source_review_allowed"
-                    for target in node.targets
-                )
-            ):
-                gate = node.value
-        self.assertIsNotNone(gate, "source_review_allowed assignment is missing")
-        self.assertIsInstance(gate, ast.Constant)
-        self.assertIs(gate.value, False)
+    def test_legacy_receipt_lineage_does_not_create_a_source_gate(self):
+        source = JOB_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("source_review_allowed", source)
+        self.assertIn("Legacy receipt lineage remains report-only", source)
 
     def test_marker_drift_is_diagnostic_not_a_validation_waiver(self):
         source = JOB_PATH.read_text(encoding="utf-8")
@@ -142,7 +130,7 @@ class SourceReviewPolicyTests(unittest.TestCase):
         )
         self.assertIn('"spm": source_identity(canonical_spm)', source)
 
-    def test_source_contracts_are_revalidated_after_every_cli_export(self):
+    def test_live_contract_is_refreshed_without_a_second_validator(self):
         tree = job_tree()
         export_lines = call_lines(tree, "run_speedtree_cli_export")
         material_validation_lines = call_lines(
@@ -157,19 +145,15 @@ class SourceReviewPolicyTests(unittest.TestCase):
         repair_lines = call_lines(tree, "run_import_and_repair")
 
         self.assertEqual(len(export_lines), 2)
-        self.assertEqual(len(material_validation_lines), 2)
+        self.assertEqual(len(material_validation_lines), 1)
         self.assertEqual(len(exact_export_refresh_lines), 1)
         self.assertLess(material_validation_lines[0], export_lines[0])
         self.assertGreater(exact_export_refresh_lines[0], max(export_lines))
-        self.assertLess(
-            exact_export_refresh_lines[0], material_validation_lines[1]
-        )
-        self.assertGreater(material_validation_lines[1], max(export_lines))
         self.assertEqual(len(assembly_inspection_lines), 1)
         self.assertGreater(assembly_inspection_lines[0], max(export_lines))
         self.assertEqual(len(repair_lines), 1)
         self.assertLess(
-            max(material_validation_lines[1], assembly_inspection_lines[0]),
+            max(exact_export_refresh_lines[0], assembly_inspection_lines[0]),
             repair_lines[0],
         )
 

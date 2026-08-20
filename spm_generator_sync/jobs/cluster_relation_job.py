@@ -206,6 +206,19 @@ def validate_recipe_registry_contract(recipe, effective_paths):
                 "Cluster normalization material binding must declare "
                 "connect_generators as an explicit boolean."
             )
+        if binding.get("adopt_source_material") not in {True, False}:
+            raise RuntimeError(
+                "Cluster normalization material binding must declare "
+                "adopt_source_material as an explicit boolean."
+            )
+        if (
+            binding.get("adopt_source_material") is True
+            and binding.get("connect_generators") is not True
+        ):
+            raise RuntimeError(
+                "Cluster source-material adoption requires a Generator-"
+                "connected target."
+            )
     connected = [
         row for row in bindings if row.get("connect_generators") is True
     ]
@@ -771,10 +784,10 @@ def sync_targets(blend, requested, normalization_recipe=None):
         runtime_recipe,
         effective_targets=requested,
     )
-    connection_targets = [
+    adoption_targets = [
         path
         for path in requested
-        if bindings_by_key[key(path)].get("connect_generators") is True
+        if bindings_by_key[key(path)].get("adopt_source_material") is True
     ]
     # Normalize each requested relation in place. The previous manifest and
     # Generator bindings are the migration input; detaching a valid relation
@@ -787,7 +800,7 @@ def sync_targets(blend, requested, normalization_recipe=None):
     transaction = execute_external_target_transaction(
         props,
         requested,
-        adoption_targets=connection_targets,
+        adoption_targets=adoption_targets,
         adoption_blend_path=blend,
         preserve_explicit_material_name=True,
     )

@@ -2035,7 +2035,11 @@ class App:
                 unit_probe_path=unit_probe_path,
                 capture_resolution=capture_resolution,
                 repair_runtime_config=job_config,
-                force_refresh=True,
+                # A refresh request is also the fast current-state check.
+                # Let the transaction's exact-target preflight decide whether
+                # Blender work is necessary instead of rebuilding every ON
+                # relationship on each sync.
+                force_refresh=False,
                 progress_callback=(
                     lambda _stage, message, i=index: report(
                         f"Cluster refresh {i}/{cluster_count} · {message}",
@@ -2560,6 +2564,9 @@ class App:
                 "backup_dir",
                 "master_hash",
                 "cluster_count",
+                "blend",
+                "target_spms",
+                "folder_relation",
                 "scale_skipped",
                 "preflight_refresh_required",
                 "preflight_refresh_reasons",
@@ -2569,6 +2576,10 @@ class App:
                 "refresh_reasons",
                 "refresh_reason_categories",
                 "source_content_identity",
+                "no_change",
+                "already_on",
+                "skip_reason",
+                "fast_current_check",
             )
             if result.get(key) is not None
         }

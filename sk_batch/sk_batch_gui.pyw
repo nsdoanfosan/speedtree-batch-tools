@@ -3632,7 +3632,7 @@ class App:
         return any(marker in text for marker in (
             "검증 중",
             "상태 확인 대기",
-            "재질 사전검사 중",
+            "재질 데이터 준비 중",
             "blender repair 중",
         ))
 
@@ -5221,6 +5221,12 @@ class App:
             legacy_calibration_settings_signature(self.cfg)
         )
         self.force_rerun = job["force_rerun"]
+        # Retrying a failed stage does not grant full-rebuild semantics.
+        # Only the operator's explicit force checkbox bypasses reusable
+        # upstream artifacts such as the material preflight receipt.
+        self.force_full_rebuild = bool(
+            job.get("force_full_rebuild", self.force_rerun)
+        )
         self.active_push_transport = job["push_transport"]
         self._active_retry_metadata = copy.deepcopy(
             job.get("retry_metadata") or {}
@@ -8758,6 +8764,9 @@ class App:
                 "Retry run · Blender/Send2UE→Unreal · "
                 f"{len(export_targets)} targets"
             )
+
+        for retry_job in jobs:
+            retry_job["force_full_rebuild"] = retry_force_full_rebuild
 
         missing_ids = [
             iid for iid in runnable_ids if iid not in targets_by_id
@@ -12488,7 +12497,7 @@ class App:
             )
             if cached is not None:
                 self.log(
-                    "기존 재질 사전검사 성공 보고서를 재사용 영수증으로 등록: "
+                    "기존 재질 데이터 준비 결과를 재사용 영수증으로 등록: "
                     f"{Path(spm).name}"
                 )
                 return cached
@@ -12564,7 +12573,11 @@ class App:
         )
         material_log_name = f"{spm.stem}_material_preflight_{stamp}.log"
         if (
-            not getattr(self, "force_rerun", False)
+            not getattr(
+                self,
+                "force_full_rebuild",
+                getattr(self, "force_rerun", False),
+            )
             and cache_context["runtime_signature"]
         ):
             cached = self._load_or_seed_material_preflight_cache(
@@ -12574,7 +12587,7 @@ class App:
             )
             if cached is not None:
                 self.log(
-                    "재질 사전검사 건너뜀 (동일 입력 성공 영수증): "
+                    "재질 데이터 준비 재사용 (동일 입력 성공 영수증): "
                     f"{spm.name}"
                 )
                 return {
@@ -12615,8 +12628,8 @@ class App:
             (MATERIAL_PREFLIGHT_FAILED_MARKER, "실패 보고서 정리 중"),
             (MATERIAL_PREFLIGHT_DONE_MARKER, "완료 처리 중"),
             (MATERIAL_PREFLIGHT_CONTRACT_DONE_MARKER, "보고서 저장 중"),
-            (MATERIAL_PREFLIGHT_INSPECTION_DONE_MARKER, "계약 봉투 생성 중"),
-            (MATERIAL_PREFLIGHT_EXPORT_DONE_MARKER, "재질/텍스처 검사 중"),
+            (MATERIAL_PREFLIGHT_INSPECTION_DONE_MARKER, "재질 데이터 정리 중"),
+            (MATERIAL_PREFLIGHT_EXPORT_DONE_MARKER, "SpeedTree FBX/XML 생성 완료"),
             (SPEEDTREE_SLOT_ACQUIRED_MARKER, "SpeedTree 실행 중"),
             (SPEEDTREE_SLOT_WAIT_MARKER, "SpeedTree 단일 슬롯 대기 중"),
             (MATERIAL_PREFLIGHT_STATIC_DONE_MARKER, "정적 계약 완료"),
@@ -12632,7 +12645,7 @@ class App:
                         and not last_progress["failure_logged"]
                     ):
                         self.log(
-                            "재질 사전검사 child 실패 단계 보고: "
+                            "재질 데이터 준비 child 실패 단계 보고: "
                             f"{spm.name} · {latest_line}"
                         )
                         last_progress["failure_logged"] = True
@@ -12649,7 +12662,7 @@ class App:
                 reported_phase=phase,
             )
             self.log(
-                f"재질 사전검사 heartbeat: {spm.name} · {phase} "
+                f"재질 데이터 준비 heartbeat: {spm.name} · {phase} "
                 f"· 총 {int(elapsed)}초"
             )
 
@@ -12685,7 +12698,7 @@ class App:
                 # Cache publication is an optimization.  The authoritative
                 # just-completed report still proceeds to Blender Repair.
                 self.log(
-                    "  [캐시 기록 경고] 재질 사전검사 결과는 유효하지만 "
+                    "  [캐시 기록 경고] 재질 데이터 준비 결과는 유효하지만 "
                     f"재사용 영수증을 기록하지 못함: {spm.name} · "
                     f"{compact_error_message(exc)}"
                 )
@@ -15621,10 +15634,10 @@ class App:
                 },
             )
         entry = self.state.setdefault(iid, {})
-        self.log(f"재질 사전검사 시작: {spm.name} (Blender 실행 전)")
+        self.log(f"재질 데이터 준비 시작: {spm.name} (Blender 실행 전)")
         self.ui_queue.put((
             "cell",
-            (iid, "blend_status", "재질 사전검사 중..."),
+            (iid, "blend_status", "재질 데이터 준비 중..."),
         ))
         artifact = self._execute_material_preflight(
             spm,
@@ -15702,7 +15715,7 @@ class App:
                     kind="internal_error",
                     report_file=live_report,
                 ) from exc
-        self.log(f"재질 사전검사 통과: {spm.name}")
+        self.log(f"재질 데이터 준비 완료: {spm.name}")
         self.log(f"Blender repair 시작: {spm.name} (수분 소요될 수 있음)")
         self.ui_queue.put(("cell", (iid, "blend_status", "Blender repair 중...")))
         wind = item["wind_override"]

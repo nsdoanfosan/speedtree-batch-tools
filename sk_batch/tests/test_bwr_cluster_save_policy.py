@@ -148,14 +148,14 @@ class ClusterSavePolicyTests(unittest.TestCase):
             source,
         )
 
-    def test_blocking_export_contract_prevents_blend_save(self):
+    def test_optional_handoff_diagnostics_do_not_prevent_blend_save(self):
         source = JOB_PATH.read_text(encoding="utf-8")
         self.assertIn(
-            'if (\n'
-            '            not blocking_export_collection_issues\n'
-            '            and vertex_payload_contract.get("status") == "ok"',
+            "# The repair result is the save authority.",
             source,
         )
+        self.assertIn("if merged_object is not None:", source)
+        self.assertNotIn("blocking_export_collection_issues", source)
 
 
 if __name__ == "__main__":

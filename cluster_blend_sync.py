@@ -1535,7 +1535,12 @@ def discover_cluster_blend_relations(
     return sorted(rows, key=lambda row: row["blend"].name.casefold())
 
 
-def _current_on_relation_state(blend, targets):
+def _current_on_relation_state(
+    blend,
+    targets,
+    *,
+    validation_cache=None,
+):
     """Return current physical proof plus fail-closed refresh diagnostics.
 
     The registry alone is not enough to skip work.  A no-op is safe only when
@@ -1545,6 +1550,8 @@ def _current_on_relation_state(blend, targets):
     blend = Path(blend).expanduser().absolute()
     owner = blend.parent.parent
     canonical = blend.with_suffix(".spm")
+    if validation_cache is None:
+        validation_cache = RelationValidationCache()
     reasons = []
     target_states = []
     if not canonical.is_file():
@@ -1565,6 +1572,7 @@ def _current_on_relation_state(blend, targets):
             True,
             canonical_spm=canonical,
             verify_physical=True,
+            validation_cache=validation_cache,
         )
         target_states.append({
             "target_spm": str(target),
@@ -1667,6 +1675,95 @@ def set_cluster_relation_registry(blend, target_spm, enabled):
     return save_target_registry(blend, list(current_by_key.values()))
 
 
+def _inspect_current_cluster_relation_state(
+    blend,
+    targets,
+    *,
+    auto_normalize=True,
+    validation_cache=None,
+):
+    """Read the exact selected relation state without publishing anything."""
+
+    registered_keys = {
+        normalized_path_key(path) for path in _registry_target_spms(blend)
+    }
+    requested_keys = {normalized_path_key(path) for path in targets}
+    if not requested_keys.issubset(registered_keys):
+        return {
+            "current": False,
+            "registered": False,
+            "targets": [],
+            "verification": None,
+            "refresh_reasons": [
+                "Cluster relationship is not registered ON for every "
+                "selected target"
+            ],
+            "refresh_reason_categories": ["relationship_registry"],
+        }
+
+    state = _current_on_relation_state(
+        blend,
+        targets,
+        validation_cache=validation_cache,
+    )
+    state["registered"] = True
+    material_freshness = (
+        inspect_bwr_material_assignment_freshness(blend)
+        if auto_normalize
+        else None
+    )
+    if (
+        state["current"]
+        and material_freshness is not None
+        and not material_freshness["current"]
+    ):
+        state["current"] = False
+        state["refresh_reasons"] = list(dict.fromkeys(
+            list(state.get("refresh_reasons") or [])
+            + list(material_freshness["refresh_reasons"])
+        ))
+        state["refresh_reason_categories"] = list(dict.fromkeys(
+            list(state.get("refresh_reason_categories") or [])
+            + ["geometry_ownership"]
+        ))
+        state["bwr_material_assignment_freshness"] = material_freshness
+    return state
+
+
+def inspect_cluster_relation_current_state(
+    blend,
+    target_spms,
+    *,
+    auto_normalize=True,
+    validation_cache=None,
+):
+    """Return a mutation-free current/stale result for selected SPMs only."""
+
+    blend = Path(blend).expanduser().absolute()
+    targets = []
+    seen = set()
+    for raw_target in target_spms:
+        checked_blend, target = _validate_local_relation(blend, raw_target)
+        if checked_blend != blend:
+            raise ClusterBlendSyncError(
+                "Selected Cluster relationships use different blends"
+            )
+        key = normalized_path_key(target)
+        if key not in seen:
+            seen.add(key)
+            targets.append(target)
+    if not targets:
+        raise ClusterBlendSyncError(
+            "No Cluster relationship target was selected"
+        )
+    return _inspect_current_cluster_relation_state(
+        blend,
+        targets,
+        auto_normalize=auto_normalize,
+        validation_cache=validation_cache,
+    )
+
+
 def run_cluster_relation_transaction(
     blend,
     target_spms,
@@ -1714,54 +1811,18 @@ def run_cluster_relation_transaction(
         if enabled
         else list(registered_before)
     )
-    requested_keys = {normalized_path_key(path) for path in targets}
-    registered_keys = {
-        normalized_path_key(path) for path in registered_before
-    }
     preflight_state = None
-    if (
-        enabled
-        and not force_refresh
-        and requested_keys.issubset(registered_keys)
-    ):
+    if enabled and not force_refresh:
         _emit_cluster_relation_progress(
             progress_callback,
             "verify_existing_relation",
             "Verifying the existing Cluster ON relationship...",
         )
-        preflight_state = _current_on_relation_state(
+        preflight_state = _inspect_current_cluster_relation_state(
             blend,
             effective_targets,
+            auto_normalize=auto_normalize,
         )
-        material_freshness = (
-            inspect_bwr_material_assignment_freshness(blend)
-            if auto_normalize
-            else None
-        )
-        if (
-            preflight_state["current"]
-            and material_freshness is not None
-            and not material_freshness["current"]
-        ):
-            preflight_state["current"] = False
-            preflight_state["refresh_reasons"] = list(dict.fromkeys(
-                list(preflight_state.get("refresh_reasons") or [])
-                + list(material_freshness["refresh_reasons"])
-            ))
-            preflight_state["refresh_reason_categories"] = list(
-                dict.fromkeys(
-                    list(
-                        preflight_state.get(
-                            "refresh_reason_categories"
-                        )
-                        or []
-                    )
-                    + ["geometry_ownership"]
-                )
-            )
-            preflight_state["bwr_material_assignment_freshness"] = (
-                material_freshness
-            )
         if preflight_state["current"]:
             report = {
                 "status": "ok",
@@ -2254,6 +2315,7 @@ __all__ = [
     "ClusterBlendSyncError",
     "cluster_authoring_sources",
     "discover_cluster_blend_relations",
+    "inspect_cluster_relation_current_state",
     "normalized_blend_for_source",
     "normalized_path_key",
     "owner_sk_spms",

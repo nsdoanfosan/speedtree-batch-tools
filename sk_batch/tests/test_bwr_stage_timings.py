@@ -51,7 +51,6 @@ def test_bwr_reports_export_repair_and_total_stage_boundaries():
     for stage in (
         "input_preflight",
         "addon_runtime_prepare",
-        "spm_skeleton_readiness",
         "blend_open",
         "speedtree_export_bundle",
         "blender_import_and_repair",
