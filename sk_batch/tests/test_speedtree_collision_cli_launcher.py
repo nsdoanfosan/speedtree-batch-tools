@@ -63,7 +63,7 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         launcher = LAUNCHER_SOURCE.read_text(encoding="utf-8")
         contract = (
             "SPEEDTREE_COLLISION_CLI_CONTRACT="
-            "native-bundle-single-bake-v2"
+            "native-bundle-single-bake-v3"
         )
 
         self.assertIn(contract, launcher)
@@ -75,6 +75,27 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         exact = SK_EXACT_PUSH_BAT.read_text(encoding="utf-8")
         self.assertIn(contract, exact)
         self.assertIn("findstr.exe /x", exact)
+
+    def test_fbx_root_weights_use_the_native_id_zero_path(self):
+        source = HOOK_SOURCE.read_text(encoding="utf-8")
+        weight_hook = source[
+            source.index("void __fastcall HookedExportVertexWeights"):
+            source.index("void __fastcall HookedInsertExportBone")
+        ]
+
+        self.assertIn("kExportVertexWeightsRva = 0x6B4FE0", source)
+        self.assertIn("kFindExportBoneMappingRva = 0x6B4DF0", source)
+        self.assertIn("if (parentId != 0)", weight_hook)
+        self.assertIn("const float rootWeight = 1.0f - childWeight;", weight_hook)
+        self.assertIn(
+            "gOriginalExportVertexWeights(\n"
+            "            exporter,\n"
+            "            position,\n"
+            "            0,",
+            weight_hook,
+        )
+        self.assertIn("FbxSkeleton::eLimbNode", source)
+        self.assertIn("No spatial lookup or normalization", weight_hook)
 
     def test_disappeared_persistent_pipe_starts_a_replacement(self):
         source = LAUNCHER_SOURCE.read_text(encoding="utf-8")

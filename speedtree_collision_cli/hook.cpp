@@ -37,6 +37,13 @@ constexpr std::uintptr_t kVfxExportBoneRva = 0x6BAC60;
 #endif
 constexpr std::uintptr_t kResolveBranchBoneIdRva = 0x4B5C00;
 constexpr std::uintptr_t kInsertExportBoneRva = 0x37D4A0;
+constexpr std::uintptr_t kExportVertexWeightsRva = 0x6B4FE0;
+constexpr std::uintptr_t kFindExportBoneMappingRva = 0x6B4DF0;
+constexpr std::uintptr_t kFbxClusterAddControlPointRva = 0x1259E50;
+constexpr std::uintptr_t kFbxClusterAppendIndexRva = 0x1248300;
+constexpr std::uintptr_t kFbxClusterAppendWeightRva = 0x125AB20;
+constexpr std::uintptr_t kFbxSingleRootWrapperBranchRva = 0x6B6C40;
+constexpr std::uintptr_t kFbxRootWrapperSkeletonTypeRva = 0x6B6C55;
 constexpr std::uintptr_t kTreeDocumentPrepareRva = 0x728F00;
 constexpr std::uintptr_t kTreeDocumentModelStageRva = 0x366AC0;
 constexpr std::uintptr_t kGenerateShadeVolumeRva = 0x2FE10;
@@ -136,6 +143,20 @@ constexpr unsigned char kInsertExportBonePrologue[15] = {
     0x48, 0x89, 0x70, 0x18,
 };
 
+constexpr unsigned char kExportVertexWeightsPrologue[15] = {
+    0x48, 0x8B, 0xC4,
+    0x48, 0x89, 0x58, 0x08,
+    0x48, 0x89, 0x70, 0x10,
+    0x48, 0x89, 0x78, 0x20,
+};
+
+constexpr unsigned char kFbxClusterAddControlPointPrologue[14] = {
+    0x85, 0xD2,
+    0x78, 0x39,
+    0xF2, 0x0F, 0x11, 0x54, 0x24, 0x18,
+    0x89, 0x54, 0x24, 0x10,
+};
+
 constexpr int kQMessageBoxQuestionIcon = 4;
 constexpr int kQMessageBoxNoButton = 0x00010000;
 
@@ -186,6 +207,19 @@ using InsertExportBoneFn = void(__fastcall*)(
     void* exportData,
     void* sourceBoneRecord,
     void* sourceBranch);
+using ExportVertexWeightsFn = void(__fastcall*)(
+    void* exporter,
+    const float* position,
+    int sourceBoneId,
+    int vertexIndex,
+    void* clusterMap);
+using FindExportBoneMappingFn = void*(__fastcall*)(void* boneMap, const int* boneId);
+using FbxClusterAddControlPointFn = void(__fastcall*)(
+    void* cluster,
+    int vertexIndex,
+    double weight);
+using FbxClusterAppendIndexFn = void*(__fastcall*)(void* array, const int* value);
+using FbxClusterAppendWeightFn = void*(__fastcall*)(void* array, const double* value);
 using TreeDocumentPrepareFn = void(__fastcall*)(void* treeDocument);
 using TreeDocumentModelStageFn = void(__fastcall*)(void* modelInterface);
 using ScheduleCollisionFn = void(__fastcall*)(void* model, bool force);
@@ -290,6 +324,11 @@ VfxExportBoneFn gOriginalVfxExportBone = nullptr;
 #endif
 ResolveBranchBoneIdFn gResolveBranchBoneId = nullptr;
 InsertExportBoneFn gOriginalInsertExportBone = nullptr;
+ExportVertexWeightsFn gOriginalExportVertexWeights = nullptr;
+FindExportBoneMappingFn gFindExportBoneMapping = nullptr;
+FbxClusterAddControlPointFn gUnusedOriginalFbxClusterAddControlPoint = nullptr;
+FbxClusterAppendIndexFn gFbxClusterAppendIndex = nullptr;
+FbxClusterAppendWeightFn gFbxClusterAppendWeight = nullptr;
 SpeedTreeExportFn gNativeSpeedTreeExport = nullptr;
 MainWindowIdleFn gOriginalMainWindowOnIdle = nullptr;
 MainWindowIdleFn gOriginalMainWindowOnIdleDraw = nullptr;
@@ -317,6 +356,7 @@ std::atomic<unsigned int> gCollisionStartCount{0};
 std::atomic<bool> gGuiExportStarted{false};
 std::atomic<bool> gNativeCliExportActive{false};
 std::atomic<bool> gSecondaryNativeSerializationActive{false};
+bool gFbxDeformRootPatchInstalled = false;
 std::atomic<unsigned char*> gNativeMainWindow{nullptr};
 std::atomic<unsigned int> gGuiModelUpdateCount{0};
 std::atomic<bool> gGuiBakeRequested{false};
@@ -341,6 +381,8 @@ HookRecord gNativeExportFinalizeDocumentHook;
 HookRecord gVfxExportBoneHook;
 #endif
 HookRecord gInsertExportBoneHook;
+HookRecord gExportVertexWeightsHook;
+HookRecord gFbxClusterAddControlPointHook;
 HookRecord gMainWindowOnIdleHook;
 HookRecord gMainWindowOnIdleDrawHook;
 HookRecord gNotifyInternalHook;
@@ -348,6 +390,21 @@ HookRecord gMainWindowConfirmDiscardHook;
 HookRecord gMainWindowRecoveryCheckHook;
 HookRecord gQDialogExecHook;
 HookRecord gMainWindowOpenFileListHook;
+
+struct FbxWeightAddCapture {
+    void* cluster = nullptr;
+    int vertexIndex = -1;
+    double weight = 0.0;
+};
+
+struct FbxWeightExportContext {
+    FbxWeightAddCapture additions[4]{};
+    int additionCount = 0;
+    bool overrideWeight = false;
+    double replacementWeight = 0.0;
+};
+
+thread_local FbxWeightExportContext* gFbxWeightExportContext = nullptr;
 #ifdef SPEEDTREE_BONE_FORENSICS
 struct BoneProbeObservation {
     void* bone = nullptr;
@@ -552,6 +609,136 @@ const char* ReadSpeedTreeRttiName(const void* object) {
         return reinterpret_cast<const char*>(typeDescriptor + kTypeDescriptorHeaderBytes);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return nullptr;
+    }
+}
+
+struct ExportBoneMapping {
+    void* boneRecord;
+    void* startNode;
+    void* endNode;
+};
+
+void __fastcall HookedFbxClusterAddControlPoint(
+    void* cluster,
+    int vertexIndex,
+    double weight) {
+    if (vertexIndex < 0) {
+        return;
+    }
+    FbxWeightExportContext* context = gFbxWeightExportContext;
+    const double effectiveWeight =
+        context != nullptr && context->overrideWeight
+        ? context->replacementWeight
+        : weight;
+    int storedIndex = vertexIndex;
+    double storedWeight = effectiveWeight;
+    gFbxClusterAppendIndex(
+        static_cast<unsigned char*>(cluster) + 0xA8,
+        &storedIndex);
+    gFbxClusterAppendWeight(
+        static_cast<unsigned char*>(cluster) + 0xB0,
+        &storedWeight);
+    if (context != nullptr) {
+        if (context->additionCount < static_cast<int>(std::size(context->additions))) {
+            context->additions[context->additionCount] = {
+                cluster,
+                vertexIndex,
+                effectiveWeight,
+            };
+        }
+        ++context->additionCount;
+    }
+}
+
+void __fastcall HookedExportVertexWeights(
+    void* exporter,
+    const float* position,
+    int sourceBoneId,
+    int vertexIndex,
+    void* clusterMap) {
+    FbxWeightExportContext primary{};
+    FbxWeightExportContext* previousContext = gFbxWeightExportContext;
+    gFbxWeightExportContext = &primary;
+    gOriginalExportVertexWeights(
+        exporter,
+        position,
+        sourceBoneId,
+        vertexIndex,
+        clusterMap);
+    gFbxWeightExportContext = previousContext;
+
+    if (sourceBoneId <= 0 || exporter == nullptr || position == nullptr ||
+        clusterMap == nullptr) {
+        return;
+    }
+
+    __try {
+        int lookupId = sourceBoneId;
+        auto* mapping = static_cast<ExportBoneMapping*>(gFindExportBoneMapping(
+            static_cast<unsigned char*>(exporter) + 0x60,
+            &lookupId));
+        if (mapping == nullptr || mapping->boneRecord == nullptr) {
+            AbortExport(
+                kHookRuntimeFailureExitCode,
+                "FBX weight export could not find the exact source bone record");
+        }
+        const auto* recordBytes =
+            static_cast<const unsigned char*>(mapping->boneRecord);
+        const int mappedId = *reinterpret_cast<const int*>(recordBytes);
+        const int parentId = *reinterpret_cast<const int*>(recordBytes + 0x04);
+        if (mappedId != sourceBoneId) {
+            AbortExport(
+                kHookRuntimeFailureExitCode,
+                "FBX weight export resolved a mismatched source bone record");
+        }
+        if (parentId != 0) {
+            return;
+        }
+
+        // The 10.1 serializer computes the exact child weight, then takes an
+        // early return when that child's parsed parent ID is zero. Mirror its
+        // existing nonzero-parent branch: the complementary float belongs to
+        // the explicit ID-0 Root cluster. No spatial lookup or normalization
+        // is involved.
+        if (primary.additionCount != 1 ||
+            primary.additions[0].vertexIndex != vertexIndex) {
+            AbortExport(
+                kHookRuntimeFailureExitCode,
+                "FBX ID-0 influence restoration observed an unexpected native cluster sequence");
+        }
+        const float childWeight = static_cast<float>(primary.additions[0].weight);
+        if (!(childWeight > 0.0f) || childWeight > 1.0f) {
+            AbortExport(
+                kHookRuntimeFailureExitCode,
+                "FBX ID-0 influence restoration observed an invalid native child weight");
+        }
+        const float rootWeight = 1.0f - childWeight;
+        if (rootWeight <= 0.0f) {
+            return;
+        }
+
+        FbxWeightExportContext root{};
+        root.overrideWeight = true;
+        root.replacementWeight = static_cast<double>(rootWeight);
+        gFbxWeightExportContext = &root;
+        gOriginalExportVertexWeights(
+            exporter,
+            position,
+            0,
+            vertexIndex,
+            clusterMap);
+        gFbxWeightExportContext = previousContext;
+        if (root.additionCount != 1 ||
+            root.additions[0].vertexIndex != vertexIndex) {
+            AbortExport(
+                kHookRuntimeFailureExitCode,
+                "FBX ID-0 influence restoration could not emit the native Root cluster entry");
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        gFbxWeightExportContext = previousContext;
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "FBX ID-0 influence restoration raised an exception while reading exporter data");
     }
 }
 
@@ -1277,12 +1464,77 @@ void RemoveHook(HookRecord& record) {
     }
 }
 
+bool ReplaceModelUpdateBranch(
+    std::uintptr_t rva,
+    const unsigned char* expected,
+    const unsigned char* replacement,
+    std::size_t byteCount);
+
+bool SetFbxDeformRootPatch(bool enabled) {
+    // SpeedTree normally creates an FBX skeleton wrapper only when it
+    // sees more than one top-level bone. Once the exact BaseRef graph reduces
+    // the tree to one root, its lone Bone_1_Start is instead emitted as the
+    // special FBX eRoot container. Importers do not expose that container as a
+    // deform bone, so its already-computed skin cluster is lost. Change the
+    // existing count > 1 condition to count > 0; the original serializer then
+    // uses its own wrapper path and preserves Bone_1_Start as a limb node.
+    constexpr unsigned char original[] = {0x83, 0xFB, 0x01, 0x7E, 0x71};
+    constexpr unsigned char wrappedSingleRoot[] = {0x83, 0xFB, 0x00, 0x7E, 0x71};
+    constexpr unsigned char rootType[] = {
+        0x48, 0x8B, 0xD8,  // mov rbx, rax
+        0x33, 0xD2,        // xor edx, edx (FbxSkeleton::eRoot)
+        0x48, 0x8B, 0xC8,  // mov rcx, rax
+    };
+    constexpr unsigned char limbType[] = {
+        0x48, 0x8B, 0xD8,  // mov rbx, rax
+        0x6A, 0x02,        // push FbxSkeleton::eLimbNode
+        0x5A,              // pop rdx
+        0x50,              // push rax
+        0x59,              // pop rcx
+    };
+    if (!ReplaceModelUpdateBranch(
+            kFbxSingleRootWrapperBranchRva,
+            enabled ? original : wrappedSingleRoot,
+            enabled ? wrappedSingleRoot : original,
+            sizeof(original))) {
+        Log(enabled
+                ? "FBX single-root wrapper patch rejected: supported bytes do not match"
+                : "FBX single-root wrapper patch could not be restored");
+        return false;
+    }
+    if (!ReplaceModelUpdateBranch(
+            kFbxRootWrapperSkeletonTypeRva,
+            enabled ? rootType : limbType,
+            enabled ? limbType : rootType,
+            sizeof(rootType))) {
+        ReplaceModelUpdateBranch(
+            kFbxSingleRootWrapperBranchRva,
+            enabled ? wrappedSingleRoot : original,
+            enabled ? original : wrappedSingleRoot,
+            sizeof(original));
+        Log(enabled
+                ? "FBX deformable root-wrapper patch rejected: supported bytes do not match"
+                : "FBX deformable root-wrapper patch could not be restored");
+        return false;
+    }
+    gFbxDeformRootPatchInstalled = enabled;
+    Log(enabled
+            ? "FBX exporter will preserve the exact ID-0 and single-root deform clusters"
+            : "FBX deform-root patch restored");
+    return true;
+}
+
 void RemoveCommonHooks() {
     RemoveHook(gInsertExportBoneHook);
+    RemoveHook(gExportVertexWeightsHook);
+    RemoveHook(gFbxClusterAddControlPointHook);
 #ifdef SPEEDTREE_BONE_FORENSICS
     RemoveHook(gVfxExportBoneHook);
 #endif
     RemoveHook(gQThreadStartHook);
+    if (gFbxDeformRootPatchInstalled) {
+        SetFbxDeformRootPatch(false);
+    }
 }
 
 void RemovePersistentSessionHooks() {
@@ -4479,6 +4731,12 @@ bool InstallHooks() {
         gSpeedTreeBase + kSpeedTreeExportRva);
     gResolveBranchBoneId = reinterpret_cast<ResolveBranchBoneIdFn>(
         gSpeedTreeBase + kResolveBranchBoneIdRva);
+    gFindExportBoneMapping = reinterpret_cast<FindExportBoneMappingFn>(
+        gSpeedTreeBase + kFindExportBoneMappingRva);
+    gFbxClusterAppendIndex = reinterpret_cast<FbxClusterAppendIndexFn>(
+        gSpeedTreeBase + kFbxClusterAppendIndexRva);
+    gFbxClusterAppendWeight = reinterpret_cast<FbxClusterAppendWeightFn>(
+        gSpeedTreeBase + kFbxClusterAppendWeightRva);
     if (qThreadStart == nullptr || qNotifyInternal == nullptr ||
         gQThreadWait == nullptr || gQThreadIsRunning == nullptr ||
         gProcessEvents == nullptr || gSendPostedEvents == nullptr || gQObjectChildren == nullptr ||
@@ -4495,12 +4753,34 @@ bool InstallHooks() {
         return false;
     }
 
+    if (!SetFbxDeformRootPatch(true)) {
+        return false;
+    }
     if (!InstallHook(
             gQThreadStartHook,
             qThreadStart,
             HookedQThreadStart,
             kQThreadStartPrologue,
             reinterpret_cast<void**>(&gOriginalQThreadStart))) {
+        SetFbxDeformRootPatch(false);
+        return false;
+    }
+    if (!InstallHook(
+            gFbxClusterAddControlPointHook,
+            reinterpret_cast<void*>(gSpeedTreeBase + kFbxClusterAddControlPointRva),
+            HookedFbxClusterAddControlPoint,
+            kFbxClusterAddControlPointPrologue,
+            reinterpret_cast<void**>(&gUnusedOriginalFbxClusterAddControlPoint))) {
+        RemoveCommonHooks();
+        return false;
+    }
+    if (!InstallRegisterPreservingHook(
+            gExportVertexWeightsHook,
+            reinterpret_cast<void*>(gSpeedTreeBase + kExportVertexWeightsRva),
+            HookedExportVertexWeights,
+            kExportVertexWeightsPrologue,
+            reinterpret_cast<void**>(&gOriginalExportVertexWeights))) {
+        RemoveCommonHooks();
         return false;
     }
 #ifdef SPEEDTREE_BONE_FORENSICS

@@ -58,7 +58,7 @@ COLLISION_BUILD_SCRIPT = COLLISION_DIR / "build.ps1"
 COLLISION_CLI = COLLISION_DIR / "bin" / "speedtree_collision_cli.exe"
 COLLISION_HOOK = COLLISION_DIR / "bin" / "speedtree_collision_hook.dll"
 COLLISION_CLI_CONTRACT = (
-    "SPEEDTREE_COLLISION_CLI_CONTRACT=native-bundle-single-bake-v2"
+    "SPEEDTREE_COLLISION_CLI_CONTRACT=native-bundle-single-bake-v3"
 )
 SPEEDTREE_SESSION_START_ATTEMPTS = 3
 SPEEDTREE_SESSION_RETRY_DELAY_SECONDS = 0.75
