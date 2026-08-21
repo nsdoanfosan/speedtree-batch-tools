@@ -161,7 +161,9 @@ jobs:
           python -m pytest -q -n 4 --dist load --import-mode=importlib
           --durations=10
           --ignore=sk_batch/tests/test_spm_calibration.py
+          --ignore=sk_batch/tests/test_retry_progress.py
           --ignore=tests/test_process_lifecycle.py
+          --ignore=tests/test_shared_queue_runtime.py
           --ignore=pcg_st9_texture_batch/tests/test_00_issue_42_real_projection.py
           batch_ui_common/tests
           cluster_card_pipeline/tests
@@ -174,6 +176,21 @@ jobs:
       # receipt replace, so keep the actual Windows lifecycle coverage serial.
       - name: Windows process lifecycle tests
         run: python -m unittest tests.test_process_lifecycle
+
+      # Windows spawn can exceed a five-second child handshake while four
+      # pytest workers are saturated. This module tests real cross-process
+      # queue ownership, so run it in an unloaded interpreter instead of
+      # weakening its liveness deadline.
+      - name: Shared queue multiprocessing tests
+        run: python -m unittest tests.test_shared_queue_runtime
+
+      # This suite launches real silent, slow, and hung helper processes and
+      # deliberately distinguishes them at a 0.5-second liveness boundary.
+      # Under xdist saturation a healthy helper can lose that entire budget
+      # waiting for CPU, so preserve the production threshold and run the
+      # timing contract in one unloaded pytest interpreter.
+      - name: Retry progress process tests
+        run: python -m pytest -q --import-mode=importlib sk_batch/tests/test_retry_progress.py
 
       - name: SpeedTree calibration timing tests
         run: python -m unittest sk_batch.tests.test_spm_calibration
