@@ -414,10 +414,6 @@ POLICY_CONTRACTS = {
         "SPM을 갱신하는 동안 다른 프로세스가 같은 파일을 변경했습니다.",
         "외부 편집을 보존한 채 다른 writer를 종료하고 SPM을 다시 검사한 뒤 재시도하세요.",
     ),
-    "interrupted_calibration": _terminal(
-        "중단된 SPM calibration을 기록된 backup으로 안전하게 복구하지 못했습니다.",
-        "calibration marker와 backup/source hash를 확인해 원본을 복원한 뒤 다시 검사하세요.",
-    ),
 }
 
 # Existing decided families whose operator wording does not need a distinct
@@ -454,9 +450,6 @@ for _policy_name in (
 
 
 _REASON_SEEDS: dict[str, ReasonRow] = {
-    "access_violation_exhausted": ReasonRow(
-        UNSUPPORTED, "sk_batch/spm_audit.py", "exporter_crash",
-    ),
     "already_current": ReasonRow(
         INFORMATIONAL, "sk_batch/sk_batch_gui.pyw",
         "relation_decision_diagnostic",
@@ -1191,9 +1184,6 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "output_identity_missing": ReasonRow(
         UNCLASSIFIED, "pcg_st9_texture_batch/pcg_texture_gui.pyw", "",
     ),
-    "output_missing": ReasonRow(
-        UNCLASSIFIED, "sk_batch/spm_audit.py", "",
-    ),
     "output_set_incomplete": ReasonRow(
         UNCLASSIFIED, "pcg_st9_texture_batch/pcg_texture_gui.pyw", "",
     ),
@@ -1405,9 +1395,6 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "source_xml_missing": ReasonRow(
         UNCLASSIFIED, "cluster_normalization_sync.py", "",
     ),
-    "speedtree_root_exit": ReasonRow(
-        UNCLASSIFIED, "sk_batch/spm_audit.py", "",
-    ),
     "speedtree_session_start_failed": ReasonRow(
         INFORMATIONAL, "launch_guard.pyw", "lifecycle_event",
     ),
@@ -1422,9 +1409,6 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     ),
     "speedtree_texture_role_unknown": ReasonRow(
         UNCLASSIFIED, "speedtree_texture_contract.py", "",
-    ),
-    "speedtree_timeout": ReasonRow(
-        UNCLASSIFIED, "sk_batch/spm_audit.py", "",
     ),
     "spm_mesh_file_missing": ReasonRow(
         FATAL, "sk_batch/jobs/speedtree_material_preflight.py",
@@ -1640,9 +1624,6 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "current_cancelled": ReasonRow(
         INFORMATIONAL, "sk_batch/sk_batch_gui.pyw", "lifecycle_cancelled",
     ),
-    "concurrent_spm_modification": ReasonRow(
-        UNSUPPORTED, "sk_batch/spm_audit.py", "spm_concurrent_edit",
-    ),
     "data_error": ReasonRow(
         UNSUPPORTED, "sk_batch/failed_retry_eligibility.py", "durable_failure",
     ),
@@ -1686,9 +1667,6 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "interpreter_exit": ReasonRow(
         UNSUPPORTED, "process_lifecycle.py", "process_lifecycle",
     ),
-    "interrupted_calibration": ReasonRow(
-        UNSUPPORTED, "sk_batch/spm_audit.py", "interrupted_calibration",
-    ),
     "owner_lost": ReasonRow(
         UNSUPPORTED, "sk_batch/retry_progress.py", "owner_lost_failure",
     ),
@@ -1706,9 +1684,6 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     ),
     "missing_source_collection": ReasonRow(
         UNSUPPORTED, "cluster_export_handoff_contract.py", "export_hierarchy",
-    ),
-    "non_retryable_returncode": ReasonRow(
-        UNSUPPORTED, "sk_batch/spm_audit.py", "exporter_process",
     ),
     "normalized_delivery_evidence_missing": ReasonRow(
         UNSUPPORTED, "sk_batch/sk_batch_gui.pyw", "modeler_recovery_scope",
@@ -2185,7 +2160,7 @@ _classify(
     "callback_error", "cancelled", "cleanup", "timed_out",
     "communication_error", "root_exit", "timeout",
     "owner_release_acknowledged", "runtime_shutdown", "before_marker_restore",
-    "sk_stop", "sk_worker_complete", "speedtree_root_exit", "speedtree_timeout",
+    "sk_stop", "sk_worker_complete",
 )
 _classify(
     INFORMATIONAL, "receipt_status", "over_budget", "publication_canceled", "written",
@@ -2215,7 +2190,6 @@ _classify(
 )
 _classify(UNSUPPORTED, "report_missing", "missing_pipeline_report")
 _classify(UNSUPPORTED, "worker_runtime", "worker_wait_failed")
-_classify(UNSUPPORTED, "export_output_missing", "output_missing")
 _classify(
     UNSUPPORTED, "dependency_output_missing", "dependency_output_missing",
 )

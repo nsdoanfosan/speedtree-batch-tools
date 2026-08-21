@@ -2476,8 +2476,6 @@ class PushQueueFlowTests(unittest.TestCase):
         app.batch_progress = mock.Mock()
         app.batch_progress_var = mock.Mock()
         app._set_batch_queue_controls = mock.Mock()
-        app.spm_calibration_signature = None
-        app.legacy_spm_calibration_signature = None
         app._reset_cluster_receipt_refresh_memo()
         app._cluster_receipt_refresh_memo["validated"] = {"result": True}
         app.pending_batch_jobs.append({
@@ -2495,10 +2493,6 @@ class PushQueueFlowTests(unittest.TestCase):
                 return None
 
         with mock.patch.object(
-            gui, "calibration_settings_signature", return_value="current"
-        ), mock.patch.object(
-            gui, "legacy_calibration_settings_signature", return_value=None
-        ), mock.patch.object(
             gui.threading, "Thread", return_value=FakeThread()
         ):
             app._start_next_batch_job()
@@ -2508,88 +2502,6 @@ class PushQueueFlowTests(unittest.TestCase):
     @staticmethod
     def targets(*names):
         return [{"spm": Path(name), "checked": True} for name in names]
-
-    def test_legacy_cluster_bootstraps_after_missing_canonical_schedule(self):
-        gui = load_gui_module()
-        app = self.make_app(gui)
-        app.cfg = {"spm_parallel_jobs": 1}
-        app.force_rerun = False
-        app.spm_calibration_signature = "current"
-        app.legacy_spm_calibration_signature = None
-        attempted = []
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            cluster = Path(temp_dir) / "cluster"
-            cluster.mkdir()
-            legacy_spm = cluster / "branch_tree_test_01.spm"
-            canonical_spm = cluster / "SK_branch_tree_test_01.spm"
-            legacy_spm.write_bytes(b"legacy cluster spm")
-            item = {
-                "spm": canonical_spm,
-                "checked": True,
-                # Scan aliases the live legacy snapshot onto the canonical row
-                # that stage ① will create.
-                "spm_snapshot": gui.file_content_snapshot(legacy_spm),
-            }
-
-            def fake_spm(_iid, spm):
-                attempted.append(app._prepare_pair_for_job(spm))
-
-            app._job_spm = mock.Mock(side_effect=fake_spm)
-            with mock.patch.object(
-                gui, "LOG_DIR", Path(temp_dir) / "logs"
-            ), mock.patch.object(gui, "save_state"):
-                result = app._run_batch(
-                    "spm", [item], emit_done=False
-                )
-
-            self.assertTrue(result)
-            self.assertEqual(app._phase_failed_items, set())
-            self.assertEqual(len(attempted), 1)
-            self.assertEqual(attempted[0], canonical_spm.resolve())
-            self.assertEqual(
-                canonical_spm.read_bytes(), legacy_spm.read_bytes()
-            )
-
-    def test_missing_spm_during_scheduling_fails_only_that_row(self):
-        gui = load_gui_module()
-        app = self.make_app(gui)
-        app.cfg = {"spm_parallel_jobs": 1}
-        app.force_rerun = False
-        app.spm_calibration_signature = "current"
-        app.legacy_spm_calibration_signature = None
-        attempted = []
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            missing_spm = root / "SK_missing.spm"
-            existing_spm = root / "SK_existing.spm"
-            existing_spm.write_bytes(b"spm")
-            targets = [
-                {"spm": missing_spm, "checked": True},
-                {"spm": existing_spm, "checked": True},
-            ]
-
-            def fake_spm(_iid, spm):
-                attempted.append(spm)
-                if not spm.exists():
-                    raise FileNotFoundError(spm)
-
-            app._job_spm = mock.Mock(side_effect=fake_spm)
-            with mock.patch.object(
-                gui, "LOG_DIR", root / "logs"
-            ), mock.patch.object(gui, "save_state"):
-                result = app._run_batch(
-                    "spm", targets, emit_done=False
-                )
-
-        self.assertTrue(result)
-        self.assertCountEqual(attempted, [missing_spm, existing_spm])
-        self.assertEqual(app._phase_failed_items, {str(missing_spm)})
-        self.assertEqual(
-            app.state[str(missing_spm)]["spm_status_kind"],
-            "data_error",
-        )
 
     def test_blender_failure_persists_structured_repair_report(self):
         gui = load_gui_module()
@@ -2869,7 +2781,7 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(ready, [target])
         self.assertIsNone(fatal)
         app._handoff_ready.assert_not_called()
-        self.assertIn("② 결과 재사용 1개", app.log.call_args.args[0])
+        self.assertIn("1/1", app.log.call_args.args[0])
 
     def test_standalone_push_still_runs_full_handoff_preflight(self):
         gui = load_gui_module()
@@ -3719,7 +3631,9 @@ class PushQueueFlowTests(unittest.TestCase):
 
         def fake_batch(phase, phase_targets, emit_done=False):
             calls.append((phase, [item["spm"].name for item in phase_targets]))
-            if phase == "spm":
+            if phase == "blender" and any(
+                item["spm"] == cluster_spm for item in phase_targets
+            ):
                 app._phase_failed_items = {str(cluster_spm)}
             elif phase == "blender" and any(
                 item["spm"] == bad_blend for item in phase_targets
@@ -3739,10 +3653,9 @@ class PushQueueFlowTests(unittest.TestCase):
             app._run_full_pipeline(targets)
 
         self.assertEqual(calls[0][1], ["SK_bad_spm.spm"])
-        self.assertEqual(calls[1][1], ["SK_bad_spm.spm"])
-        self.assertEqual(calls[2][1], ["SK_bad_blend.spm", "SK_good.spm"])
+        self.assertEqual(calls[1][1], ["SK_bad_blend.spm", "SK_good.spm"])
         self.assertEqual(
-            calls[3][1],
+            calls[2][1],
             ["SK_bad_spm.spm", "SK_bad_blend.spm", "SK_good.spm"],
         )
         final_progress = [
@@ -3757,7 +3670,6 @@ class PushQueueFlowTests(unittest.TestCase):
         gui = load_gui_module()
         app = self.make_app(gui)
         app.cfg = {
-            "spm_parallel_jobs": 1,
             "blender_parallel_jobs": 1,
             "push_parallel_jobs": 1,
         }
@@ -3779,15 +3691,13 @@ class PushQueueFlowTests(unittest.TestCase):
         preflight_inputs = []
         blocked_contracts_at_push_expand = []
 
-        def fail_cluster_spm(_iid, spm):
-            if spm == failed_cluster:
-                raise gui.BatchItemError(
-                    "cluster SPM failed",
-                    kind="data_error",
-                )
-
         def record_blender(_iid, spm, _item):
             blender_attempts.append(spm)
+            if spm == failed_cluster:
+                raise gui.BatchItemError(
+                    "cluster Assembly failed",
+                    kind="data_error",
+                )
 
         def record_push(_iid, spm):
             push_attempts.append(spm)
@@ -3842,10 +3752,6 @@ class PushQueueFlowTests(unittest.TestCase):
             side_effect=record_preflight,
         ), mock.patch.object(
             app,
-            "_job_spm",
-            side_effect=fail_cluster_spm,
-        ), mock.patch.object(
-            app,
             "_job_blender",
             side_effect=record_blender,
         ), mock.patch.object(
@@ -3879,7 +3785,7 @@ class PushQueueFlowTests(unittest.TestCase):
             set(),
         )
         self.assertEqual(
-            app.state[str(failed_cluster)]["spm_status_kind"],
+            app.state[str(failed_cluster)]["blend_status_kind"],
             "data_error",
         )
         self.assertNotEqual(
@@ -3960,7 +3866,7 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertNotIn("dependency_resolution", row["evidence"])
         verdict.assert_not_called()
 
-    def test_full_pipeline_finishes_cluster_before_tree_spm_and_blender(self):
+    def test_full_pipeline_finishes_cluster_before_tree_assembly(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         owner = Path(r"D:\Trees\Tree_elm")
@@ -4006,7 +3912,6 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                ("spm", [cluster_spm]),
                 ("blender", [cluster_spm]),
                 ("blender", [tree_spm]),
                 ("push", [cluster_spm, tree_spm]),
@@ -4065,7 +3970,6 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                ("spm", [cluster_spm]),
                 ("blender", [cluster_spm]),
                 ("blender", consumers),
                 ("push", [cluster_spm, *consumers]),

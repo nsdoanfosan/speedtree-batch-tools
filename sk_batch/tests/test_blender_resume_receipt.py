@@ -449,7 +449,6 @@ class BlenderResumeQueueTests(unittest.TestCase):
             item = {
                 "spm": spm,
                 "wind_override": "auto",
-                "manual_bones_locked": False,
                 "referenced_by_spms": (),
             }
             app.items = {str(spm): item}
@@ -571,7 +570,6 @@ class BlenderResumeQueueTests(unittest.TestCase):
             item = {
                 "spm": spm,
                 "wind_override": "auto",
-                "manual_bones_locked": False,
                 "referenced_by_spms": (),
             }
             app.items = {iid: item}

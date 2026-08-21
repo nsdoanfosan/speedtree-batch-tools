@@ -40,6 +40,10 @@ DEFAULT_KILL_GRACE_SECONDS = 3.0
 DEFAULT_DESCENDANT_GRACE_SECONDS = 0.2
 DEFAULT_RUN_TIMEOUT_SECONDS = 6 * 60 * 60
 RECEIPT_SCHEMA_VERSION = 1
+ACTIVE_RECEIPT_INDEX_VERSION = 1
+ACTIVE_RECEIPT_DIRECTORY_NAME = "active_v1"
+ACTIVE_RECEIPT_MIGRATION_MARKER = ".active_index_v1_complete"
+MAX_TERMINAL_RECEIPTS = 512
 _DEFAULT_POPEN = subprocess.Popen
 _DEFAULT_RUN = subprocess.run
 _SUPERVISOR_LOCK = threading.RLock()
@@ -467,6 +471,82 @@ def process_identity_is_alive(pid, process_start_identity):
         kernel32.CloseHandle(handle)
 
 
+def _active_receipt_directory(directory):
+    return Path(directory) / ACTIVE_RECEIPT_DIRECTORY_NAME
+
+
+def _active_receipt_marker(directory, run_id):
+    return _active_receipt_directory(directory) / f"{run_id}.active"
+
+
+def _publish_active_receipt_marker(directory, run_id):
+    marker = _active_receipt_marker(directory, run_id)
+    if marker.is_file():
+        return marker
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    temporary = marker.with_name(
+        f".{marker.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        temporary.write_text(
+            f"active_receipt_index_v{ACTIVE_RECEIPT_INDEX_VERSION}\n",
+            encoding="ascii",
+        )
+        os.replace(temporary, marker)
+    finally:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+    return marker
+
+
+def _remove_active_receipt_marker(directory, run_id):
+    try:
+        _active_receipt_marker(directory, run_id).unlink()
+    except OSError:
+        pass
+
+
+def _receipt_candidates(directory):
+    """Return active receipts plus one legacy migration scan."""
+    directory = Path(directory)
+    active_directory = _active_receipt_directory(directory)
+    candidates = {
+        directory / f"{marker.stem}.json"
+        for marker in active_directory.glob("*.active")
+    } if active_directory.is_dir() else set()
+    migration_marker = directory / ACTIVE_RECEIPT_MIGRATION_MARKER
+    legacy_migration = not migration_marker.is_file()
+    if legacy_migration:
+        candidates.update(directory.glob("*.json"))
+    return candidates, legacy_migration, migration_marker
+
+
+def _complete_active_receipt_migration(marker):
+    temporary = marker.with_name(
+        f".{marker.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        temporary.write_text(
+            f"active_receipt_index_v{ACTIVE_RECEIPT_INDEX_VERSION}\n",
+            encoding="ascii",
+        )
+        os.replace(temporary, marker)
+    finally:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+
+
+def _receipt_mtime_ns(path):
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
 def recover_incomplete_receipts(receipt_dir=None):
     """Seal receipts whose exact owner identity is no longer alive.
 
@@ -480,14 +560,22 @@ def recover_incomplete_receipts(receipt_dir=None):
     if not directory.is_dir():
         return []
     recovered = []
-    for path in sorted(directory.glob("*.json")):
+    candidates, legacy_migration, migration_marker = _receipt_candidates(
+        directory
+    )
+    terminal_receipts = []
+    for path in sorted(candidates):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
+            _remove_active_receipt_marker(directory, path.stem)
             continue
         if payload.get("schema_version") != RECEIPT_SCHEMA_VERSION:
+            _remove_active_receipt_marker(directory, path.stem)
             continue
         if payload.get("status") not in {"running", "shutting_down"}:
+            terminal_receipts.append(path)
+            _remove_active_receipt_marker(directory, path.stem)
             continue
         owner = payload.get("owner") or {}
         pid = owner.get("pid")
@@ -497,6 +585,7 @@ def recover_incomplete_receipts(receipt_dir=None):
             or not identity
             or process_identity_is_alive(pid, identity)
         ):
+            _publish_active_receipt_marker(directory, path.stem)
             continue
         completed_at = _utc_now()
         payload["status"] = "recovered_forced_owner_exit"
@@ -536,6 +625,24 @@ def recover_incomplete_receipts(receipt_dir=None):
                 pass
             continue
         recovered.append(path)
+        terminal_receipts.append(path)
+        _remove_active_receipt_marker(directory, path.stem)
+    if legacy_migration:
+        for path in sorted(
+            terminal_receipts,
+            key=_receipt_mtime_ns,
+            reverse=True,
+        )[MAX_TERMINAL_RECEIPTS:]:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        try:
+            _complete_active_receipt_migration(migration_marker)
+        except OSError:
+            # A failed marker write is safe: the next process repeats the
+            # legacy scan instead of ever skipping a possibly active receipt.
+            pass
     return recovered
 
 
@@ -650,6 +757,16 @@ class ProcessSupervisor:
                 encoding="utf-8",
             )
             os.replace(temporary, self.receipt_path)
+            if self.status in {"running", "shutting_down"}:
+                _publish_active_receipt_marker(
+                    self.receipt_dir,
+                    self.run_id,
+                )
+            else:
+                _remove_active_receipt_marker(
+                    self.receipt_dir,
+                    self.run_id,
+                )
         except OSError as exc:
             raise ProcessLifecycleError(
                 "process_receipt_write_failed",

@@ -27,7 +27,6 @@ runtime = prepare_runtime(
     "tests.blender_addon_gateway_smoke",
     {
         "speedtree_bone_weight_repair": (
-            "spm_sk_preflight_v1",
             "speedtree_export_v1",
             "assembly_pipeline_v1",
             "material_handoff_v1",

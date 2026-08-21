@@ -64,7 +64,7 @@ class CodeCompileGateTests(unittest.TestCase):
     def test_current_repository_passes_without_importing_runtime_modules(self):
         result = run_gate(REPO_ROOT, GUI_PATH)
         self.assertGreater(result.source_count, 0)
-        self.assertEqual(result.contract_count, 4)
+        self.assertEqual(result.contract_count, 3)
         self.assertEqual(
             result.source_count,
             result.production_source_manifest.source_count,
@@ -429,19 +429,6 @@ class CodeCompileGateTests(unittest.TestCase):
             "non-Cluster rows must return before",
         ):
             validate_gui_contracts(source)
-
-    def test_non_cluster_bone_calibration_regression_fails_at_compile_gate(self):
-        module = ast.parse(gui_source())
-        changed = ReplaceFunctionReturn(
-            "should_calibrate_spm",
-            ast.Constant(value=True),
-        ).visit(module)
-        ast.fix_missing_locations(changed)
-        with self.assertRaisesRegex(
-            CompileGateError,
-            "Bone calibration contract failed",
-        ):
-            validate_gui_contracts(ast.unparse(changed))
 
     def test_push_reaudit_regression_fails_at_compile_gate(self):
         module = ast.parse(gui_source())

@@ -698,26 +698,6 @@ def _require_owner_atlas_scope(module: ast.Module, methods) -> None:
         )
 
 
-def _require_cluster_only_calibration(module: ast.Module) -> None:
-    policy = _function(module, "should_calibrate_spm")
-    probe = _compile_isolated_function(
-        policy,
-        {"is_cluster_source_spm": lambda value: value == "cluster"},
-    )
-    cases = (
-        ({"spm": "owner"}, False, "owner"),
-        ({"spm": "cluster"}, True, "cluster"),
-        ({"spm": "cluster", "source_read_only": True}, False, "read-only cluster"),
-        ({"spm": None}, False, "missing SPM"),
-    )
-    for item, expected, label in cases:
-        if bool(probe(item)) is not expected:
-            raise CompileGateError(
-                "Bone calibration contract failed: "
-                f"{label} expected {expected}"
-            )
-
-
 def _is_none_test(node: ast.AST, variable: str) -> bool:
     return (
         isinstance(node, ast.Compare)
@@ -917,9 +897,8 @@ def validate_gui_contracts(source: str, filename=str(GUI_PATH)) -> int:
         )
 
     _require_owner_atlas_scope(module, methods)
-    _require_cluster_only_calibration(module)
     _require_repair_push_reuse(methods)
-    return 3
+    return 2
 
 
 def validate_push_job_contracts(

@@ -1,14 +1,13 @@
 """Conditionally rebuild a Cluster source blend before Generator Sync.
 
 Generator Sync consumes the normalized render mesh saved by the SK Batch/Assembly
-job.  This module does not weaken that hash contract.  It only runs the same
-SPM bone-normalization, material preflight, and headless Blender source-build
-stages when the canonical Cluster SPM proves that saved result is stale.
+job. This module does not weaken that contract. It runs material preflight and
+the headless Blender source-build when the saved result proves stale. Native
+SpeedTree FBX/XML carries the authored skeleton unchanged.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
@@ -30,7 +29,6 @@ from sk_batch.sk_common import (
     LOG_DIR,
     atomic_write_bytes,
     blender_open_file_window_titles,
-    file_content_fingerprint,
     load_config,
     load_job_report,
     prepare_cluster_spm_pair_for_job,
@@ -134,47 +132,6 @@ def _run_stage(command, log_file, *, timeout, stage):
     return result
 
 
-def _first_report(path):
-    try:
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError):
-        return {}
-    if isinstance(payload, list) and payload and isinstance(payload[0], dict):
-        return payload[0]
-    return payload if isinstance(payload, dict) else {}
-
-
-def _validate_spm_bone_report(canonical_spm, report):
-    """Require the producer's locked final identity and Cluster fixed point."""
-    expected = str(report.get("final_spm_fingerprint") or "")
-    if not expected:
-        raise ValueError("SPM bone report has no final content fingerprint")
-    actual = file_content_fingerprint(canonical_spm)
-    if expected != actual:
-        raise ValueError(
-            "SPM changed after its bone transaction: "
-            f"report={expected}, actual={actual}"
-        )
-    postcondition = report.get("cluster_root_logical_postcondition")
-    if not (
-        isinstance(postcondition, dict)
-        and postcondition.get("ok") is True
-    ):
-        errors = (
-            postcondition.get("errors")
-            if isinstance(postcondition, dict)
-            else None
-        )
-        raise ValueError(
-            "Cluster root bone logical postcondition is not proven"
-            + (": " + "; ".join(errors) if errors else "")
-        )
-    return {
-        "final_spm_fingerprint": actual,
-        "cluster_root_logical_postcondition": postcondition,
-    }
-
-
 def _python_executable():
     executable = str(sys.executable)
     if executable.casefold().endswith("pythonw.exe"):
@@ -206,56 +163,6 @@ def _build_cluster_source(
                 "open_windows": open_windows,
             },
         )
-
-    _notify(
-        progress_callback,
-        "spm_bone_setup",
-        f"Cluster 본 규격 정규화 · {canonical_spm.name}",
-    )
-    spm_report_path = LOG_DIR / f"{canonical_spm.stem}_spm_{stamp}.json"
-    spm_log = LOG_DIR / f"{canonical_spm.stem}_spm_{stamp}.log"
-    spm_command = [
-        _python_executable(),
-        "-X",
-        "utf8",
-        "-u",
-        SK_BATCH_DIR / "spm_audit.py",
-        canonical_spm,
-        "--report",
-        spm_report_path,
-    ]
-    spm_result = _run_stage(
-        spm_command,
-        spm_log,
-        timeout=int(cfg.get("spm_verify_timeout", 120)) * 5,
-        stage="spm_bone_setup",
-    )
-    spm_report = _first_report(spm_report_path)
-    spm_status = str(spm_report.get("status") or "")
-    if (
-        spm_result.returncode != 0
-        or spm_status not in {"calibrated", "already-ok"}
-    ):
-        reason = str(spm_report.get("error") or f"status={spm_status or 'missing'}")
-        raise ClusterSourcePreparationError(
-            "spm_bone_setup",
-            reason,
-            log_file=spm_log,
-            report_file=spm_report_path,
-            report=spm_report,
-        )
-    try:
-        spm_contract = _validate_spm_bone_report(
-            canonical_spm, spm_report
-        )
-    except (OSError, ValueError) as exc:
-        raise ClusterSourcePreparationError(
-            "spm_bone_setup",
-            str(exc),
-            log_file=spm_log,
-            report_file=spm_report_path,
-            report=spm_report,
-        ) from exc
 
     fbx_ini = Path(str(cfg.get("fbx_ini") or "")).resolve()
     xml_ini = Path(str(cfg.get("xml_ini") or "")).resolve()
@@ -391,12 +298,6 @@ def _build_cluster_source(
         "status": "rebuilt",
         "spm": str(canonical_spm),
         "blend": str(blend),
-        "spm_bone_setup": {
-            "status": spm_status,
-            "report": str(spm_report_path),
-            "log": str(spm_log),
-            **spm_contract,
-        },
         "material_preflight": {
             "status": "ok",
             "report": str(material_report_path),
@@ -426,8 +327,8 @@ def prepare_cluster_source_if_required(
     """Return immediately when current; otherwise rebuild and revalidate once.
 
     ``known_required`` lets the relation transaction hand off the exact
-    preflight failure it already observed.  That avoids re-hashing and
-    re-parsing a large SPM merely to rediscover the same stale-source result.
+    preflight failure it already observed instead of rediscovering the same
+    stale-source result.
     """
     blend = Path(blend).expanduser().absolute()
     targets = [Path(path).expanduser().absolute() for path in target_spms]

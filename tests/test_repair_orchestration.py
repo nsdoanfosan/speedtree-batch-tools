@@ -654,7 +654,7 @@ class RepairOrchestrationTests(unittest.TestCase):
         self.assertIn("등록되지 않은 차단 코드", plan.friendly_reason)
         self.assertNotIn("PCG", plan.friendly_reason)
 
-    def test_export_material_and_access_violation_are_friendly_unsupported(self):
+    def test_export_material_is_friendly_unsupported(self):
         material = self.plan({
             "classification": "asset_export_material_missing",
             "missing_export_materials": ["M_leaf", "M_branch"],
@@ -663,13 +663,6 @@ class RepairOrchestrationTests(unittest.TestCase):
         self.assertIn("내보내기에 재질이 없습니다", material.friendly_reason)
         self.assertIn("M_leaf", material.remaining_action)
         self.assertNotIn("obsolete", material.remaining_action.casefold())
-
-        crash = self.plan({
-            "result": "access_violation_exhausted",
-            "attempt_count": 3,
-        })
-        self.assertFalse(crash.supported)
-        self.assertIn("3회", crash.friendly_reason)
 
     def test_texture_telemetry_adds_no_repair_progress_stage(self):
         plan = self.plan({

@@ -5,6 +5,7 @@ import json
 import queue
 import tempfile
 import threading
+import time
 import unittest
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -24,6 +25,7 @@ from sk_batch.assembly_runtime_contract import (
     write_assembly_runtime_receipt,
 )
 from speedtree_pipeline_contract import build_preflight_envelope, source_identity
+from sk_batch.code_compile_gate import production_source_revision_state
 
 
 SK_BATCH_DIR = Path(__file__).resolve().parents[1]
@@ -134,35 +136,6 @@ class DynamicWindSkeletonContractTests(unittest.TestCase):
         self.assertTrue(ready, reason)
 
 
-class SpmAuditResultContractTests(unittest.TestCase):
-    def test_child_report_fingerprint_must_match_live_spm(self):
-        gui = load_gui_module()
-        with self.assertRaisesRegex(RuntimeError, "지문"):
-            gui.validate_spm_audit_result(
-                Path("SK_tree_test.spm"),
-                {"final_spm_fingerprint": "reported"},
-                {"fingerprint": "actual"},
-            )
-
-    def test_cluster_cache_requires_live_logical_postcondition(self):
-        gui = load_gui_module()
-        spm = Path("Tree") / "cluster" / "SK_branch_test_01.spm"
-        report = {
-            "final_spm_fingerprint": "same",
-            "cluster_root_logical_postcondition": {"ok": True},
-        }
-        with mock.patch.object(
-            gui,
-            "current_cluster_root_postcondition",
-            return_value={"ok": False, "mode": "not_fixed_point"},
-        ), self.assertRaisesRegex(RuntimeError, "root-bone"):
-            gui.validate_spm_audit_result(
-                spm,
-                report,
-                {"fingerprint": "same"},
-            )
-
-
 class FakeCheckedRows:
     @staticmethod
     def sync_after_reload():
@@ -220,7 +193,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 result = gui.App._collect_scan_result(root, stale_caches)
 
             self.assertEqual(result["spms"], [live])
-            self.assertEqual(set(result["snapshots"]), {str(live)})
+            self.assertNotIn("snapshots", result)
 
     def setUp(self):
         self._isolated_logs = tempfile.TemporaryDirectory()
@@ -253,161 +226,6 @@ class BlendLiveStatusTests(unittest.TestCase):
     @staticmethod
     def set_time(path, nanoseconds):
         os.utime(path, ns=(nanoseconds, nanoseconds))
-
-    def test_spm_process_failure_kind_reaches_batch_item_error(self):
-        gui = load_gui_module()
-        app = self.make_app(gui)
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            spm = root / "SK_tree_process_failure.spm"
-            write_empty_spm(spm)
-            iid = str(spm)
-            app.state[iid] = {}
-            app.force_rerun = True
-            app.cfg = {
-                "spm_parallel_jobs": 1,
-                "spm_verify_timeout": 120,
-                "spm_job_timeout": 7200,
-            }
-            app.spm_calibration_signature = "settings"
-            app.legacy_spm_calibration_signature = None
-            app.log = mock.Mock()
-            app._prepare_pair_for_job = mock.Mock(return_value=spm)
-            app._batch_job_item = mock.Mock(
-                return_value={"manual_bones_locked": False}
-            )
-            app._current_spm_snapshot = mock.Mock(
-                return_value={"fingerprint": "before"}
-            )
-
-            def fake_run(command, log_name, *_args, **_kwargs):
-                report_path = Path(
-                    command[command.index("--report") + 1]
-                )
-                report_path.parent.mkdir(parents=True, exist_ok=True)
-                report_path.write_text(
-                    json.dumps([{
-                        "spm": str(spm),
-                        "status": "failed",
-                        "failure_kind": "internal_error",
-                        "error": "SpeedTree export stalled",
-                        "diagnostic": {
-                            "category": "speedtree_export_timeout",
-                        },
-                    }]),
-                    encoding="utf-8",
-                )
-                return 1, root / log_name
-
-            app._run_limited = fake_run
-            with mock.patch.object(
-                gui,
-                "LOG_DIR",
-                root / "logs",
-            ), mock.patch.object(
-                gui,
-                "should_calibrate_spm",
-                return_value=True,
-            ), self.assertRaises(gui.BatchItemError) as caught:
-                app._job_spm(iid, spm)
-
-        self.assertEqual(caught.exception.kind, "internal_error")
-        self.assertEqual(
-            caught.exception.report["diagnostic"]["category"],
-            "speedtree_export_timeout",
-        )
-
-    def test_malformed_spm_report_is_internal_error(self):
-        gui = load_gui_module()
-        app = self.make_app(gui)
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            spm = root / "SK_tree_bad_report.spm"
-            write_empty_spm(spm)
-            iid = str(spm)
-            app.state[iid] = {}
-            app.force_rerun = True
-            app.cfg = {
-                "spm_parallel_jobs": 1,
-                "spm_verify_timeout": 120,
-                "spm_job_timeout": 7200,
-            }
-            app.spm_calibration_signature = "settings"
-            app.legacy_spm_calibration_signature = None
-            app.log = mock.Mock()
-            app._prepare_pair_for_job = mock.Mock(return_value=spm)
-            app._batch_job_item = mock.Mock(
-                return_value={"manual_bones_locked": False}
-            )
-            app._current_spm_snapshot = mock.Mock(
-                return_value={"fingerprint": "before"}
-            )
-
-            def fake_run(command, log_name, *_args, **_kwargs):
-                report_path = Path(
-                    command[command.index("--report") + 1]
-                )
-                report_path.parent.mkdir(parents=True, exist_ok=True)
-                report_path.write_text("{", encoding="utf-8")
-                return 1, root / log_name
-
-            app._run_limited = fake_run
-            with mock.patch.object(
-                gui,
-                "LOG_DIR",
-                root / "logs",
-            ), mock.patch.object(
-                gui,
-                "should_calibrate_spm",
-                return_value=True,
-            ), self.assertRaises(gui.BatchItemError) as caught:
-                app._job_spm(iid, spm)
-
-        self.assertEqual(caught.exception.kind, "internal_error")
-        self.assertIn("보고서 손상", str(caught.exception))
-
-    def test_spm_worker_outer_timeout_is_internal_error(self):
-        gui = load_gui_module()
-        app = self.make_app(gui)
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            spm = root / "SK_tree_worker_timeout.spm"
-            write_empty_spm(spm)
-            iid = str(spm)
-            app.state[iid] = {}
-            app.force_rerun = True
-            app.cfg = {
-                "spm_parallel_jobs": 1,
-                "spm_verify_timeout": 120,
-                "spm_job_timeout": 7200,
-            }
-            app.spm_calibration_signature = "settings"
-            app.legacy_spm_calibration_signature = None
-            app.log = mock.Mock()
-            app._prepare_pair_for_job = mock.Mock(return_value=spm)
-            app._batch_job_item = mock.Mock(
-                return_value={"manual_bones_locked": False}
-            )
-            app._current_spm_snapshot = mock.Mock(
-                return_value={"fingerprint": "before"}
-            )
-            app._run_limited = mock.Mock(
-                side_effect=RuntimeError("worker watchdog timeout")
-            )
-
-            with mock.patch.object(
-                gui,
-                "LOG_DIR",
-                root / "logs",
-            ), mock.patch.object(
-                gui,
-                "should_calibrate_spm",
-                return_value=True,
-            ), self.assertRaises(gui.BatchItemError) as caught:
-                app._job_spm(iid, spm)
-
-        self.assertEqual(caught.exception.kind, "internal_error")
-        self.assertIn("watchdog timeout", str(caught.exception))
 
     def test_live_status_distinguishes_missing_stale_and_current(self):
         gui = load_gui_module()
@@ -884,13 +702,13 @@ class BlendLiveStatusTests(unittest.TestCase):
             })
             app._record_live_blend_status = mock.Mock()
             app._run_limited = mock.Mock(
-                side_effect=AssertionError("current review must not rerun Repair")
+                side_effect=AssertionError("current review must not rerun Assembly")
             )
 
             app._job_blender(
                 str(spm),
                 spm,
-                {"manual_bones_locked": False, "wind_override": "auto"},
+                {"wind_override": "auto"},
             )
 
             app._run_limited.assert_not_called()
@@ -922,17 +740,14 @@ class BlendLiveStatusTests(unittest.TestCase):
             app._job_blender(
                 str(spm),
                 spm,
-                {
-                    "manual_bones_locked": False,
-                    "wind_override": "auto",
-                },
+                {"wind_override": "auto"},
             )
 
             app._assembly_output_state.assert_called_once_with(spm)
             app._publish_current_assembly_skip.assert_called_once()
             app._refresh_stale_cluster_receipt.assert_not_called()
 
-    def test_repair_code_newer_than_saved_outputs_does_not_force_rerun(self):
+    def test_assembly_code_newer_than_saved_outputs_does_not_force_rerun(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as temporary:
@@ -2643,7 +2458,6 @@ class BlendLiveStatusTests(unittest.TestCase):
             app.root_var = FakeVar(str(root))
             app.cfg = {"root": str(root)}
             app._collect_cfg = lambda: dict(app.cfg)
-            app.spm_calibration_signature = "test"
             app.tree = FakeTree()
             app.items = {}
             app.checked_rows = FakeCheckedRows()
@@ -2655,7 +2469,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             ), mock.patch.object(gui, "save_state"):
                 app.scan()
 
-            displayed = app.tree.rows[str(spm)]["values"][3]
+            displayed = app.tree.rows[str(spm)]["values"][2]
             self.assertEqual(displayed, "상태 확인 대기…")
             self.assertNotIn("검증 중", displayed)
             # A scan placeholder is never persisted as an active job state.
@@ -2679,7 +2493,6 @@ class BlendLiveStatusTests(unittest.TestCase):
             app.root_var = FakeVar(str(root))
             app.cfg = {"root": str(root)}
             app._collect_cfg = lambda: dict(app.cfg)
-            app.spm_calibration_signature = "test"
             app.tree = FakeTree()
             app.items = {}
             app.checked_rows = FakeCheckedRows()
@@ -2698,7 +2511,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             ):
                 app.scan()
 
-            displayed = app.tree.rows[str(spm)]["values"][3]
+            displayed = app.tree.rows[str(spm)]["values"][2]
             self.assertEqual(displayed, "최신 ✓")
             self.assertEqual(
                 app.items[str(spm)]["live_status_signature"],
@@ -2719,7 +2532,6 @@ class BlendLiveStatusTests(unittest.TestCase):
             app.root_var = FakeVar(str(root))
             app.cfg = {"root": str(root)}
             app._collect_cfg = lambda: dict(app.cfg)
-            app.spm_calibration_signature = "test"
             app.tree = FakeTree()
             app.items = {}
             app.checked_rows = FakeCheckedRows()
@@ -2738,7 +2550,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 app.scan()
 
             self.assertEqual(
-                app.tree.rows[str(spm)]["values"][3],
+                app.tree.rows[str(spm)]["values"][2],
                 "상태 확인 대기…",
             )
             self.assertIsNone(
@@ -2809,110 +2621,6 @@ class BlendLiveStatusTests(unittest.TestCase):
         )
         self.assertFalse(app._live_poll_active)
 
-    def test_scan_migrates_current_legacy_calibration_signature(self):
-        gui = load_gui_module()
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            spm = root / "SK_tree_cache_migration.spm"
-            write_empty_spm(spm)
-
-            app = self.make_app(gui)
-            app.root_var = FakeVar(str(root))
-            app.cfg = {"root": str(root)}
-            app._collect_cfg = lambda: dict(app.cfg)
-            app.spm_calibration_signature = "content-signature"
-            app.legacy_spm_calibration_signature = "legacy-stat-signature"
-            app.tree = FakeTree()
-            app.items = {}
-            app.checked_rows = FakeCheckedRows()
-            app.log = mock.Mock()
-            app.state[str(spm)] = {
-                "calibration_cache": {
-                    "version": gui.CALIBRATION_CACHE_VERSION,
-                    "spm_fingerprint": "spm-content",
-                    "settings_signature": "legacy-stat-signature",
-                    "status": "calibrated",
-                }
-            }
-            prepared = {
-                "spms": [spm],
-                "snapshots": {
-                    str(spm): {
-                        "fingerprint": "spm-content",
-                        "size": spm.stat().st_size,
-                        "mtime_ns": spm.stat().st_mtime_ns,
-                    }
-                },
-                "errors": [],
-                "snapshot_cache_hits": 1,
-            }
-
-            with mock.patch.object(
-                app, "_collect_scan_result", return_value=prepared
-            ), mock.patch.object(gui, "save_config"), mock.patch.object(
-                gui, "save_state"
-            ), mock.patch.object(
-                gui,
-                "calibration_settings_signature",
-                return_value="content-signature",
-            ), mock.patch.object(
-                gui,
-                "legacy_calibration_settings_signature",
-                return_value="legacy-stat-signature",
-            ):
-                app.scan()
-
-            self.assertEqual(
-                app.state[str(spm)]["calibration_cache"]["settings_signature"],
-                "content-signature",
-            )
-
-    def test_scan_migrates_cache_from_owned_marker_restore(self):
-        gui = load_gui_module()
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            spm = root / "SK_tree_marker_restore.spm"
-            original_backup = root / "original" / spm.name
-            marked_backup = root / "marked" / spm.name
-            original_backup.parent.mkdir()
-            marked_backup.parent.mkdir()
-            spm.write_bytes(b"original-spm")
-            original_backup.write_bytes(spm.read_bytes())
-            marked_backup.write_bytes(b"marked-spm")
-            report_dir = root / "reports"
-            report_dir.mkdir()
-            (report_dir / f"{spm.stem}_material_problem_node_markers.json").write_text(
-                json.dumps({
-                    "status": "restored",
-                    "spm": str(spm),
-                    "restore_source": str(original_backup),
-                    "restore_preserved_original_timestamp": True,
-                    "backups": [{
-                        "path": str(marked_backup),
-                        "reason": "before_exact_marker_cleanup_restore",
-                    }],
-                }),
-                encoding="utf-8",
-            )
-            current_snapshot = gui.file_content_snapshot(spm)
-            marked_snapshot = gui.file_content_snapshot(marked_backup)
-            cache = {
-                "version": gui.CALIBRATION_CACHE_VERSION,
-                "spm_fingerprint": marked_snapshot["fingerprint"],
-                "settings_signature": "legacy-stat-signature",
-                "status": "already-ok",
-            }
-
-            migrated = gui.App._migrate_restored_marker_calibration_cache(
-                spm, cache, current_snapshot
-            )
-
-            self.assertTrue(migrated)
-            self.assertEqual(
-                cache["spm_fingerprint"], current_snapshot["fingerprint"]
-            )
-            self.assertIn("marker_restore_cache_migrated_at", cache)
-
     def test_blender_job_runs_material_preflight_before_starting_blender(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -2938,10 +2646,12 @@ class BlendLiveStatusTests(unittest.TestCase):
             app.log = mock.Mock()
             commands = []
             timeouts = []
+            affinities = []
 
             def fake_run(cmd, log_name, _timeout, **_kwargs):
                 commands.append(list(cmd))
                 timeouts.append(_timeout)
+                affinities.append(_kwargs.get("affinity"))
                 report = Path(cmd[cmd.index("--report") + 1])
                 report.parent.mkdir(parents=True, exist_ok=True)
                 payload = {"status": "ok", "warnings": []}
@@ -2952,16 +2662,14 @@ class BlendLiveStatusTests(unittest.TestCase):
             app._leaf_reference_ready = mock.Mock(return_value=(True, "정상"))
             app._handoff_ready = mock.Mock(return_value=(True, "준비됨"))
             app._blend_status_text = mock.Mock(return_value="최신 ✓")
-            item = {"manual_bones_locked": False, "wind_override": "auto"}
+            item = {"wind_override": "auto"}
             app.state[str(spm)] = {
                 "push_status": "건너뜀: Blender 갱신 필요",
                 "push_status_kind": "preflight_skip",
                 "push_status_error": {"kind": "preflight_skip"},
             }
 
-            with mock.patch("spm_audit.audit_spm", return_value={}), mock.patch(
-                "spm_audit.sk_readiness", return_value={"ready": True}
-            ), mock.patch.object(
+            with mock.patch.object(
                 gui, "LOG_DIR", root / "logs"
             ), mock.patch.object(gui, "save_state"):
                 app._job_blender(str(spm), spm, item)
@@ -2969,6 +2677,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.assertEqual(len(commands), 2)
             self.assertIsNone(timeouts[0])
             self.assertEqual(timeouts[1], 3600)
+            self.assertEqual(affinities, [True, True])
             self.assertIn("speedtree_material_preflight.py", commands[0][1])
             self.assertTrue(any(
                 str(value).endswith("assembly_headless_job.py")
@@ -2982,7 +2691,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.assertEqual(app.state[str(spm)]["push_status_kind"], "ready")
             self.assertNotIn("push_status_error", app.state[str(spm)])
 
-    def test_stale_cluster_receipt_is_refreshed_and_revalidated(self):
+    def test_owner_live_audit_uses_child_persistence_without_old_receipt_hash(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         app.log = mock.Mock()
@@ -3001,13 +2710,21 @@ class BlendLiveStatusTests(unittest.TestCase):
                 report = Path(command[command.index("--json") + 1])
                 report.parent.mkdir(parents=True, exist_ok=True)
                 report.write_text(
-                    json.dumps({"items": [{"cluster_assembly": {
-                        "tree_source_identities": [{
-                            "target_spm": {"path": str(spm)},
-                        }],
-                        "dependencies": [{"role": "branch"}],
-                        "handoff": {"errors": [], "issues": []},
-                    }}]}),
+                    json.dumps({
+                        "cluster_assembly_receipt_persistence": {
+                            "status": "ok",
+                            "written": [str(selected)],
+                            "unchanged": [],
+                            "error": "",
+                        },
+                        "items": [{"cluster_assembly": {
+                            "tree_source_identities": [{
+                                "target_spm": {"path": str(spm)},
+                            }],
+                            "dependencies": [{"role": "branch"}],
+                            "handoff": {"errors": [], "issues": []},
+                        }}],
+                    }),
                     encoding="utf-8",
                 )
                 return 0, Path(temporary) / "refresh.log"
@@ -3017,14 +2734,14 @@ class BlendLiveStatusTests(unittest.TestCase):
             with mock.patch.object(
                 gui,
                 "cluster_assembly_receipt_resolution",
-                side_effect=[
-                    gui.ClusterAssemblyReceiptStaleError("stale"),
-                    current,
-                ],
-            ):
+                side_effect=AssertionError(
+                    "owner live audit must not hash an old receipt"
+                ),
+            ) as old_resolution:
                 resolution = app._refresh_stale_cluster_receipt(
                     spm, "20260725_120000"
                 )
+            old_resolution.assert_not_called()
 
             self.assertEqual(
                 resolution["policy"],
@@ -3047,6 +2764,10 @@ class BlendLiveStatusTests(unittest.TestCase):
             )
             self.assertIn("--cluster-assembly-only", command)
             self.assertIsNone(app._run_limited.call_args.args[2])
+            self.assertIs(
+                app._run_limited.call_args.kwargs["affinity"],
+                True,
+            )
             progress_limits = app._run_limited.call_args.kwargs[
                 "inactivity_timeout_by_marker"
             ]
@@ -3138,6 +2859,107 @@ class BlendLiveStatusTests(unittest.TestCase):
         self.assertEqual(app._run_limited.call_count, 2)
         self.assertTrue(any(
             "memo hit" in call.args[0]
+            for call in app.log.call_args_list
+        ))
+
+    def test_cluster_live_audit_exact_cache_survives_restart_and_hashes_bytes(
+        self,
+    ):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.log = mock.Mock()
+        app.cfg = {"cluster_receipt_refresh_timeout": 321}
+        manifest = app._assert_active_production_source_manifest()
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            gui, "LOG_DIR", Path(temporary) / "logs"
+        ):
+            spm = Path(temporary) / "Tree_elm" / "SK_Tree_elm_01.spm"
+            (spm.parent / "Cluster").mkdir(parents=True)
+            spm.write_bytes(b"tree")
+            capture = spm.parent / "Cluster" / "cluster_elm_01.tga"
+            capture.write_bytes(b"capture-one")
+            original_mtime_ns = capture.stat().st_mtime_ns
+            runs = {"count": 0}
+
+            def run_audit(command, *_args, **_kwargs):
+                runs["count"] += 1
+                report = Path(command[command.index("--json") + 1])
+                report.parent.mkdir(parents=True, exist_ok=True)
+                sampled = gui.sampled_file_content_snapshot(capture)
+                report.write_text(
+                    json.dumps({
+                        "production_source_revision": (
+                            production_source_revision_state(
+                                manifest.content_hash,
+                                manifest.as_dict(),
+                                manifest.as_dict(),
+                            )
+                        ),
+                        "items": [{"cluster_assembly": {
+                            "tree_source_identities": [{
+                                "target_spm": {
+                                    "path": str(spm),
+                                    "exists": True,
+                                },
+                            }],
+                            "dependencies": [{
+                                "role": "branch",
+                                "texture_dependencies": [{
+                                    "path": str(capture),
+                                    "exists": True,
+                                    "sha256": None,
+                                    **sampled,
+                                }],
+                            }],
+                            "handoff": {"errors": [], "issues": []},
+                        }}],
+                    }),
+                    encoding="utf-8",
+                )
+                return 0, Path(temporary) / "refresh.log"
+
+            app._run_limited = mock.Mock(side_effect=run_audit)
+            with mock.patch.object(
+                gui,
+                "cluster_assembly_receipt_resolution",
+                return_value={
+                    "selected_receipt": str(
+                        Path(temporary) / "receipt.json"
+                    )
+                },
+            ):
+                first = app._refresh_stale_cluster_receipt(
+                    spm, "20260821_220101"
+                )
+                app._reset_cluster_receipt_refresh_memo()
+                warm_started = time.perf_counter()
+                second = app._refresh_stale_cluster_receipt(
+                    spm, "20260821_220102"
+                )
+                warm_elapsed = time.perf_counter() - warm_started
+                # Preserve size and timestamp while changing bytes. A durable
+                # positive hit must still reject this and run a fresh audit.
+                capture.write_bytes(b"capture-two")
+                os.utime(
+                    capture,
+                    ns=(original_mtime_ns, original_mtime_ns),
+                )
+                app._reset_cluster_receipt_refresh_memo()
+                third = app._refresh_stale_cluster_receipt(
+                    spm, "20260821_220103"
+                )
+
+        self.assertEqual(first["policy"], "live_audit_authoritative")
+        self.assertEqual(second["policy"], "live_audit_authoritative")
+        self.assertEqual(third["policy"], "live_audit_authoritative")
+        self.assertEqual(runs["count"], 2)
+        self.assertLess(
+            warm_elapsed,
+            0.5,
+            f"exact live-audit cache hit took {warm_elapsed:.3f}s",
+        )
+        self.assertTrue(any(
+            "exact cache hit" in call.args[0]
             for call in app.log.call_args_list
         ))
 
@@ -4642,7 +4464,9 @@ class BlendLiveStatusTests(unittest.TestCase):
                     "20260729_036103",
                 )
 
-        self.assertEqual(app._run_limited.call_count, 3)
+        # Both producer slices share one exact no-receipt observation; the
+        # owner audit remains separate because it publishes a receipt.
+        self.assertEqual(app._run_limited.call_count, 2)
         self.assertEqual(
             owner_resolution["policy"],
             "live_audit_authoritative",
@@ -5107,7 +4931,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                         "self-ambiguity"
                     ),
                 ],
-            ):
+            ) as old_resolution:
                 resolution = app._refresh_stale_cluster_receipt(
                     spm, "20260725_120000"
                 )
@@ -5120,10 +4944,8 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.assertTrue(report_name.startswith("SK_Tree_elm_01_"))
             self.assertIn("_jobadhoc_20260725_120000_", report_name)
             self.assertTrue(report_name.endswith(".json"))
-            self.assertIn(
-                "self-ambiguity",
-                resolution["receipt_persistence_warning"],
-            )
+            self.assertEqual(resolution["receipt_persistence_warning"], "")
+            self.assertEqual(old_resolution.call_count, 1)
 
     def test_receipt_persistence_only_nonzero_exit_uses_live_contract(self):
         gui = load_gui_module()
@@ -5278,18 +5100,9 @@ class BlendLiveStatusTests(unittest.TestCase):
                 return 0, Path(temporary) / log_name
 
             app._run_limited = fake_run
-            item = {
-                "manual_bones_locked": False,
-                "wind_override": "auto",
-            }
+            item = {"wind_override": "auto"}
             app.state[str(spm)] = {}
-            with mock.patch(
-                "spm_audit.audit_spm",
-                return_value={},
-            ), mock.patch(
-                "spm_audit.sk_readiness",
-                return_value={"ready": True},
-            ), mock.patch.object(gui, "save_state"):
+            with mock.patch.object(gui, "save_state"):
                 app._job_blender(str(spm), spm, item)
 
             self.assertEqual(
@@ -5307,7 +5120,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             )
             self.assertIn("cluster_assembly", material_payload)
 
-    def test_missing_cluster_receipt_is_audited_and_recovered(self):
+    def test_owner_live_audit_does_not_search_old_receipts(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         app.log = mock.Mock()
@@ -5326,13 +5139,21 @@ class BlendLiveStatusTests(unittest.TestCase):
                 report = Path(command[command.index("--json") + 1])
                 report.parent.mkdir(parents=True, exist_ok=True)
                 report.write_text(
-                    json.dumps({"items": [{"cluster_assembly": {
-                        "tree_source_identities": [{
-                            "target_spm": {"path": str(spm)},
-                        }],
-                        "dependencies": [{"role": "branch"}],
-                        "handoff": {"errors": [], "issues": []},
-                    }}]}),
+                    json.dumps({
+                        "cluster_assembly_receipt_persistence": {
+                            "status": "ok",
+                            "written": [str(selected)],
+                            "unchanged": [],
+                            "error": "",
+                        },
+                        "items": [{"cluster_assembly": {
+                            "tree_source_identities": [{
+                                "target_spm": {"path": str(spm)},
+                            }],
+                            "dependencies": [{"role": "branch"}],
+                            "handoff": {"errors": [], "issues": []},
+                        }}],
+                    }),
                     encoding="utf-8",
                 )
                 return 0, Path(temporary) / "refresh.log"
@@ -5342,11 +5163,14 @@ class BlendLiveStatusTests(unittest.TestCase):
             with mock.patch.object(
                 gui,
                 "cluster_assembly_receipt_resolution",
-                side_effect=[FileNotFoundError("missing"), current],
-            ):
+                side_effect=AssertionError(
+                    "owner live audit must not search old receipts"
+                ),
+            ) as old_resolution:
                 resolution = app._refresh_stale_cluster_receipt(
                     spm, "20260725_120000"
                 )
+            old_resolution.assert_not_called()
 
             self.assertEqual(
                 resolution["policy"],
@@ -5549,11 +5373,9 @@ class BlendLiveStatusTests(unittest.TestCase):
             app._blend_status_text = mock.Mock(
                 return_value="Blend 완료 · 원본 검토 필요 · Unreal Push 차단"
             )
-            item = {"manual_bones_locked": False, "wind_override": "auto"}
+            item = {"wind_override": "auto"}
 
-            with mock.patch("spm_audit.audit_spm", return_value={}), mock.patch(
-                "spm_audit.sk_readiness", return_value={"ready": True}
-            ), mock.patch.object(
+            with mock.patch.object(
                 gui, "LOG_DIR", root / "logs"
             ), mock.patch.object(gui, "save_state"):
                 app._job_blender(str(spm), spm, item)
@@ -5676,7 +5498,6 @@ class BlendLiveStatusTests(unittest.TestCase):
             app._write_assembly_runtime_receipt = mock.Mock()
             item = {
                 "spm": spm,
-                "manual_bones_locked": False,
                 "wind_override": "auto",
                 # Dependency provenance contains both the editable source and
                 # the final output.  Only the final SK output is a relationship
@@ -5685,10 +5506,6 @@ class BlendLiveStatusTests(unittest.TestCase):
             }
 
             with mock.patch(
-                "spm_audit.audit_spm", return_value={}
-            ), mock.patch(
-                "spm_audit.sk_readiness", return_value={"ready": True}
-            ), mock.patch(
                 "cluster_blend_sync.run_cluster_relation_transaction",
                 side_effect=fake_relation,
             ) as relation, mock.patch.object(
@@ -5792,7 +5609,6 @@ class BlendLiveStatusTests(unittest.TestCase):
             app._write_assembly_runtime_receipt = mock.Mock()
             item = {
                 "spm": spm,
-                "manual_bones_locked": False,
                 "wind_override": "auto",
                 "referenced_by_spms": (
                     owner / "SK_Tree_blackgum_01.spm",
@@ -5800,11 +5616,6 @@ class BlendLiveStatusTests(unittest.TestCase):
             }
 
             with mock.patch(
-                "spm_audit.audit_spm", return_value={}
-            ), mock.patch(
-                "spm_audit.sk_readiness",
-                return_value={"ready": True},
-            ), mock.patch(
                 "cluster_blend_sync.run_cluster_relation_transaction",
             ) as relation, mock.patch.object(
                 gui, "LOG_DIR", root / "logs"
@@ -5937,16 +5748,11 @@ class BlendLiveStatusTests(unittest.TestCase):
             app._write_assembly_runtime_receipt = mock.Mock()
             item = {
                 "spm": spm,
-                "manual_bones_locked": False,
                 "wind_override": "auto",
                 "referenced_by_spms": (target,),
             }
 
             with mock.patch(
-                "spm_audit.audit_spm", return_value={}
-            ), mock.patch(
-                "spm_audit.sk_readiness", return_value={"ready": True}
-            ), mock.patch(
                 "cluster_blend_sync.run_cluster_relation_transaction",
                 side_effect=fake_relation,
             ), mock.patch.object(
@@ -6013,11 +5819,9 @@ class BlendLiveStatusTests(unittest.TestCase):
             app._run_limited = fake_run
             app._leaf_reference_ready = mock.Mock(return_value=(True, "정상"))
             app._handoff_ready = mock.Mock(return_value=(False, "갱신 필요"))
-            item = {"manual_bones_locked": False, "wind_override": "auto"}
+            item = {"wind_override": "auto"}
 
-            with mock.patch("spm_audit.audit_spm", return_value={}), mock.patch(
-                "spm_audit.sk_readiness", return_value={"ready": True}
-            ), mock.patch.object(
+            with mock.patch.object(
                 gui, "LOG_DIR", root / "logs"
             ):
                 with self.assertRaises(gui.BatchItemError):

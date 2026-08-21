@@ -177,7 +177,7 @@ G height 감쇠만 복구한다. 따라서 Skeletal Nanite에서 R도 필요해�
 - 대상 하나라도 필수 Red property가 없거나 ProfileSpline이 지원되지 않는 형태이면
   해당 호출은 원본 text 전체를 반환한다. 일부 Branch만 바뀐 상태를 기록하지 않는다.
 - 기본 `backup_spm=true`에서는 ① 단계 시작 전에 `_spm_backups`에 원본을 보관하며,
-  이후 calibration/material rename/R authoring 중 실패하면 전체 SPM을 복원한다.
+  이후 material rename/R authoring 중 실패하면 전체 SPM을 복원한다.
 - 같은 입력에 다시 적용하면 byte-for-byte 같은 결과여야 한다(idempotent).
 - 해석할 수 없는 leaf `ParentGUID`나 잘못된 Branch `GeneratorGUID`는 report warning에
   남는다. 실제 배포 전에 warning을 검토해 topology 누락이 아닌지 확인한다.

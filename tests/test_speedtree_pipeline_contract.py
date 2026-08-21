@@ -20,7 +20,7 @@ for path in (REPO, PCG_DIR, SK_DIR):
         sys.path.insert(0, str(path))
 
 from pcg_texture_audit import canonical_material_name, derived_material_base
-from spm_audit import read_spm as read_sk_spm, write_spm as write_sk_spm
+from spm_document import read_spm as read_sk_spm, write_spm as write_sk_spm
 from speedtree_pipeline_contract import (
     BACKUP_DIRECTORY_NAMES,
     build_preflight_envelope,
@@ -259,7 +259,7 @@ class SpeedTreePipelineContractTests(unittest.TestCase):
                 )
             )
             receipt = source.parent / "reports" / "normalize.json"
-            (source.parent / "reports" / "000_spm_audit.json").write_text(
+            (source.parent / "reports" / "000_pipeline_audit.json").write_text(
                 json.dumps([{"status": "already-ok", "spm": str(source)}]),
                 encoding="utf-8",
             )

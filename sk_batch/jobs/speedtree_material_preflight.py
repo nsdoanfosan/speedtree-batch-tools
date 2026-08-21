@@ -1,7 +1,7 @@
 """Fast pre-Blender SpeedTree FBX/XML/STMAT material preflight.
 
 This process produces the exact cached collision/prune FBX+XML bundle consumed
-by Blender Repair, then performs read-only SPM/STMAT checks. Blender is launched
+by Blender Assembly, then performs read-only SPM/STMAT checks. Blender is launched
 only after this succeeds and reuses the same export receipts.
 """
 from __future__ import annotations
@@ -1500,8 +1500,8 @@ def main():
                 report["missing_export_materials"] = missing
                 # Material preflight is a diagnostic boundary.  Never write a
                 # foreground marker into the source SPM here: that cosmetic
-                # edit invalidates the already-current Blender repair, SK
-                # calibration and Unreal Push receipts.  The report contains
+                # edit invalidates the already-current Assembly and Unreal
+                # Push receipts.  The report contains
                 # the exact Generator GUIDs/names for UI-side highlighting.
                 report["problem_node_marker"] = {
                     "status": "reported_only",

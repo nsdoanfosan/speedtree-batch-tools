@@ -193,25 +193,21 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
                     "spm": ordinary,
                     "display_name": ordinary.name,
                     "checked": False,
-                    "manual_bones_locked": False,
                 },
                 str(missing): {
                     "spm": missing,
                     "display_name": missing.name,
                     "checked": False,
-                    "manual_bones_locked": False,
                 },
                 str(assembly): {
                     "spm": assembly,
                     "display_name": assembly.name,
                     "checked": True,
-                    "manual_bones_locked": False,
                 },
                 str(provider): {
                     "spm": provider,
                     "display_name": provider.name,
                     "checked": True,
-                    "manual_bones_locked": False,
                 },
             }
             app.checked_rows = gui.CheckedRowController(
@@ -403,20 +399,17 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
                     "spm": recent,
                     "authoring_spm": recent,
                     "checked": False,
-                    "manual_bones_locked": False,
                 },
                 str(old): {
                     "spm": old,
                     "authoring_spm": old,
                     "output_spm": mirror,
                     "checked": True,
-                    "manual_bones_locked": False,
                 },
                 str(missing): {
                     "spm": missing,
                     "authoring_spm": missing,
                     "checked": True,
-                    "manual_bones_locked": False,
                 },
             }
             app.checked_rows = gui.CheckedRowController(
@@ -593,7 +586,6 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
                 "display_name": "SK_branch_elm_01.spm",
                 "source_read_only": False,
                 "checked": True,
-                "manual_bones_locked": False,
             }
         }
 
@@ -602,35 +594,6 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
         self.assertIn("SK_branch_elm_01.spm", label)
         self.assertNotIn("branch_elm_01.spm →", label)
         self.assertNotIn("Atlas output", label)
-        # Cluster rows use the dedicated one-root-per-piece stage-① policy.
-        self.assertTrue(gui.should_calibrate_spm(app.items[iid]))
-
-    def test_only_cluster_authoring_spm_uses_root_only_calibration(self):
-        # Canonical and legacy Cluster row names both route through stage ①;
-        # spm_audit selects the first renderable structural roots and writes
-        # Absolute/1 instead of using the normal tree density solver.
-        gui = load_gui_module()
-        for name in ("SK_branch_elm_01.spm", "branch_elm_01.spm"):
-            item = {
-                "spm": Path("Tree_elm/Cluster") / name,
-                "source_read_only": False,
-                "manual_bones_locked": False,
-            }
-            self.assertTrue(gui.should_calibrate_spm(item), name)
-
-        read_only_item = {
-            "spm": Path("Tree_elm/Cluster/SK_branch_elm_01.spm"),
-            "source_read_only": True,
-            "manual_bones_locked": False,
-        }
-        self.assertFalse(gui.should_calibrate_spm(read_only_item))
-
-        tree_item = {
-            "spm": Path("Tree_elm/SK_Tree_elm_01.spm"),
-            "source_read_only": False,
-            "manual_bones_locked": False,
-        }
-        self.assertFalse(gui.should_calibrate_spm(tree_item))
 
     def test_canonical_atlas_manifest_preflight_runs_before_blender(self):
         gui = load_gui_module()
@@ -1165,7 +1128,6 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
             str(spm): {
                 "spm": spm,
                 "checked": True,
-                "manual_bones_locked": False,
             }
         }
         folder_iid = "folder::cluster"
@@ -1182,80 +1144,9 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
         self.assertEqual(app.tree.selection(), (folder_iid,))
         self.assertEqual(app.tree.focused, folder_iid)
 
-    def test_verified_xml_bone_count_is_read_only_and_content_matched(self):
-        gui = load_gui_module()
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            spm = root / "SK_tree_manual_01.spm"
-            spm.write_bytes(b"current-spm")
-            xml_path = root / "xml" / f"{spm.stem}.xml"
-            xml_path.parent.mkdir()
-            xml_path.write_text(
-                (
-                    f'<SpeedTreeRaw Source="{spm}"><Bones Count="2">'
-                    '<Bone ID="0" Generator="Branch" />'
-                    '<Bone ID="1" Generator="Branch 2" />'
-                    "</Bones></SpeedTreeRaw>"
-                ),
-                encoding="utf-8",
-            )
-            receipt_path = (
-                xml_path.parent
-                / ".speedtree_export_cache"
-                / f"{xml_path.name}.json"
-            )
-            receipt_path.parent.mkdir()
-            receipt_path.write_text(
-                json.dumps(
-                    {
-                        "inputs": {
-                            "spm": {
-                                "path": str(spm),
-                                "size": spm.stat().st_size,
-                                "sha256": hashlib.sha256(spm.read_bytes()).hexdigest(),
-                            }
-                        },
-                        "artifacts": [
-                            {
-                                "relative_path": xml_path.name,
-                                "size": xml_path.stat().st_size,
-                                "sha256": hashlib.sha256(
-                                    xml_path.read_bytes()
-                                ).hexdigest(),
-                            }
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            before = (
-                spm.read_bytes(),
-                spm.stat().st_mtime_ns,
-                xml_path.read_bytes(),
-                xml_path.stat().st_mtime_ns,
-            )
-
-            measurement = gui.current_speedtree_bone_measurement(spm)
-
-            self.assertEqual(measurement["count"], 2)
-            self.assertTrue(measurement["current"])
-            self.assertEqual(
-                before,
-                (
-                    spm.read_bytes(),
-                    spm.stat().st_mtime_ns,
-                    xml_path.read_bytes(),
-                    xml_path.stat().st_mtime_ns,
-                ),
-            )
-            spm.write_bytes(b"changed-spm")
-            stale = gui.current_speedtree_bone_measurement(spm)
-            self.assertEqual(stale["count"], 2)
-            self.assertFalse(stale["current"])
-
     def test_compact_table_keeps_full_selected_row_detail(self):
         gui = load_gui_module()
-        full = "수동 본 유지 🔒 · SpeedTree 본 282개 (현재 SPM과 일치하는 XML)"
+        full = "Assembly 최신 · 현재 산출물 계약과 일치"
 
         compact = gui.compact_table_status(full, max_chars=24)
         detail = gui.selected_row_detail_text(
@@ -1272,37 +1163,6 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
         self.assertIn(full, detail)
         self.assertIn("SK_tree_birch_paper_03.spm", detail)
 
-    def test_spm_check_uses_clear_bone_style_names(self):
-        gui = load_gui_module()
-        parts = gui.spm_check_status_parts(
-            {
-                "generators": [
-                    {"style": 0.0, "bones": 2.0},
-                    {"style": 1.0, "bones": 0.5},
-                    {"style": 0.0, "bones": 0.0},
-                ],
-                "materials": [{"needs_prefix": True}],
-                "bone_graph": {
-                    "root_target_generator_count": 2,
-                    "base_excluded_generator_count": 1,
-                    "unknown_base_generators": [{"name": "Unknown"}],
-                },
-            }
-        )
-
-        self.assertEqual(
-            parts,
-            [
-                "고정 본(Absolute) 1개",
-                "자동 본(Relative) 1개",
-                "본 꺼짐 1개",
-                "M_ 필요 1개",
-                "자동 대상 2 / Base 제외 1",
-                "Base 미분류 1",
-            ],
-        )
-        self.assertNotIn("미보정", " · ".join(parts))
-
     def test_first_click_isolates_row_and_ctrl_c_copies_that_spm_path(self):
         gui = load_gui_module()
         with tempfile.TemporaryDirectory() as temporary:
@@ -1317,7 +1177,6 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
                 str(spm): {
                     "spm": spm,
                     "checked": True,
-                    "manual_bones_locked": False,
                 }
                 for spm in spms
             }
@@ -1360,7 +1219,6 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
                 str(path): {
                     "spm": path,
                     "checked": path == first,
-                    "manual_bones_locked": False,
                 }
                 for path in (first, second)
             }

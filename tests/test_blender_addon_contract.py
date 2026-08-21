@@ -159,7 +159,6 @@ class BlenderAddonGatewayTests(unittest.TestCase):
         package.bl_info = {"version": (9, 8, 7)}
 
         core = types.ModuleType("speedtree_bone_weight_repair.core")
-        core.require_spm_sk_ready = lambda value: ("ready", value)
         core.run_import_and_assemble = lambda value: ("assembled", value)
         core.run_speedtree_cli_export = lambda **kwargs: kwargs
         core.consolidate_speedtree_group_materials = lambda *args: args
@@ -185,15 +184,14 @@ class BlenderAddonGatewayTests(unittest.TestCase):
                     "test.gateway",
                     {
                         "speedtree_bone_weight_repair": [
-                            "spm_sk_preflight_v1",
                             "assembly_pipeline_v1",
                         ]
                     },
                 )
                 operation = session.operation(
-                    "speedtree_bone_weight_repair", "require_spm_sk_ready"
+                    "speedtree_bone_weight_repair", "run_import_and_assemble"
                 )
-                self.assertEqual(operation("tree.spm"), ("ready", "tree.spm"))
+                self.assertEqual(operation({"tree": "spm"}), ("assembled", {"tree": "spm"}))
                 row = session.receipt["addons"][0]
                 self.assertEqual(row["addon_version"], "9.8.7")
                 self.assertEqual(row["module_file"], str(package_file.resolve()))
