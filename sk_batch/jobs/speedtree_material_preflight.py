@@ -921,13 +921,13 @@ def run_export(args, speedtree_cli):
     export_bundle = getattr(speedtree_cli, "export_bundle", None)
     if not callable(export_bundle):
         raise RuntimeError(
-            "Installed SpeedTree BWR helper does not support one-process "
+            "Installed SpeedTree export helper does not support one-process "
             "FBX/XML export_bundle; update the junction-installed add-on."
         )
     original_gate = getattr(speedtree_cli, "speedtree_export_gate", None)
     if not callable(original_gate):
         raise RuntimeError(
-            "Installed SpeedTree BWR helper does not expose the shared "
+            "Installed SpeedTree export helper does not expose the shared "
             "SpeedTree export gate."
         )
 
@@ -1386,7 +1386,7 @@ def main():
                 report["speedtree_xml_export"] = export_bundle["xml"]
                 report["speedtree_export_bundle"] = {
                     "policy": (
-                        "native_collision_prune_fbx_xml_one_process_shared_with_bwr"
+                        "native_collision_prune_fbx_xml_one_process"
                     ),
                     "fbx_cache_hit": bool(
                         export_bundle["fbx"].get("cache_hit")
@@ -1528,7 +1528,7 @@ def main():
                     )
                 else:
                     report["error"] = (
-                        "SpeedTree FBX 재질 데이터 준비 실패 — "
+                        "SpeedTree FBX/XML 선행 생성 실패 — "
                         + str(material.get("status") or "unknown")
                     )
             else:
