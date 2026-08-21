@@ -14,9 +14,36 @@ SpeedTree Modeler 10.1.0의 공식 `-export` 경로가 Collision과 Shade Prunin
 3. Modeler의 collision 완료 scheduler와 generator commit을 동기 실행합니다.
 4. UI 전용 알림/뷰 callback만 계산 구간 동안 우회합니다.
 5. 최종 generator geometry를 공식 exporter가 FBX/XML로 기록하게 합니다.
+6. Modeler가 파싱한 BaseRef 연결을 공통 export bone graph에 다시 기록한 뒤
+   FBX/XML serializer가 같은 정확한 계층을 사용하게 합니다.
 
 Modeler 창, 파일 선택창, recovery Question, blank 문서, 마우스 포커스,
 Windows desktop 격리는 생산 경로에서 사용하지 않습니다.
+
+## BaseRef 본 계층 복원
+
+SpeedTree 10.1.0은 SPM을 연 뒤 런타임 node graph에는 BaseRef 연결을 유지하지만,
+export bone record를 만들 때 일반 parent 조회가 Base node에서 끊겨 해당 branch의
+첫 본을 parent ID 0으로 기록합니다. FBX와 XML이 같은 잘못된 임시 bone graph를
+사용하므로 serializer 옵션이나 공식 CLI 사용 여부로는 해결되지 않습니다.
+
+이 확장은 두 serializer보다 앞선 공통 bone-record 삽입 지점을 version-locked
+hook으로 보완합니다. 끊긴 record마다 Modeler가 이미 파싱한 다음 연결만 사용합니다.
+
+1. child `CBranchNode`의 실제 parent `CBaseNode`
+2. `CBaseNode`가 보유한 paired `CBaseRefNode`와 target `CBranchNode`
+3. child node에 저장된 anchor index, anchor record, branch offset, section
+4. target branch의 Modeler 원본 bone-ID resolver
+
+target branch와 BaseRef의 역참조가 정확히 일치할 때만 원본 resolver가 반환한
+parent ID를 기록합니다. 가장 가까운 본, 좌표 tolerance, 이름 유사도, scale 추정,
+기존 repair mapping은 사용하지 않습니다. 참조 체인이나 anchor record가 불완전하거나
+resolver가 유효한 ID를 반환하지 못하면 export를 실패시키며 근사값으로 진행하지
+않습니다.
+
+`SK_Tree_elm_01.spm` 검증에서는 누락된 BaseRef edge 305개가 모두 복원됐습니다.
+XML의 305개 ParentID는 내부 resolver 결과와 전부 일치했고, Blender 5.1 FBX
+재임포트에서도 305개가 모두 부모를 가지며 BaseRef root로 남은 항목은 없었습니다.
 
 ## 사용법
 
