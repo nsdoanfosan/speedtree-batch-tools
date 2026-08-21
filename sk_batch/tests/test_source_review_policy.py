@@ -143,7 +143,7 @@ class SourceReviewPolicyTests(unittest.TestCase):
         assembly_inspection_lines = call_lines(
             tree, "inspect_cluster_assembly_fbx"
         )
-        repair_lines = call_lines(tree, "run_import_and_repair")
+        repair_lines = call_lines(tree, "run_import_and_assemble")
 
         self.assertEqual(len(export_lines), 2)
         self.assertEqual(len(material_validation_lines), 1)

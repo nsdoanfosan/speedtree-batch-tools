@@ -16,7 +16,7 @@ from unittest import mock
 
 from atlas_target_registry import TargetRegistryError
 from sk_batch.repair_runtime_contract import (
-    REPAIR_OUTPUT_CONTRACT_VERSION,
+    ASSEMBLY_OUTPUT_CONTRACT_VERSION,
     RepairPipelineEvidenceError,
     repair_pipeline_output_contract,
     repair_runtime_receipt_path,
@@ -426,7 +426,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.assertIn("Blender 갱신 필요", app._blend_status_text(spm))
 
             report = root / "reports" / (
-                "SK_tree_test_01_speedtree_repair_pipeline_report_codex.json"
+                "SK_tree_test_01_speedtree_assembly_pipeline_report_codex.json"
             )
             report.parent.mkdir()
             report.write_text(
@@ -434,7 +434,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                     "speedtree_pipeline_contract": {},
                     "unassigned_geometry_cleanup": {
                         "status": "not_applicable",
-                        "policy": "discard_unassigned_geometry_before_repair",
+                        "policy": "discard_unassigned_geometry_before_assembly",
                         "cleanup_contract_version": 1,
                     },
                     "texture_normalization": {"status": "ok", "missing": []},
@@ -495,7 +495,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             write_empty_spm(spm)
             blend.write_bytes(b"blend")
             report = root / "reports" / (
-                "SK_tree_legacy_01_speedtree_repair_pipeline_report_codex.json"
+                "SK_tree_legacy_01_speedtree_assembly_pipeline_report_codex.json"
             )
             report.parent.mkdir()
             report.write_text(
@@ -738,7 +738,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             stmat.parent.mkdir()
             stmat.write_text("<SpeedTreeMaterials />", encoding="utf-8")
             report = cluster / "reports" / (
-                "SK_branch_elm_01_speedtree_repair_pipeline_report_codex.json"
+                "SK_branch_elm_01_speedtree_assembly_pipeline_report_codex.json"
             )
             report.parent.mkdir()
             report.write_text(
@@ -774,7 +774,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             write_empty_spm(spm)
             blend.write_bytes(b"blend")
             report = root / "reports" / (
-                "SK_tree_touch_only_speedtree_repair_pipeline_report_codex.json"
+                "SK_tree_touch_only_speedtree_assembly_pipeline_report_codex.json"
             )
             report.parent.mkdir()
             report.write_text(
@@ -782,7 +782,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                     "speedtree_pipeline_contract": {},
                     "unassigned_geometry_cleanup": {
                         "status": "not_applicable",
-                        "policy": "discard_unassigned_geometry_before_repair",
+                        "policy": "discard_unassigned_geometry_before_assembly",
                         "cleanup_contract_version": 1,
                     },
                     "texture_normalization": {"status": "ok", "missing": []},
@@ -817,7 +817,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             blend = gui.blend_path_for(spm)
             blend.write_bytes(b"blend")
             report = cluster / "reports" / (
-                "branch_elm_01_speedtree_repair_pipeline_report_codex.json"
+                "branch_elm_01_speedtree_assembly_pipeline_report_codex.json"
             )
             report.parent.mkdir()
             report.write_text(
@@ -825,7 +825,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                     "speedtree_pipeline_contract": {},
                     "unassigned_geometry_cleanup": {
                         "status": "not_applicable",
-                        "policy": "discard_unassigned_geometry_before_repair",
+                        "policy": "discard_unassigned_geometry_before_assembly",
                         "cleanup_contract_version": 1,
                     },
                     "texture_normalization": {
@@ -940,7 +940,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             spm = root / "SK_tree_runtime_stale.spm"
             blend = spm.with_suffix(".blend")
             report = root / "reports" / (
-                "SK_tree_runtime_stale_speedtree_repair_pipeline_report_codex.json"
+                "SK_tree_runtime_stale_speedtree_assembly_pipeline_report_codex.json"
             )
             addon_dir = root / "speedtree_bone_weight_repair"
             fbx_ini = (
@@ -973,7 +973,7 @@ class BlendLiveStatusTests(unittest.TestCase):
         spm = root / "SK_tree_runtime_stale.spm"
         blend = spm.with_suffix(".blend")
         report = root / "reports" / (
-            "SK_tree_runtime_stale_speedtree_repair_pipeline_report_codex.json"
+            "SK_tree_runtime_stale_speedtree_assembly_pipeline_report_codex.json"
         )
         addon_dir = root / "speedtree_bone_weight_repair"
         fbx_ini = addon_dir / "presets" / "speedtree_10_1" / "Options_MA_Fbx.ini"
@@ -1019,7 +1019,7 @@ class BlendLiveStatusTests(unittest.TestCase):
         ).hexdigest()
         common = {
             "status": status,
-            "policy": "discard_unassigned_geometry_before_repair",
+            "policy": "discard_unassigned_geometry_before_assembly",
             "cleanup_contract_version": 2,
             "cleanup_authorized": True,
             "strict_speedtree_pipeline_contract": True,
@@ -1134,7 +1134,10 @@ class BlendLiveStatusTests(unittest.TestCase):
         }
         return {
             "status": "done",
-            "repair_output_contract_version": 2,
+            "assembly_output_contract_version": (
+                ASSEMBLY_OUTPUT_CONTRACT_VERSION
+            ),
+            "native_skin_passthrough": True,
             "unassigned_geometry_cleanup": cleanup,
             "unassigned_geometry_cleanup_recheck": (
                 cls._cleanup_contract_record(
@@ -1181,7 +1184,7 @@ class BlendLiveStatusTests(unittest.TestCase):
         blend=None,
     ):
         report = Path(spm).parent / "reports" / (
-            f"{Path(spm).stem}_speedtree_repair_pipeline_report_codex.json"
+            f"{Path(spm).stem}_speedtree_assembly_pipeline_report_codex.json"
         )
         report.parent.mkdir(parents=True, exist_ok=True)
         payload = cls._cleanup_contract_evidence(
@@ -1280,7 +1283,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             receipt_path = app._repair_runtime_receipt_path(spm)
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
             receipt["output_contract_version"] = (
-                REPAIR_OUTPUT_CONTRACT_VERSION + 1
+                ASSEMBLY_OUTPUT_CONTRACT_VERSION + 1
             )
             receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
 
@@ -1367,7 +1370,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             receipt_path = app._repair_runtime_receipt_path(spm)
             current_receipt = receipt_path.read_bytes()
             report = root / "reports" / (
-                f"{spm.stem}_speedtree_repair_pipeline_report_codex.json"
+                f"{spm.stem}_speedtree_assembly_pipeline_report_codex.json"
             )
             report.write_text(
                 json.dumps({
@@ -1446,7 +1449,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                     "unassigned_geometry_cleanup": {
                         "status": "not_applicable",
                         "policy": (
-                            "discard_unassigned_geometry_before_repair"
+                            "discard_unassigned_geometry_before_assembly"
                         ),
                         "cleanup_contract_version": 1,
                     },
@@ -1649,9 +1652,9 @@ class BlendLiveStatusTests(unittest.TestCase):
                 blend=blend,
             )
 
-            self.assertEqual(result, REPAIR_OUTPUT_CONTRACT_VERSION)
+            self.assertEqual(result, ASSEMBLY_OUTPUT_CONTRACT_VERSION)
 
-    def test_v2_pipeline_rejects_incomplete_export_material_assignments(self):
+    def test_assembly_pipeline_rejects_incomplete_export_material_assignments(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             spm = root / "Tree.spm"
@@ -1707,7 +1710,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                         1,
                     )
 
-    def test_v2_pipeline_requires_complete_cluster_pending_contract(self):
+    def test_assembly_pipeline_requires_complete_cluster_pending_contract(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             spm = root / "Tree.spm"
@@ -1715,7 +1718,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             write_empty_spm(spm)
             blend.write_bytes(b"blend")
             valid = self._cleanup_contract_evidence(spm, blend=blend)
-            valid["paths"] = {"merged_name": "Tree_Codex_Merged"}
+            valid["paths"] = {"merged_name": "Tree_Codex_Assembled"}
             valid["handoff_preflight"] = {
                 "status": "cluster_export_pending",
                 "unreal_push_ready": False,
@@ -1728,7 +1731,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 ],
                 "final_export_required": True,
                 "source_blend_committed": True,
-                "source_object": "Tree_Codex_Merged",
+                "source_object": "Tree_Codex_Assembled",
             }
             self.assertEqual(
                 repair_pipeline_output_contract(
@@ -1737,7 +1740,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                     blend=blend,
                     source_fbx=spm.with_suffix(".fbx"),
                 ),
-                2,
+                ASSEMBLY_OUTPUT_CONTRACT_VERSION,
             )
 
             for field in (
@@ -1790,7 +1793,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             root = Path(temporary)
             spm = root / "SK_Tree_elm_01.spm"
             report = root / "reports" / (
-                "SK_Tree_elm_01_speedtree_repair_pipeline_report_codex.json"
+                "SK_Tree_elm_01_speedtree_assembly_pipeline_report_codex.json"
             )
             manifest_path = root / "assembly" / "manifest.json"
             report.parent.mkdir()
@@ -1851,7 +1854,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             spm = root / "SK_Tree_elm_01.spm"
             cluster_dir = root / "Cluster"
             report = root / "reports" / (
-                "SK_Tree_elm_01_speedtree_repair_pipeline_report_codex.json"
+                "SK_Tree_elm_01_speedtree_assembly_pipeline_report_codex.json"
             )
             manifest_path = root / "assembly" / "manifest.json"
             source_spm = cluster_dir / "SK_cluster_elm_01.spm"
@@ -1911,7 +1914,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             spm = root / "SK_tree_clustered_01.spm"
             report = root / "reports" / (
                 "SK_tree_clustered_01_"
-                "speedtree_repair_pipeline_report_codex.json"
+                "speedtree_assembly_pipeline_report_codex.json"
             )
             report.parent.mkdir()
             write_empty_spm(spm)
@@ -1939,7 +1942,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             spm = root / "SK_tree_clustered_01.spm"
             report = root / "reports" / (
                 "SK_tree_clustered_01_"
-                "speedtree_repair_pipeline_report_codex.json"
+                "speedtree_assembly_pipeline_report_codex.json"
             )
             old_receipt = root / "old_receipt.json"
             current_receipt = root / "current_receipt.json"
@@ -2001,7 +2004,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             spm = root / "SK_tree_lauraceae_10.spm"
             report = root / "reports" / (
                 "SK_tree_lauraceae_10_"
-                "speedtree_repair_pipeline_report_codex.json"
+                "speedtree_assembly_pipeline_report_codex.json"
             )
             live_report = root / "live_material_contract.json"
             report.parent.mkdir()
@@ -2067,7 +2070,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             spm = root / "SK_tree_clustered_01.spm"
             report = root / "reports" / (
                 "SK_tree_clustered_01_"
-                "speedtree_repair_pipeline_report_codex.json"
+                "speedtree_assembly_pipeline_report_codex.json"
             )
             current_receipt = root / "current_receipt.json"
             report.parent.mkdir()
@@ -2208,7 +2211,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             spm = root / "SK_tree_clustered_01.spm"
             report = root / "reports" / (
                 "SK_tree_clustered_01_"
-                "speedtree_repair_pipeline_report_codex.json"
+                "speedtree_assembly_pipeline_report_codex.json"
             )
             manifest_path = root / "assembly" / "manifest.json"
             old_receipt = root / "old_receipt.json"
@@ -2327,7 +2330,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             texture = root / "T_leaf_color.tga"
             texture.write_bytes(b"pixels")
             report = root / "reports" / (
-                "SK_tree_texture_01_speedtree_repair_pipeline_report_codex.json"
+                "SK_tree_texture_01_speedtree_assembly_pipeline_report_codex.json"
             )
             report.parent.mkdir()
             data = {
@@ -2374,7 +2377,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             spm = root / "SK_tree_detached_frond.spm"
             write_empty_spm(spm)
             report = root / "reports" / (
-                "SK_tree_detached_frond_speedtree_repair_pipeline_report_codex.json"
+                "SK_tree_detached_frond_speedtree_assembly_pipeline_report_codex.json"
             )
             report.parent.mkdir()
             report.write_text(
@@ -2414,7 +2417,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             spm = root / "SK_tree_new_contract.spm"
             write_empty_spm(spm)
             report = root / "reports" / (
-                "SK_tree_new_contract_speedtree_repair_pipeline_report_codex.json"
+                "SK_tree_new_contract_speedtree_assembly_pipeline_report_codex.json"
             )
             report.parent.mkdir()
             report.write_text(
@@ -2444,7 +2447,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             cluster_file.parent.mkdir()
             cluster_file.write_bytes(b"pixels")
             report = root / "reports" / (
-                "SK_tree_cluster_01_speedtree_repair_pipeline_report_codex.json"
+                "SK_tree_cluster_01_speedtree_assembly_pipeline_report_codex.json"
             )
             report.parent.mkdir()
             report.write_text(
@@ -2486,7 +2489,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             source_texture.write_bytes(b"pixels")
             report = root / "reports" / (
                 "SK_cluster_Silky_Dogwood_01_"
-                "speedtree_repair_pipeline_report_codex.json"
+                "speedtree_assembly_pipeline_report_codex.json"
             )
             report.parent.mkdir()
             report.write_text(
@@ -2562,7 +2565,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             source_texture.write_bytes(b"pixels")
             report = root / "reports" / (
                 "SK_cluster_unknown_01_"
-                "speedtree_repair_pipeline_report_codex.json"
+                "speedtree_assembly_pipeline_report_codex.json"
             )
             report.parent.mkdir()
             report.write_text(
@@ -2602,7 +2605,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             texture.parent.mkdir()
             texture.write_bytes(b"pixels")
             report = root / "reports" / (
-                "SK_tree_live_texture_01_speedtree_repair_pipeline_report_codex.json"
+                "SK_tree_live_texture_01_speedtree_assembly_pipeline_report_codex.json"
             )
             report.parent.mkdir()
             report.write_text(
@@ -4032,7 +4035,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 )
                 (reports / (
                     "SK_Tree_elm_01_"
-                    "speedtree_repair_pipeline_report_codex.json"
+                    "speedtree_assembly_pipeline_report_codex.json"
                 )).write_text('{"status":"ok"}', encoding="utf-8")
                 backups = owner / "_spm_backups"
                 backups.mkdir()
@@ -5591,7 +5594,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             save_target_registry(blend, [target])
             pipeline_report = cluster / "reports" / (
                 "SK_branch_elm_01_"
-                "speedtree_repair_pipeline_report_codex.json"
+                "speedtree_assembly_pipeline_report_codex.json"
             )
             pipeline_report.parent.mkdir()
             pipeline_report.write_text(
@@ -5857,7 +5860,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             reports.mkdir()
             pipeline_report = reports / (
                 "SK_branch_elm_01_"
-                "speedtree_repair_pipeline_report_codex.json"
+                "speedtree_assembly_pipeline_report_codex.json"
             )
             previous_pipeline = b'{"handoff_preflight":{"status":"ok"}}'
             pipeline_report.write_bytes(previous_pipeline)
@@ -5964,7 +5967,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             spm = root / "SK_tree_preserve_report.spm"
             write_empty_spm(spm)
             pipeline_report = root / "reports" / (
-                "SK_tree_preserve_report_speedtree_repair_pipeline_report_codex.json"
+                "SK_tree_preserve_report_speedtree_assembly_pipeline_report_codex.json"
             )
             pipeline_report.parent.mkdir(parents=True)
             previous = b'{"handoff_preflight":{"status":"ok"}}'

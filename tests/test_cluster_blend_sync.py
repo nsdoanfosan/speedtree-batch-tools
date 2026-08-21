@@ -1771,7 +1771,7 @@ class ClusterBlendSyncTests(unittest.TestCase):
             pipeline_report = (
                 reports
                 / "SK_branch_elm_01_"
-                "speedtree_repair_pipeline_report_codex.json"
+                "speedtree_assembly_pipeline_report_codex.json"
             )
             pipeline_report.write_bytes(b"good-pipeline")
             import_manifest = owner / "speedtree_import_manifest.json"
@@ -1953,7 +1953,7 @@ class ClusterBlendSyncTests(unittest.TestCase):
             reports.mkdir()
             pipeline_report = reports / (
                 f"{blend.stem}_"
-                "speedtree_repair_pipeline_report_codex.json"
+                "speedtree_assembly_pipeline_report_codex.json"
             )
             pipeline_report.write_bytes(b"clean-pipeline")
             runtime_receipt = reports / (

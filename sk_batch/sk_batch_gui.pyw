@@ -472,7 +472,7 @@ def repair_pipeline_report_path(spm):
     spm = Path(spm)
     return (
         spm.parent / "reports" /
-        f"{spm.stem}_speedtree_repair_pipeline_report_codex.json"
+        f"{spm.stem}_speedtree_assembly_pipeline_report_codex.json"
     )
 
 
@@ -3755,7 +3755,7 @@ class App:
     def _reported_texture_paths(spm):
         report = (
             Path(spm).parent / "reports" /
-            f"{Path(spm).stem}_speedtree_repair_pipeline_report_codex.json"
+            f"{Path(spm).stem}_speedtree_assembly_pipeline_report_codex.json"
         )
         try:
             data = json.loads(report.read_text(encoding="utf-8"))
@@ -3784,7 +3784,7 @@ class App:
         blend = blend_path_for(spm)
         report = (
             spm.parent / "reports" /
-            f"{spm.stem}_speedtree_repair_pipeline_report_codex.json"
+            f"{spm.stem}_speedtree_assembly_pipeline_report_codex.json"
         )
         stmat = speedtree_stmat_path(speedtree_spm)
 
@@ -11201,7 +11201,7 @@ class App:
 
         report_path = (
             Path(spm).parent / "reports" /
-            f"{Path(spm).stem}_speedtree_repair_pipeline_report_codex.json"
+            f"{Path(spm).stem}_speedtree_assembly_pipeline_report_codex.json"
         )
         try:
             pipeline = _read_repair_pipeline_json(report_path)
@@ -11318,7 +11318,7 @@ class App:
         blend = blend_path_for(spm)
         report_path = (
             Path(spm).parent / "reports" /
-            f"{Path(spm).stem}_speedtree_repair_pipeline_report_codex.json"
+            f"{Path(spm).stem}_speedtree_assembly_pipeline_report_codex.json"
         )
         if not blend.is_file() or not report_path.is_file():
             # Missing/stale source outputs are explained by the ordinary
@@ -15644,7 +15644,7 @@ class App:
         job_report = LOG_DIR / f"{spm.stem}_bwr_{stamp}.json"
         pipeline_report = (
             spm.parent / "reports" /
-            f"{spm.stem}_speedtree_repair_pipeline_report_codex.json"
+            f"{spm.stem}_speedtree_assembly_pipeline_report_codex.json"
         )
         try:
             previous_pipeline_report = pipeline_report.read_bytes()
@@ -16366,7 +16366,7 @@ class App:
         spm = Path(spm)
         repair_report = (
             spm.parent / "reports" /
-            f"{spm.stem}_speedtree_repair_pipeline_report_codex.json"
+            f"{spm.stem}_speedtree_assembly_pipeline_report_codex.json"
         )
         try:
             payload = json.loads(repair_report.read_text(encoding="utf-8"))

@@ -53,7 +53,7 @@ def test_bwr_reports_export_repair_and_total_stage_boundaries():
         "addon_runtime_prepare",
         "blend_open",
         "speedtree_export_bundle",
-        "blender_import_and_repair",
+        "blender_import_and_assemble",
         "post_repair_spm_contracts",
         "vertex_payload_finalize",
         "blend_save",

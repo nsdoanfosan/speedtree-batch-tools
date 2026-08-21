@@ -113,7 +113,7 @@ class BwrAtlasManifestBridgeTests(unittest.TestCase):
             SK_BATCH / "jobs" / "bwr_headless_job.py"
         ).read_text(encoding="utf-8")
         install_at = source.index("install_bwr_atlas_manifest_resolver(")
-        repair_at = source.index("run_import_and_repair(repair_settings)")
+        repair_at = source.index("run_import_and_assemble(assembly_settings)")
         self.assertLess(install_at, repair_at)
 
     def test_provider_disagreement_is_diagnostic_and_export_remains_reachable(self):

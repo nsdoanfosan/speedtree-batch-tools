@@ -49,7 +49,7 @@ def test_repair_pass_through_supersedes_direct_bindings_file(tmp_path):
         encoding="utf-8",
     )
     reports.joinpath(
-        "SK_tree_pass_through_speedtree_repair_pipeline_report_codex.json"
+        "SK_tree_pass_through_speedtree_assembly_pipeline_report_codex.json"
     ).write_text(
         json.dumps({
             "cluster_assembly_manifest": {
@@ -97,7 +97,7 @@ def test_report_without_assembly_decision_uses_legacy_direct_fallback(tmp_path):
     assembly.mkdir()
     reports.mkdir()
     reports.joinpath(
-        "SK_tree_legacy_report_speedtree_repair_pipeline_report_codex.json"
+        "SK_tree_legacy_report_speedtree_assembly_pipeline_report_codex.json"
     ).write_text(json.dumps({"status": "done"}), encoding="utf-8")
     assembly.joinpath(
         "SK_tree_legacy_report_cluster_assembly_bindings.json"
