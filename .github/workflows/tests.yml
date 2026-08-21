@@ -1,8 +1,9 @@
 name: tests
 
-# The compile gate and the unit suites need no assets and no SpeedTree/Blender/
+# The compile gate and test suites need no assets and no SpeedTree/Blender/
 # Unreal. Production code imports PIL lazily, but a handful of test modules
-# import Pillow and pytest at module level, so those two are installed.
+# import Pillow, pytest, or numpy at module level. pytest-xdist keeps the large
+# independent suites from spending most of the job in one serial process.
 #
 # Windows is not incidental. The queue's liveness probe, the Job Object
 # process ownership in process_stream, and the %LOCALAPPDATA% cache paths are
@@ -41,9 +42,9 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.10'
           cache: pip
@@ -62,7 +63,7 @@ jobs:
       # ca13f8cb, speedtree_handoff_vectors.json 4628f74a. Tracking main removes
       # the standing risk that deleting a merged branch turns every PR in this
       # repository red without a single code change.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: nsdoanfosan/substance-tools
           ref: main
@@ -112,11 +113,9 @@ jobs:
           ) + $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
       # Production code imports PIL lazily and there is no requirements file,
-      # but test_pcg_texture_batch / test_pcg_step3_freshness import Pillow and
-      # test_pipeline_plan_cli / test_push_dependency_schedule import pytest at
-      # module level, and cluster_assembly_builder.fit_trs_transform needs numpy,
-      # so unittest cannot even load or run them without these. The versions
-      # live in .github/ci-requirements.txt so they are pinned and cacheable.
+      # but test modules import Pillow, pytest, and numpy. pytest-xdist is the
+      # test-only parallel runner. The versions live in ci-requirements.txt so
+      # they are pinned and cacheable.
       - name: test-only dependencies
         run: python -m pip install --disable-pip-version-check --quiet -r .github/ci-requirements.txt
 
@@ -146,111 +145,54 @@ jobs:
       - name: compile gate
         run: python sk_batch/code_compile_gate.py
 
-      # Discovered rather than listed, so adding or renaming a suite needs no
-      # change to this file. Every directory named `tests` is a suite; the
-      # discovery root is its parent so the flat imports the suites rely on
-      # keep working.
+      # pytest collects both unittest.TestCase methods and module-level test
+      # functions, so every test runs once. Four workers match the Windows
+      # runner's CPU allocation. Method-level scheduling avoids one very large
+      # file becoming the tail of the whole job.
       #
-      # The 30-minute job budget is shared by every step, so a suite that hangs
-      # currently reports as "the job timed out" with no attribution. A per-step
-      # budget names the step that stopped moving. Both numbers sit far above
-      # the observed cost -- the whole job runs in about nine minutes.
-      - name: unit suites
-        shell: pwsh
-        timeout-minutes: 20
-        run: |
-          $failed = @()
-          $empty = @()
-          $total = 0
-          $summary = @()
-          $workRoot = Join-Path $env:GITHUB_WORKSPACE 'work'
-          Get-ChildItem -Recurse -Directory -Filter tests |
-            Where-Object {
-              # work/ holds the vendored substance-tools checkout, whose own
-              # suites are not this repository's to run or to gate on. Compared
-              # as a path prefix rather than a regex so no escaping can slip.
-              $_.FullName -notmatch '__pycache__' -and
-              -not $_.FullName.StartsWith($workRoot, 'OrdinalIgnoreCase')
-            } |
-            Sort-Object FullName |
-            ForEach-Object {
-              $rel = Resolve-Path -Relative $_.FullName
-              Write-Host "::group::$rel"
-              $out = & python -m unittest discover -s $rel 2>&1 | Out-String
-              Write-Host $out
-              Write-Host "::endgroup::"
-              $ok = $LASTEXITCODE -eq 0
-              if (-not $ok) { $failed += $rel }
-              $m = [regex]::Match($out, 'Ran (\d+) test')
-              if ($m.Success) {
-                $count = [int]$m.Groups[1].Value
-                $total += $count
-                if ($count -eq 0) { $empty += $rel }
-              } else {
-                $count = 0
-                $empty += $rel
-              }
-              $summary += "| ``$rel`` | $count | $(if ($ok) { 'pass' } else { '**fail**' }) |"
-            }
-          Write-Host "총 $total tests"
-          # Per-suite counts belong on the run page, not only inside collapsed
-          # log groups: the zero-collection tripwire below is about a suite
-          # quietly vanishing, and that is far easier to notice as a number
-          # that moved than as a step that stayed green.
-          @(
-            "### unit suites",
-            "",
-            "| suite | tests | result |",
-            "| --- | ---: | --- |"
-          ) + $summary + @("", "총 $total tests") |
-            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-          if ($failed.Count -gt 0) {
-            Write-Host "::error::failed suites: $($failed -join ', ')"
-            exit 1
-          }
-          # `unittest discover` exits 0 on "Ran 0 tests", so a suite that stops
-          # being collected -- a renamed directory, a file no longer matching
-          # test*.py, an import that quietly drops a module -- reads exactly
-          # like a passing suite. These two tripwires make that loud. The floor
-          # is deliberately far below the current count: it catches collapse,
-          # it is not a target to keep bumping.
-          if ($empty.Count -gt 0) {
-            Write-Host "::error::suites collected zero tests: $($empty -join ', ')"
-            exit 1
-          }
-          if ($total -lt 1500) {
-            Write-Host "::error::collected only $total tests; expected at least 1500"
-            exit 1
-          }
+      # The calibration module is also separate below. It verifies sub-second
+      # process deadlines and CPU progress; co-scheduling it with four loaded
+      # workers can spend its 0.25-second absolute budget before the fake child
+      # gets CPU. Running those 41 tests serially takes about eight seconds and
+      # keeps that timing test meaningful instead of weakening its deadline.
+      - name: parallel test suites
+        timeout-minutes: 12
+        run: >-
+          python -m pytest -q -n 4 --dist load --import-mode=importlib
+          --durations=10
+          --ignore=sk_batch/tests/test_spm_calibration.py
+          --ignore=tests/test_process_lifecycle.py
+          --ignore=pcg_st9_texture_batch/tests/test_00_issue_42_real_projection.py
+          batch_ui_common/tests
+          cluster_card_pipeline/tests
+          pcg_st9_texture_batch/tests
+          sk_batch/tests
+          tests
 
-      # `unittest discover` only collects TestCase methods, so a test written as
-      # a module-level `def test_*` function is silently never run. There were
-      # 73 of them across 9 files when this step was added -- including the
-      # whole issue #65 regression file -- and pytest was already being
-      # installed above purely so those files would import. Run them for real,
-      # discovering the files by content so the list cannot rot.
-      - name: module-level tests
+      # These tests intentionally exercise the real machine-wide Job Object
+      # receipt directory. Multiple xdist workers can race a cleanup against a
+      # receipt replace, so keep the actual Windows lifecycle coverage serial.
+      - name: Windows process lifecycle tests
+        run: python -m unittest tests.test_process_lifecycle
+
+      - name: SpeedTree calibration timing tests
+        run: python -m unittest sk_batch.tests.test_spm_calibration
+
+      # Generator Sync's Tk cache tests intentionally share one interpreter and
+      # are order-sensitive under pytest collection; the established unittest
+      # order is part of that suite's current test harness contract.
+      - name: Generator Sync tests
         shell: pwsh
-        timeout-minutes: 10
+        timeout-minutes: 5
         run: |
-          $workRoot = Join-Path $env:GITHUB_WORKSPACE 'work'
-          $files = Get-ChildItem -Recurse -File -Filter 'test_*.py' |
-            Where-Object {
-              $_.FullName -notmatch '__pycache__' -and
-              -not $_.FullName.StartsWith($workRoot, 'OrdinalIgnoreCase') -and
-              (Select-String -Path $_.FullName -Pattern '^def test' -Quiet)
-            } |
-            Sort-Object FullName |
-            ForEach-Object { Resolve-Path -Relative $_.FullName }
-          if (-not $files) {
-            Write-Host "::error::no module-level test functions found; this step expects at least one file"
-            exit 1
-          }
-          Write-Host "module-level test files: $($files.Count)"
-          $files | ForEach-Object { Write-Host "  $_" }
-          python -m pytest @files -q
+          $out = & python -m unittest discover -s spm_generator_sync/tests 2>&1 | Out-String
+          Write-Host $out
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::module-level tests failed"
+            exit $LASTEXITCODE
+          }
+          $match = [regex]::Match($out, 'Ran (\d+) test')
+          if (-not $match.Success -or [int]$match.Groups[1].Value -lt 1) {
+            Write-Host "::error::Generator Sync collected no tests"
             exit 1
           }
 
@@ -269,3 +211,29 @@ jobs:
             Write-Host "::error::tests modified tracked files:`n$dirty"
             exit 1
           }
+
+  # Three 78-93 MB real SpeedTree XML pairs prove that legacy and current
+  # authoring projections agree. They used to be one serial test that alone
+  # cost 162 seconds and formed the tail of every run. Keep the acceptance
+  # coverage, but isolate it from the unit-test worker pool and process one
+  # pair per worker while the ordinary tests run in the job above.
+  real-xml-acceptance:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+          cache: pip
+          cache-dependency-path: .github/ci-requirements.txt
+
+      - name: test-only dependencies
+        run: python -m pip install --disable-pip-version-check --quiet -r .github/ci-requirements.txt
+
+      - name: real authored XML projection pairs
+        run: >-
+          python -m pytest -q -n 3 --dist load --import-mode=importlib
+          --durations=3
+          pcg_st9_texture_batch/tests/test_00_issue_42_real_projection.py

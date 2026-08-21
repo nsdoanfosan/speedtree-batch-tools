@@ -532,6 +532,12 @@ class ArtifactRetentionTests(unittest.TestCase):
                         receipts_seen.append(
                             len(list(retention._reservation_directory().glob("*.json")))
                         )
+                        # Do not let either context clean its reservation until
+                        # both workers have observed the concurrent state. The
+                        # first barrier only proves both contexts were entered;
+                        # without this one, the failing worker can exit and
+                        # remove its receipt before its peer performs the glob.
+                        barrier.wait(timeout=10)
                         if index == 0:
                             raise RuntimeError("producer failed")
                 except RuntimeError as exc:

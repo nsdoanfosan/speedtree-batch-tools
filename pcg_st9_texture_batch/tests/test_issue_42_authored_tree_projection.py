@@ -1,7 +1,5 @@
 """Full-tree core-v4 acceptance and fail-closed regressions for #42."""
 
-import gzip
-import hashlib
 import json
 import re
 import sys
@@ -26,7 +24,6 @@ FIXTURES = Path(__file__).parent / "fixtures"
 BEFORE = FIXTURES / "issue_42_no_edit_before.xml"
 AFTER = FIXTURES / "issue_42_no_edit_after.xml"
 EVIDENCE = FIXTURES / "issue_42_real_no_edit_evidence.json"
-REAL_FIXTURES = FIXTURES / "issue_42" / "real"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 WINDOWS_PATH_RE = re.compile(
     r"(?i)(?:(?<![a-z])[a-z]:[\\/]|users[\\/][^\\/]+)"
@@ -148,52 +145,6 @@ class AuthoredTreeProjectionV4Tests(unittest.TestCase):
                 pair["before_raw_sha256"],
                 pair["after_raw_sha256"],
             )
-
-    def test_three_sanitized_real_xml_pairs_execute_the_projector(self):
-        manifest_text = (REAL_FIXTURES / "manifest.json").read_text(
-            encoding="utf-8"
-        )
-        manifest = json.loads(manifest_text)
-        self.assertEqual(manifest["issue_number"], 42)
-        self.assertEqual(len(manifest["pairs"]), 3)
-        self.assertNotRegex(
-            manifest_text,
-            r"(?i)(PARK|OneDrive|Forestportfolio|[A-Z]:[\\/])",
-        )
-        for pair in manifest["pairs"]:
-            with self.subTest(pair=pair["pair_id"]):
-                before_bytes = gzip.decompress(
-                    (REAL_FIXTURES / pair["before_fixture"]).read_bytes()
-                )
-                after_bytes = gzip.decompress(
-                    (REAL_FIXTURES / pair["after_fixture"]).read_bytes()
-                )
-                self.assertEqual(
-                    hashlib.sha256(before_bytes).hexdigest(),
-                    pair["sanitized_before_xml_sha256"],
-                )
-                self.assertEqual(
-                    hashlib.sha256(after_bytes).hexdigest(),
-                    pair["sanitized_after_xml_sha256"],
-                )
-                before_text = before_bytes.decode("utf-8")
-                after_text = after_bytes.decode("utf-8")
-                self.assertNotRegex(
-                    before_text + after_text,
-                    r"(?i)(PARK|OneDrive|Forestportfolio|[A-Z]:[\\/])",
-                )
-                # Projecting one of these documents costs about 15 s -- they
-                # are 78-93 MB of real authored XML -- so the repeated
-                # project_v4(before_text) is worth hoisting rather than
-                # recomputing. Same three assertions, one fewer projection per
-                # pair.
-                before_core_v4 = project_v4(before_text)
-                self.assertEqual(
-                    before_core_v4,
-                    pair["expected_core_fingerprint"],
-                )
-                self.assertEqual(before_core_v4, project_v4(after_text))
-                self.assertEqual(project(before_text), project(after_text))
 
     def test_authored_attack_matrix_changes_the_fingerprint(self):
         replacements = {
