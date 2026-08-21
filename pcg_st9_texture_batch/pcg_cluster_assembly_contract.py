@@ -4556,7 +4556,7 @@ def _validated_isolated_bark_capture(normalized_variants, output_spm):
         )
     return {
         "status": "validated",
-        "policy": "current_bwr_isolated_bark_physical_capture_v1",
+        "policy": "current_assembly_isolated_bark_physical_capture_v1",
         "canonical_material": canonical_material,
         "output_materials": output_materials,
         "production_spm": current_output,

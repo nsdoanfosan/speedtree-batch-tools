@@ -437,7 +437,7 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             blender_exe=Path(r"C:\Blender\blender.exe"),
             unit_probe_path=GUI.DEFAULT_CLUSTER_UNIT_PROBE,
             capture_resolution=1024,
-            repair_runtime_config=app.config,
+            assembly_runtime_config=app.config,
             progress_callback=mock.ANY,
         )
         refresh.assert_not_called()
@@ -584,7 +584,7 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
             blender_exe=Path(r"C:\Blender\blender.exe"),
             unit_probe_path=GUI.DEFAULT_CLUSTER_UNIT_PROBE,
             capture_resolution=1024,
-            repair_runtime_config=app.config,
+            assembly_runtime_config=app.config,
             force_refresh=False,
             progress_callback=mock.ANY,
         )
@@ -689,7 +689,7 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
                     blender_exe=Path(r"C:\Blender\blender.exe"),
                     unit_probe_path=GUI.DEFAULT_CLUSTER_UNIT_PROBE,
                     capture_resolution=1024,
-                    repair_runtime_config=app.config,
+                    assembly_runtime_config=app.config,
                     force_refresh=False,
                     progress_callback=mock.ANY,
                 ),
@@ -700,7 +700,7 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
                     blender_exe=Path(r"C:\Blender\blender.exe"),
                     unit_probe_path=GUI.DEFAULT_CLUSTER_UNIT_PROBE,
                     capture_resolution=1024,
-                    repair_runtime_config=app.config,
+                    assembly_runtime_config=app.config,
                     force_refresh=False,
                     progress_callback=mock.ANY,
                 ),

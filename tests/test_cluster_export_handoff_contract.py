@@ -62,7 +62,7 @@ def ordinal_pivots(stem):
     ]
 
 
-def transient_bwr_hierarchy(stem, source_fbx, source_identity, *, owned=True):
+def transient_assembly_hierarchy(stem, source_fbx, source_identity, *, owned=True):
     properties = (
         {
             "codex_source_fbx": source_fbx,
@@ -139,7 +139,7 @@ class ClusterExportHandoffContractTests(unittest.TestCase):
             [],
         )
 
-    def test_sanitized_two_ordinal_providers_reconcile_current_bwr_root(self):
+    def test_sanitized_two_ordinal_providers_reconcile_current_assembly_root(self):
         stems = (
             "SK_cluster_densiflora_02",
             "SK_leaf_weeping_willow_side_01",
@@ -152,7 +152,7 @@ class ClusterExportHandoffContractTests(unittest.TestCase):
                 source = FakeCollection()
                 data = SimpleNamespace(collections={"Export": export})
                 before = capture_cluster_export_snapshot(data, stem)
-                hierarchy = transient_bwr_hierarchy(
+                hierarchy = transient_assembly_hierarchy(
                     stem,
                     source_fbx,
                     source_identity,
@@ -187,7 +187,7 @@ class ClusterExportHandoffContractTests(unittest.TestCase):
         source = FakeCollection()
         data = SimpleNamespace(collections={"Export": export})
         before = capture_cluster_export_snapshot(data, stem)
-        hierarchy = transient_bwr_hierarchy(
+        hierarchy = transient_assembly_hierarchy(
             stem,
             source_fbx,
             source_identity,
@@ -223,7 +223,7 @@ class ClusterExportHandoffContractTests(unittest.TestCase):
         source = FakeCollection()
         data = SimpleNamespace(collections={"Export": export})
         before = capture_cluster_export_snapshot(data, stem)
-        hierarchy = transient_bwr_hierarchy(
+        hierarchy = transient_assembly_hierarchy(
             stem,
             source_fbx,
             rf"C:\Sanitized\Other\{stem}.spm",
@@ -250,7 +250,7 @@ class ClusterExportHandoffContractTests(unittest.TestCase):
         stem = "SK_leaf_weeping_willow_side_01"
         source_fbx = rf"C:\Sanitized\Cluster\fbx\{stem}.fbx"
         source_identity = rf"C:\Sanitized\Cluster\{stem}.spm"
-        hierarchy = transient_bwr_hierarchy(
+        hierarchy = transient_assembly_hierarchy(
             stem,
             source_fbx,
             source_identity,
@@ -336,7 +336,7 @@ class ClusterExportHandoffContractTests(unittest.TestCase):
 
         self.assertTrue(changed)
         self.assertEqual(
-            finalized["repair_push_export_postcondition"],
+            finalized["assembly_export_postcondition"],
             postcondition,
         )
 

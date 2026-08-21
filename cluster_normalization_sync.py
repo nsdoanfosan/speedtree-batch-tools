@@ -1043,7 +1043,7 @@ def _validate_unit_probe(path):
     return candidate
 
 
-def _bwr_report(blend, canonical_spm):
+def _assembly_report(blend, canonical_spm):
     blend = Path(blend).expanduser().absolute()
     canonical_spm = Path(canonical_spm).expanduser().absolute()
     report_path = (
@@ -1186,12 +1186,12 @@ def _bwr_report(blend, canonical_spm):
     )
 
 
-def _bwr_material_assignment_identity(report):
-    """Return stable evidence for the materials assigned to the BWR source.
+def _assembly_material_assignment_identity(report):
+    """Return stable evidence for the materials assigned to the Assembly source.
 
-    The raw Cluster FBX can stay byte-identical while a BWR repair changes the
+    The raw Cluster FBX can stay byte-identical while a Assembly repair changes the
     material datablocks used by the merged source.  Normalized prototypes copy
-    those datablocks, so the final BWR material intent is a physical
+    those datablocks, so the final Assembly material intent is a physical
     Normalizer dependency even though texture-only edits to the saved Atlas
     plan collection are not.
     """
@@ -1264,8 +1264,8 @@ def _bwr_material_assignment_identity(report):
     }
 
 
-def inspect_bwr_material_assignment_freshness(blend):
-    """Compare the latest BWR material assignment with the Normalizer receipt."""
+def inspect_assembly_material_assignment_freshness(blend):
+    """Compare the latest Assembly material assignment with the Normalizer receipt."""
     blend = Path(blend).expanduser().absolute()
     report_path = (
         blend.parent
@@ -1282,7 +1282,7 @@ def inspect_bwr_material_assignment_freshness(blend):
             "receipt": str(normalization_receipt_path(blend)),
             "refresh_reasons": [],
         }
-    identity = _bwr_material_assignment_identity(report)
+    identity = _assembly_material_assignment_identity(report)
     required = bool(
         identity["materials"]
         or identity["unmatched_materials"]
@@ -1292,7 +1292,7 @@ def inspect_bwr_material_assignment_freshness(blend):
     receipt_path = normalization_receipt_path(blend)
     receipt = _read_json(receipt_path)
     recorded = str(
-        (receipt or {}).get("bwr_material_assignment_sha256") or ""
+        (receipt or {}).get("assembly_material_assignment_sha256") or ""
     ).casefold()
     current = bool(not required or recorded == expected.casefold())
     return {
@@ -1304,7 +1304,7 @@ def inspect_bwr_material_assignment_freshness(blend):
         "expected_sha256": expected,
         "recorded_sha256": recorded,
         "refresh_reasons": (
-            [] if current else ["bwr_material_assignment_changed"]
+            [] if current else ["assembly_material_assignment_changed"]
         ),
     }
 
@@ -1320,9 +1320,9 @@ def _receipt_is_current(recipe):
         return False
     build = receipt.get("build") or {}
     if (
-        recipe.get("bwr_material_assignment_required")
-        and receipt.get("bwr_material_assignment_sha256")
-        != recipe.get("bwr_material_assignment_sha256")
+        recipe.get("assembly_material_assignment_required")
+        and receipt.get("assembly_material_assignment_sha256")
+        != recipe.get("assembly_material_assignment_sha256")
     ):
         return False
     current_source_fbx = recipe.get("source_fbx_identity")
@@ -1336,7 +1336,7 @@ def _receipt_is_current(recipe):
             ).casefold()
             != str(current_source_fbx.get("sha256") or "").casefold()
         ):
-            # The physical plan receipt is derived from this exact FBX.  BWR can
+            # The physical plan receipt is derived from this exact FBX.  Assembly can
             # legitimately rewrite it while preserving the SPM semantic graph
             # (for example by removing a zero-face object).  Reusing the older
             # receipt in that case publishes a brand-new target manifest whose
@@ -1463,7 +1463,7 @@ def resolve_normalization_recipe(
     capture_resolution=1024,
     delivery_scope_intents=None,
 ):
-    """Build a fail-closed Blender recipe from current BWR and SPM evidence."""
+    """Build a fail-closed Blender recipe from current Assembly and SPM evidence."""
     blend = Path(blend).expanduser().absolute()
     canonical = Path(canonical_spm or blend.with_suffix(".spm")).expanduser().absolute()
     targets = [Path(path).expanduser().absolute() for path in target_spms]
@@ -1501,7 +1501,7 @@ def resolve_normalization_recipe(
         source_hash,
         source_semantic,
         merged_name,
-    ) = _bwr_report(
+    ) = _assembly_report(
         blend, canonical
     )
     source_xml = blend.parent / "xml" / f"{blend.stem}.xml"
@@ -1591,14 +1591,14 @@ def resolve_normalization_recipe(
         )
 
     receipt = normalization_receipt_path(blend)
-    bwr_material_assignment = _bwr_material_assignment_identity(_report)
-    bwr_material_assignment_required = bool(
-        bwr_material_assignment["materials"]
-        or bwr_material_assignment["unmatched_materials"]
-        or bwr_material_assignment["production_groups"]
+    assembly_material_assignment = _assembly_material_assignment_identity(_report)
+    assembly_material_assignment_required = bool(
+        assembly_material_assignment["materials"]
+        or assembly_material_assignment["unmatched_materials"]
+        or assembly_material_assignment["production_groups"]
     )
-    bwr_material_assignment_sha256 = _canonical_sha256(
-        bwr_material_assignment
+    assembly_material_assignment_sha256 = _canonical_sha256(
+        assembly_material_assignment
     )
     bwr_semantic_identity = {
         "status": str(_report.get("status") or ""),
@@ -1609,7 +1609,7 @@ def resolve_normalization_recipe(
         "handoff_preflight_status": str(
             (_report.get("handoff_preflight") or {}).get("status") or ""
         ),
-        "material_assignment": bwr_material_assignment,
+        "material_assignment": assembly_material_assignment,
     }
     normalization_contract = {
         "version": 6,
@@ -1622,11 +1622,11 @@ def resolve_normalization_recipe(
         "bwr_semantic_sha256": _canonical_sha256(
             bwr_semantic_identity
         ),
-        "bwr_material_assignment_sha256": (
-            bwr_material_assignment_sha256
+        "assembly_material_assignment_sha256": (
+            assembly_material_assignment_sha256
         ),
-        "bwr_material_assignment_required": (
-            bwr_material_assignment_required
+        "assembly_material_assignment_required": (
+            assembly_material_assignment_required
         ),
         "source_object": merged_name,
         "source_xml": str(source_xml),
@@ -1685,7 +1685,7 @@ def resolve_normalization_recipe(
 __all__ = [
     "ClusterNormalizationSyncError",
     "ClusterSourceBuildRequiredError",
-    "inspect_bwr_material_assignment_freshness",
+    "inspect_assembly_material_assignment_freshness",
     "inspect_normalization_source_identity",
     "normalization_receipt_path",
     "resolve_normalization_recipe",

@@ -1354,7 +1354,7 @@ class PushQueueFlowTests(unittest.TestCase):
         app._run_batch = mock.Mock(side_effect=fake_batch)
         with mock.patch.object(
             gui,
-            "expand_blender_repair_targets",
+            "expand_blender_assembly_targets",
             return_value=(expanded, dependency_map, {str(provider)}),
         ), mock.patch.object(gui, "save_state"):
             result = app._run_full_pipeline(root_items)
@@ -1923,7 +1923,7 @@ class PushQueueFlowTests(unittest.TestCase):
     def test_blender_dependency_verdict_reads_saved_output_truth(self):
         gui = load_gui_module()
         app = self.make_app(gui)
-        app._repair_output_state = mock.Mock(
+        app._assembly_output_state = mock.Mock(
             side_effect=AssertionError("dependency gate must not run full audit")
         )
         with tempfile.TemporaryDirectory() as temporary:
@@ -1963,7 +1963,7 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(missing["status"], "missing")
         self.assertIn("Blender 산출물이 없습니다", missing["reason"])
         current_receipt.assert_called_once_with(dependency)
-        app._repair_output_state.assert_not_called()
+        app._assembly_output_state.assert_not_called()
 
     def test_dependency_receipt_check_never_migrates_saved_reports(self):
         gui = load_gui_module()
@@ -1971,7 +1971,7 @@ class PushQueueFlowTests(unittest.TestCase):
         dependency = Path("sanitized") / "SK_provider.spm"
         with mock.patch.object(
             gui,
-            "load_current_repair_pipeline_report",
+            "load_current_assembly_pipeline_report",
             return_value={"handoff_preflight": {"status": "ok"}},
         ) as load_report:
             current = app._saved_dependency_blender_receipt_current(
@@ -2122,10 +2122,10 @@ class PushQueueFlowTests(unittest.TestCase):
                 return original_read_text(path, *args, **kwargs)
 
             with mock.patch.object(gui.Path, "read_text", tracked_read_text):
-                with gui.repair_report_read_scope():
-                    first = gui._read_repair_pipeline_json(report)
-                    second = gui._read_repair_pipeline_json(report)
-                third = gui._read_repair_pipeline_json(report)
+                with gui.assembly_report_read_scope():
+                    first = gui._read_assembly_pipeline_json(report)
+                    second = gui._read_assembly_pipeline_json(report)
+                third = gui._read_assembly_pipeline_json(report)
 
         self.assertIs(first, second)
         self.assertEqual(first, third)
@@ -2149,9 +2149,9 @@ class PushQueueFlowTests(unittest.TestCase):
                 reads.append(path)
                 return original_read_text(path, *args, **kwargs)
 
-            app._repair_output_state_scoped = mock.Mock(
+            app._assembly_output_state_scoped = mock.Mock(
                 side_effect=lambda _spm: (
-                    gui._read_repair_pipeline_json(report)
+                    gui._read_assembly_pipeline_json(report)
                     and {
                         "current": True,
                         "push_ready": True,
@@ -2163,10 +2163,10 @@ class PushQueueFlowTests(unittest.TestCase):
             projection = {}
             with mock.patch.object(
                 gui,
-                "repair_pipeline_report_path",
+                "assembly_pipeline_report_path",
                 return_value=report,
             ), mock.patch.object(gui.Path, "read_text", tracked_read_text):
-                state = app._repair_output_state(
+                state = app._assembly_output_state(
                     Path(temporary) / "SK_tree_test_01.spm",
                     pipeline_projection_out=projection,
                 )
@@ -2615,7 +2615,7 @@ class PushQueueFlowTests(unittest.TestCase):
                 kind="automatic_repair_pending",
                 report=report,
             ))
-            app._publish_repair_stage_contract = mock.Mock()
+            app._publish_assembly_stage_contract = mock.Mock()
             with mock.patch.object(
                 gui, "LOG_DIR", Path(temp_dir) / "logs"
             ), mock.patch.object(gui, "save_state"):
@@ -2845,7 +2845,7 @@ class PushQueueFlowTests(unittest.TestCase):
         app = self.make_app(gui)
         app.active_push_transport = "headless"
         app._unreal_running = mock.Mock(return_value=False)
-        app._active_repair_stage_contracts = {}
+        app._active_assembly_stage_contracts = {}
         spm = Path("D:/asset/SK_tree_test_01.spm")
         target = {"spm": spm, "checked": True}
         app._handoff_ready = mock.Mock(
@@ -2853,7 +2853,7 @@ class PushQueueFlowTests(unittest.TestCase):
                 "same-pipeline Push must not repeat the ② handoff audit"
             )
         )
-        app._publish_repair_stage_contract(
+        app._publish_assembly_stage_contract(
             spm,
             ready=True,
             reason="준비됨 ✓",
@@ -2900,7 +2900,7 @@ class PushQueueFlowTests(unittest.TestCase):
         app = self.make_app(gui)
         app.active_push_transport = "headless"
         app._unreal_running = mock.Mock(return_value=False)
-        app._active_repair_stage_contracts = {}
+        app._active_assembly_stage_contracts = {}
         spm = Path("D:/asset/SK_tree_stale_01.spm")
         target = {"spm": spm, "checked": True}
         app._handoff_ready = mock.Mock(
@@ -2908,7 +2908,7 @@ class PushQueueFlowTests(unittest.TestCase):
                 "stale same-generation evidence must not become standalone"
             )
         )
-        app._publish_repair_stage_contract(
+        app._publish_assembly_stage_contract(
             spm,
             ready=True,
             reason="ready",
@@ -2941,13 +2941,13 @@ class PushQueueFlowTests(unittest.TestCase):
         app = self.make_app(gui)
         app.active_push_transport = "headless"
         app._unreal_running = mock.Mock(return_value=False)
-        app._active_repair_stage_contracts = {}
+        app._active_assembly_stage_contracts = {}
         spm = Path("D:/asset/SK_tree_review_01.spm")
         target = {"spm": spm, "checked": True}
         app._handoff_ready = mock.Mock(
             side_effect=AssertionError("source review must not be re-audited")
         )
-        app._publish_repair_stage_contract(
+        app._publish_assembly_stage_contract(
             spm,
             ready=False,
             reason="원본/재질 검토 필요 — Unreal Push 차단",
@@ -2983,14 +2983,14 @@ class PushQueueFlowTests(unittest.TestCase):
             app._phase_failed_items = set()
             app._phase_abort_reason = None
             if phase == "blender":
-                app._publish_repair_stage_contract(
+                app._publish_assembly_stage_contract(
                     spm,
                     ready=True,
                     reason="준비됨 ✓",
                 )
             if phase == "push":
                 self.assertEqual(
-                    app._repair_stage_contract(spm),
+                    app._assembly_stage_contract(spm),
                     {
                         "ready": True,
                         "reason": "준비됨 ✓",
@@ -3002,7 +3002,7 @@ class PushQueueFlowTests(unittest.TestCase):
         app._run_batch = mock.Mock(side_effect=run_phase)
         with mock.patch.object(
             gui,
-            "expand_blender_repair_targets",
+            "expand_blender_assembly_targets",
             return_value=(targets, {}, set()),
         ):
             completed = app._run_full_pipeline(
@@ -3017,25 +3017,25 @@ class PushQueueFlowTests(unittest.TestCase):
             [call.args[0] for call in app._run_batch.call_args_list],
             ["blender", "push"],
         )
-        self.assertNotIn("_active_repair_stage_contracts", app.__dict__)
+        self.assertNotIn("_active_assembly_stage_contracts", app.__dict__)
 
-    def test_repair_stage_contract_uses_canonical_cluster_pair_key(self):
+    def test_assembly_stage_contract_uses_canonical_cluster_pair_key(self):
         gui = load_gui_module()
         app = self.make_app(gui)
-        app._active_repair_stage_contracts = {}
+        app._active_assembly_stage_contracts = {}
         mirror = Path(
             "D:/asset/Tree_test/cluster/branch_tree_test_01.spm"
         )
         canonical = mirror.with_name("SK_" + mirror.name)
 
-        app._publish_repair_stage_contract(
+        app._publish_assembly_stage_contract(
             canonical,
             ready=True,
             reason="준비됨 ✓",
         )
 
         self.assertEqual(
-            app._repair_stage_contract(mirror),
+            app._assembly_stage_contract(mirror),
             {
                 "ready": True,
                 "reason": "준비됨 ✓",
@@ -3043,10 +3043,10 @@ class PushQueueFlowTests(unittest.TestCase):
             },
         )
 
-    def test_repair_stage_contract_preserves_verified_push_dependencies(self):
+    def test_assembly_stage_contract_preserves_verified_push_dependencies(self):
         gui = load_gui_module()
         app = self.make_app(gui)
-        app._active_repair_stage_contracts = {}
+        app._active_assembly_stage_contracts = {}
         spm = Path("D:/asset/Tree_test/SK_tree_test_01.spm")
         dependency_contract = {
             "kind": "sk_batch_verified_push_dependencies",
@@ -3059,7 +3059,7 @@ class PushQueueFlowTests(unittest.TestCase):
             "evidence": "validated_cluster_assembly_manifest",
         }
 
-        app._publish_repair_stage_contract(
+        app._publish_assembly_stage_contract(
             spm,
             ready=True,
             reason="ready",
@@ -3067,7 +3067,7 @@ class PushQueueFlowTests(unittest.TestCase):
         )
         dependency_contract["dependency_spms"].clear()
 
-        published = app._repair_stage_contract(spm)
+        published = app._assembly_stage_contract(spm)
         self.assertEqual(
             published["push_dependency_contract"]["dependency_spms"],
             ["D:/asset/Tree_test/Cluster/SK_cluster_test_01.spm"],
@@ -3087,7 +3087,7 @@ class PushQueueFlowTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "unexpected"):
             app._run_full_pipeline([target], emit_done=False)
 
-        self.assertNotIn("_active_repair_stage_contracts", app.__dict__)
+        self.assertNotIn("_active_assembly_stage_contracts", app.__dict__)
 
     def test_push_contract_preserves_current_envelope_without_identity_gate(self):
         gui = load_gui_module()
@@ -3235,7 +3235,7 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertIn("--canonical-spm", blender_job_strings)
 
         bwr_source = (
-            SK_BATCH_DIR / "jobs" / "bwr_headless_job.py"
+            SK_BATCH_DIR / "jobs" / "assembly_headless_job.py"
         ).read_text(encoding="utf-8")
         self.assertIn("name_stem=speedtree_spm.stem", bwr_source)
         self.assertIn("settings.name_stem = canonical_spm.stem", bwr_source)
@@ -3320,7 +3320,7 @@ class PushQueueFlowTests(unittest.TestCase):
         )
         self.assertNotIn("--repair-evidence", push_source)
         self.assertNotIn(
-            "validate_repair_push_evidence_bundle(",
+            "validate_assembly_export_evidence_bundle(",
             push_source,
         )
         self.assertNotIn(
@@ -3419,11 +3419,11 @@ class PushQueueFlowTests(unittest.TestCase):
             "evidence": "validated_cluster_assembly_manifest",
         }
         app.items = {str(root): target}
-        app._active_repair_stage_contracts = {}
-        app._validate_repair_stage_contract = mock.Mock(
+        app._active_assembly_stage_contracts = {}
+        app._validate_assembly_stage_contract = mock.Mock(
             return_value=True
         )
-        app._publish_repair_stage_contract(
+        app._publish_assembly_stage_contract(
             root,
             ready=True,
             reason="ready",
@@ -3733,7 +3733,7 @@ class PushQueueFlowTests(unittest.TestCase):
         app._run_batch = mock.Mock(side_effect=fake_batch)
         with mock.patch.object(
             gui,
-            "expand_blender_repair_targets",
+            "expand_blender_assembly_targets",
             return_value=(targets, {}, set()),
         ):
             app._run_full_pipeline(targets)
@@ -3804,7 +3804,7 @@ class PushQueueFlowTests(unittest.TestCase):
             stage_dependency_contracts=None,
         ):
             blocked_contracts_at_push_expand.append(
-                app._repair_stage_contract(blocked_tree)
+                app._assembly_stage_contract(blocked_tree)
             )
             self.assertIsNone(stage_dependency_contracts)
             return (
@@ -3823,7 +3823,7 @@ class PushQueueFlowTests(unittest.TestCase):
             Path(temp_dir) / "logs",
         ), mock.patch.object(
             gui,
-            "expand_blender_repair_targets",
+            "expand_blender_assembly_targets",
             return_value=(
                 expanded,
                 {
@@ -3925,7 +3925,7 @@ class PushQueueFlowTests(unittest.TestCase):
         app._run_batch = mock.Mock(side_effect=fake_batch)
         with mock.patch.object(
             gui,
-            "expand_blender_repair_targets",
+            "expand_blender_assembly_targets",
             return_value=(
                 [provider_item, consumer_item],
                 {str(consumer): (str(provider),)},
@@ -4810,8 +4810,8 @@ class PushQueueFlowTests(unittest.TestCase):
             for path in app._push_source_dependency_paths(spm)
         }
 
-        self.assertIn(gui.repair_pipeline_report_path(spm), paths)
-        self.assertEqual(paths, {gui.repair_pipeline_report_path(spm)})
+        self.assertIn(gui.assembly_pipeline_report_path(spm), paths)
+        self.assertEqual(paths, {gui.assembly_pipeline_report_path(spm)})
         self.assertTrue(
             paths.isdisjoint({Path(path) for path in app._push_dependency_paths()})
         )

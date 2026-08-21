@@ -1,4 +1,4 @@
-"""Bind the external BWR add-on to the shared Atlas manifest resolver."""
+"""Bind the installed Assembly add-on to the Atlas manifest resolver."""
 from __future__ import annotations
 
 import os
@@ -10,16 +10,16 @@ from atlas_manifest_resolver import (
 )
 
 
-def install_bwr_atlas_manifest_resolver(addon_runtime, target_spm):
-    """Replace BWR's rolling-global lookup for one exact exported target.
+def install_assembly_atlas_manifest_resolver(addon_runtime, target_spm):
+    """Replace the add-on's rolling-global lookup for one exported target.
 
-    The installed BWR add-on predates the shared resolver.  Its legacy lookup
+    The installed add-on predates the shared resolver. Its legacy lookup
     reads ``speedtree_import_manifest.json`` even when that rolling file names
     another SPM.  A headless batch process is short-lived, so installing this
     exact-target adapter before import is both isolated and deterministic.
     """
     target = Path(target_spm).expanduser().resolve(strict=False)
-    # BWR consumes paths read-only. Provider overlap or stale metadata cannot
+    # The add-on consumes paths read-only. Provider overlap or stale metadata
     # veto the normal SpeedTree export; the diagnostic resolver preserves only
     # deterministic/disjoint selected claims and keeps mutation unauthorized.
     resolution = resolve_atlas_manifests(target, diagnostic_only=True)
@@ -32,7 +32,7 @@ def install_bwr_atlas_manifest_resolver(addon_runtime, target_spm):
         if key not in seen:
             seen.add(key)
             resolver_selected_paths.append(path)
-            # BWR can prove a scoped identity only from the consumer-suffixed
+            # The add-on proves a scoped identity only from consumer-suffixed
             # record.  Exact per-target/global records remain authoritative to
             # the strict preflight envelope, but must not be reinterpreted by
             # the add-on's older scope-only overlay reader.
@@ -50,7 +50,7 @@ def install_bwr_atlas_manifest_resolver(addon_runtime, target_spm):
     )
     if not callable(original):
         raise RuntimeError(
-            "Installed speedtree_bone_weight_repair add-on does not expose "
+            "Installed SpeedTree Assembly add-on does not expose "
             "the Atlas manifest lookup required by the shared resolver bridge"
         )
     target_stem = target.stem.casefold()
@@ -66,7 +66,7 @@ def install_bwr_atlas_manifest_resolver(addon_runtime, target_spm):
         exact_target_manifest_paths,
     )
     evidence = resolution_evidence(resolution)
-    evidence["consumer"] = "speedtree_bone_weight_repair"
+    evidence["consumer"] = "speedtree_assembly"
     evidence["adapter"] = "shared_exact_target_manifest_paths"
     evidence["resolver_selected_manifest_paths"] = [
         str(path) for path in resolver_selected_paths

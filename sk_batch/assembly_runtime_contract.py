@@ -1,4 +1,4 @@
-"""Saved-output contract plus diagnostic producer hashes for Blender Repair."""
+"""Saved-output contract plus diagnostic producer hashes for Assembly."""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ from pathlib import Path
 from cluster_export_handoff_contract import validate_pending_source_contract
 
 
-REPAIR_RUNTIME_RECEIPT_VERSION = 2
-# Increment this only when an existing saved Blender Repair result is no
+ASSEMBLY_RUNTIME_RECEIPT_VERSION = 3
+# Increment this only when an existing saved Assembly result is no
 # longer semantically valid.  Source-file hashes below are diagnostics, not a
 # cache-invalidation contract.
 ASSEMBLY_OUTPUT_CONTRACT_VERSION = 3
@@ -30,7 +30,7 @@ TOOL_DIR = Path(__file__).resolve().parent
 REPO_DIR = TOOL_DIR.parent
 
 
-class RepairPipelineEvidenceError(ValueError):
+class AssemblyPipelineEvidenceError(ValueError):
     """A pipeline report cannot prove the current saved-output contract."""
 
 
@@ -44,7 +44,7 @@ def _normalized_path(value):
 
 def _nonnegative_int(value, label):
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise RepairPipelineEvidenceError(
+        raise AssemblyPipelineEvidenceError(
             f"{label} must be a non-negative integer"
         )
     return value
@@ -52,22 +52,22 @@ def _nonnegative_int(value, label):
 
 def _require_same_path(actual, expected, label):
     if not str(actual or "").strip():
-        raise RepairPipelineEvidenceError(f"{label} is missing")
+        raise AssemblyPipelineEvidenceError(f"{label} is missing")
     if expected is not None and _normalized_path(actual) != _normalized_path(
         expected
     ):
-        raise RepairPipelineEvidenceError(
+        raise AssemblyPipelineEvidenceError(
             f"{label} does not match the expected path"
         )
 
 
 def _normalized_cleanup_live_identity(value, label):
     if not isinstance(value, dict):
-        raise RepairPipelineEvidenceError(f"{label} is missing")
+        raise AssemblyPipelineEvidenceError(f"{label} is missing")
 
     def normalized_row(row, row_label):
         if not isinstance(row, dict):
-            raise RepairPipelineEvidenceError(f"{row_label} is invalid")
+            raise AssemblyPipelineEvidenceError(f"{row_label} is invalid")
         canonical_path = str(row.get("canonical_path") or "").strip()
         digest = str(row.get("sha256") or "").strip().casefold()
         size = _nonnegative_int(row.get("size"), f"{row_label}.size")
@@ -79,7 +79,7 @@ def _normalized_cleanup_live_identity(value, label):
                 for character in digest
             )
         ):
-            raise RepairPipelineEvidenceError(f"{row_label} is invalid")
+            raise AssemblyPipelineEvidenceError(f"{row_label} is invalid")
         return {
             "canonical_path": canonical_path,
             "sha256": digest,
@@ -89,7 +89,7 @@ def _normalized_cleanup_live_identity(value, label):
     spm = normalized_row(value.get("spm"), f"{label}.spm")
     raw_stmat = value.get("stmat")
     if not isinstance(raw_stmat, list) or not raw_stmat:
-        raise RepairPipelineEvidenceError(f"{label}.stmat is missing")
+        raise AssemblyPipelineEvidenceError(f"{label}.stmat is missing")
     stmat = [
         normalized_row(row, f"{label}.stmat[{index}]")
         for index, row in enumerate(raw_stmat)
@@ -112,26 +112,26 @@ def _validate_cleanup_record(
     expected_fbx=None,
 ):
     if not isinstance(cleanup, dict):
-        raise RepairPipelineEvidenceError(f"{label} is missing")
+        raise AssemblyPipelineEvidenceError(f"{label} is missing")
     if cleanup.get("policy") != UNASSIGNED_GEOMETRY_CLEANUP_POLICY:
-        raise RepairPipelineEvidenceError(f"{label} policy is invalid")
+        raise AssemblyPipelineEvidenceError(f"{label} policy is invalid")
     try:
         cleanup_version = int(cleanup.get("cleanup_contract_version"))
     except (TypeError, ValueError):
         cleanup_version = 0
     if cleanup_version < UNASSIGNED_GEOMETRY_CLEANUP_CONTRACT_VERSION:
-        raise RepairPipelineEvidenceError(f"{label} version is obsolete")
+        raise AssemblyPipelineEvidenceError(f"{label} version is obsolete")
     if cleanup.get("status") not in {"applied", "not_applicable"}:
-        raise RepairPipelineEvidenceError(f"{label} status is incomplete")
+        raise AssemblyPipelineEvidenceError(f"{label} status is incomplete")
     if cleanup.get("strict_speedtree_pipeline_contract") is not True:
-        raise RepairPipelineEvidenceError(
+        raise AssemblyPipelineEvidenceError(
             f"{label} did not run under the strict SpeedTree contract"
         )
     if (
         cleanup.get("cleanup_authorized") is not True
         or cleanup.get("live_source_identity_validated") is not True
     ):
-        raise RepairPipelineEvidenceError(
+        raise AssemblyPipelineEvidenceError(
             f"{label} has no validated cleanup authority"
         )
     _require_same_path(
@@ -150,7 +150,7 @@ def _validate_cleanup_record(
         == _normalized_path(expected_stmat)
         for row in live_identity["stmat"]
     ):
-        raise RepairPipelineEvidenceError(
+        raise AssemblyPipelineEvidenceError(
             f"{label} live STMAT identity does not match its source FBX"
         )
     fingerprint = hashlib.sha256(
@@ -162,7 +162,7 @@ def _validate_cleanup_record(
         ).encode("utf-8")
     ).hexdigest()
     if cleanup.get("live_source_identity_fingerprint") != fingerprint:
-        raise RepairPipelineEvidenceError(
+        raise AssemblyPipelineEvidenceError(
             f"{label} live source fingerprint is invalid"
         )
 
@@ -185,15 +185,15 @@ def _validate_cleanup_record(
     rows = cleanup.get("objects")
     removed_objects = cleanup.get("removed_objects")
     if not isinstance(rows, list) or not isinstance(removed_objects, list):
-        raise RepairPipelineEvidenceError(
+        raise AssemblyPipelineEvidenceError(
             f"{label} object evidence is incomplete"
         )
     if aggregates["changed_object_count"] != len(rows):
-        raise RepairPipelineEvidenceError(
+        raise AssemblyPipelineEvidenceError(
             f"{label} changed-object aggregate is inconsistent"
         )
     if inspected_count < len(rows):
-        raise RepairPipelineEvidenceError(
+        raise AssemblyPipelineEvidenceError(
             f"{label} inspected-object aggregate is inconsistent"
         )
 
@@ -209,16 +209,16 @@ def _validate_cleanup_record(
     for index, row in enumerate(rows):
         row_label = f"{label}.objects[{index}]"
         if not isinstance(row, dict):
-            raise RepairPipelineEvidenceError(f"{row_label} is invalid")
+            raise AssemblyPipelineEvidenceError(f"{row_label} is invalid")
         name = str(row.get("object") or "").strip()
         if not name or name in seen_names:
-            raise RepairPipelineEvidenceError(
+            raise AssemblyPipelineEvidenceError(
                 f"{row_label} has a missing or duplicate object name"
             )
         seen_names.add(name)
         removed_object = row.get("removed_object")
         if not isinstance(removed_object, bool):
-            raise RepairPipelineEvidenceError(
+            raise AssemblyPipelineEvidenceError(
                 f"{row_label}.removed_object must be boolean"
             )
         if removed_object:
@@ -243,7 +243,7 @@ def _validate_cleanup_record(
                 f"{row_label}.removed_{noun}_count",
             )
             if before - after != removed:
-                raise RepairPipelineEvidenceError(
+                raise AssemblyPipelineEvidenceError(
                     f"{row_label} {noun} counts are inconsistent"
                 )
             row_totals[f"removed_{noun}_count"] += removed
@@ -258,17 +258,17 @@ def _validate_cleanup_record(
         )
         removed_slots = row.get("removed_material_slots")
         if not isinstance(removed_slots, list):
-            raise RepairPipelineEvidenceError(
+            raise AssemblyPipelineEvidenceError(
                 f"{row_label}.removed_material_slots is invalid"
             )
         if slots_before - slots_after != len(removed_slots):
-            raise RepairPipelineEvidenceError(
+            raise AssemblyPipelineEvidenceError(
                 f"{row_label} material-slot counts are inconsistent"
             )
         row_totals["removed_material_slot_count"] += len(removed_slots)
         reasons = row.get("removed_face_reasons")
         if not isinstance(reasons, dict):
-            raise RepairPipelineEvidenceError(
+            raise AssemblyPipelineEvidenceError(
                 f"{row_label}.removed_face_reasons is invalid"
             )
         reason_total = sum(
@@ -276,22 +276,22 @@ def _validate_cleanup_record(
             for value in reasons.values()
         )
         if reason_total != row.get("removed_face_count"):
-            raise RepairPipelineEvidenceError(
+            raise AssemblyPipelineEvidenceError(
                 f"{row_label} removed-face reasons are inconsistent"
             )
 
     if removed_names != removed_objects:
-        raise RepairPipelineEvidenceError(
+        raise AssemblyPipelineEvidenceError(
             f"{label} removed-object names are inconsistent"
         )
     for field, total in row_totals.items():
         if aggregates[field] != total:
-            raise RepairPipelineEvidenceError(
+            raise AssemblyPipelineEvidenceError(
                 f"{label}.{field} aggregate is inconsistent"
             )
     changed = aggregates["changed_object_count"] > 0
     if (cleanup.get("status") == "applied") != changed:
-        raise RepairPipelineEvidenceError(
+        raise AssemblyPipelineEvidenceError(
             f"{label} status disagrees with its changed-object count"
         )
     return cleanup
@@ -299,16 +299,16 @@ def _validate_cleanup_record(
 
 def _validate_renderable_geometry(evidence, label):
     if not isinstance(evidence, dict) or evidence.get("status") != "ok":
-        raise RepairPipelineEvidenceError(f"{label} is not ready")
+        raise AssemblyPipelineEvidenceError(f"{label} is not ready")
     if _nonnegative_int(
         evidence.get("mesh_object_count"),
         f"{label}.mesh_object_count",
     ) < 1:
-        raise RepairPipelineEvidenceError(f"{label} has no mesh object")
+        raise AssemblyPipelineEvidenceError(f"{label} has no mesh object")
     if _nonnegative_int(
         evidence.get("face_count"), f"{label}.face_count"
     ) < 1:
-        raise RepairPipelineEvidenceError(f"{label} has no renderable face")
+        raise AssemblyPipelineEvidenceError(f"{label} has no renderable face")
 
 
 def validate_unassigned_geometry_cleanup_evidence(
@@ -319,7 +319,7 @@ def validate_unassigned_geometry_cleanup_evidence(
     require_recheck=True,
     missing_is_diagnostic=False,
 ):
-    """Validate exact pre-repair cleanup and its final material postcondition.
+    """Validate exact pre-assembly cleanup and its material postcondition.
 
     This function is intentionally pure: callers can use it both inside the
     Blender producer and while inspecting a committed report.  It rejects
@@ -327,8 +327,8 @@ def validate_unassigned_geometry_cleanup_evidence(
     Blend that never ran the Default/empty-face cleanup.
     """
     if not isinstance(payload, dict) or payload.get("status") != "done":
-        raise RepairPipelineEvidenceError(
-            "pipeline did not complete the Blender repair"
+        raise AssemblyPipelineEvidenceError(
+            "pipeline did not complete Blender Assembly"
         )
     if (
         missing_is_diagnostic
@@ -341,7 +341,7 @@ def validate_unassigned_geometry_cleanup_evidence(
             "cleanup_applied": None,
             "message": (
                 "The active Blender add-on did not emit optional unassigned "
-                "geometry cleanup telemetry; completed Repair output remains "
+                "geometry cleanup telemetry; completed Assembly output remains "
                 "authoritative."
             ),
         }
@@ -368,18 +368,18 @@ def validate_unassigned_geometry_cleanup_evidence(
                 candidate,
                 f"pipeline live source candidate {index}",
             )
-        except RepairPipelineEvidenceError:
+        except AssemblyPipelineEvidenceError:
             continue
         if normalized_candidate == cleanup_live_identity:
             identity_matches = True
             break
     if not identity_matches:
-        raise RepairPipelineEvidenceError(
+        raise AssemblyPipelineEvidenceError(
             "cleanup identity is not bound to the validated material input"
         )
     imported = payload.get("import")
     if not isinstance(imported, dict):
-        raise RepairPipelineEvidenceError("import evidence is missing")
+        raise AssemblyPipelineEvidenceError("import evidence is missing")
     _require_same_path(
         imported.get("source_fbx"),
         cleanup.get("source_fbx"),
@@ -391,7 +391,7 @@ def validate_unassigned_geometry_cleanup_evidence(
         "import.source_identity",
     )
     if imported.get("unassigned_geometry_cleanup") != cleanup:
-        raise RepairPipelineEvidenceError(
+        raise AssemblyPipelineEvidenceError(
             "import cleanup evidence disagrees with the pipeline cleanup"
         )
     _validate_renderable_geometry(
@@ -411,13 +411,13 @@ def validate_unassigned_geometry_cleanup_evidence(
             expected_fbx=expected_fbx,
         )
         if recheck.get("status") != "not_applicable":
-            raise RepairPipelineEvidenceError(
+            raise AssemblyPipelineEvidenceError(
                 "cleanup recheck found geometry introduced after import"
             )
         if recheck.get("live_source_identity") != cleanup.get(
             "live_source_identity"
         ):
-            raise RepairPipelineEvidenceError(
+            raise AssemblyPipelineEvidenceError(
                 "cleanup recheck used a different live source identity"
             )
 
@@ -451,7 +451,7 @@ def validate_unassigned_geometry_cleanup_evidence(
         )
         or assigned_slots != sorted(set(assigned_slots))
     ):
-        raise RepairPipelineEvidenceError(
+        raise AssemblyPipelineEvidenceError(
             "final material-slot postcondition is incomplete"
         )
     return cleanup
@@ -476,16 +476,16 @@ def _stable_sha256(path):
 
 def _validate_source_identity(identity, expected_spm=None):
     if not isinstance(identity, dict):
-        raise RepairPipelineEvidenceError("live SPM identity is missing")
+        raise AssemblyPipelineEvidenceError("live SPM identity is missing")
     path_value = identity.get("canonical_path")
     _require_same_path(path_value, expected_spm, "live SPM identity path")
     candidate = Path(path_value)
     if not candidate.is_file():
-        raise RepairPipelineEvidenceError("live SPM identity file is missing")
+        raise AssemblyPipelineEvidenceError("live SPM identity file is missing")
     try:
         digest, stat = _stable_sha256(candidate)
     except OSError as exc:
-        raise RepairPipelineEvidenceError(str(exc)) from exc
+        raise AssemblyPipelineEvidenceError(str(exc)) from exc
     recorded_size = _nonnegative_int(
         identity.get("size"), "live SPM identity size"
     )
@@ -497,21 +497,21 @@ def _validate_source_identity(identity, expected_spm=None):
         or str(identity.get("sha256") or "").casefold()
         != digest.casefold()
     ):
-        raise RepairPipelineEvidenceError(
+        raise AssemblyPipelineEvidenceError(
             "live SPM identity does not match the current source"
         )
 
 
 def _validate_blend_identity(identity, expected_blend=None):
     if not isinstance(identity, dict) or identity.get("exists") is not True:
-        raise RepairPipelineEvidenceError("committed Blend identity is missing")
+        raise AssemblyPipelineEvidenceError("committed Blend identity is missing")
     path_value = identity.get("path")
     _require_same_path(path_value, expected_blend, "committed Blend path")
     candidate = Path(path_value)
     try:
         stat = candidate.stat()
     except OSError as exc:
-        raise RepairPipelineEvidenceError(
+        raise AssemblyPipelineEvidenceError(
             "committed Blend file is missing"
         ) from exc
     recorded_size = _nonnegative_int(
@@ -543,7 +543,7 @@ def _validate_blend_identity(identity, expected_blend=None):
         }
         or digest_invalid
     ):
-        raise RepairPipelineEvidenceError(
+        raise AssemblyPipelineEvidenceError(
             "committed Blend fingerprint does not match the saved file"
         )
 
@@ -553,13 +553,13 @@ def _validate_export_postcondition(payload, handoff_status):
         try:
             validate_pending_source_contract(payload)
         except (TypeError, ValueError) as exc:
-            raise RepairPipelineEvidenceError(
+            raise AssemblyPipelineEvidenceError(
                 "Cluster source Blend commit evidence is incomplete"
             ) from exc
         return
-    postcondition = payload.get("repair_push_export_postcondition")
+    postcondition = payload.get("assembly_export_postcondition")
     if not isinstance(postcondition, dict):
-        raise RepairPipelineEvidenceError(
+        raise AssemblyPipelineEvidenceError(
             "final Export object postcondition is missing"
         )
     recorded = str(postcondition.get("content_sha256") or "").casefold()
@@ -585,7 +585,7 @@ def _validate_export_postcondition(payload, handoff_status):
         or not objects
         or postcondition.get("empty_material_slots") != []
     ):
-        raise RepairPipelineEvidenceError(
+        raise AssemblyPipelineEvidenceError(
             "final Export object postcondition is invalid"
         )
     renderable_mesh = False
@@ -602,14 +602,14 @@ def _validate_export_postcondition(payload, handoff_status):
         if not isinstance(materials, list) or not isinstance(
             index_counts, list
         ):
-            raise RepairPipelineEvidenceError(
+            raise AssemblyPipelineEvidenceError(
                 "final Export mesh material evidence is incomplete"
             )
         counted_polygons = 0
         seen_indices = set()
         for index, count_row in enumerate(index_counts):
             if not isinstance(count_row, dict):
-                raise RepairPipelineEvidenceError(
+                raise AssemblyPipelineEvidenceError(
                     "final Export mesh material-index evidence is invalid"
                 )
             material_index = count_row.get("material_index")
@@ -624,19 +624,19 @@ def _validate_export_postcondition(payload, handoff_status):
                 or not isinstance(assigned_count, int)
                 or assigned_count < 1
             ):
-                raise RepairPipelineEvidenceError(
+                raise AssemblyPipelineEvidenceError(
                     "final Export mesh has an invalid material assignment"
                 )
             seen_indices.add(material_index)
             counted_polygons += assigned_count
         if counted_polygons != polygon_count:
-            raise RepairPipelineEvidenceError(
+            raise AssemblyPipelineEvidenceError(
                 "final Export mesh material assignments do not cover its faces"
             )
         renderable_mesh = renderable_mesh or polygon_count > 0
         for material in materials:
             if not isinstance(material, dict):
-                raise RepairPipelineEvidenceError(
+                raise AssemblyPipelineEvidenceError(
                     "final Export mesh contains an empty material slot"
                 )
             name = re.sub(
@@ -646,17 +646,17 @@ def _validate_export_postcondition(payload, handoff_status):
                 name = name[:-4]
             key = re.sub(r"[^a-z0-9]+", "", name.casefold())
             if key == "default":
-                raise RepairPipelineEvidenceError(
+                raise AssemblyPipelineEvidenceError(
                     "final Export mesh contains canonical Default material"
                 )
     if not renderable_mesh:
-        raise RepairPipelineEvidenceError(
+        raise AssemblyPipelineEvidenceError(
             "final Export postcondition has no renderable mesh"
         )
 
 
 def addon_dir_from_config(cfg):
-    """Resolve the installed BWR add-on folder exactly as SK Batch does."""
+    """Resolve the installed Assembly add-on folder exactly as SK Batch does."""
     value = str((cfg or {}).get("fbx_ini") or "")
     if not value:
         return None
@@ -666,7 +666,7 @@ def addon_dir_from_config(cfg):
         return None
 
 
-def repair_runtime_code_paths(addon_dir):
+def assembly_runtime_code_paths(addon_dir):
     """Return producer modules recorded for diagnostics after a build."""
     addon_dir = Path(addon_dir)
     paths = list(addon_dir.rglob("*.py"))
@@ -683,12 +683,12 @@ def repair_runtime_code_paths(addon_dir):
         REPO_DIR / "pcg_st9_texture_batch"
         / "pcg_cluster_bark_normalization.py",
         REPO_DIR / "pcg_st9_texture_batch" / "pcg_texture_audit.py",
-        TOOL_DIR / "jobs" / "bwr_headless_job.py",
+        TOOL_DIR / "jobs" / "assembly_headless_job.py",
         TOOL_DIR / "jobs" / "speedtree_material_preflight.py",
         TOOL_DIR / "cluster_assembly_builder.py",
         TOOL_DIR / "cluster_assembly_handoff_contract.py",
         TOOL_DIR / "nanite_assembly_materials.py",
-        TOOL_DIR / "repair_runtime_contract.py",
+        TOOL_DIR / "assembly_runtime_contract.py",
     ])
     unique = {}
     for path in paths:
@@ -700,11 +700,11 @@ def repair_runtime_code_paths(addon_dir):
     return [unique[key] for key in sorted(unique)]
 
 
-def repair_runtime_code_state(addon_dir, modules=None):
+def assembly_runtime_code_state(addon_dir, modules=None):
     """Return diagnostic content hashes independent of source timestamps."""
     addon_dir = Path(addon_dir).resolve()
     modules = list(
-        repair_runtime_code_paths(addon_dir)
+        assembly_runtime_code_paths(addon_dir)
         if modules is None
         else modules
     )
@@ -742,15 +742,15 @@ def repair_runtime_code_state(addon_dir, modules=None):
         after = source_snapshot()
         if after == before:
             return state
-    raise OSError("Repair runtime source changed while hashing")
+    raise OSError("Assembly runtime source changed while hashing")
 
 
-def repair_runtime_receipt_path(spm):
+def assembly_runtime_receipt_path(spm):
     spm = Path(spm)
-    return spm.parent / "reports" / f"{spm.stem}_repair_runtime_codex.json"
+    return spm.parent / "reports" / f"{spm.stem}_assembly_runtime_codex.json"
 
 
-def repair_runtime_output_contract(payload):
+def assembly_runtime_output_contract(payload):
     """Return the semantic saved-output contract recorded by *payload*.
 
     Old runtime receipts did not have an explicit semantic contract field.
@@ -762,7 +762,7 @@ def repair_runtime_output_contract(payload):
     """
     if not isinstance(payload, dict):
         return None
-    if payload.get("kind") != "sk_repair_runtime":
+    if payload.get("kind") != "sk_assembly_runtime":
         return None
     value = payload.get("output_contract_version")
     if value is None:
@@ -773,7 +773,7 @@ def repair_runtime_output_contract(payload):
         return None
 
 
-def repair_pipeline_output_contract(
+def assembly_pipeline_output_contract(
     payload,
     *,
     spm=None,
@@ -811,11 +811,11 @@ def repair_pipeline_output_contract(
             "source_review",
             "cluster_export_pending",
         }:
-            raise RepairPipelineEvidenceError(
+            raise AssemblyPipelineEvidenceError(
                 "final handoff preflight did not commit a usable Blend"
             )
         _validate_export_postcondition(payload, handoff.get("status"))
-    except (OSError, RepairPipelineEvidenceError, TypeError, ValueError):
+    except (OSError, AssemblyPipelineEvidenceError, TypeError, ValueError):
         return LEGACY_ASSEMBLY_OUTPUT_CONTRACT_VERSION
     claimed_contract = payload.get("assembly_output_contract_version")
     if claimed_contract is None:
@@ -834,19 +834,19 @@ def repair_pipeline_output_contract(
     return LEGACY_ASSEMBLY_OUTPUT_CONTRACT_VERSION
 
 
-def repair_runtime_receipt_needs_migration(payload):
+def assembly_runtime_receipt_needs_migration(payload):
     """Whether a compatible/current artifact should rewrite this receipt."""
     if not isinstance(payload, dict):
         return True
-    if payload.get("kind") != "sk_repair_runtime":
+    if payload.get("kind") != "sk_assembly_runtime":
         return True
     try:
         schema_version = int(payload.get("version"))
     except (TypeError, ValueError):
         return True
-    if schema_version != REPAIR_RUNTIME_RECEIPT_VERSION:
+    if schema_version != ASSEMBLY_RUNTIME_RECEIPT_VERSION:
         return True
-    if repair_runtime_output_contract(payload) != ASSEMBLY_OUTPUT_CONTRACT_VERSION:
+    if assembly_runtime_output_contract(payload) != ASSEMBLY_OUTPUT_CONTRACT_VERSION:
         return True
     if "output_contract_version" not in payload:
         return True
@@ -875,36 +875,36 @@ def _atomic_write_receipt(path, payload):
         temporary.unlink(missing_ok=True)
 
 
-def migrate_repair_runtime_receipt(spm, payload, *, addon_dir=None):
-    """Rewrite compatible diagnostic metadata without re-running Repair.
+def migrate_assembly_runtime_receipt(spm, payload, *, addon_dir=None):
+    """Rewrite compatible diagnostic metadata without re-running Assembly.
 
     This is called only after the caller independently validates the live
     content-addressed artifact contract.  Preserve old producer hashes when
     present so scanning many legacy assets does not repeatedly hash the whole
-    add-on; a later successful Repair will refresh those diagnostics normally.
+    add-on; a later successful Assembly refreshes those diagnostics normally.
     """
     if (
         isinstance(payload, dict)
-        and payload.get("kind") == "sk_repair_runtime"
+        and payload.get("kind") == "sk_assembly_runtime"
     ):
         migrated = dict(payload)
     else:
         migrated = {}
     migrated.update({
-        "kind": "sk_repair_runtime",
-        "version": REPAIR_RUNTIME_RECEIPT_VERSION,
+        "kind": "sk_assembly_runtime",
+        "version": ASSEMBLY_RUNTIME_RECEIPT_VERSION,
         "output_contract_version": ASSEMBLY_OUTPUT_CONTRACT_VERSION,
     })
     if addon_dir is not None:
         migrated["addon_dir"] = str(addon_dir)
     if not isinstance(migrated.get("code"), dict):
         migrated["code"] = {}
-    path = repair_runtime_receipt_path(spm)
+    path = assembly_runtime_receipt_path(spm)
     _atomic_write_receipt(path, migrated)
     return path
 
 
-def write_repair_runtime_receipt(
+def write_assembly_runtime_receipt(
     spm,
     cfg,
     *,
@@ -916,9 +916,9 @@ def write_repair_runtime_receipt(
     """Record compatibility only for a positively proven current output.
 
     Generator/Cluster sync paths also call this helper, so a successful
-    no-op must not bless a legacy Blend as the current BWR output contract.
+    no-op must not bless a legacy Blend as the current Assembly contract.
     Contract v2 is recorded only when the committed pipeline report contains
-    the pre-repair Default/empty-material cleanup evidence.
+    the pre-assembly Default/empty-material cleanup evidence.
     """
     spm = Path(spm)
     if pipeline is None:
@@ -929,7 +929,7 @@ def write_repair_runtime_receipt(
             pipeline = json.loads(pipeline_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             pipeline = None
-    if repair_pipeline_output_contract(
+    if assembly_pipeline_output_contract(
         pipeline,
         spm=spm,
         blend=blend or spm.with_suffix(".blend"),
@@ -941,14 +941,14 @@ def write_repair_runtime_receipt(
     state = (
         code_state
         if code_state is not None
-        else repair_runtime_code_state(addon_dir)
+        else assembly_runtime_code_state(addon_dir)
     )
     if not state:
         return None
-    path = repair_runtime_receipt_path(spm)
+    path = assembly_runtime_receipt_path(spm)
     payload = {
-        "kind": "sk_repair_runtime",
-        "version": REPAIR_RUNTIME_RECEIPT_VERSION,
+        "kind": "sk_assembly_runtime",
+        "version": ASSEMBLY_RUNTIME_RECEIPT_VERSION,
         "output_contract_version": ASSEMBLY_OUTPUT_CONTRACT_VERSION,
         "addon_dir": str(addon_dir),
         "code": state,

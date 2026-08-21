@@ -2034,7 +2034,7 @@ class App:
                 blender_exe=blender_path,
                 unit_probe_path=unit_probe_path,
                 capture_resolution=capture_resolution,
-                repair_runtime_config=job_config,
+                assembly_runtime_config=job_config,
                 # A refresh request is also the fast current-state check.
                 # Let the transaction's exact-target preflight decide whether
                 # Blender work is necessary instead of rebuilding every ON
@@ -2283,7 +2283,7 @@ class App:
                     capture_resolution=int(
                         job_config.get("cluster_capture_resolution") or 1024
                     ),
-                    repair_runtime_config=job_config,
+                    assembly_runtime_config=job_config,
                     progress_callback=lambda _stage, message: report(
                         f"Cluster relationship · {message}",
                         55,

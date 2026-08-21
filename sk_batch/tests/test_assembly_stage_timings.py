@@ -3,7 +3,7 @@ import copy
 from pathlib import Path
 
 
-JOB_PATH = Path(__file__).resolve().parents[1] / "jobs" / "bwr_headless_job.py"
+JOB_PATH = Path(__file__).resolve().parents[1] / "jobs" / "assembly_headless_job.py"
 
 
 def load_record_stage_duration(now):
@@ -46,7 +46,7 @@ def test_stage_duration_uses_monotonic_elapsed_seconds():
     }
 
 
-def test_bwr_reports_export_repair_and_total_stage_boundaries():
+def test_assembly_reports_export_and_total_stage_boundaries():
     source = JOB_PATH.read_text(encoding="utf-8")
     for stage in (
         "input_preflight",
@@ -54,7 +54,7 @@ def test_bwr_reports_export_repair_and_total_stage_boundaries():
         "blend_open",
         "speedtree_export_bundle",
         "blender_import_and_assemble",
-        "post_repair_spm_contracts",
+        "post_assembly_spm_contracts",
         "vertex_payload_finalize",
         "blend_save",
         "blend_identity_fingerprint",

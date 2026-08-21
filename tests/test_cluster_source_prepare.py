@@ -217,7 +217,7 @@ class ClusterSourcePrepareTests(unittest.TestCase):
                 side_effect=run_stage,
             ), mock.patch.object(
                 source_prepare,
-                "write_repair_runtime_receipt",
+                "write_assembly_runtime_receipt",
                 return_value=root / "runtime.json",
             ):
                 result = source_prepare._build_cluster_source(

@@ -214,7 +214,7 @@ def _current_dependency_normalized_variants(spm, dependency, persisted):
     return persisted
 
 
-def current_assembly_manifest_repair_handoff(spm_path, full_fbx_path):
+def current_assembly_manifest_handoff(spm_path, full_fbx_path):
     """Recover a live Repair handoff from the current production manifest.
 
     PCG receipts are discovery-time evidence and can become stale after a

@@ -746,8 +746,8 @@ def _reads_mapping_key(node: ast.AST, variable: str, key: str) -> bool:
 def _require_repair_push_reuse(methods) -> None:
     required = {
         "_run_full_pipeline",
-        "_publish_repair_stage_contract",
-        "_repair_stage_contract",
+        "_publish_assembly_stage_contract",
+        "_assembly_stage_contract",
         "_job_blender",
         "_push_preflight",
         "_export_manifest_item",
@@ -761,7 +761,7 @@ def _require_repair_push_reuse(methods) -> None:
     obsolete_guards = sorted({
         "_build_repair_stage_evidence",
         "_repair_stage_evidence_if_active",
-        "_validate_repair_stage_contract",
+        "_validate_assembly_stage_contract",
         "_repair_evidence_path_for_push",
     }.intersection(methods))
     if obsolete_guards:
@@ -776,7 +776,7 @@ def _require_repair_push_reuse(methods) -> None:
         and isinstance(node.value, ast.Dict)
         and any(
             isinstance(target, ast.Attribute)
-            and target.attr == "_active_repair_stage_contracts"
+            and target.attr == "_active_assembly_stage_contracts"
             for target in node.targets
         )
         for node in ast.walk(pipeline)
@@ -798,7 +798,7 @@ def _require_repair_push_reuse(methods) -> None:
             and isinstance(child.value, str)
         }
         if (
-            "_active_repair_stage_contracts" in constants
+            "_active_assembly_stage_contracts" in constants
             and any(_calls(statement, "pop") for statement in node.finalbody)
         ):
             cleanup_found = True
@@ -808,7 +808,7 @@ def _require_repair_push_reuse(methods) -> None:
             "Repair-to-Push reuse contract failed: full pipeline does not "
             "clear its job-scoped Repair result in finally"
         )
-    if not _calls(methods["_job_blender"], "_publish_repair_stage_contract"):
+    if not _calls(methods["_job_blender"], "_publish_assembly_stage_contract"):
         raise CompileGateError(
             "Repair-to-Push reuse contract failed: Blender Repair does not "
             "publish its final result"
@@ -822,14 +822,14 @@ def _require_repair_push_reuse(methods) -> None:
             "Repair-to-Push reuse contract failed: Blender Repair repeats "
             "the final Repair state instead of sharing one computed result"
         )
-    if _calls(methods["_job_blender"], "_read_repair_pipeline_json"):
+    if _calls(methods["_job_blender"], "_read_assembly_pipeline_json"):
         raise CompileGateError(
             "Repair status efficiency contract failed: Blender job must "
             "reuse the Repair report projection instead of reading it again"
         )
 
     push_preflight = methods["_push_preflight"]
-    if not _calls(push_preflight, "_repair_stage_contract"):
+    if not _calls(push_preflight, "_assembly_stage_contract"):
         raise CompileGateError(
             "Repair-to-Push reuse contract failed: Push does not read the "
             "job-scoped Repair result"
@@ -866,11 +866,11 @@ def _require_repair_push_reuse(methods) -> None:
             "Repair ready/reason values"
         )
 
-    repair_state = methods.get("_repair_output_state_scoped")
+    repair_state = methods.get("_assembly_output_state_scoped")
     if repair_state is None:
         raise CompileGateError(
             "Repair status efficiency contract failed: "
-            "_repair_output_state_scoped is missing"
+            "_assembly_output_state_scoped is missing"
         )
     if len(_calls(repair_state, "_cluster_assembly_inputs_current")) != 1:
         raise CompileGateError(
@@ -880,7 +880,7 @@ def _require_repair_push_reuse(methods) -> None:
     assembly_inputs = methods.get("_cluster_assembly_inputs_current")
     if assembly_inputs is None or not _calls(
         assembly_inputs,
-        "_read_repair_pipeline_json",
+        "_read_assembly_pipeline_json",
     ):
         raise CompileGateError(
             "Repair status efficiency contract failed: the large Repair "
@@ -946,7 +946,7 @@ def validate_push_job_contracts(
             "Push worker exposes obsolete Repair evidence CLI"
         )
     for function_name in (
-        "validate_repair_push_evidence_bundle",
+        "validate_assembly_export_evidence_bundle",
         "validate_export_object_postcondition",
     ):
         if _calls(main, function_name):
