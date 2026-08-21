@@ -516,7 +516,7 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
             ):
                 validate_isolated_bark_recipe_bundle(recipe)
 
-    def test_resolves_leaf_recipe_from_current_bwr_and_target_material(self):
+    def test_resolves_leaf_recipe_from_current_assembly_and_target_material(self):
         with tempfile.TemporaryDirectory() as temporary:
             blend, source, target, unit_probe = self.fixture(temporary)
 
@@ -1144,7 +1144,7 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
             )
             self.assertFalse(rebuilt["normalization_required"])
 
-    def test_changed_bwr_material_assignment_rebuilds_normalized_prototypes_once(self):
+    def test_changed_assembly_material_assignment_rebuilds_normalized_prototypes_once(self):
         with tempfile.TemporaryDirectory() as temporary:
             blend, source, target, unit_probe = self.fixture(temporary)
             report = blend.parent / "reports" / (
@@ -1174,7 +1174,7 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
                 unit_probe_path=unit_probe,
             )
             self.assertFalse(
-                normalization_sync.inspect_bwr_material_assignment_freshness(
+                normalization_sync.inspect_assembly_material_assignment_freshness(
                     blend
                 )["current"]
             )
@@ -1189,8 +1189,8 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
                         "normalization_contract_sha256": recipe[
                             "normalization_contract_sha256"
                         ],
-                        "bwr_material_assignment_sha256": recipe.get(
-                            "bwr_material_assignment_sha256"
+                        "assembly_material_assignment_sha256": recipe.get(
+                            "assembly_material_assignment_sha256"
                         ),
                         "source_spm_sha256": recipe["source_spm_sha256"],
                         "source_spm_semantic_projection_version": recipe[
@@ -1217,7 +1217,7 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
             )
             self.assertFalse(unchanged["normalization_required"])
             self.assertTrue(
-                normalization_sync.inspect_bwr_material_assignment_freshness(
+                normalization_sync.inspect_assembly_material_assignment_freshness(
                     blend
                 )["current"]
             )
@@ -1260,7 +1260,7 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
             )
             self.assertTrue(changed["normalization_required"])
             self.assertFalse(
-                normalization_sync.inspect_bwr_material_assignment_freshness(
+                normalization_sync.inspect_assembly_material_assignment_freshness(
                     blend
                 )["current"]
             )
@@ -1278,7 +1278,7 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
             )
             self.assertFalse(rebuilt["normalization_required"])
             self.assertTrue(
-                normalization_sync.inspect_bwr_material_assignment_freshness(
+                normalization_sync.inspect_assembly_material_assignment_freshness(
                     blend
                 )["current"]
             )
@@ -1602,7 +1602,7 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
                 changed["refresh_reasons"],
             )
 
-    def test_changed_source_rejects_stale_bwr_before_blender(self):
+    def test_changed_source_rejects_stale_assembly_before_blender(self):
         with tempfile.TemporaryDirectory() as temporary:
             blend, source, target, unit_probe = self.fixture(temporary)
             source.write_bytes(b"changed-after-bwr")

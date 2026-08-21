@@ -1,6 +1,6 @@
 """Conditionally rebuild a Cluster source blend before Generator Sync.
 
-Generator Sync consumes the normalized render mesh saved by the SK Batch/BWR
+Generator Sync consumes the normalized render mesh saved by the SK Batch/Assembly
 job.  This module does not weaken that hash contract.  It only runs the same
 SPM bone-normalization, material preflight, and headless Blender source-build
 stages when the canonical Cluster SPM proves that saved result is stale.
@@ -25,7 +25,7 @@ from cluster_normalization_sync import (
     ClusterSourceBuildRequiredError,
     resolve_normalization_recipe,
 )
-from sk_batch.repair_runtime_contract import write_repair_runtime_receipt
+from sk_batch.assembly_runtime_contract import write_assembly_runtime_receipt
 from sk_batch.sk_common import (
     LOG_DIR,
     atomic_write_bytes,
@@ -71,8 +71,8 @@ def _material_preflight_export_executable():
     """Resolve the collision-aware CLI required by the bundled FBX/XML export.
 
     The material preflight intentionally shares the exact one-process
-    Collision/Prune bake used by BWR.  Passing SpeedTree_Modeler.exe directly
-    to BWR's export_bundle would send the custom secondary-export switches to
+    Collision/Prune bake used by Assembly.  Passing SpeedTree_Modeler.exe directly
+    to Assembly's export_bundle would send the custom secondary-export switches to
     the stock Modeler, which can leave the XML side of the bundle missing.
     Never silently fall back to that path.
     """
@@ -326,8 +326,8 @@ def _build_cluster_source(
         "cluster_source_build",
         f"Cluster 기준 Blend 재생성 · {blend.name}",
     )
-    job_report_path = LOG_DIR / f"{canonical_spm.stem}_bwr_{stamp}.json"
-    job_log = LOG_DIR / f"{canonical_spm.stem}_bwr_{stamp}.log"
+    job_report_path = LOG_DIR / f"{canonical_spm.stem}_assembly_{stamp}.json"
+    job_log = LOG_DIR / f"{canonical_spm.stem}_assembly_{stamp}.log"
     pipeline_report = (
         canonical_spm.parent
         / "reports"
@@ -342,7 +342,7 @@ def _build_cluster_source(
         "--factory-startup",
         "-b",
         "--python",
-        SK_BATCH_DIR / "jobs" / "bwr_headless_job.py",
+        SK_BATCH_DIR / "jobs" / "assembly_headless_job.py",
         "--",
         "--spm",
         canonical_spm,
@@ -386,7 +386,7 @@ def _build_cluster_source(
             report=job_report,
         )
 
-    runtime_receipt = write_repair_runtime_receipt(canonical_spm, cfg)
+    runtime_receipt = write_assembly_runtime_receipt(canonical_spm, cfg)
     return {
         "status": "rebuilt",
         "spm": str(canonical_spm),

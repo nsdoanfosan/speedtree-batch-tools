@@ -17,7 +17,7 @@ SK_BATCH_DIR = Path(__file__).resolve().parents[1]
 if str(SK_BATCH_DIR) not in sys.path:
     sys.path.insert(0, str(SK_BATCH_DIR))
 
-JOB_PATH = SK_BATCH_DIR / "jobs" / "bwr_headless_job.py"
+JOB_PATH = SK_BATCH_DIR / "jobs" / "assembly_headless_job.py"
 
 
 def job_tree():
@@ -105,7 +105,7 @@ class SourceReviewPolicyTests(unittest.TestCase):
         self.assertNotIn("source_review_allowed", source)
         self.assertNotIn("inspect_legacy_cluster_state", source)
         self.assertIn(
-            "legacy_lineage_is_not_a_repair_or_export_input",
+            "legacy_lineage_is_not_an_assembly_or_export_input",
             source,
         )
 
@@ -123,7 +123,7 @@ class SourceReviewPolicyTests(unittest.TestCase):
             "speedtree_spm = Path(args.speedtree_spm or args.spm)", source
         )
 
-    def test_bwr_receipt_records_the_live_canonical_spm_identity(self):
+    def test_assembly_receipt_records_the_live_canonical_spm_identity(self):
         source = JOB_PATH.read_text(encoding="utf-8")
         self.assertIn(
             'pipeline_data["speedtree_live_source_identity"]',

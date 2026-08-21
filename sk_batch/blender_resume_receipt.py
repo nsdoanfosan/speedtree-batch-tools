@@ -1,8 +1,8 @@
-"""Non-blocking resume hints for completed Blender Repair rows.
+"""Non-blocking resume hints for completed Blender Assembly rows.
 
 A receipt may remove an unchanged row from a restarted queue.  A missing or
 changed receipt never fails an item: orchestration either runs relationship
-maintenance before deciding whether BWR is still reusable, or rebuilds the
+maintenance before deciding whether Assembly is still reusable, or rebuilds the
 row when an output-affecting input changed.
 """
 
@@ -15,7 +15,7 @@ import os
 from pathlib import Path
 
 BLENDER_RESUME_RECEIPT_KIND = "sk_batch_blender_resume_receipt"
-BLENDER_RESUME_RECEIPT_VERSION = 1
+BLENDER_RESUME_RECEIPT_VERSION = 2
 
 
 class BlenderResumeReceiptError(ValueError):
@@ -55,7 +55,7 @@ def _file_identity(path):
         }
     if not candidate.is_file():
         raise BlenderResumeReceiptError(
-            f"bound Repair artifact is not a file: {candidate}"
+            f"bound Assembly artifact is not a file: {candidate}"
         )
     identity = {
         "path": str(candidate),
@@ -83,13 +83,13 @@ def build_blender_resume_receipt(
     relation_paths=(),
     relation_signature=None,
     settings,
-    repair_state,
+    assembly_state,
 ):
-    """Seal one already-validated current Repair decision."""
+    """Seal one already-validated current Assembly decision."""
 
-    if not isinstance(repair_state, dict) or repair_state.get("current") is not True:
+    if not isinstance(assembly_state, dict) or assembly_state.get("current") is not True:
         raise BlenderResumeReceiptError(
-            "only a current live Repair decision can create a resume receipt"
+            "only a current live Assembly decision can create a resume receipt"
         )
     queue_spm = _canonical_path(queue_spm)
     if not Path(queue_spm).is_file():
@@ -118,7 +118,7 @@ def build_blender_resume_receipt(
         for key in sorted(paths)
     ]
     result = {
-        key: copy.deepcopy(repair_state[key])
+        key: copy.deepcopy(assembly_state[key])
         for key in (
             "current",
             "push_ready",
@@ -127,7 +127,7 @@ def build_blender_resume_receipt(
             "texture_reason",
             "push_dependency_contract",
         )
-        if key in repair_state
+        if key in assembly_state
     }
     payload = {
         "kind": BLENDER_RESUME_RECEIPT_KIND,
@@ -136,7 +136,7 @@ def build_blender_resume_receipt(
         "settings_sha256": settings_signature(settings),
         "relation_signature": copy.deepcopy(relation_signature),
         "files": files,
-        "repair_state": result,
+        "assembly_state": result,
     }
     payload["receipt_sha256"] = _canonical_json_sha256(payload)
     return payload
@@ -176,12 +176,12 @@ def validate_blender_resume_receipt(
         )
     if receipt.get("settings_sha256") != settings_signature(settings):
         raise BlenderResumeReceiptError(
-            "Blender Repair output settings changed",
+            "Blender Assembly output settings changed",
             resume_action="rebuild_required",
         )
     if receipt.get("relation_signature") != relation_signature:
         raise BlenderResumeReceiptError(
-            "Blender Repair relationship signal changed",
+            "Blender Assembly relationship signal changed",
             resume_action="relation_changed",
         )
     files = receipt.get("files")
@@ -214,7 +214,7 @@ def validate_blender_resume_receipt(
         expected.pop("content_key", None)
         if current != expected:
             raise BlenderResumeReceiptError(
-                f"bound Repair artifact changed: {recorded['path']}",
+                f"bound Assembly artifact changed: {recorded['path']}",
                 resume_action=(
                     "relation_changed"
                     if role == "relation"
@@ -226,10 +226,10 @@ def validate_blender_resume_receipt(
             "Blender resume receipt does not bind its queue SPM",
             resume_action="invalid",
         )
-    result = copy.deepcopy(receipt.get("repair_state"))
+    result = copy.deepcopy(receipt.get("assembly_state"))
     if not isinstance(result, dict) or result.get("current") is not True:
         raise BlenderResumeReceiptError(
-            "Blender resume receipt has no current Repair result",
+            "Blender resume receipt has no current Assembly result",
             resume_action="invalid",
         )
     return result

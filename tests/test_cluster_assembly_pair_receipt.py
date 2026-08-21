@@ -83,7 +83,7 @@ class ClusterAssemblyPairReceiptTests(unittest.TestCase):
             with self.assertRaises(ClusterAssemblyReceiptStaleError):
                 load_cluster_assembly_receipt(receipt, requested_spm=target)
 
-    def test_bwr_dependency_gate_checks_both_pair_members(self):
+    def test_assembly_dependency_gate_checks_both_pair_members(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             contract, target, _canonical, output = self._fixture(root)

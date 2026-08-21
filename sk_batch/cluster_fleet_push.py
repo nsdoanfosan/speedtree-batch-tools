@@ -1,11 +1,11 @@
-"""Repair and push every current production Cluster Assembly into Unreal.
+"""Assembly and push every current production Cluster Assembly into Unreal.
 
 Target selection comes only from manifests directly under
 ``<root>/<asset>/assembly``. Historical logs, staging copies, backups, and old
 Unreal results never select work. A current pass-through manifest is selected
 for live receipt revalidation as well, so a legacy pass-through overwrite can
 recover from the latest Full FBX instead of orphaning an existing Assembly.
-Exact normalized provider SPMs are repaired and pushed once, ahead of every
+Exact normalized provider SPMs are assembled and pushed once, ahead of every
 root that consumes them; each root is then rebuilt from the latest Full FBX.
 Birch Paper is sorted last by default.
 """
@@ -41,7 +41,7 @@ from sk_common import wind_preset_for_spm
 
 
 DEFAULT_ROOT = Path(r"D:\OneDrive\Forestportfolio\02_nature\Tree")
-BWR_JOB = Path(__file__).resolve().parent / "jobs" / "bwr_headless_job.py"
+ASSEMBLY_JOB = Path(__file__).resolve().parent / "jobs" / "assembly_headless_job.py"
 PCG_AUDIT = (
     Path(__file__).resolve().parents[1]
     / "pcg_st9_texture_batch"
@@ -143,14 +143,14 @@ def build_receipt_refresh_command(target, report_path):
     ]
 
 
-def build_repair_command(target, blender, material_contract, report_path):
+def build_assembly_command(target, blender, material_contract, report_path):
     spm = Path(target["spm"]).resolve()
     return [
         str(Path(blender).resolve()),
         "--factory-startup",
         "-b",
         "--python",
-        str(BWR_JOB),
+        str(ASSEMBLY_JOB),
         "--",
         "--spm",
         str(spm),
@@ -167,7 +167,7 @@ def build_repair_command(target, blender, material_contract, report_path):
     ]
 
 
-def validate_repair_result(report_path, target):
+def validate_assembly_result(report_path, target):
     report = json.loads(Path(report_path).read_text(encoding="utf-8"))
     assembly_manifest = report.get("cluster_assembly_manifest") or {}
     role_demotions = list(
@@ -205,7 +205,7 @@ def validate_repair_result(report_path, target):
     parts = list(manifest.get("parts") or [])
     problems = []
     if report.get("status") != "ok":
-        problems.append("repair_not_ok")
+        problems.append("assembly_not_ok")
     if (
         placement.get("version") != 2
         or placement.get("identity_policy")
@@ -264,7 +264,7 @@ def validate_repair_result(report_path, target):
         len(part.get("bindings") or []) for part in parts
     )
     if not parts or binding_count <= 0:
-        problems.append("repair_manifest_has_no_parts_or_bindings")
+        problems.append("assembly_manifest_has_no_parts_or_bindings")
     exact_binding_count = int(
         placement.get("exact_render_attachment_binding_count") or 0
     )
@@ -288,13 +288,13 @@ def validate_repair_result(report_path, target):
     }
 
 
-def validate_provider_repair_result(report_path):
-    """Validate the normalized provider artifact produced by BWR Repair."""
+def validate_provider_assembly_result(report_path):
+    """Validate the normalized provider artifact produced by Assembly."""
     report_path = Path(report_path).resolve()
     report = json.loads(report_path.read_text(encoding="utf-8"))
     problems = []
     if report.get("status") != "ok":
-        problems.append("provider_repair_not_ok")
+        problems.append("provider_assembly_not_ok")
     pipeline_path = Path(str(report.get("pipeline_report") or ""))
     try:
         pipeline = json.loads(pipeline_path.read_text(encoding="utf-8"))
@@ -302,15 +302,15 @@ def validate_provider_repair_result(report_path):
         pipeline = {}
         problems.append(f"provider_pipeline_report_unreadable:{exc}")
     source = pipeline.get("cluster_source_build_contract") or {}
-    postcondition = pipeline.get("repair_push_export_postcondition") or {}
+    postcondition = pipeline.get("assembly_export_postcondition") or {}
     objects = list(postcondition.get("objects") or [])
     if pipeline and pipeline.get("status") != "done":
         problems.append("provider_pipeline_not_done")
-    repaired_blend = Path(str(report.get("blend") or ""))
+    assembled_blend = Path(str(report.get("blend") or ""))
     if report.get("unreal_push_ready") is not True:
         problems.append("provider_unreal_push_not_ready")
-    if not repaired_blend.is_file():
-        problems.append("provider_repaired_blend_missing")
+    if not assembled_blend.is_file():
+        problems.append("provider_assembled_blend_missing")
     if not objects:
         problems.append("provider_export_postcondition_has_no_objects")
     final_consolidation = next(
@@ -334,7 +334,7 @@ def validate_provider_repair_result(report_path):
         "problems": problems,
         "report": str(report_path),
         "pipeline_report": str(pipeline_path),
-        "repaired_blend": str(repaired_blend),
+        "assembled_blend": str(assembled_blend),
         "cluster_source_mode": source.get("mode"),
         "source_object": source.get("source_object"),
         "export_objects": [str(row.get("name") or "") for row in objects],
@@ -379,7 +379,7 @@ def discover_provider_dependencies(targets):
             # fingerprints stale until those roots are rebuilt.  Their old
             # manifest may still seed *execution order* from exact recorded
             # source_blend paths; it never decides role presence or geometry.
-            # The post-Repair manifest below is rebuilt from the latest Full
+            # The post-Assembly manifest below is rebuilt from the latest Full
             # FBX, re-resolved, and any newly required provider is processed
             # before that root is exported.
             try:
@@ -696,9 +696,9 @@ def main(argv=None):
         "status": "running",
         "root": str(args.root.expanduser().resolve()),
         "transport": "headless_commandlet",
-        "repair_policy": (
-            "provider_repair_push_then_refresh_exact_target_"
-            "repair_export_and_push"
+        "assembly_policy": (
+            "provider_assembly_push_then_refresh_exact_target_"
+            "assembly_export_and_push"
         ),
         "birch_paper_order": "last",
         "targets": [str(row["spm"]) for row in targets],
@@ -752,7 +752,7 @@ def main(argv=None):
         fleet["provider_results"].append(result)
         save_fleet()
         print(
-            f"[provider {ordinal}] REPAIR/EXPORT {provider_spm.stem}",
+            f"[provider {ordinal}] ASSEMBLY/EXPORT {provider_spm.stem}",
             flush=True,
         )
         try:
@@ -763,39 +763,39 @@ def main(argv=None):
                 run_id=f"fleet_{run_id}_provider_{ordinal:03d}",
                 unreal_project=args.unreal_project,
             )
-            repair_report = (
+            assembly_report = (
                 args.log_dir
                 / (
-                    f"{provider_spm.stem}_fleet_provider_repair_"
+                    f"{provider_spm.stem}_fleet_provider_assembly_"
                     f"{run_id}_{ordinal:03d}.json"
                 )
             )
-            repair_command = build_repair_command(
+            assembly_command = build_assembly_command(
                 {"spm": provider_spm},
                 args.blender,
                 outputs["material_contract"],
-                repair_report,
+                assembly_report,
             )
-            result["repair_report"] = str(repair_report)
-            repair_completed = owned_run(
-                repair_command,
+            result["assembly_report"] = str(assembly_report)
+            assembly_completed = owned_run(
+                assembly_command,
                 source=(
-                    "sk_batch.cluster_fleet_push.provider_blender_repair"
+                    "sk_batch.cluster_fleet_push.provider_blender_assembly"
                 ),
                 run_factory=subprocess.run,
                 check=False,
             )
-            result["repair_returncode"] = repair_completed.returncode
-            if repair_completed.returncode:
+            result["assembly_returncode"] = assembly_completed.returncode
+            if assembly_completed.returncode:
                 raise RuntimeError(
-                    "provider Repair exited "
-                    f"{repair_completed.returncode}"
+                    "provider Assembly exited "
+                    f"{assembly_completed.returncode}"
                 )
-            verification = validate_provider_repair_result(repair_report)
-            result["repair_verification"] = verification
+            verification = validate_provider_assembly_result(assembly_report)
+            result["assembly_verification"] = verification
             if not verification["ok"]:
                 raise RuntimeError(
-                    "provider Repair postcondition failed: "
+                    "provider Assembly postcondition failed: "
                     + "; ".join(verification["problems"])
                 )
             completed = owned_run(
@@ -919,49 +919,49 @@ def main(argv=None):
                 run_id=f"fleet_{run_id}_{index:03d}",
                 unreal_project=args.unreal_project,
             )
-            repair_report = (
+            assembly_report = (
                 args.log_dir
-                / f"{target['stem']}_fleet_repair_{run_id}_{index:03d}.json"
+                / f"{target['stem']}_fleet_assembly_{run_id}_{index:03d}.json"
             )
-            repair_command = build_repair_command(
+            assembly_command = build_assembly_command(
                 target,
                 args.blender,
                 outputs["material_contract"],
-                repair_report,
+                assembly_report,
             )
-            result["repair_report"] = str(repair_report)
+            result["assembly_report"] = str(assembly_report)
             while True:
-                repair_completed = owned_run(
-                    repair_command,
-                    source="sk_batch.cluster_fleet_push.blender_repair",
+                assembly_completed = owned_run(
+                    assembly_command,
+                    source="sk_batch.cluster_fleet_push.blender_assembly",
                     run_factory=subprocess.run,
                     check=False,
                 )
-                result["repair_returncode"] = repair_completed.returncode
-                if repair_completed.returncode:
+                result["assembly_returncode"] = assembly_completed.returncode
+                if assembly_completed.returncode:
                     raise RuntimeError(
-                        "production Repair exited "
-                        f"{repair_completed.returncode}"
+                        "production Assembly exited "
+                        f"{assembly_completed.returncode}"
                     )
-                repair_verification = validate_repair_result(
-                    repair_report,
+                assembly_verification = validate_assembly_result(
+                    assembly_report,
                     target,
                 )
-                result["repair_verification"] = repair_verification
-                if not repair_verification["ok"]:
+                result["assembly_verification"] = assembly_verification
+                if not assembly_verification["ok"]:
                     raise RuntimeError(
-                        "production Repair postcondition failed: "
-                        + "; ".join(repair_verification["problems"])
+                        "production Assembly postcondition failed: "
+                        + "; ".join(assembly_verification["problems"])
                     )
-                if repair_verification.get("pass_through"):
+                if assembly_verification.get("pass_through"):
                     break
-                repair_payload = json.loads(
-                    repair_report.read_text(encoding="utf-8")
+                assembly_payload = json.loads(
+                    assembly_report.read_text(encoding="utf-8")
                 )
                 dependency_contract = (
                     exact_dependency_contract_from_validated_manifest(
                         target["spm"],
-                        repair_payload.get("cluster_assembly_manifest"),
+                        assembly_payload.get("cluster_assembly_manifest"),
                     )
                 )
                 current_dependencies = list(
@@ -986,8 +986,8 @@ def main(argv=None):
                         )
                 if not newly_processed:
                     break
-                result["repair_repeated_after_new_provider"] = True
-            if repair_verification.get("pass_through"):
+                result["assembly_repeated_after_new_provider"] = True
+            if assembly_verification.get("pass_through"):
                 result["status"] = "skipped_no_current_assembly"
                 result["diagnostic"] = (
                     "current receipt declares Assembly pass-through; it was "
@@ -996,8 +996,8 @@ def main(argv=None):
                 )
                 save_fleet()
                 continue
-            target["expected_parts"] = repair_verification["parts"]
-            target["expected_bindings"] = repair_verification["bindings"]
+            target["expected_parts"] = assembly_verification["parts"]
+            target["expected_bindings"] = assembly_verification["bindings"]
             completed = owned_run(
                 command,
                 source="sk_batch.cluster_fleet_push.blender_export",

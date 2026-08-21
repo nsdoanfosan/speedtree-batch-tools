@@ -18,13 +18,13 @@ from cluster_fleet_push import (  # noqa: E402
     ExactPushError,
     PushDependencyError,
     build_receipt_refresh_command,
-    build_repair_command,
+    build_assembly_command,
     checkout_headless_manifest_assets,
     discover_provider_dependencies,
     discover_current_cluster_targets,
     validate_provider_live_result,
-    validate_provider_repair_result,
-    validate_repair_result,
+    validate_provider_assembly_result,
+    validate_assembly_result,
     validate_live_result,
 )
 
@@ -142,11 +142,11 @@ class ClusterFleetPushTests(unittest.TestCase):
             "saved_manifest_execution_hint_only",
         )
 
-    def test_provider_repair_requires_push_ready_blend_and_export_objects(self):
+    def test_provider_assembly_requires_push_ready_blend_and_export_objects(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             pipeline = root / "pipeline.json"
-            report = root / "repair.json"
+            report = root / "assembly_report.json"
             pipeline.write_text(json.dumps({
                 "status": "done",
                 "cluster_source_build_contract": {
@@ -154,7 +154,7 @@ class ClusterFleetPushTests(unittest.TestCase):
                     "source_blend_committed": True,
                     "source_object": "SK_leaf_sample_Merged",
                 },
-                "repair_push_export_postcondition": {
+                "assembly_export_postcondition": {
                     "objects": [{"name": "SK_leaf_sample_01"}],
                 },
                 "import": {"material_consolidation": {
@@ -181,7 +181,7 @@ class ClusterFleetPushTests(unittest.TestCase):
             }), encoding="utf-8")
             (root / "provider.blend").write_bytes(b"blend")
 
-            result = validate_provider_repair_result(report)
+            result = validate_provider_assembly_result(report)
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["export_objects"], ["SK_leaf_sample_01"])
@@ -295,32 +295,32 @@ class ClusterFleetPushTests(unittest.TestCase):
                 str(report.resolve()),
             )
 
-    def test_fleet_repair_command_precedes_push_with_current_inputs(self):
+    def test_fleet_assembly_command_precedes_push_with_current_inputs(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             spm = root / "Tree_01.spm"
             blend = spm.with_suffix(".blend")
             blender = root / "blender.exe"
             contract = root / "material.json"
-            report = root / "repair.json"
+            report = root / "assembly_report.json"
             for path in (spm, blend, blender, contract):
                 path.write_bytes(b"current")
 
-            command = build_repair_command(
+            command = build_assembly_command(
                 {"spm": spm}, blender, contract, report
             )
 
-            self.assertIn("bwr_headless_job.py", " ".join(command))
+            self.assertIn("assembly_headless_job.py", " ".join(command))
             self.assertEqual(command[command.index("--spm") + 1], str(spm))
             self.assertEqual(
                 command[command.index("--material-contract") + 1],
                 str(contract),
             )
 
-    def test_repair_result_requires_exact_attachment_bindings(self):
+    def test_assembly_result_requires_exact_attachment_bindings(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            report = root / "repair.json"
+            report = root / "assembly_report.json"
             manifest = root / "assembly.json"
             report.write_text(json.dumps({"status": "ok"}), encoding="utf-8")
             manifest.write_text(json.dumps({
@@ -332,7 +332,7 @@ class ClusterFleetPushTests(unittest.TestCase):
                 "parts": [{"bindings": [{"id": 1}, {"id": 2}]}],
             }), encoding="utf-8")
 
-            result = validate_repair_result(
+            result = validate_assembly_result(
                 report, {"manifest": manifest}
             )
 
@@ -340,10 +340,10 @@ class ClusterFleetPushTests(unittest.TestCase):
             self.assertEqual(result["bindings"], 2)
             self.assertEqual(result["preserved_role_polygons_kept"], 3)
 
-    def test_repair_result_rejects_spatial_node_recovery_contract(self):
+    def test_assembly_result_rejects_spatial_node_recovery_contract(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            report = root / "repair.json"
+            report = root / "assembly_report.json"
             manifest = root / "assembly.json"
             report.write_text(json.dumps({"status": "ok"}), encoding="utf-8")
             manifest.write_text(json.dumps({
@@ -363,7 +363,7 @@ class ClusterFleetPushTests(unittest.TestCase):
                 "parts": [{"bindings": [{"id": 1}]}],
             }), encoding="utf-8")
 
-            result = validate_repair_result(report, {"manifest": manifest})
+            result = validate_assembly_result(report, {"manifest": manifest})
 
             self.assertFalse(result["ok"])
             self.assertIn(
@@ -371,10 +371,10 @@ class ClusterFleetPushTests(unittest.TestCase):
                 result["problems"],
             )
 
-    def test_repair_result_accepts_current_pass_through_without_stale_manifest(self):
+    def test_assembly_result_accepts_current_pass_through_without_stale_manifest(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            report = root / "repair.json"
+            report = root / "assembly_report.json"
             report.write_text(json.dumps({
                 "status": "ok",
                 "cluster_assembly_manifest": {
@@ -383,7 +383,7 @@ class ClusterFleetPushTests(unittest.TestCase):
                 },
             }), encoding="utf-8")
 
-            result = validate_repair_result(
+            result = validate_assembly_result(
                 report,
                 {"manifest": root / "stale_ready_manifest.json"},
             )
@@ -395,7 +395,7 @@ class ClusterFleetPushTests(unittest.TestCase):
     def test_pass_through_with_preserved_build_is_actionable(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            report = root / "repair.json"
+            report = root / "assembly_report.json"
             report.write_text(json.dumps({
                 "cluster_assembly_manifest": {
                     "status": "pass_through",
@@ -407,7 +407,7 @@ class ClusterFleetPushTests(unittest.TestCase):
                 },
             }), encoding="utf-8")
 
-            result = validate_repair_result(report, {})
+            result = validate_assembly_result(report, {})
 
             self.assertTrue(result["ok"])
             self.assertEqual(result["problems"], [])
@@ -416,10 +416,10 @@ class ClusterFleetPushTests(unittest.TestCase):
                 ["Base", "Assembly"],
             )
 
-    def test_repair_result_reports_role_demotion_as_diagnostic(self):
+    def test_assembly_result_reports_role_demotion_as_diagnostic(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            report = root / "repair.json"
+            report = root / "assembly_report.json"
             manifest = root / "assembly.json"
             report.write_text(json.dumps({
                 "status": "ok",
@@ -438,7 +438,7 @@ class ClusterFleetPushTests(unittest.TestCase):
                 "parts": [{"bindings": [{"id": 1}]}],
             }), encoding="utf-8")
 
-            result = validate_repair_result(
+            result = validate_assembly_result(
                 report,
                 {"manifest": manifest},
             )

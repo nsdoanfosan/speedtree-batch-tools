@@ -7,7 +7,7 @@ from pathlib import Path
 SK_BATCH_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SK_BATCH_DIR))
 
-from repair_push_evidence import export_object_postcondition  # noqa: E402
+from assembly_export_evidence import export_object_postcondition  # noqa: E402
 
 
 class FakeMaterial:
@@ -72,7 +72,7 @@ class ExportPostconditionTests(unittest.TestCase):
             [{"material_index": 0, "polygon_count": 1}],
         )
 
-    def test_missing_export_collection_is_a_repair_error(self):
+    def test_missing_export_collection_is_an_assembly_error(self):
         scene = types.SimpleNamespace(collections={})
 
         with self.assertRaisesRegex(RuntimeError, "missing Export collection"):

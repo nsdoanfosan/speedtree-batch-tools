@@ -21,7 +21,7 @@ from cluster_assembly_handoff_contract import (  # noqa: E402
     build_assembly_handoff,
     build_blender_fbx_inventory,
     classify_inventory_role,
-    current_assembly_manifest_repair_handoff,
+    current_assembly_manifest_handoff,
     file_fingerprint,
     normalize_export_name,
     _normalized_variants_ready,
@@ -116,7 +116,7 @@ class CurrentFbxRoleAuthorityTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            handoff = current_assembly_manifest_repair_handoff(
+            handoff = current_assembly_manifest_handoff(
                 spm, full_fbx
             )
 
@@ -180,7 +180,7 @@ class CurrentFbxRoleAuthorityTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            handoff = current_assembly_manifest_repair_handoff(spm, full_fbx)
+            handoff = current_assembly_manifest_handoff(spm, full_fbx)
 
             self.assertIsNone(handoff)
 
@@ -246,7 +246,7 @@ class CurrentFbxRoleAuthorityTests(unittest.TestCase):
                 },
             }), encoding="utf-8")
 
-            handoff = current_assembly_manifest_repair_handoff(
+            handoff = current_assembly_manifest_handoff(
                 spm, full_fbx
             )
 
@@ -348,7 +348,7 @@ class CurrentFbxRoleAuthorityTests(unittest.TestCase):
                 "_atlas_normalized_variants",
                 return_value=canonical,
             ) as resolver:
-                handoff = current_assembly_manifest_repair_handoff(
+                handoff = current_assembly_manifest_handoff(
                     spm, full_fbx
                 )
 

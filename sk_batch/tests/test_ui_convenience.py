@@ -144,7 +144,7 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
                 spm.parent.mkdir(parents=True, exist_ok=True)
                 spm.write_bytes(b"spm")
 
-            pass_report = gui.repair_pipeline_report_path(pass_through)
+            pass_report = gui.assembly_pipeline_report_path(pass_through)
             pass_report.parent.mkdir(parents=True, exist_ok=True)
             pass_report.write_text(
                 json.dumps({
@@ -154,7 +154,7 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
                 }),
                 encoding="utf-8",
             )
-            assembly_report = gui.repair_pipeline_report_path(assembly)
+            assembly_report = gui.assembly_pipeline_report_path(assembly)
             assembly_report.parent.mkdir(parents=True, exist_ok=True)
             assembly_report.write_text(
                 json.dumps({
@@ -268,7 +268,7 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
             ),
         ):
             ordered, dependencies, auto_added = (
-                gui.expand_blender_repair_targets(root_items, all_items)
+                gui.expand_blender_assembly_targets(root_items, all_items)
             )
 
         self.assertEqual(
@@ -300,7 +300,7 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
             return_value=[raw_tree],
         ):
             ordered, dependencies, auto_added = (
-                gui.expand_blender_repair_targets(
+                gui.expand_blender_assembly_targets(
                     [root_item],
                     [root_item, cluster_item],
                 )
@@ -357,7 +357,7 @@ class SkBatchUiConvenienceTests(unittest.TestCase):
             ])
 
             ordered, dependencies, auto_added = (
-                gui.expand_blender_repair_targets(
+                gui.expand_blender_assembly_targets(
                     [{"spm": roots[4]}],
                     items,
                 )

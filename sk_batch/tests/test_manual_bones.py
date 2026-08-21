@@ -93,7 +93,7 @@ class ManualBonesTests(unittest.TestCase):
         queued = list(app.ui_queue.queue)
         self.assertEqual(sum(kind == "done" for kind, _payload in queued), 1)
         self.assertIn(
-            ("progress", "② Blender Repair 연계 실행 완료"),
+            ("progress", "② Blender Assembly 연계 실행 완료"),
             queued,
         )
 
