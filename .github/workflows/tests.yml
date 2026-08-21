@@ -69,12 +69,12 @@ jobs:
           ref: main
           path: work/substance-tools
 
-      # The blob SHAs below are the ones PR #109 verified when it moved this
-      # checkout from a merged branch to main. Tracking a moving ref means a
-      # commit in the other repository can change what this repository's suites
-      # are measured against, silently and with no commit here. Comparing the
-      # blobs turns that comment into a live tripwire: drift is annotated and
-      # recorded in the job summary rather than discovered later as a mystery.
+      # The blob SHAs below include the cutout-opacity contract v3 merged by
+      # substance-tools PR #2. Tracking a moving ref means a commit in the other
+      # repository can change what this repository's suites are measured
+      # against, silently and with no commit here. Comparing the blobs turns
+      # that comment into a live tripwire: drift is annotated and recorded in
+      # the job summary rather than discovered later as a mystery.
       # A warning, not a failure -- an intentional contract change upstream
       # should not block every PR here, it should be visible and then followed.
       - name: point at the shared contract
@@ -89,9 +89,9 @@ jobs:
           "SUBSTANCE_TOOLS_PIPELINE_CONTRACT=$contract" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
           $expected = [ordered]@{
-            'pipeline_contract.json'          = '42a0c819'
+            'pipeline_contract.json'          = '1edbccda'
             'speedtree_handoff_contract.py'   = 'ca13f8cb'
-            'speedtree_handoff_vectors.json'  = '4628f74a'
+            'speedtree_handoff_vectors.json'  = '541d180f'
           }
           Push-Location $vendored
           $head = (git rev-parse HEAD).Trim()
@@ -162,6 +162,7 @@ jobs:
           --durations=10
           --ignore=sk_batch/tests/test_spm_calibration.py
           --ignore=sk_batch/tests/test_retry_progress.py
+          --ignore=tests/test_launch_guard.py
           --ignore=tests/test_process_lifecycle.py
           --ignore=tests/test_shared_queue_runtime.py
           --ignore=pcg_st9_texture_batch/tests/test_00_issue_42_real_projection.py
@@ -176,6 +177,13 @@ jobs:
       # receipt replace, so keep the actual Windows lifecycle coverage serial.
       - name: Windows process lifecycle tests
         run: python -m unittest tests.test_process_lifecycle
+
+      # Launch Guard's rotation test starts eight real processes and asserts
+      # that only one of them owns the file lock at a time. Nesting that
+      # process group inside a saturated xdist worker can distort the shared
+      # Value instrumentation, so keep its concurrency test single-hosted.
+      - name: Launch Guard multiprocessing tests
+        run: python -m unittest tests.test_launch_guard
 
       # Windows spawn can exceed a five-second child handshake while four
       # pytest workers are saturated. This module tests real cross-process
