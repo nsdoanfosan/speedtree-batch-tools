@@ -98,7 +98,7 @@ def load_cluster_assembly_manifest(blend_dir, spm_path):
     pipeline_path = (
         blend_dir
         / "reports"
-        / f"{spm_path.stem}_speedtree_repair_pipeline_report_codex.json"
+        / f"{spm_path.stem}_speedtree_assembly_pipeline_report_codex.json"
     )
     if pipeline_path.is_file():
         pipeline = json.loads(pipeline_path.read_text(encoding="utf-8"))

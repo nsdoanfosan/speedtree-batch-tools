@@ -397,7 +397,7 @@ def _normalization_artifact_paths(recipe):
     paths.extend([
         report_dir / (
             blend.stem
-            + "_speedtree_repair_pipeline_report_codex.json"
+            + "_speedtree_assembly_pipeline_report_codex.json"
         ),
         report_dir / f"{blend.stem}_repair_runtime_codex.json",
     ])

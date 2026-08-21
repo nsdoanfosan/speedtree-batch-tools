@@ -80,8 +80,8 @@ ADDONS = {
             "speedtree_export_v1": {
                 "operations": ["run_speedtree_cli_export"],
             },
-            "repair_pipeline_v1": {
-                "operations": ["run_import_and_repair"],
+            "assembly_pipeline_v1": {
+                "operations": ["run_import_and_assemble"],
             },
             "material_handoff_v1": {
                 "operations": [
@@ -101,8 +101,8 @@ ADDONS = {
             "run_speedtree_cli_export": (
                 "speedtree_bone_weight_repair.core:run_speedtree_cli_export"
             ),
-            "run_import_and_repair": (
-                "speedtree_bone_weight_repair.core:run_import_and_repair"
+            "run_import_and_assemble": (
+                "speedtree_bone_weight_repair.core:run_import_and_assemble"
             ),
             "consolidate_speedtree_group_materials": (
                 "speedtree_bone_weight_repair.core:"

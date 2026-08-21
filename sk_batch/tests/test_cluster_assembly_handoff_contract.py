@@ -1790,7 +1790,7 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
             }
             (
                 reports
-                / "SK_leaf_elm_01_speedtree_repair_pipeline_report_codex.json"
+                / "SK_leaf_elm_01_speedtree_assembly_pipeline_report_codex.json"
             ).write_text(json.dumps(report), encoding="utf-8")
             inventory = build_blender_fbx_inventory(
                 [role_object(fbx, material="M_leaf_elm_01")],

@@ -3350,7 +3350,7 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             pipeline_path = (
                 cluster_dir
                 / "reports"
-                / "SK_branch_elm_01_speedtree_repair_pipeline_report_codex.json"
+                / "SK_branch_elm_01_speedtree_assembly_pipeline_report_codex.json"
             )
             pipeline_path.parent.mkdir(parents=True)
             pipeline = {

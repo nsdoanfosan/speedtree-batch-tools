@@ -29,7 +29,7 @@ runtime = prepare_runtime(
         "speedtree_bone_weight_repair": (
             "spm_sk_preflight_v1",
             "speedtree_export_v1",
-            "repair_pipeline_v1",
+            "assembly_pipeline_v1",
             "material_handoff_v1",
             "atlas_manifest_consumer_v1",
         ),
@@ -55,7 +55,7 @@ assert len(runtime.receipt["addons"]) == 5, runtime.receipt
 assert runtime.operation("send2ue", "send_to_disk_path_mode")
 assert callable(
     runtime.operation(
-        "speedtree_bone_weight_repair", "run_import_and_repair"
+        "speedtree_bone_weight_repair", "run_import_and_assemble"
     )
 )
 assert callable(

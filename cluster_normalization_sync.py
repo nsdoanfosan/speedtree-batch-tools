@@ -1049,7 +1049,7 @@ def _bwr_report(blend, canonical_spm):
     report_path = (
         blend.parent
         / "reports"
-        / f"{blend.stem}_speedtree_repair_pipeline_report_codex.json"
+        / f"{blend.stem}_speedtree_assembly_pipeline_report_codex.json"
     )
     report = _read_json(report_path)
     if not report or str(report.get("status") or "").casefold() != "done":
@@ -1270,7 +1270,7 @@ def inspect_bwr_material_assignment_freshness(blend):
     report_path = (
         blend.parent
         / "reports"
-        / f"{blend.stem}_speedtree_repair_pipeline_report_codex.json"
+        / f"{blend.stem}_speedtree_assembly_pipeline_report_codex.json"
     )
     report = _read_json(report_path)
     if not report or str(report.get("status") or "").casefold() != "done":
@@ -1485,7 +1485,7 @@ def resolve_normalization_recipe(
     report_path = (
         blend.parent
         / "reports"
-        / f"{blend.stem}_speedtree_repair_pipeline_report_codex.json"
+        / f"{blend.stem}_speedtree_assembly_pipeline_report_codex.json"
     )
     if not blend.is_file():
         raise ClusterSourceBuildRequiredError(

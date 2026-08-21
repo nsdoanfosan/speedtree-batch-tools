@@ -62,7 +62,7 @@ def repair_pipeline_report_path(spm):
     return (
         spm.parent
         / "reports"
-        / f"{spm.stem}_speedtree_repair_pipeline_report_codex.json"
+        / f"{spm.stem}_speedtree_assembly_pipeline_report_codex.json"
     )
 
 

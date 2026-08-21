@@ -331,7 +331,7 @@ def _build_cluster_source(
     pipeline_report = (
         canonical_spm.parent
         / "reports"
-        / f"{canonical_spm.stem}_speedtree_repair_pipeline_report_codex.json"
+        / f"{canonical_spm.stem}_speedtree_assembly_pipeline_report_codex.json"
     )
     try:
         previous_pipeline_report = pipeline_report.read_bytes()

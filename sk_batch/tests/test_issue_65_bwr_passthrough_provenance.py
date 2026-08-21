@@ -127,7 +127,7 @@ def make_scenario(tmp_path):
         pass_through_target_spm=target_spm,
     )
     report = target_folder / "reports" / (
-        f"{target_spm.stem}_speedtree_repair_pipeline_report_codex.json"
+        f"{target_spm.stem}_speedtree_assembly_pipeline_report_codex.json"
     )
     report.parent.mkdir()
     report.write_text(
