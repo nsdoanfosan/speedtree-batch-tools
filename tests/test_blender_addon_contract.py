@@ -42,13 +42,13 @@ class BlenderAddonContractTests(unittest.TestCase):
             "test.job",
             {
                 "send2ue": ["unreal_rpc_v1", "headless_export_v1"],
-                "speedtree_bone_weight_repair": ["repair_pipeline_v1"],
+                "speedtree_bone_weight_repair": ["assembly_pipeline_v1"],
             },
         )
         second = contract.build_runtime_request(
             "test.job",
             {
-                "speedtree_bone_weight_repair": ["repair_pipeline_v1"],
+                "speedtree_bone_weight_repair": ["assembly_pipeline_v1"],
                 "send2ue": ["headless_export_v1", "unreal_rpc_v1"],
             },
         )
@@ -108,7 +108,7 @@ class BlenderAddonContractTests(unittest.TestCase):
     def test_receipt_is_bound_to_exact_request(self):
         request = contract.build_runtime_request(
             "test.job",
-            {"speedtree_bone_weight_repair": ["repair_pipeline_v1"]},
+            {"speedtree_bone_weight_repair": ["assembly_pipeline_v1"]},
         )
         receipt = {
             "schema_version": 1,
@@ -120,7 +120,7 @@ class BlenderAddonContractTests(unittest.TestCase):
                     "id": "speedtree_bone_weight_repair",
                     "status": "ready",
                     "module_file": r"C:\addon\__init__.py",
-                    "capabilities": ["repair_pipeline_v1"],
+                    "capabilities": ["assembly_pipeline_v1"],
                 }
             ],
         }
@@ -160,7 +160,7 @@ class BlenderAddonGatewayTests(unittest.TestCase):
 
         core = types.ModuleType("speedtree_bone_weight_repair.core")
         core.require_spm_sk_ready = lambda value: ("ready", value)
-        core.run_import_and_repair = lambda value: ("repaired", value)
+        core.run_import_and_assemble = lambda value: ("assembled", value)
         core.run_speedtree_cli_export = lambda **kwargs: kwargs
         core.consolidate_speedtree_group_materials = lambda *args: args
         core.load_speedtree_texture_readiness_contract = lambda *args: args
@@ -186,7 +186,7 @@ class BlenderAddonGatewayTests(unittest.TestCase):
                     {
                         "speedtree_bone_weight_repair": [
                             "spm_sk_preflight_v1",
-                            "repair_pipeline_v1",
+                            "assembly_pipeline_v1",
                         ]
                     },
                 )
@@ -226,7 +226,7 @@ class BlenderAddonGatewayTests(unittest.TestCase):
                         "test.gateway",
                         {
                             "speedtree_bone_weight_repair": [
-                                "repair_pipeline_v1"
+                                "assembly_pipeline_v1"
                             ]
                         },
                         expected_sources={

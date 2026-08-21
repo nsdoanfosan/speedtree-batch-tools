@@ -3100,7 +3100,7 @@ class PushQueueFlowTests(unittest.TestCase):
             spm.write_bytes(b"spm")
             envelope = {"source_fingerprint": "a" * 64}
             report = root / "reports" / (
-                "SK_tree_contract_01_speedtree_repair_pipeline_report_codex.json"
+                "SK_tree_contract_01_speedtree_assembly_pipeline_report_codex.json"
             )
             report.parent.mkdir()
             report.write_text(
@@ -3149,7 +3149,7 @@ class PushQueueFlowTests(unittest.TestCase):
             }
             report = cluster / "reports" / (
                 "SK_branch_test_01_"
-                "speedtree_repair_pipeline_report_codex.json"
+                "speedtree_assembly_pipeline_report_codex.json"
             )
             report.parent.mkdir()
             report.write_text(
@@ -3240,13 +3240,13 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertIn("name_stem=speedtree_spm.stem", bwr_source)
         self.assertIn("settings.name_stem = canonical_spm.stem", bwr_source)
         self.assertNotIn("canonical_spm.name[3:]", bwr_source)
-        self.assertIn('report["cluster_source_skin_contract"]', bwr_source)
+        self.assertIn('report["cluster_source_contract"]', bwr_source)
         self.assertIn(
-            'repair_settings["cluster_source_skin_contract"] = is_cluster_source',
+            'assembly_settings["cluster_source_contract"] = is_cluster_source',
             bwr_source,
         )
         self.assertIn(
-            'repair_settings["defer_cluster_export_to_normalizer"] = bool(',
+            'assembly_settings["defer_cluster_export_to_normalizer"] = bool(',
             bwr_source,
         )
         self.assertNotIn("cluster_single_bone_rigid_binding", bwr_source)

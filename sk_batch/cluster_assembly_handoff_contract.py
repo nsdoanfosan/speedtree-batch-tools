@@ -1336,7 +1336,7 @@ def _validated_isolated_bark_capture(provider_spm, canonical_material):
     report_path = (
         provider.parent
         / "reports"
-        / f"{provider.stem}_speedtree_repair_pipeline_report_codex.json"
+        / f"{provider.stem}_speedtree_assembly_pipeline_report_codex.json"
     )
     result = {
         "provider_spm": str(provider),

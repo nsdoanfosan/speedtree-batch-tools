@@ -308,7 +308,7 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
         source_xml = xml_dir / "SK_leaf_elm_01.xml"
         source_xml.write_text("<SpeedTreeRaw />", encoding="utf-8")
         report = reports / (
-            "SK_leaf_elm_01_speedtree_repair_pipeline_report_codex.json"
+            "SK_leaf_elm_01_speedtree_assembly_pipeline_report_codex.json"
         )
         report.write_text(
             json.dumps(
@@ -316,7 +316,7 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
                     "status": "done",
                     "paths": {
                         "merged_name": (
-                            "SK_leaf_elm_01_Codex_MergedSkinned_WeightsFixed"
+                            "SK_leaf_elm_01_Codex_Assembled"
                         )
                     },
                     "speedtree_live_source_identity": {
@@ -369,7 +369,7 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
             encoding="utf-8",
         )
         report_path = blend.parent / "reports" / (
-            f"{blend.stem}_speedtree_repair_pipeline_report_codex.json"
+            f"{blend.stem}_speedtree_assembly_pipeline_report_codex.json"
         )
         report = json.loads(report_path.read_text(encoding="utf-8"))
         report["cluster_bark_source_resolution"] = {
@@ -682,7 +682,7 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
                 / "reports"
                 / (
                     blend.stem
-                    + "_speedtree_repair_pipeline_report_codex.json"
+                    + "_speedtree_assembly_pipeline_report_codex.json"
                 )
             )
             report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -717,7 +717,7 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
                 / "reports"
                 / (
                     blend.stem
-                    + "_speedtree_repair_pipeline_report_codex.json"
+                    + "_speedtree_assembly_pipeline_report_codex.json"
                 )
             )
             report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -742,7 +742,7 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
                 / "reports"
                 / (
                     blend.stem
-                    + "_speedtree_repair_pipeline_report_codex.json"
+                    + "_speedtree_assembly_pipeline_report_codex.json"
                 )
             )
             report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -982,7 +982,7 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
             source_xml.write_text("<SpeedTreeRaw />", encoding="utf-8")
             report = reports / (
                 "SK_cluster_densiflora_02_"
-                "speedtree_repair_pipeline_report_codex.json"
+                "speedtree_assembly_pipeline_report_codex.json"
             )
             report.write_text(
                 json.dumps(
@@ -1148,7 +1148,7 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             blend, source, target, unit_probe = self.fixture(temporary)
             report = blend.parent / "reports" / (
-                f"{blend.stem}_speedtree_repair_pipeline_report_codex.json"
+                f"{blend.stem}_speedtree_assembly_pipeline_report_codex.json"
             )
             payload = json.loads(report.read_text(encoding="utf-8"))
             payload["speedtree_material_intents"] = {

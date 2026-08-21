@@ -83,7 +83,7 @@ from cluster_assembly_handoff_contract import (
 from cluster_assembly_builder import build_blender_assembly_inputs
 from spm_audit import is_cluster_normalization_spm
 from job_report_contract import mark_job_failed
-from repair_runtime_contract import REPAIR_OUTPUT_CONTRACT_VERSION
+from repair_runtime_contract import ASSEMBLY_OUTPUT_CONTRACT_VERSION
 from cluster_export_handoff_contract import (
     capture_cluster_export_snapshot,
     cluster_export_contract_issues as inspect_cluster_export_contract,
@@ -577,7 +577,7 @@ def main():
             {
                 "speedtree_bone_weight_repair": (
                     "speedtree_export_v1",
-                    "repair_pipeline_v1",
+                    "assembly_pipeline_v1",
                     "atlas_manifest_consumer_v1",
                 ),
             },
@@ -592,9 +592,9 @@ def main():
             "speedtree_bone_weight_repair",
             "run_speedtree_cli_export",
         )
-        run_import_and_repair = addon_runtime.operation(
+        run_import_and_assemble = addon_runtime.operation(
             "speedtree_bone_weight_repair",
-            "run_import_and_repair",
+            "run_import_and_assemble",
         )
 
         blend_path = os.path.abspath(args.blend)
@@ -681,16 +681,16 @@ def main():
         settings.wind_preset = "WEED" if args.wind == "GRASS" else args.wind
         settings.write_unreal_json = True
         settings.write_dynamic_wind_json = True
-        report["cluster_source_skin_contract"] = {
+        report["cluster_source_contract"] = {
             "requested": is_cluster_source,
             "policy": (
-                "canonicalize_xml_render_root_axes_preserve_authored_skin_or_bind_unskinned_single_axis"
+                "native_speedtree_skin_passthrough_export_ownership_only"
                 if is_cluster_source
                 else "not_applicable"
             ),
         }
         # The additive Assembly stage fingerprints the existing Full SK FBX;
-        # keep the established BWR Full export enabled instead of synthesizing
+        # keep the established Full export enabled instead of synthesizing
         # a second, differently-configured Full mesh inside the builder.
         settings.export_fbx = True
 
@@ -703,7 +703,7 @@ def main():
             bpy.ops.wm.save_as_mainfile(filepath=blend_path)
 
         # The add-on UI operator uses one name_stem for both the SpeedTree
-        # export and the repaired Blender output.  Cluster pairs deliberately
+        # export and the assembled Blender output. Cluster pairs deliberately
         # have two identities, so perform those two existing core stages with
         # explicit stems instead of deriving one by removing ``SK_``.
         report["atlas_manifest_resolution"] = (
@@ -769,7 +769,7 @@ def main():
         # A content-driven Assembly receipt can legitimately be written before
         # its authoritative general-tree FBX exists.  Do not silently degrade
         # that Tree to a Full-SK-only import: export the exact source SPM named
-        # by the receipt, then reconcile the actual FBX before repair continues.
+        # by the receipt, then reconcile the actual FBX before assembly continues.
         if (
             cluster_assembly_contract is not None
             and cluster_assembly_handoff is None
@@ -940,27 +940,27 @@ def main():
         if xml_export.get("exists"):
             settings.xml_path = xml_export["path"]
         settings.name_stem = canonical_spm.stem
-        repair_settings = settings.as_dict()
-        repair_settings["cluster_source_skin_contract"] = is_cluster_source
+        assembly_settings = settings.as_dict()
+        assembly_settings["cluster_source_contract"] = is_cluster_source
         # This job appends the final handoff/Assembly summary and writes the
         # authoritative report once.  The add-on must not write an incomplete
         # intermediate copy immediately before that final write.
-        repair_settings["defer_pipeline_report_write"] = True
+        assembly_settings["defer_pipeline_report_write"] = True
         # A Cluster source is parked outside Send2UE only when this invocation
         # is the raw producer for the downstream Cluster Normalizer. Standalone
         # Cluster assets have no later stage that can create ordinal Export
         # pivots, so they must build the normal final Export structure here.
-        repair_settings["defer_cluster_export_to_normalizer"] = bool(
+        assembly_settings["defer_cluster_export_to_normalizer"] = bool(
             args.cluster_source_build_only
         )
-        repair_settings["source_identity_path"] = str(canonical_spm)
+        assembly_settings["source_identity_path"] = str(canonical_spm)
         canonical_source_fbx = (
             canonical_spm.parent
             / "fbx"
             / f"{canonical_spm.stem}.fbx"
         ).resolve()
         if canonical_source_fbx != Path(fbx_export["path"]).resolve():
-            repair_settings["source_fbx_cleanup_aliases"] = [
+            assembly_settings["source_fbx_cleanup_aliases"] = [
                 str(canonical_source_fbx)
             ]
         cluster_export_snapshot = None
@@ -969,12 +969,32 @@ def main():
                 bpy.data,
                 canonical_spm.stem,
             )
-        blender_repair_started = perf_counter()
-        result = run_import_and_repair(repair_settings)
+        blender_assembly_started = perf_counter()
+        result = run_import_and_assemble(assembly_settings)
         record_stage_duration(
             report,
-            "blender_import_and_repair",
-            blender_repair_started,
+            "blender_import_and_assemble",
+            blender_assembly_started,
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError(
+                "SpeedTree Assembly did not return a pipeline report"
+            )
+        native_skin_steps = [
+            step
+            for step in result.get("steps", [])
+            if isinstance(step, dict) and step.get("name") == "merge_export"
+        ]
+        if (
+            len(native_skin_steps) != 1
+            or native_skin_steps[0].get("native_skin_passthrough") is not True
+        ):
+            raise RuntimeError(
+                "SpeedTree Assembly did not prove native skin passthrough"
+            )
+        result["native_skin_passthrough"] = True
+        result["assembly_output_contract_version"] = (
+            ASSEMBLY_OUTPUT_CONTRACT_VERSION
         )
         unassigned_geometry_cleanup = result.get(
             "unassigned_geometry_cleanup"
@@ -982,7 +1002,7 @@ def main():
         if not isinstance(unassigned_geometry_cleanup, dict):
             unassigned_geometry_cleanup = {
                 "status": "diagnostic_only",
-                "policy": "completed_repair_is_authoritative_v1",
+                "policy": "completed_assembly_is_authoritative_v1",
                 "telemetry_present": False,
                 "cleanup_applied": None,
                 "message": (
@@ -990,8 +1010,8 @@ def main():
                     "unassigned-geometry cleanup telemetry."
                 ),
             }
-        report["repair_output_contract_version"] = (
-            REPAIR_OUTPUT_CONTRACT_VERSION
+        report["assembly_output_contract_version"] = (
+            ASSEMBLY_OUTPUT_CONTRACT_VERSION
         )
         report["unassigned_geometry_cleanup"] = (
             unassigned_geometry_cleanup
@@ -1007,7 +1027,7 @@ def main():
                 reconcile_transient_cluster_export_root(
                     bpy.data,
                     bpy.data.collections.get(
-                        repair_settings.get(
+                        assembly_settings.get(
                             "source_collection_name",
                             "SpeedTree_Source",
                         )
@@ -1054,12 +1074,12 @@ def main():
                     json_dir, f"{stem}_dynamic_wind_import_from_megaplant_groups.json"
                 ),
                 "pipeline_report": os.path.join(
-                    blend_dir, "reports", f"{stem}_speedtree_repair_pipeline_report_codex.json"
+                    blend_dir, "reports", f"{stem}_speedtree_assembly_pipeline_report_codex.json"
                 ),
             }
         )
         pipeline_path = Path(report["pipeline_report"])
-        # run_import_and_repair already returns the authoritative pipeline
+        # run_import_and_assemble already returns the authoritative pipeline
         # payload.  Keep it in memory so the batch job can append its final
         # handoff data and write the report once, without requiring an
         # incomplete intermediate report on disk.

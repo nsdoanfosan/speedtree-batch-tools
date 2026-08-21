@@ -368,7 +368,7 @@ class ClusterSourcePrepareTests(unittest.TestCase):
             pipeline_report = (
                 spm.parent
                 / "reports"
-                / "SK_branch_01_speedtree_repair_pipeline_report_codex.json"
+                / "SK_branch_01_speedtree_assembly_pipeline_report_codex.json"
             )
             pipeline_report.parent.mkdir(parents=True)
             previous = b'{"status":"done","handoff_preflight":{"status":"ok"}}'

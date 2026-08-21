@@ -16,13 +16,13 @@ REPAIR_RUNTIME_RECEIPT_VERSION = 2
 # Increment this only when an existing saved Blender Repair result is no
 # longer semantically valid.  Source-file hashes below are diagnostics, not a
 # cache-invalidation contract.
-REPAIR_OUTPUT_CONTRACT_VERSION = 2
+ASSEMBLY_OUTPUT_CONTRACT_VERSION = 3
 # Runtime receipt schemas that predate ``output_contract_version`` all
 # describe this original saved-output contract.  Receipt schema revisions and
 # producer hashes are deliberately not cache invalidators.
-LEGACY_REPAIR_OUTPUT_CONTRACT_VERSION = 1
+LEGACY_ASSEMBLY_OUTPUT_CONTRACT_VERSION = 1
 UNASSIGNED_GEOMETRY_CLEANUP_POLICY = (
-    "discard_unassigned_geometry_before_repair"
+    "discard_unassigned_geometry_before_assembly"
 )
 UNASSIGNED_GEOMETRY_CLEANUP_CONTRACT_VERSION = 2
 UNASSIGNED_GEOMETRY_CLEANUP_OUTPUT_CONTRACT_VERSION = 2
@@ -766,7 +766,7 @@ def repair_runtime_output_contract(payload):
         return None
     value = payload.get("output_contract_version")
     if value is None:
-        return LEGACY_REPAIR_OUTPUT_CONTRACT_VERSION
+        return LEGACY_ASSEMBLY_OUTPUT_CONTRACT_VERSION
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -783,10 +783,9 @@ def repair_pipeline_output_contract(
 ):
     """Infer the saved-output contract from positive pipeline evidence.
 
-    Contract v2 requires raw Default/empty-material geometry cleanup before
-    bounds, skinning, weight repair, and merge.  A missing or corrupt runtime
-    receipt must never upgrade a legacy blend merely because its older content
-    hashes are otherwise current; only the new cleanup report proves v2.
+    Contract v2 proves the exact unassigned-geometry cleanup contract.
+    Contract v3 additionally proves that Blender preserved the native FBX skin
+    without reconstructing or modifying bone weights.
     """
     try:
         validate_unassigned_geometry_cleanup_evidence(
@@ -817,8 +816,22 @@ def repair_pipeline_output_contract(
             )
         _validate_export_postcondition(payload, handoff.get("status"))
     except (OSError, RepairPipelineEvidenceError, TypeError, ValueError):
-        return LEGACY_REPAIR_OUTPUT_CONTRACT_VERSION
-    return UNASSIGNED_GEOMETRY_CLEANUP_OUTPUT_CONTRACT_VERSION
+        return LEGACY_ASSEMBLY_OUTPUT_CONTRACT_VERSION
+    claimed_contract = payload.get("assembly_output_contract_version")
+    if claimed_contract is None:
+        return UNASSIGNED_GEOMETRY_CLEANUP_OUTPUT_CONTRACT_VERSION
+    try:
+        claimed_contract = int(claimed_contract)
+    except (TypeError, ValueError):
+        return LEGACY_ASSEMBLY_OUTPUT_CONTRACT_VERSION
+    if claimed_contract == UNASSIGNED_GEOMETRY_CLEANUP_OUTPUT_CONTRACT_VERSION:
+        return claimed_contract
+    if (
+        claimed_contract == ASSEMBLY_OUTPUT_CONTRACT_VERSION
+        and payload.get("native_skin_passthrough") is True
+    ):
+        return claimed_contract
+    return LEGACY_ASSEMBLY_OUTPUT_CONTRACT_VERSION
 
 
 def repair_runtime_receipt_needs_migration(payload):
@@ -833,7 +846,7 @@ def repair_runtime_receipt_needs_migration(payload):
         return True
     if schema_version != REPAIR_RUNTIME_RECEIPT_VERSION:
         return True
-    if repair_runtime_output_contract(payload) != REPAIR_OUTPUT_CONTRACT_VERSION:
+    if repair_runtime_output_contract(payload) != ASSEMBLY_OUTPUT_CONTRACT_VERSION:
         return True
     if "output_contract_version" not in payload:
         return True
@@ -880,7 +893,7 @@ def migrate_repair_runtime_receipt(spm, payload, *, addon_dir=None):
     migrated.update({
         "kind": "sk_repair_runtime",
         "version": REPAIR_RUNTIME_RECEIPT_VERSION,
-        "output_contract_version": REPAIR_OUTPUT_CONTRACT_VERSION,
+        "output_contract_version": ASSEMBLY_OUTPUT_CONTRACT_VERSION,
     })
     if addon_dir is not None:
         migrated["addon_dir"] = str(addon_dir)
@@ -910,7 +923,7 @@ def write_repair_runtime_receipt(
     spm = Path(spm)
     if pipeline is None:
         pipeline_path = spm.parent / "reports" / (
-            f"{spm.stem}_speedtree_repair_pipeline_report_codex.json"
+            f"{spm.stem}_speedtree_assembly_pipeline_report_codex.json"
         )
         try:
             pipeline = json.loads(pipeline_path.read_text(encoding="utf-8"))
@@ -920,7 +933,7 @@ def write_repair_runtime_receipt(
         pipeline,
         spm=spm,
         blend=blend or spm.with_suffix(".blend"),
-    ) != REPAIR_OUTPUT_CONTRACT_VERSION:
+    ) != ASSEMBLY_OUTPUT_CONTRACT_VERSION:
         return None
     addon_dir = addon_dir or addon_dir_from_config(cfg)
     if addon_dir is None:
@@ -936,7 +949,7 @@ def write_repair_runtime_receipt(
     payload = {
         "kind": "sk_repair_runtime",
         "version": REPAIR_RUNTIME_RECEIPT_VERSION,
-        "output_contract_version": REPAIR_OUTPUT_CONTRACT_VERSION,
+        "output_contract_version": ASSEMBLY_OUTPUT_CONTRACT_VERSION,
         "addon_dir": str(addon_dir),
         "code": state,
     }

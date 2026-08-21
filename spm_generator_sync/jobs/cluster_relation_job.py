@@ -100,7 +100,7 @@ def finalize_cluster_source_pipeline(recipe):
     report_path = (
         blend.parent
         / "reports"
-        / f"{blend.stem}_speedtree_repair_pipeline_report_codex.json"
+        / f"{blend.stem}_speedtree_assembly_pipeline_report_codex.json"
     )
     payload = json.loads(report_path.read_text(encoding="utf-8"))
     blend_stat = blend.stat()
