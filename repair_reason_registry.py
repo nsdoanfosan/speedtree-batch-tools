@@ -1116,7 +1116,7 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
         "cluster_source_integrity",
     ),
     "missing_pipeline_report": ReasonRow(
-        UNCLASSIFIED, "sk_batch/jobs/bwr_headless_job.py", "",
+        UNCLASSIFIED, "sk_batch/jobs/assembly_headless_job.py", "",
     ),
     "missing_spm_identity": ReasonRow(
         UNCLASSIFIED, "atlas_manifest_resolver.py", "",
@@ -1127,7 +1127,7 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "multiple_unsuffixed_export_roots": ReasonRow(
         UNCLASSIFIED, "cluster_export_handoff_contract.py", "",
     ),
-    "new_exact_bwr_source_hierarchy": ReasonRow(
+    "new_exact_assembly_source_hierarchy": ReasonRow(
         UNCLASSIFIED, "cluster_export_handoff_contract.py", "",
     ),
     "no_cluster_assembly_roles": ReasonRow(
@@ -2171,7 +2171,7 @@ _classify(
 _classify(
     INFORMATIONAL, "cluster_handoff_diagnostic",
     "cluster_missing_normalized_export_pivot", "missing_export_collection",
-    "multiple_unsuffixed_export_roots", "new_exact_bwr_source_hierarchy",
+    "multiple_unsuffixed_export_roots", "new_exact_assembly_source_hierarchy",
     "no_unsuffixed_export_root", "persisted_unsuffixed_export_root",
     "assembly_source_fbx_pending_export", "hash_validated_cluster_assembly_source",
     "no_cluster_assembly_roles",

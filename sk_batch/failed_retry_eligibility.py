@@ -65,7 +65,7 @@ BLENDER_EXPORT_RETRY_FAILURE_KINDS = frozenset({
     "unreal_unavailable",
 })
 
-# These states come from App._repair_output_state, whose positive decisions
+# These states come from App._assembly_output_state, whose positive decisions
 # validate the current SPM/report/material/assembly/wind fingerprint contracts.
 # Every listed negative state is repairable by a full forced pipeline. Unknown
 # states fail closed instead of being silently treated as stale.

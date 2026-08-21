@@ -1,6 +1,6 @@
 """Shared Cluster source-build and final Export handoff contract.
 
-The BWR source-build stage intentionally runs before the Cluster Normalizer.
+The Assembly source-build stage intentionally runs before the Cluster Normalizer.
 At that point the Send2UE ``Export`` collection is an output that may not exist
 yet.  This module keeps that temporary state explicit and provides the same
 structural inspection to both stages, so a pending raw source can never be
@@ -38,11 +38,11 @@ def _normalized_source_path(value):
 
 
 def capture_cluster_export_snapshot(blender_data, cluster_source_stem):
-    """Capture persisted Export ownership before BWR mutates the scene.
+    """Capture persisted Export ownership before Assembly mutates the scene.
 
     Object pointers distinguish objects authored in the loaded blend from
     objects created by the current FBX import.  The unsuffixed-name snapshot is
-    retained separately so an owned object removed and recreated by BWR cannot
+    retained separately so an owned object removed and recreated by Assembly cannot
     make a persisted ambiguous root look transient.
     """
 
@@ -89,10 +89,10 @@ def reconcile_transient_cluster_export_root(
     source_identity_path,
     before_snapshot,
 ):
-    """Move one proven current-run BWR Export hierarchy out of Send2UE.
+    """Move one proven current-run Assembly Export hierarchy out of Send2UE.
 
     A standalone Cluster blend may already contain normalized ordinal pivots.
-    BWR additionally builds a Full-SK reference hierarchy for the current FBX;
+    Assembly additionally builds a Full-SK reference hierarchy for the current FBX;
     that hierarchy belongs in ``SpeedTree_Source``, not alongside the persisted
     pivots in ``Export``.  Reconciliation is fail-closed unless the unsuffixed
     root and every connected Export member are new and carry both the exact
@@ -227,7 +227,7 @@ def reconcile_transient_cluster_export_root(
     base_report.update(
         {
             "status": "reconciled",
-            "reason": "new_exact_bwr_source_hierarchy",
+            "reason": "new_exact_assembly_source_hierarchy",
             "moved_export_objects": [obj.name for obj in moved],
         }
     )
@@ -348,10 +348,10 @@ def finalize_cluster_pipeline_payload(
     if status in FINAL_HANDOFF_STATUSES or not status:
         if (
             export_postcondition is not None
-            and result.get("repair_push_export_postcondition")
+            and result.get("assembly_export_postcondition")
             != export_postcondition
         ):
-            result["repair_push_export_postcondition"] = copy.deepcopy(
+            result["assembly_export_postcondition"] = copy.deepcopy(
                 export_postcondition
             )
             return result, True
@@ -388,7 +388,7 @@ def finalize_cluster_pipeline_payload(
     source_build["final_export_verified"] = True
     result["cluster_source_build_contract"] = source_build
     if export_postcondition is not None:
-        result["repair_push_export_postcondition"] = copy.deepcopy(
+        result["assembly_export_postcondition"] = copy.deepcopy(
             export_postcondition
         )
     return result, True

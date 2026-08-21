@@ -15,13 +15,13 @@ from types import SimpleNamespace
 from unittest import mock
 
 from atlas_target_registry import TargetRegistryError
-from sk_batch.repair_runtime_contract import (
+from sk_batch.assembly_runtime_contract import (
     ASSEMBLY_OUTPUT_CONTRACT_VERSION,
-    RepairPipelineEvidenceError,
-    repair_pipeline_output_contract,
-    repair_runtime_receipt_path,
+    AssemblyPipelineEvidenceError,
+    assembly_pipeline_output_contract,
+    assembly_runtime_receipt_path,
     validate_unassigned_geometry_cleanup_evidence,
-    write_repair_runtime_receipt,
+    write_assembly_runtime_receipt,
 )
 from speedtree_pipeline_contract import build_preflight_envelope, source_identity
 
@@ -485,7 +485,7 @@ class BlendLiveStatusTests(unittest.TestCase):
         self.assertNotIn("blend_status_error", app.state[iid])
         self.assertNotIn("blend_status_result", app.state[iid])
 
-    def test_legacy_report_without_pipeline_contract_requires_repair(self):
+    def test_legacy_report_without_pipeline_contract_requires_assembly(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as temporary:
@@ -512,7 +512,7 @@ class BlendLiveStatusTests(unittest.TestCase):
 
             self.assertFalse(ready)
             self.assertIn("공통 SpeedTree 계약 정보 없음", reason)
-            self.assertIn("Repair 필요", app._blend_status_text(spm))
+            self.assertIn("Assembly 필요", app._blend_status_text(spm))
 
     def test_legacy_report_with_exact_source_identity_migrates_without_repair(
         self,
@@ -525,7 +525,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             blend = spm.with_suffix(".blend")
             write_empty_spm(spm)
             blend.write_bytes(b"blend")
-            report = gui.repair_pipeline_report_path(spm)
+            report = gui.assembly_pipeline_report_path(spm)
             report.parent.mkdir()
             report.write_text(
                 json.dumps({
@@ -544,7 +544,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.set_time(blend, 1_000_000_000)
             self.set_time(report, 2_000_000_000)
 
-            self.assertTrue(app._repair_contract_current(spm))
+            self.assertTrue(app._assembly_contract_current(spm))
             migrated = json.loads(report.read_text(encoding="utf-8"))
             self.assertEqual(
                 migrated["report_contract_migration"]["kind"],
@@ -569,7 +569,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             spm.write_bytes(gzip.compress(
                 b"<SpeedTreeModel><Assets><Changed /></Assets></SpeedTreeModel>"
             ))
-            report = gui.repair_pipeline_report_path(spm)
+            report = gui.assembly_pipeline_report_path(spm)
             report.parent.mkdir()
             original = {
                 "speedtree_live_source_identity": {"spm": stale_identity},
@@ -580,7 +580,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.set_time(blend, 1_000_000_000)
             self.set_time(report, 2_000_000_000)
 
-            self.assertFalse(app._repair_contract_current(spm))
+            self.assertFalse(app._assembly_contract_current(spm))
             self.assertNotIn(
                 "speedtree_pipeline_contract",
                 json.loads(report.read_text(encoding="utf-8")),
@@ -607,7 +607,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                     "stmat": [],
                 },
             }
-            report = gui.repair_pipeline_report_path(spm)
+            report = gui.assembly_pipeline_report_path(spm)
             report.parent.mkdir()
             payload = {
                 "speedtree_pipeline_contract": {"legacy": True},
@@ -633,7 +633,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 gui,
                 "validate_preflight_envelope",
             ) as validate:
-                loaded = gui.load_current_repair_pipeline_report(spm)
+                loaded = gui.load_current_assembly_pipeline_report(spm)
 
             self.assertEqual(loaded, payload)
             self.assertEqual(report.read_bytes(), before)
@@ -655,7 +655,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             write_empty_spm(isolated)
             production_identity = source_identity(spm)
             isolated_identity = source_identity(isolated)
-            report = gui.repair_pipeline_report_path(spm)
+            report = gui.assembly_pipeline_report_path(spm)
             report.parent.mkdir()
             payload = {
                 "speedtree_pipeline_contract": {"outcome": "ok"},
@@ -676,7 +676,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 ValueError,
                 "no exact material handoff contract",
             ):
-                gui.load_current_repair_pipeline_report(spm)
+                gui.load_current_assembly_pipeline_report(spm)
 
             self.assertEqual(report.read_bytes(), before)
 
@@ -690,7 +690,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             blend = spm.with_suffix(".blend")
             write_empty_spm(spm)
             blend.write_bytes(b"blend")
-            report = gui.repair_pipeline_report_path(spm)
+            report = gui.assembly_pipeline_report_path(spm)
             report.parent.mkdir()
             payload = {
                 "speedtree_live_source_identity": {
@@ -712,7 +712,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                     }],
                 },
             ):
-                migrated = gui.load_current_repair_pipeline_report(spm)
+                migrated = gui.load_current_assembly_pipeline_report(spm)
 
             self.assertEqual(
                 migrated["speedtree_pipeline_contract"]["material_intents"][0]
@@ -858,7 +858,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             app._leaf_reference_ready = mock.Mock(return_value=(True, "정상"))
 
             with mock.patch.object(gui, "validate_preflight_envelope"):
-                self.assertTrue(app._repair_contract_current(spm))
+                self.assertTrue(app._assembly_contract_current(spm))
                 self.assertEqual(
                     app._blend_status_text(spm),
                     "Blend 완료 · 원본 검토 필요 · Unreal Push 차단",
@@ -876,7 +876,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             app.force_rerun = False
             app.log = mock.Mock()
             app._leaf_reference_ready = mock.Mock(return_value=(True, "ok"))
-            app._repair_output_state = mock.Mock(return_value={
+            app._assembly_output_state = mock.Mock(return_value={
                 "current": True,
                 "push_ready": False,
                 "kind": "source_review",
@@ -911,13 +911,13 @@ class BlendLiveStatusTests(unittest.TestCase):
                     "current receipt must not trigger a new live audit"
                 )
             )
-            app._repair_output_state = mock.Mock(return_value={
+            app._assembly_output_state = mock.Mock(return_value={
                 "current": True,
                 "push_ready": True,
                 "kind": "ready",
                 "reason": "ready",
             })
-            app._publish_current_repair_skip = mock.Mock(return_value=True)
+            app._publish_current_assembly_skip = mock.Mock(return_value=True)
 
             app._job_blender(
                 str(spm),
@@ -928,8 +928,8 @@ class BlendLiveStatusTests(unittest.TestCase):
                 },
             )
 
-            app._repair_output_state.assert_called_once_with(spm)
-            app._publish_current_repair_skip.assert_called_once()
+            app._assembly_output_state.assert_called_once_with(spm)
+            app._publish_current_assembly_skip.assert_called_once()
             app._refresh_stale_cluster_receipt.assert_not_called()
 
     def test_repair_code_newer_than_saved_outputs_does_not_force_rerun(self):
@@ -961,9 +961,9 @@ class BlendLiveStatusTests(unittest.TestCase):
             app.cfg = {"fbx_ini": str(fbx_ini)}
             app._leaf_reference_ready = mock.Mock(return_value=(True, "정상"))
             self._write_cleanup_contract_evidence(spm)
-            app._write_repair_runtime_receipt(spm)
+            app._write_assembly_runtime_receipt(spm)
 
-            ready, reason = app._repair_runtime_fresh(spm)
+            ready, reason = app._assembly_runtime_fresh(spm)
 
             self.assertTrue(ready, reason)
             self.assertEqual(reason, "")
@@ -1172,7 +1172,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 "sha256": hashlib.sha256(blend.read_bytes()).hexdigest(),
             },
             "handoff_preflight": {"status": "ok"},
-            "repair_push_export_postcondition": cls._export_postcondition(),
+            "assembly_export_postcondition": cls._export_postcondition(),
         }
 
     @classmethod
@@ -1208,10 +1208,10 @@ class BlendLiveStatusTests(unittest.TestCase):
             app._leaf_reference_ready = mock.Mock(return_value=(True, "정상"))
             app.log = mock.Mock()
 
-            fresh, reason = app._repair_runtime_fresh(spm)
+            fresh, reason = app._assembly_runtime_fresh(spm)
             self.assertTrue(fresh, reason)
             self.assertEqual(reason, "")
-            self.assertFalse(app._repair_runtime_receipt_path(spm).is_file())
+            self.assertFalse(app._assembly_runtime_receipt_path(spm).is_file())
 
     def test_cleanup_evidence_does_not_require_runtime_receipt_migration(self):
         gui = load_gui_module()
@@ -1222,12 +1222,12 @@ class BlendLiveStatusTests(unittest.TestCase):
             self._write_cleanup_contract_evidence(spm)
             app.cfg = {"fbx_ini": str(fbx_ini)}
             app.log = mock.Mock()
-            app._repair_contract_current = mock.Mock(return_value=True)
+            app._assembly_contract_current = mock.Mock(return_value=True)
 
-            fresh, reason = app._repair_runtime_fresh(spm)
+            fresh, reason = app._assembly_runtime_fresh(spm)
 
             self.assertTrue(fresh, reason)
-            self.assertFalse(app._repair_runtime_receipt_path(spm).exists())
+            self.assertFalse(app._assembly_runtime_receipt_path(spm).exists())
 
     def test_runtime_receipt_stays_current_when_addon_code_changes(self):
         gui = load_gui_module()
@@ -1238,12 +1238,12 @@ class BlendLiveStatusTests(unittest.TestCase):
             app.cfg = {"fbx_ini": str(fbx_ini)}
             app.log = mock.Mock()
             self._write_cleanup_contract_evidence(spm)
-            app._write_repair_runtime_receipt(spm)
-            self.assertTrue(app._repair_runtime_fresh(spm)[0])
+            app._write_assembly_runtime_receipt(spm)
+            self.assertTrue(app._assembly_runtime_fresh(spm)[0])
 
             core.write_text("# edited again", encoding="utf-8")
 
-            fresh, reason = app._repair_runtime_fresh(spm)
+            fresh, reason = app._assembly_runtime_fresh(spm)
             self.assertTrue(fresh, reason)
             self.assertEqual(reason, "")
 
@@ -1257,16 +1257,16 @@ class BlendLiveStatusTests(unittest.TestCase):
             producer.write_text("# producer v1", encoding="utf-8")
             app.cfg = {"fbx_ini": str(fbx_ini)}
             app.log = mock.Mock()
-            app._repair_runtime_code_paths = mock.Mock(
+            app._assembly_runtime_code_paths = mock.Mock(
                 return_value=[core, producer]
             )
             self._write_cleanup_contract_evidence(spm)
-            app._write_repair_runtime_receipt(spm)
-            self.assertTrue(app._repair_runtime_fresh(spm)[0])
+            app._write_assembly_runtime_receipt(spm)
+            self.assertTrue(app._assembly_runtime_fresh(spm)[0])
 
             producer.write_text("# producer v2", encoding="utf-8")
 
-            fresh, reason = app._repair_runtime_fresh(spm)
+            fresh, reason = app._assembly_runtime_fresh(spm)
             self.assertTrue(fresh, reason)
             self.assertEqual(reason, "")
 
@@ -1279,15 +1279,15 @@ class BlendLiveStatusTests(unittest.TestCase):
             app.cfg = {"fbx_ini": str(fbx_ini)}
             app.log = mock.Mock()
             self._write_cleanup_contract_evidence(spm)
-            app._write_repair_runtime_receipt(spm)
-            receipt_path = app._repair_runtime_receipt_path(spm)
+            app._write_assembly_runtime_receipt(spm)
+            receipt_path = app._assembly_runtime_receipt_path(spm)
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
             receipt["output_contract_version"] = (
                 ASSEMBLY_OUTPUT_CONTRACT_VERSION + 1
             )
             receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
 
-            fresh, reason = app._repair_runtime_fresh(spm)
+            fresh, reason = app._assembly_runtime_fresh(spm)
 
             self.assertTrue(fresh, reason)
             self.assertEqual(reason, "")
@@ -1304,29 +1304,29 @@ class BlendLiveStatusTests(unittest.TestCase):
             spm, _core, fbx_ini = self._runtime_stale_fixture(root)
             self._write_cleanup_contract_evidence(spm)
             app.cfg = {"fbx_ini": str(fbx_ini)}
-            receipt_path = app._repair_runtime_receipt_path(spm)
+            receipt_path = app._assembly_runtime_receipt_path(spm)
             receipt_path.write_text(
                 json.dumps({
-                    "kind": "sk_repair_runtime",
+                    "kind": "sk_assembly_runtime",
                     "version": 1,
                     "code": {"addon/core.py": "legacy-diagnostic-hash"},
                 }),
                 encoding="utf-8",
             )
             app.log = mock.Mock()
-            app._repair_contract_current = mock.Mock(return_value=True)
-            app._repair_runtime_code_state = mock.Mock(
+            app._assembly_contract_current = mock.Mock(return_value=True)
+            app._assembly_runtime_code_state = mock.Mock(
                 side_effect=AssertionError(
                     "legacy receipt migration must not rehash producer code"
                 )
             )
 
-            fresh, reason = app._repair_runtime_fresh(spm)
+            fresh, reason = app._assembly_runtime_fresh(spm)
 
             self.assertTrue(fresh, reason)
             diagnostic = json.loads(receipt_path.read_text(encoding="utf-8"))
             self.assertEqual(diagnostic["version"], 1)
-            app._repair_runtime_code_state.assert_not_called()
+            app._assembly_runtime_code_state.assert_not_called()
 
     def test_version_one_runtime_receipt_never_blocks_current_export(
         self,
@@ -1338,17 +1338,17 @@ class BlendLiveStatusTests(unittest.TestCase):
             spm, _core, fbx_ini = self._runtime_stale_fixture(root)
             self._write_cleanup_contract_evidence(spm)
             app.cfg = {"fbx_ini": str(fbx_ini)}
-            receipt_path = app._repair_runtime_receipt_path(spm)
+            receipt_path = app._assembly_runtime_receipt_path(spm)
             legacy = {
-                "kind": "sk_repair_runtime",
+                "kind": "sk_assembly_runtime",
                 "version": 1,
                 "code": {"addon/core.py": "legacy-diagnostic-hash"},
             }
             receipt_path.write_text(json.dumps(legacy), encoding="utf-8")
             app.log = mock.Mock()
-            app._repair_contract_current = mock.Mock(return_value=False)
+            app._assembly_contract_current = mock.Mock(return_value=False)
 
-            fresh, reason = app._repair_runtime_fresh(spm)
+            fresh, reason = app._assembly_runtime_fresh(spm)
 
             self.assertTrue(fresh, reason)
             self.assertEqual(reason, "")
@@ -1366,8 +1366,8 @@ class BlendLiveStatusTests(unittest.TestCase):
             self._write_cleanup_contract_evidence(spm)
             app.cfg = {"fbx_ini": str(fbx_ini)}
             app.log = mock.Mock()
-            app._write_repair_runtime_receipt(spm)
-            receipt_path = app._repair_runtime_receipt_path(spm)
+            app._write_assembly_runtime_receipt(spm)
+            receipt_path = app._assembly_runtime_receipt_path(spm)
             current_receipt = receipt_path.read_bytes()
             report = root / "reports" / (
                 f"{spm.stem}_speedtree_assembly_pipeline_report_codex.json"
@@ -1383,7 +1383,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            fresh, reason = app._repair_runtime_fresh(spm)
+            fresh, reason = app._assembly_runtime_fresh(spm)
 
             self.assertTrue(fresh, reason)
             self.assertEqual(reason, "")
@@ -1399,19 +1399,19 @@ class BlendLiveStatusTests(unittest.TestCase):
             spm, _core, fbx_ini = self._runtime_stale_fixture(root)
             app.cfg = {"fbx_ini": str(fbx_ini)}
             app.log = mock.Mock()
-            receipt_path = app._repair_runtime_receipt_path(spm)
+            receipt_path = app._assembly_runtime_receipt_path(spm)
             receipt_path.write_text("{broken", encoding="utf-8")
-            app._repair_contract_current = mock.Mock(return_value=False)
+            app._assembly_contract_current = mock.Mock(return_value=False)
 
-            fresh, reason = app._repair_runtime_fresh(spm)
+            fresh, reason = app._assembly_runtime_fresh(spm)
 
             self.assertTrue(fresh, reason)
             self.assertEqual(reason, "")
             self.assertEqual(receipt_path.read_text(encoding="utf-8"), "{broken")
 
             self._write_cleanup_contract_evidence(spm)
-            app._repair_contract_current.return_value = True
-            fresh, reason = app._repair_runtime_fresh(spm)
+            app._assembly_contract_current.return_value = True
+            fresh, reason = app._assembly_runtime_fresh(spm)
 
             self.assertTrue(fresh, reason)
             self.assertEqual(receipt_path.read_text(encoding="utf-8"), "{broken")
@@ -1425,14 +1425,14 @@ class BlendLiveStatusTests(unittest.TestCase):
             write_empty_spm(spm)
             blend.write_bytes(b"blend")
             addon_dir.mkdir()
-            receipt = repair_runtime_receipt_path(spm)
+            receipt = assembly_runtime_receipt_path(spm)
             writer_args = {
                 "addon_dir": addon_dir,
                 "code_state": {"addon/core.py": "diagnostic-hash"},
                 "blend": blend,
             }
 
-            missing = write_repair_runtime_receipt(
+            missing = write_assembly_runtime_receipt(
                 spm,
                 {},
                 pipeline=None,
@@ -1441,7 +1441,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.assertIsNone(missing)
             self.assertFalse(receipt.exists())
 
-            partial = write_repair_runtime_receipt(
+            partial = write_assembly_runtime_receipt(
                 spm,
                 {},
                 pipeline={
@@ -1608,7 +1608,7 @@ class BlendLiveStatusTests(unittest.TestCase):
 
             for label, candidate in invalid.items():
                 with self.subTest(invalid=label):
-                    with self.assertRaises(RepairPipelineEvidenceError):
+                    with self.assertRaises(AssemblyPipelineEvidenceError):
                         validate_unassigned_geometry_cleanup_evidence(
                             candidate,
                             expected_spm=spm,
@@ -1627,7 +1627,7 @@ class BlendLiveStatusTests(unittest.TestCase):
         )
         self.assertFalse(result["telemetry_present"])
 
-        with self.assertRaises(RepairPipelineEvidenceError):
+        with self.assertRaises(AssemblyPipelineEvidenceError):
             validate_unassigned_geometry_cleanup_evidence(payload)
 
     def test_saved_blend_stat_identity_does_not_require_content_rehash(self):
@@ -1645,7 +1645,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 }
             )
 
-            result = repair_pipeline_output_contract(
+            result = assembly_pipeline_output_contract(
                 payload,
                 spm=spm,
                 source_fbx=spm.with_suffix(".fbx"),
@@ -1668,28 +1668,28 @@ class BlendLiveStatusTests(unittest.TestCase):
 
             invalid = {}
             candidate = clone()
-            mesh = candidate["repair_push_export_postcondition"][
+            mesh = candidate["assembly_export_postcondition"][
                 "objects"
             ][0]["mesh"]
             mesh["materials"] = []
             invalid["no materials"] = candidate
             candidate = clone()
-            mesh = candidate["repair_push_export_postcondition"][
+            mesh = candidate["assembly_export_postcondition"][
                 "objects"
             ][0]["mesh"]
             mesh["material_index_counts"][0]["material_index"] = 1
             invalid["out-of-range material index"] = candidate
             candidate = clone()
-            mesh = candidate["repair_push_export_postcondition"][
+            mesh = candidate["assembly_export_postcondition"][
                 "objects"
             ][0]["mesh"]
             mesh["material_index_counts"][0]["polygon_count"] = 0
             invalid["uncovered polygon"] = candidate
 
             for label, candidate in invalid.items():
-                unsigned = dict(candidate["repair_push_export_postcondition"])
+                unsigned = dict(candidate["assembly_export_postcondition"])
                 unsigned.pop("content_sha256", None)
-                candidate["repair_push_export_postcondition"][
+                candidate["assembly_export_postcondition"][
                     "content_sha256"
                 ] = hashlib.sha256(
                     json.dumps(
@@ -1701,7 +1701,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 ).hexdigest()
                 with self.subTest(invalid=label):
                     self.assertEqual(
-                        repair_pipeline_output_contract(
+                        assembly_pipeline_output_contract(
                             candidate,
                             spm=spm,
                             blend=blend,
@@ -1734,7 +1734,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 "source_object": "Tree_Codex_Assembled",
             }
             self.assertEqual(
-                repair_pipeline_output_contract(
+                assembly_pipeline_output_contract(
                     valid,
                     spm=spm,
                     blend=blend,
@@ -1754,7 +1754,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 candidate["cluster_source_build_contract"].pop(field)
                 with self.subTest(missing=field):
                     self.assertEqual(
-                        repair_pipeline_output_contract(
+                        assembly_pipeline_output_contract(
                             candidate,
                             spm=spm,
                             blend=blend,
@@ -1772,11 +1772,11 @@ class BlendLiveStatusTests(unittest.TestCase):
 
             paths = {
                 Path(path).resolve()
-                for path in app._repair_runtime_code_paths(addon_dir)
+                for path in app._assembly_runtime_code_paths(addon_dir)
             }
 
         self.assertIn(
-            (SK_BATCH_DIR / "repair_runtime_contract.py").resolve(),
+            (SK_BATCH_DIR / "assembly_runtime_contract.py").resolve(),
             paths,
         )
 
@@ -1833,8 +1833,8 @@ class BlendLiveStatusTests(unittest.TestCase):
             write_empty_spm(spm)
             blend.write_bytes(b"blend")
             app._leaf_reference_ready = mock.Mock(return_value=(True, "ok"))
-            app._repair_runtime_fresh = mock.Mock(return_value=(True, ""))
-            app._repair_contract_current = mock.Mock(return_value=True)
+            app._assembly_runtime_fresh = mock.Mock(return_value=(True, ""))
+            app._assembly_contract_current = mock.Mock(return_value=True)
             app._cluster_assembly_inputs_current = mock.Mock(
                 return_value=(False, "Cluster Assembly input changed")
             )
@@ -2316,7 +2316,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             ):
                 status = app._blend_status_text(spm)
 
-            self.assertIn("Repair 필요", status)
+            self.assertIn("Assembly 필요", status)
             self.assertIn("재질이 SpeedTree FBX에서 빠짐", status)
             self.assertIn("M_leaf_atlas_01", status)
 
@@ -2530,8 +2530,8 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.set_time(blend, 2_000_000_000)
             self.set_time(report, 3_000_000_000)
             app._leaf_reference_ready = mock.Mock(return_value=(True, "ok"))
-            app._repair_runtime_fresh = mock.Mock(return_value=(True, ""))
-            app._repair_contract_current = mock.Mock(return_value=True)
+            app._assembly_runtime_fresh = mock.Mock(return_value=(True, ""))
+            app._assembly_contract_current = mock.Mock(return_value=True)
             app._cluster_assembly_inputs_current = mock.Mock(
                 return_value=(True, "")
             )
@@ -2725,7 +2725,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             app.checked_rows = FakeCheckedRows()
             app.log = mock.Mock()
             app.state[str(spm)] = {
-                "blend_status": "Blender Repair 중...",
+                "blend_status": "Blender Assembly 중...",
                 "live_status_signature": json.loads(json.dumps(signature)),
                 "live_texture_paths": [],
             }
@@ -2971,7 +2971,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.assertEqual(timeouts[1], 3600)
             self.assertIn("speedtree_material_preflight.py", commands[0][1])
             self.assertTrue(any(
-                str(value).endswith("bwr_headless_job.py")
+                str(value).endswith("assembly_headless_job.py")
                 for value in commands[1]
             ))
             self.assertIn("--material-contract", commands[1])
@@ -3986,7 +3986,7 @@ class BlendLiveStatusTests(unittest.TestCase):
         self.assertEqual(result["live_audit_payload"], payload)
         self.assertTrue(gui.cluster_receipt_resolution_uses_live_audit(result))
 
-    def test_cluster_live_audit_ignores_new_bwr_runtime_report(self):
+    def test_cluster_live_audit_ignores_new_assembly_runtime_report(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         app.log = mock.Mock()
@@ -5499,7 +5499,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             spm = owner / "SK_Tree_elm_01.spm"
             write_empty_spm(spm)
             app.force_rerun = True
-            app._active_repair_stage_contracts = {}
+            app._active_assembly_stage_contracts = {}
             app.cfg = {
                 "speedtree_exe": "SpeedTree.exe",
                 "fbx_ini": str(
@@ -5563,7 +5563,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 for call in app.log.call_args_list
             ))
             self.assertEqual(
-                app._repair_stage_contract(spm),
+                app._assembly_stage_contract(spm),
                 {
                     "ready": False,
                     "reason": "원본/재질 검토 필요 — Unreal Push 차단",
@@ -5673,7 +5673,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             app._leaf_reference_ready = mock.Mock(return_value=(True, "ok"))
             app._handoff_ready = mock.Mock(return_value=(True, "ready"))
             app._blend_status_text = mock.Mock(return_value="latest")
-            app._write_repair_runtime_receipt = mock.Mock()
+            app._write_assembly_runtime_receipt = mock.Mock()
             item = {
                 "spm": spm,
                 "manual_bones_locked": False,
@@ -5700,7 +5700,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 command
                 for command in commands
                 if any(
-                    value.endswith("bwr_headless_job.py")
+                    value.endswith("assembly_headless_job.py")
                     for value in command
                 )
             )
@@ -5789,7 +5789,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 return_value=(True, "ready")
             )
             app._blend_status_text = mock.Mock(return_value="latest")
-            app._write_repair_runtime_receipt = mock.Mock()
+            app._write_assembly_runtime_receipt = mock.Mock()
             item = {
                 "spm": spm,
                 "manual_bones_locked": False,
@@ -5815,7 +5815,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 command
                 for command in commands
                 if any(
-                    value.endswith("bwr_headless_job.py")
+                    value.endswith("assembly_headless_job.py")
                     for value in command
                 )
             )
@@ -5823,7 +5823,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             relation.assert_not_called()
             job_report = next(
                 (root / "logs").glob(
-                    "SK_cluster_blackgum_01_bwr_*.json"
+                    "SK_cluster_blackgum_01_assembly_*.json"
                 )
             )
             persisted = json.loads(
@@ -5835,7 +5835,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                     "status": "pass_through",
                     "reason": "no_explicit_owner_relation",
                     "targets": [],
-                    "repair_mode": "standalone_final_handoff",
+                    "assembly_mode": "standalone_final_handoff",
                 },
             )
 
@@ -5868,7 +5868,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 b'{"status":"done","handoff_preflight":'
                 b'{"status":"cluster_export_pending"}}'
             )
-            runtime_receipt = app._repair_runtime_receipt_path(spm)
+            runtime_receipt = app._assembly_runtime_receipt_path(spm)
             previous_runtime = b'{"code":{"producer":"old"}}'
             runtime_receipt.write_bytes(previous_runtime)
             app.force_rerun = True
@@ -5934,7 +5934,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             app._leaf_reference_ready = mock.Mock(return_value=(True, "ok"))
             app._handoff_ready = mock.Mock(return_value=(False, "stale"))
             app._blend_status_text = mock.Mock(return_value="stale")
-            app._write_repair_runtime_receipt = mock.Mock()
+            app._write_assembly_runtime_receipt = mock.Mock()
             item = {
                 "spm": spm,
                 "manual_bones_locked": False,
@@ -6117,7 +6117,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             app._validated_blender_resume_state = mock.Mock(
                 return_value=repair_state
             )
-            app._publish_current_repair_skip = mock.Mock(return_value=True)
+            app._publish_current_assembly_skip = mock.Mock(return_value=True)
             app._refresh_canonical_atlas_manifests = mock.Mock()
             app._cluster_relation_input_plan = mock.Mock(
                 side_effect=AssertionError(
@@ -6151,14 +6151,14 @@ class BlendLiveStatusTests(unittest.TestCase):
             app._refresh_cluster_source_relations.assert_not_called()
             app._cluster_normalization_stage_with_recovery.assert_not_called()
             app._run_limited.assert_not_called()
-            app._publish_current_repair_skip.assert_called_once_with(
+            app._publish_current_assembly_skip.assert_called_once_with(
                 str(spm),
                 spm,
                 repair_state,
                 validated_resume_receipt={"receipt_sha256": "saved"},
             )
 
-    def test_current_owner_bwr_skips_atlas_refresh_and_material_preflight(self):
+    def test_current_owner_assembly_skips_atlas_refresh_and_material_preflight(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as temporary:
@@ -6169,7 +6169,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             for path in (spm, blend):
                 path.touch()
             app.force_rerun = False
-            app._repair_output_state = mock.Mock(return_value={
+            app._assembly_output_state = mock.Mock(return_value={
                 "current": True,
                 "push_ready": True,
                 "kind": "ready",
@@ -6177,7 +6177,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 "push_dependency_contract": {"status": "current"},
             })
             app._record_live_blend_status = mock.Mock()
-            app._publish_repair_stage_contract = mock.Mock()
+            app._publish_assembly_stage_contract = mock.Mock()
             app._refresh_canonical_atlas_manifests = mock.Mock(
                 side_effect=AssertionError(
                     "current owner must not refresh Atlas manifests"
@@ -6204,7 +6204,7 @@ class BlendLiveStatusTests(unittest.TestCase):
 
             app._job_blender(str(spm), spm, item)
 
-            app._repair_output_state.assert_called_once_with(spm)
+            app._assembly_output_state.assert_called_once_with(spm)
             app._refresh_canonical_atlas_manifests.assert_not_called()
             app._cluster_receipt_with_recovery.assert_not_called()
             app._execute_material_preflight.assert_not_called()
@@ -6251,8 +6251,8 @@ class BlendLiveStatusTests(unittest.TestCase):
             app._cluster_receipt_with_recovery = mock.Mock(
                 side_effect=refresh_relations
             )
-            app._repair_output_state = mock.Mock(side_effect=current_state)
-            app._publish_current_repair_skip = mock.Mock(return_value=True)
+            app._assembly_output_state = mock.Mock(side_effect=current_state)
+            app._publish_current_assembly_skip = mock.Mock(return_value=True)
             app._execute_material_preflight = mock.Mock(
                 side_effect=AssertionError("BWR must not run")
             )
@@ -6272,10 +6272,10 @@ class BlendLiveStatusTests(unittest.TestCase):
 
             self.assertEqual(events, ["relation_refresh", "output_state"])
             app._refresh_canonical_atlas_manifests.assert_called_once_with(spm)
-            app._publish_current_repair_skip.assert_called_once()
+            app._publish_current_assembly_skip.assert_called_once()
             app._execute_material_preflight.assert_not_called()
 
-    def test_core_receipt_drift_forces_bwr_despite_old_current_state(self):
+    def test_core_receipt_drift_forces_assembly_despite_old_current_state(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as temporary:
@@ -6290,13 +6290,13 @@ class BlendLiveStatusTests(unittest.TestCase):
             app.cfg = {}
             app._refresh_canonical_atlas_manifests = mock.Mock()
             app._leaf_reference_ready = mock.Mock(return_value=(True, "ok"))
-            app._repair_output_state = mock.Mock(return_value={
+            app._assembly_output_state = mock.Mock(return_value={
                 "current": True,
                 "push_ready": True,
                 "kind": "ready",
                 "reason": "준비됨 ✓",
             })
-            app._publish_current_repair_skip = mock.Mock(return_value=True)
+            app._publish_current_assembly_skip = mock.Mock(return_value=True)
             app._execute_material_preflight = mock.Mock(
                 side_effect=RuntimeError("entered material preflight")
             )
@@ -6321,11 +6321,11 @@ class BlendLiveStatusTests(unittest.TestCase):
             ):
                 app._job_blender(str(spm), spm, item)
 
-            app._repair_output_state.assert_called_once_with(
+            app._assembly_output_state.assert_called_once_with(
                 spm,
                 pipeline_projection_out=None,
             )
-            app._publish_current_repair_skip.assert_not_called()
+            app._publish_current_assembly_skip.assert_not_called()
             app._execute_material_preflight.assert_called_once()
 
     def test_provider_metadata_disagreement_is_not_relation_refresh_gate(self):
@@ -6570,7 +6570,7 @@ class ClusterBarkRepairSkipGateTests(unittest.TestCase):
             )
         )
 
-    def test_cached_source_without_bwr_capture_invalidates_current_blend(self):
+    def test_cached_source_without_assembly_capture_invalidates_current_blend(self):
         gui = load_gui_module()
         resolution = {
             "status": "cached",

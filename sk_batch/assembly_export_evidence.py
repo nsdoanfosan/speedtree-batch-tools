@@ -1,6 +1,6 @@
-"""Diagnostic snapshot of the Blender Export collection after Repair.
+"""Diagnostic snapshot of the Blender Export collection after Assembly.
 
-This module deliberately contains no Repair-to-Push validation. Upstream
+This module deliberately contains no Assembly-to-Push validation. Upstream
 authoring state is mutable and must never freeze a queued Unreal import.
 """
 

@@ -1,4 +1,4 @@
-"""SK Vegetation Batch — SPM 본 캘리브레이션 + Blender Repair + Unreal Push GUI.
+"""SK Vegetation Batch — SPM 본 캘리브레이션 + Blender Assembly + Unreal Push GUI.
 
 단계 (왼쪽부터, 빠른 것 → 느린 것):
   🔍 검사        : 아무것도 수정하지 않고 상태만 표에 채움 (SPM 본 세팅 상태,
@@ -6,7 +6,7 @@
   ① SPM 본 세팅 : 가지 수를 실측(프로브 익스포트)해서 "가지당 목표 본 수"에
                    맞게 Relative 값을 자동 계산. 파일당 수십초~수분. 실패해도
                    백업에서 자동 복원되므로 여기서 전부 끝내고 ②로 넘어가면 됨.
-  ② Blender Repair : 헤드리스 Blender로 import/repair 후 SPM 옆에 .blend 저장.
+  ② Blender Assembly : 헤드리스 Blender로 import/assembly 후 SPM 옆에 .blend 저장.
                    파일당 수분~수십분(느림). 이미 최신인 blend는 건너뜀.
   ③ Unreal Push : 보내기 전에 준비 검사(blend/JSON 존재, 언리얼 실행 여부)를
                    먼저 전부 통과시킨 뒤에만 실제 push 시작.
@@ -251,13 +251,13 @@ from pcg_st9_texture_batch.pcg_canonical_outputs import (
     refresh_atlas_manifests_for_spm,
 )
 from atlas_manifest_resolver import atlas_manifest_mirror_repair_plan
-from repair_runtime_contract import (
-    REPAIR_RUNTIME_RECEIPT_VERSION,
+from assembly_runtime_contract import (
+    ASSEMBLY_RUNTIME_RECEIPT_VERSION,
     addon_dir_from_config,
-    repair_runtime_code_paths,
-    repair_runtime_code_state,
-    repair_runtime_receipt_path,
-    write_repair_runtime_receipt,
+    assembly_runtime_code_paths,
+    assembly_runtime_code_state,
+    assembly_runtime_receipt_path,
+    write_assembly_runtime_receipt,
 )
 from blender_resume_receipt import (
     BlenderResumeReceiptError,
@@ -300,7 +300,7 @@ BLENDER_RESUME_CONFIG_KEYS = (
     "cluster_capture_resolution",
 )
 CLUSTER_RELATION_LOCKS_GUARD = threading.Lock()
-_REPAIR_REPORT_READ_LOCAL = threading.local()
+_ASSEMBLY_REPORT_READ_LOCAL = threading.local()
 CLUSTER_RELATION_LOCKS = {}
 MATERIAL_PREFLIGHT_START_MARKER = "SK_BATCH_MATERIAL_PREFLIGHT_START"
 MATERIAL_PREFLIGHT_STATIC_DONE_MARKER = (
@@ -468,7 +468,7 @@ def manifest_item_requires_unreal_asset_verification(item):
     )
 
 
-def repair_pipeline_report_path(spm):
+def assembly_pipeline_report_path(spm):
     spm = Path(spm)
     return (
         spm.parent / "reports" /
@@ -506,8 +506,8 @@ def is_cluster_without_assembly_push_row(spm):
     if is_cluster_source_spm(spm) or not owner_cluster_spm_paths(spm):
         return False
     try:
-        report = _read_repair_pipeline_json(
-            repair_pipeline_report_path(spm)
+        report = _read_assembly_pipeline_json(
+            assembly_pipeline_report_path(spm)
         )
     except (OSError, ValueError):
         return True
@@ -517,23 +517,23 @@ def is_cluster_without_assembly_push_row(spm):
 
 
 @contextmanager
-def repair_report_read_scope():
-    """Reuse one large Repair JSON only within one semantic status decision."""
-    previous = getattr(_REPAIR_REPORT_READ_LOCAL, "cache", None)
-    _REPAIR_REPORT_READ_LOCAL.cache = {}
+def assembly_report_read_scope():
+    """Reuse one large Assembly JSON only within one semantic status decision."""
+    previous = getattr(_ASSEMBLY_REPORT_READ_LOCAL, "cache", None)
+    _ASSEMBLY_REPORT_READ_LOCAL.cache = {}
     try:
         yield
     finally:
         if previous is None:
             try:
-                del _REPAIR_REPORT_READ_LOCAL.cache
+                del _ASSEMBLY_REPORT_READ_LOCAL.cache
             except AttributeError:
                 pass
         else:
-            _REPAIR_REPORT_READ_LOCAL.cache = previous
+            _ASSEMBLY_REPORT_READ_LOCAL.cache = previous
 
 
-def _repair_report_stat_key(path):
+def _assembly_report_stat_key(path):
     path = Path(path)
     stat = path.stat()
     return (
@@ -543,11 +543,11 @@ def _repair_report_stat_key(path):
     )
 
 
-def _read_repair_pipeline_json(path):
+def _read_assembly_pipeline_json(path):
     """Read a report once per scope without retaining multi-MB data globally."""
     path = Path(path)
-    cache = getattr(_REPAIR_REPORT_READ_LOCAL, "cache", None)
-    key = _repair_report_stat_key(path)
+    cache = getattr(_ASSEMBLY_REPORT_READ_LOCAL, "cache", None)
+    key = _assembly_report_stat_key(path)
     if cache is not None and key in cache:
         return cache[key]
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -559,12 +559,12 @@ def _read_repair_pipeline_json(path):
     return payload
 
 
-def _cache_written_repair_pipeline_json(path, payload):
-    cache = getattr(_REPAIR_REPORT_READ_LOCAL, "cache", None)
+def _cache_written_assembly_pipeline_json(path, payload):
+    cache = getattr(_ASSEMBLY_REPORT_READ_LOCAL, "cache", None)
     if cache is None:
         return
     cache.clear()
-    cache[_repair_report_stat_key(path)] = payload
+    cache[_assembly_report_stat_key(path)] = payload
 
 
 def _artifact_fingerprints_match(expected, actual):
@@ -674,7 +674,7 @@ def _material_handoff_envelope_for_push(pipeline, canonical_spm):
 
 def cluster_bark_pipeline_matches_resolution(
         spm, resolution, pipeline, fingerprint):
-    """Prove that a cached isolated-bark source was actually consumed by BWR."""
+    """Prove that a cached isolated-bark source was actually consumed by Assembly."""
     if not isinstance(resolution, dict) or resolution.get("status") not in {
         "prepared",
         "cached",
@@ -719,7 +719,7 @@ def cluster_bark_pipeline_matches_resolution(
 
 
 def cluster_bark_resolution_requires_repair(spm, resolution):
-    """Return True until BWR has captured this exact isolated bark bundle."""
+    """Return True until Assembly has captured this exact isolated bark bundle."""
     if not isinstance(resolution, dict) or resolution.get("status") not in {
         "prepared",
         "cached",
@@ -728,7 +728,7 @@ def cluster_bark_resolution_requires_repair(spm, resolution):
     try:
         from cluster_assembly_builder import file_fingerprint
 
-        pipeline = load_current_repair_pipeline_report(spm)
+        pipeline = load_current_assembly_pipeline_report(spm)
         return not cluster_bark_pipeline_matches_resolution(
             spm,
             resolution,
@@ -963,8 +963,8 @@ def _same_content_identity(recorded, current):
     )
 
 
-def load_current_repair_pipeline_report(spm, *, migrate_legacy=True):
-    """Load a content-current Repair report, upgrading proven legacy data.
+def load_current_assembly_pipeline_report(spm, *, migrate_legacy=True):
+    """Load a content-current Assembly report, upgrading proven legacy data.
 
     Legacy reports can be upgraded without Blender only when they already
     contain the exact live SPM content identity and were committed after the
@@ -973,13 +973,13 @@ def load_current_repair_pipeline_report(spm, *, migrate_legacy=True):
     bless an unrelated old blend.
     """
     canonical_spm = speedtree_output_spm_for(spm)
-    report_path = repair_pipeline_report_path(spm)
+    report_path = assembly_pipeline_report_path(spm)
     try:
-        report = _read_repair_pipeline_json(report_path)
+        report = _read_assembly_pipeline_json(report_path)
     except (OSError, ValueError) as exc:
-        raise ValueError(f"Repair report could not be read: {exc}") from exc
+        raise ValueError(f"Assembly report could not be read: {exc}") from exc
     if not isinstance(report, dict):
-        raise ValueError("Repair report is not an object")
+        raise ValueError("Assembly report is not an object")
 
     bark_resolution = report.get("cluster_bark_source_resolution") or {}
     isolated_bark_input = bool(
@@ -1007,8 +1007,8 @@ def load_current_repair_pipeline_report(spm, *, migrate_legacy=True):
         return report
     if isolated_bark_input:
         raise ValueError(
-            "Repair report used an isolated bark-normalized source but has "
-            "no exact material handoff contract; run Blender Repair again"
+            "Assembly report used an isolated bark-normalized source but has "
+            "no exact material handoff contract; run Blender Assembly again"
         )
 
     envelope = report.get("speedtree_pipeline_contract")
@@ -1024,7 +1024,7 @@ def load_current_repair_pipeline_report(spm, *, migrate_legacy=True):
     )
     if handoff_status not in {"ok", "source_review"}:
         raise ValueError(
-            "legacy Repair report has no completed handoff state"
+            "legacy Assembly report has no completed handoff state"
         )
     recorded_identity = (
         (report.get("speedtree_live_source_identity") or {}).get("spm")
@@ -1032,7 +1032,7 @@ def load_current_repair_pipeline_report(spm, *, migrate_legacy=True):
     current_identity = source_identity(canonical_spm)
     if not _same_content_identity(recorded_identity, current_identity):
         raise ValueError(
-            "legacy Repair report source identity is missing or stale"
+            "legacy Assembly report source identity is missing or stale"
         )
     blend = blend_path_for(spm)
     try:
@@ -1041,11 +1041,11 @@ def load_current_repair_pipeline_report(spm, *, migrate_legacy=True):
             or report_path.stat().st_mtime_ns < blend.stat().st_mtime_ns
         ):
             raise ValueError(
-                "legacy Repair report predates the saved blend"
+                "legacy Assembly report predates the saved blend"
             )
     except OSError as exc:
         raise ValueError(
-            f"legacy Repair artifact timestamp could not be read: {exc}"
+            f"legacy Assembly artifact timestamp could not be read: {exc}"
         ) from exc
 
     normalization = report.get("texture_normalization") or {}
@@ -1069,7 +1069,7 @@ def load_current_repair_pipeline_report(spm, *, migrate_legacy=True):
         "source_identity": current_identity,
     }
     atomic_write_json(report_path, migrated)
-    _cache_written_repair_pipeline_json(report_path, migrated)
+    _cache_written_assembly_pipeline_json(report_path, migrated)
     return migrated
 
 
@@ -1871,7 +1871,7 @@ def blender_open_file_window_titles(blend_path):
     return titles
 
 
-def blender_repair_schedule_waves(targets):
+def blender_assembly_schedule_waves(targets):
     """Run authored Cluster sources before root assets that fingerprint them."""
     cluster_sources = []
     downstream = []
@@ -1890,7 +1890,7 @@ def blender_repair_schedule_waves(targets):
     ]
 
 
-def expand_blender_repair_targets(selected_targets, all_items):
+def expand_blender_assembly_targets(selected_targets, all_items):
     """Add only Cluster rows selected by both registry intent and live use.
 
     The Atlas target registry supplies the explicit ON/OFF intent, and current
@@ -2527,7 +2527,7 @@ class App:
             "단, Unreal Wait를 선택하면 전체 자동에서도 이를 덮어쓰지 않고 "
             "영구 대기 상태로 남깁니다. 단독 ③ Push도 왼쪽 transport 선택을 따릅니다.",
         )
-        ttk.Label(transport_opts, text="② Repair·③ export 동시:").pack(
+        ttk.Label(transport_opts, text="② Assembly·③ export 동시:").pack(
             side="left", padx=(18, 0)
         )
         self.blender_parallel_var = tk.IntVar(
@@ -2543,7 +2543,7 @@ class App:
         blender_parallel_spin.pack(side="left", padx=4)
         Tooltip(
             blender_parallel_spin,
-            "Blender Repair와 headless Send2UE export를 동시에 처리할 개수입니다. "
+            "Blender Assembly와 headless Send2UE export를 동시에 처리할 개수입니다. "
             "기본값 2는 시작 비용을 겹치되 메모리 사용량을 제한합니다.",
         )
 
@@ -2611,7 +2611,7 @@ class App:
             variable=self.force_var,
         )
         chk.pack(side="left", padx=12)
-        Tooltip(chk, ("② Blender Repair에서, 이미 SPM보다 최신인 .blend가 있는 항목은 기본적으로 "
+        Tooltip(chk, ("② Blender Assembly에서, 이미 SPM보다 최신인 .blend가 있는 항목은 기본적으로 "
                       "건너뜁니다. ① SPM 본 세팅도 동일 SPM/옵션 캐시를 기본 사용합니다. "
                       "이 옵션을 켜면 ①② 모두 강제로 다시 실행합니다.\n"
                       "판정 기준은 '작업이 성공했는가'가 아니라 '.blend가 SPM보다 최신인가' "
@@ -2643,10 +2643,10 @@ class App:
                                "머티리얼에 M_ 프리픽스를 붙입니다.\n"
                                "수정 전 _spm_backups\\ 에 백업이 남고, 실패하면 자동 복원됩니다.\n"
                                "느린 ②로 넘어가기 전에 여기서 전부 끝내고 결과를 확인하세요."))
-        self.btn_blender = ttk.Button(actions, text="② Blender Repair (느림)",
+        self.btn_blender = ttk.Button(actions, text="② Blender Assembly (느림)",
                                       command=lambda: self.start_batch("blender"))
         self.btn_blender.pack(side="left", padx=6)
-        Tooltip(self.btn_blender, ("① SPM 본 세팅을 먼저 실행한 뒤 ② Blender Repair를 실행합니다.\n"
+        Tooltip(self.btn_blender, ("① SPM 본 세팅을 먼저 실행한 뒤 ② Blender Assembly를 실행합니다.\n"
                                    "헤드리스 Blender로 SpeedTree 익스포트→임포트→본/웨이트 수리를 돌리고 "
                                    "SPM 옆에 같은 이름의 .blend와 wind JSON을 저장합니다.\n"
                                    "완료 전에 T_ 6종 또는 보존 Cluster 텍스처, 빈 머티리얼 슬롯까지 검사합니다.\n"
@@ -2655,11 +2655,11 @@ class App:
         self.btn_push = ttk.Button(actions, text="③ Unreal Push",
                                    command=lambda: self.start_batch("push"))
         self.btn_push.pack(side="left", padx=6)
-        Tooltip(self.btn_push, ("① SPM 본 세팅→② Blender Repair를 먼저 실행한 뒤 "
+        Tooltip(self.btn_push, ("① SPM 본 세팅→② Blender Assembly를 먼저 실행한 뒤 "
                                 "③ Unreal Push를 실행합니다.\n"
                                 "push 전에 준비 검사를 먼저 전부 통과시킵니다:\n"
                                 "· .blend 존재 + SPM보다 최신인지\n"
-                                "· 텍스처 세트와 Repair 사전검사(빈 머티리얼 슬롯 포함)\n"
+                                "· 텍스처 세트와 Assembly 사전검사(빈 머티리얼 슬롯 포함)\n"
                                 "· wind JSON(핸드오프 산출물) 존재\n"
                                 "· 언리얼 에디터 실행 여부\n"
                                 "준비 안 된 항목은 이유를 표시하고 건너뛴 뒤, 준비된 것만 push합니다."))
@@ -2714,7 +2714,7 @@ class App:
         Tooltip(
             self.btn_all,
             "체크 상태와 무관하게 현재 목록의 모든 항목을 밤새 순서대로 처리합니다.\n"
-            "① SPM 본 세팅 전체 완료 → ② Blender Repair 전체 완료 → "
+            "① SPM 본 세팅 전체 완료 → ② Blender Assembly 전체 완료 → "
             "③ Unreal Push 순서입니다.\n"
             "개별 ①/②/③ 버튼만 체크된 항목을 대상으로 합니다.\n"
             "개별 실패·수동 처리 항목은 기록하고 나머지 파일은 계속 진행합니다.",
@@ -3429,7 +3429,7 @@ class App:
         """Paint a non-running placeholder; live validation follows."""
         blend = blend_path_for(spm)
         if not blend.exists():
-            return "생성 필요 — blend 없음 → ② Blender Repair"
+            return "생성 필요 — blend 없음 → ② Blender Assembly"
         return "상태 확인 대기…"
 
     @staticmethod
@@ -3449,7 +3449,7 @@ class App:
             "검증 중",
             "상태 확인 대기",
             "재질 데이터 준비 중",
-            "blender repair 중",
+            "blender assembly 중",
         ))
 
     def _set_scan_controls(self, scanning):
@@ -3806,7 +3806,7 @@ class App:
         )
 
     def _blender_resume_settings(self, iid, item=None):
-        """Return only settings that can change durable Repair output."""
+        """Return only settings that can change durable Assembly output."""
 
         if item is None:
             item = self._batch_job_item(iid)
@@ -3829,11 +3829,11 @@ class App:
         repair_state,
         texture_paths=None,
     ):
-        """Bind the files consulted by the successful live Repair audit."""
+        """Bind the files consulted by the successful live Assembly audit."""
 
         spm = Path(spm)
         speedtree_spm = speedtree_output_spm_for(spm)
-        report_path = repair_pipeline_report_path(spm)
+        report_path = assembly_pipeline_report_path(spm)
         wind_path = (
             blend_path_for(spm).parent
             / "JSON"
@@ -3849,7 +3849,7 @@ class App:
         for path in required:
             if not Path(path).is_file():
                 raise BlenderResumeReceiptError(
-                    f"current Repair result is missing a required file: {path}"
+                    f"current Assembly result is missing a required file: {path}"
                 )
 
         optional = []
@@ -4042,7 +4042,7 @@ class App:
             ),
             relation_signature=relation_signature,
             settings=self._blender_resume_settings(iid, item=item),
-            repair_state=repair_state,
+            assembly_state=repair_state,
         )
 
     def _validated_blender_resume_state(self, iid, spm, item, receipt):
@@ -4080,7 +4080,7 @@ class App:
         spm = Path(spm).expanduser().absolute()
         speedtree_spm = speedtree_output_spm_for(spm)
         blend = blend_path_for(spm)
-        report = repair_pipeline_report_path(spm)
+        report = assembly_pipeline_report_path(spm)
         wind = (
             blend.parent
             / "JSON"
@@ -4153,7 +4153,7 @@ class App:
             return {"policy": "live_validation"}
         return {
             "policy": "skip",
-            "repair_state": repair_state,
+            "assembly_state": repair_state,
             "receipt": receipt,
         }
 
@@ -4190,10 +4190,10 @@ class App:
                         item,
                     )
                     if migration.get("policy") == "skip":
-                        if self._publish_current_repair_skip(
+                        if self._publish_current_assembly_skip(
                             iid,
                             spm,
-                            migration["repair_state"],
+                            migration["assembly_state"],
                             validated_resume_receipt=migration["receipt"],
                         ):
                             skipped.append(item)
@@ -4216,7 +4216,7 @@ class App:
                 item["_blender_resume_policy"] = "live_validation"
                 runnable.append(item)
                 continue
-            if not self._publish_current_repair_skip(
+            if not self._publish_current_assembly_skip(
                 iid,
                 spm,
                 repair_state,
@@ -4227,7 +4227,7 @@ class App:
             skipped.append(item)
         if skipped:
             self.log(
-                "Blender Repair 재개 영수증: 완료 항목 "
+                "Blender Assembly 재개 영수증: 완료 항목 "
                 f"{len(skipped)}개를 실행 대기열 전에 건너뜀"
             )
         return runnable, skipped
@@ -4312,8 +4312,8 @@ class App:
                     if legacy_snapshot:
                         status = self._blend_status_text(spm)
                     else:
-                        repair_state = self._repair_output_state(spm)
-                        status = self._blend_status_from_repair_state(
+                        repair_state = self._assembly_output_state(spm)
+                        status = self._blend_status_from_assembly_state(
                             repair_state
                         )
                     push_status = self._current_push_status_text(iid, spm)
@@ -5698,7 +5698,7 @@ class App:
             "_active_retry_metadata",
             "_active_blender_dependency_map",
             "_active_pipeline_terminal_phase",
-            "_active_repair_stage_contracts",
+            "_active_assembly_stage_contracts",
             "_pipeline_upstream_failed_items",
             "_active_push_dependency_map",
             "_active_push_auto_added_ids",
@@ -5779,7 +5779,7 @@ class App:
         phase_labels = {
             "check": "검사",
             "spm": "① SPM 본 세팅",
-            "blender": "② Blender Repair 연계 ①→②",
+            "blender": "② Blender Assembly 연계 ①→②",
             "push": "③ Unreal Push 연계 ①→②→③",
         }
         job = {
@@ -6133,7 +6133,7 @@ class App:
     def _failed_retry_repair_state(self, iid):
         """Return one live provenance decision, never a saved table label."""
         try:
-            state = self._repair_output_state(Path(iid))
+            state = self._assembly_output_state(Path(iid))
             if not isinstance(state, dict) or "current" not in state:
                 raise ValueError("Repair eligibility state is incomplete")
             return state
@@ -6143,7 +6143,7 @@ class App:
                 "push_ready": False,
                 "kind": "inspection_incomplete",
                 "reason": (
-                    "Blender Repair freshness could not be proven: "
+                    "Blender Assembly freshness could not be proven: "
                     + compact_error_message(exc, 160)
                 ),
             }
@@ -7972,7 +7972,7 @@ class App:
                 and repair_states[iid].get("current") is True
             ):
                 # A content-proven successful ingest is not a failed Unreal
-                # parent. Unknown Repair state still takes the existing
+                # parent. Unknown Assembly state still takes the existing
                 # fail-closed parent path; known stale state rebuilds below.
                 continue
             paths = entry.get("push_paths") or {}
@@ -8916,7 +8916,7 @@ class App:
             "producer_blend": blend_path_for(dependency),
         }
         if phase == "blender":
-            paths["producer_repair_report"] = repair_pipeline_report_path(
+            paths["producer_assembly_report"] = assembly_pipeline_report_path(
                 Path(dependency)
             )
         manifest = str((verdict or {}).get("manifest") or "")
@@ -8932,7 +8932,7 @@ class App:
         """Read-only content-key check for an existing producer output."""
 
         try:
-            report = load_current_repair_pipeline_report(
+            report = load_current_assembly_pipeline_report(
                 Path(dependency),
                 migrate_legacy=False,
             )
@@ -9062,7 +9062,7 @@ class App:
                     "status": "current",
                     "phase": "blender",
                     "reason": (
-                        "saved Blender/Repair 영수증이 current producer "
+                        "saved Blender/Assembly 영수증이 current producer "
                         "SPM content key와 일치합니다."
                     ),
                 }
@@ -9072,7 +9072,7 @@ class App:
                     "phase": "blender",
                     "output_kind": "repair_receipt_not_current",
                     "reason": (
-                        "Blender/Repair 영수증이 current producer SPM "
+                        "Blender/Assembly 영수증이 current producer SPM "
                         "content key와 일치하지 않습니다."
                     ),
                 }
@@ -9702,7 +9702,7 @@ class App:
         emit_done=True,
     ):
         self._active_pipeline_terminal_phase = terminal_phase
-        self._active_repair_stage_contracts = {}
+        self._active_assembly_stage_contracts = {}
         self._pipeline_root_failed_items = set()
         self._pipeline_blocked_items = set()
         self._pipeline_planned_exclusions = {}
@@ -9722,7 +9722,7 @@ class App:
             for key in (
                 "_active_blender_dependency_map",
                 "_active_pipeline_terminal_phase",
-                "_active_repair_stage_contracts",
+                "_active_assembly_stage_contracts",
                 "_pipeline_upstream_failed_items",
                 "_pipeline_root_failed_items",
                 "_pipeline_blocked_items",
@@ -9745,14 +9745,14 @@ class App:
             targets,
             self._active_blender_dependency_map,
             auto_added_cluster_ids,
-        ) = expand_blender_repair_targets(
+        ) = expand_blender_assembly_targets(
             targets,
             self._batch_job_inventory()
             or {str(item["spm"]): item for item in targets},
         )
         if auto_added_cluster_ids:
             self.log(
-                "Tree Repair dependency: Cluster "
+                "Tree Assembly dependency: Cluster "
                 f"{len(auto_added_cluster_ids)}개 자동 포함 — "
                 + ", ".join(
                     sorted(
@@ -9762,7 +9762,7 @@ class App:
             )
         phase_labels = {
             "spm": "① SPM 본 세팅",
-            "blender": "② Blender Repair",
+            "blender": "② Blender Assembly",
             "push": "③ Unreal Push",
         }
         cluster_targets = [
@@ -9792,7 +9792,7 @@ class App:
                     (
                         "blender",
                         downstream_targets,
-                        "Tree ② Blender Repair",
+                        "Tree ② Blender Assembly",
                     )
                 )
         if terminal_phase == "push":
@@ -10327,7 +10327,7 @@ class App:
             }
             repair_contracts = getattr(
                 self,
-                "_active_repair_stage_contracts",
+                "_active_assembly_stage_contracts",
                 None,
             )
             if isinstance(repair_contracts, dict):
@@ -10617,14 +10617,14 @@ class App:
             if not targets:
                 self.ui_queue.put(("batch_progress", (0, 0)))
                 self.log(
-                    "Blender Repair 실행 항목 없음 — 재개 영수증으로 "
+                    "Blender Assembly 실행 항목 없음 — 재개 영수증으로 "
                     f"{len(resume_skipped)}개 완료 상태 확인"
                 )
                 if emit_done:
                     self.ui_queue.put(("progress", "대기"))
                     self.ui_queue.put(("done", None))
                 return True
-        titles = {"check": "검사", "spm": "SPM 본 세팅", "blender": "Blender Repair", "push": "Unreal Push"}
+        titles = {"check": "검사", "spm": "SPM 본 세팅", "blender": "Blender Assembly", "push": "Unreal Push"}
         column_by_phase = {"check": "spm_status", "spm": "spm_status",
                            "blender": "blend_status", "push": "push_status"}
         if (
@@ -10707,7 +10707,7 @@ class App:
                     reason = reason or "사용자 중지"
                     full_reason = full_reason or reason
                 if phase == "blender":
-                    self._publish_repair_stage_contract(
+                    self._publish_assembly_stage_contract(
                         spm,
                         ready=False,
                         reason=full_reason,
@@ -10788,7 +10788,7 @@ class App:
 
         # Independent jobs overlap inside a wave. Blender keeps a barrier
         # between Cluster sources and root assemblies so saved input hashes
-        # cannot change after a downstream Repair receipt is written.
+        # cannot change after a downstream Assembly receipt is written.
         # RPC Push stays serial; headless Push parallelizes only its Blender
         # export stage below.
         if phase == "spm":
@@ -10801,13 +10801,13 @@ class App:
             workers = 1
         workers = max(1, min(int(workers), total))
         waves = (
-            blender_repair_schedule_waves(targets)
+            blender_assembly_schedule_waves(targets)
             if phase == "blender"
             else [targets]
         )
         if phase == "blender" and len(waves) > 1:
             self.log(
-                "Blender Repair 의존성: Cluster 소스를 먼저 완료한 뒤 "
+                "Blender Assembly 의존성: Cluster 소스를 먼저 완료한 뒤 "
                 "루트/Assembly Repair를 시작합니다."
             )
         for wave_index, wave in enumerate(waves):
@@ -11173,10 +11173,10 @@ class App:
         return proc.returncode, log_file
 
     @staticmethod
-    def _repair_contract_current(spm, pipeline_out=None):
+    def _assembly_contract_current(spm, pipeline_out=None):
         """Prove the saved blend/report came from the current SPM content."""
         try:
-            report = load_current_repair_pipeline_report(spm)
+            report = load_current_assembly_pipeline_report(spm)
             if isinstance(pipeline_out, dict):
                 pipeline_out["payload"] = report
             if (report.get("handoff_preflight") or {}).get("status") not in {
@@ -11204,11 +11204,11 @@ class App:
             f"{Path(spm).stem}_speedtree_assembly_pipeline_report_codex.json"
         )
         try:
-            pipeline = _read_repair_pipeline_json(report_path)
+            pipeline = _read_assembly_pipeline_json(report_path)
             embedded = pipeline.get("cluster_assembly_manifest")
             if not isinstance(embedded, dict):
                 # Vegetation with no saved Assembly is a legitimate ordinary
-                # asset.  A newer PCG relation is work for a future Repair, not
+                # asset.  A newer PCG relation is work for a future Assembly, not
                 # a reason to invalidate an already materialized Push payload.
                 return True, ""
 
@@ -11225,17 +11225,17 @@ class App:
             manifest_path = Path(str(manifest_record.get("path") or ""))
             if not manifest_path.is_file():
                 raise RuntimeError(
-                    "BWR Cluster Assembly manifest file is missing: "
+                    "Assembly Cluster Assembly manifest file is missing: "
                     + str(manifest_path)
                 )
             validate_file_fingerprint(
-                manifest_record, "BWR Cluster Assembly manifest"
+                manifest_record, "Assembly Cluster Assembly manifest"
             )
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             manifest["manifest"] = manifest_record
             if manifest.get("kind") != MANIFEST_KIND:
                 raise RuntimeError(
-                    "unsupported BWR Cluster Assembly manifest kind"
+                    "unsupported Assembly Cluster Assembly manifest kind"
                 )
             validate_manifest_artifacts(manifest)
             if isinstance(dependency_contract_out, dict):
@@ -11252,8 +11252,8 @@ class App:
                 + str(exc)
             )
 
-    def _repair_runtime_addon_dir(self):
-        """Installed BWR addon folder, derived identically for read and write."""
+    def _assembly_runtime_addon_dir(self):
+        """Installed Assembly addon folder, derived identically for read and write."""
         planning = self._failed_retry_planning_context()
         cfg = (
             planning.cfg_snapshot
@@ -11263,41 +11263,41 @@ class App:
         return addon_dir_from_config(cfg)
 
     @staticmethod
-    def _repair_runtime_code_paths(addon_dir):
-        """Every producer module that can change a completed Repair result."""
-        return repair_runtime_code_paths(addon_dir)
+    def _assembly_runtime_code_paths(addon_dir):
+        """Every producer module that can change a completed Assembly result."""
+        return assembly_runtime_code_paths(addon_dir)
 
-    def _repair_runtime_code_state(self, addon_dir):
+    def _assembly_runtime_code_state(self, addon_dir):
         """Content hash per producer module, independent of timestamps."""
-        return repair_runtime_code_state(
+        return assembly_runtime_code_state(
             addon_dir,
-            modules=self._repair_runtime_code_paths(addon_dir),
+            modules=self._assembly_runtime_code_paths(addon_dir),
         )
 
     @staticmethod
-    def _repair_runtime_receipt_path(spm):
-        return repair_runtime_receipt_path(spm)
+    def _assembly_runtime_receipt_path(spm):
+        return assembly_runtime_receipt_path(spm)
 
-    def _write_repair_runtime_receipt(self, spm):
-        """Record which BWR code produced this completed Repair result.
+    def _write_assembly_runtime_receipt(self, spm):
+        """Record which Assembly code produced this completed Assembly result.
 
         A run that finds nothing to change legitimately saves no .blend, so the
         blend timestamp cannot stand in for code freshness: it pins the check
         forever and keeps demanding a rerun that can never satisfy it.  The
         receipt states what the run actually verified instead.
         """
-        addon_dir = self._repair_runtime_addon_dir()
+        addon_dir = self._assembly_runtime_addon_dir()
         if addon_dir is None:
             return
         try:
-            state = self._repair_runtime_code_state(addon_dir)
+            state = self._assembly_runtime_code_state(addon_dir)
         except OSError as exc:
-            self.log(f"  [② 경고] Repair 런타임 지문 계산 실패: {spm.name}: {exc}")
+            self.log(f"  [② 경고] Assembly 런타임 지문 계산 실패: {spm.name}: {exc}")
             return
         if not state:
             return
         try:
-            write_repair_runtime_receipt(
+            write_assembly_runtime_receipt(
                 spm,
                 getattr(self, "cfg", {}) or {},
                 addon_dir=addon_dir,
@@ -11305,9 +11305,9 @@ class App:
                 blend=blend_path_for(spm),
             )
         except OSError as exc:
-            self.log(f"  [② 경고] Repair 런타임 기록 실패: {spm.name}: {exc}")
+            self.log(f"  [② 경고] Assembly 런타임 기록 실패: {spm.name}: {exc}")
 
-    def _repair_runtime_fresh(self, spm, content_contract_out=None):
+    def _assembly_runtime_fresh(self, spm, content_contract_out=None):
         """Gate only on an explicit saved-output contract revision.
 
         Producer source hashes are retained in the receipt for diagnostics,
@@ -11323,11 +11323,11 @@ class App:
         if not blend.is_file() or not report_path.is_file():
             # Missing/stale source outputs are explained by the ordinary
             # handoff checks; runtime freshness applies only to a completed
-            # Repair result that would otherwise be skipped as current.
+            # Assembly result that would otherwise be skipped as current.
             return True, ""
 
         pipeline_probe = {}
-        content_contract_current = self._repair_contract_current(
+        content_contract_current = self._assembly_contract_current(
             spm,
             pipeline_out=pipeline_probe,
         )
@@ -11338,13 +11338,13 @@ class App:
         # must not demand another Repair solely to refresh this metadata.
         return True, ""
 
-    def _repair_output_state(self, spm, pipeline_projection_out=None):
-        with repair_report_read_scope():
-            state = self._repair_output_state_scoped(spm)
+    def _assembly_output_state(self, spm, pipeline_projection_out=None):
+        with assembly_report_read_scope():
+            state = self._assembly_output_state_scoped(spm)
             if isinstance(pipeline_projection_out, dict):
                 try:
-                    pipeline = _read_repair_pipeline_json(
-                        repair_pipeline_report_path(spm)
+                    pipeline = _read_assembly_pipeline_json(
+                        assembly_pipeline_report_path(spm)
                     )
                 except (OSError, TypeError, ValueError):
                     pipeline = {}
@@ -11355,7 +11355,7 @@ class App:
                     )
             return state
 
-    def _repair_output_state_scoped(self, spm):
+    def _assembly_output_state_scoped(self, spm):
         """One semantic decision shared by row status and the ② queue gate."""
         speedtree_spm = speedtree_output_spm_for(spm)
         leaf_projection = {}
@@ -11377,10 +11377,10 @@ class App:
                 "current": False,
                 "push_ready": False,
                 "kind": "missing_blend",
-                "reason": "생성 필요 — blend 없음 → ② Blender Repair",
+                "reason": "생성 필요 — blend 없음 → ② Blender Assembly",
             }
         content_contract_probe = {}
-        runtime_fresh, runtime_reason = self._repair_runtime_fresh(
+        runtime_fresh, runtime_reason = self._assembly_runtime_fresh(
             spm,
             content_contract_out=content_contract_probe,
         )
@@ -11393,7 +11393,7 @@ class App:
             }
         receipt_current = content_contract_probe.get("current")
         if not isinstance(receipt_current, bool):
-            receipt_current = self._repair_contract_current(spm)
+            receipt_current = self._assembly_contract_current(spm)
         assembly_state = None
         assembly_dependency_contract = {}
 
@@ -11422,14 +11422,14 @@ class App:
                 "kind": "stale_content",
                 "reason": (
                     "Blender 갱신 필요 — SPM이 더 최근에 수정됨 "
-                    "→ ② Blender Repair"
+                    "→ ② Blender Assembly"
                 ),
             }
 
         handoff_status = ""
         if receipt_current:
             try:
-                report = load_current_repair_pipeline_report(spm)
+                report = load_current_assembly_pipeline_report(spm)
                 handoff_status = str(
                     (report.get("handoff_preflight") or {}).get("status")
                     or ""
@@ -11480,7 +11480,7 @@ class App:
                 "kind": "wind_contract",
                 "reason": (
                     f"{wind_reason} — "
-                    "② Blender Repair에서 자동 재생성"
+                    "② Blender Assembly에서 자동 재생성"
                 ),
             }
         texture_ok, texture_reason = self._texture_normalization_ready(
@@ -11515,13 +11515,13 @@ class App:
         return state
 
     def _handoff_ready(self, spm, state_out=None):
-        """Return Unreal handoff readiness from the shared Repair decision."""
-        state = self._repair_output_state(spm)
+        """Return Unreal handoff readiness from the shared Assembly decision."""
+        state = self._assembly_output_state(spm)
         if isinstance(state_out, dict):
             state_out.update(copy.deepcopy(state))
         return bool(state["current"] and state["push_ready"]), state["reason"]
 
-    def _publish_repair_stage_contract(
+    def _publish_assembly_stage_contract(
         self,
         spm,
         *,
@@ -11532,7 +11532,7 @@ class App:
         evidence_bundle=None,
     ):
         """Publish ②'s final result for ③ in the same pipeline only."""
-        contracts = getattr(self, "_active_repair_stage_contracts", None)
+        contracts = getattr(self, "_active_assembly_stage_contracts", None)
         if not isinstance(contracts, dict):
             return
         value = {
@@ -11550,9 +11550,9 @@ class App:
         with self.state_lock:
             contracts[key] = value
 
-    def _repair_stage_contract(self, spm):
+    def _assembly_stage_contract(self, spm):
         """Read a job-scoped ② result without accepting persisted state."""
-        contracts = getattr(self, "_active_repair_stage_contracts", None)
+        contracts = getattr(self, "_active_assembly_stage_contracts", None)
         if not isinstance(contracts, dict):
             return None
         key = _normalized_path(speedtree_output_spm_for(spm))
@@ -11590,7 +11590,7 @@ class App:
             return True, "SpeedTree 재질 export 정상"
         missing = list(exported.get("missing_materials") or [])
         if status == "missing_stmat":
-            return False, "SpeedTree .stmat 없음 → ② Blender Repair"
+            return False, "SpeedTree .stmat 없음 → ② Blender Assembly"
         if status == "invalid_stmat":
             return False, (
                 "SpeedTree .stmat 파싱 실패 — "
@@ -11608,26 +11608,26 @@ class App:
 
     @staticmethod
     def _texture_normalization_ready(spm, content_receipt_current=None):
-        report_path = repair_pipeline_report_path(spm)
+        report_path = assembly_pipeline_report_path(spm)
         if not report_path.is_file():
             return False, "텍스처 정규화 정보 없음 → ② 필요"
         if content_receipt_current is None:
-            content_receipt_current = App._repair_contract_current(spm)
+            content_receipt_current = App._assembly_contract_current(spm)
         try:
             if (
                 report_path.stat().st_mtime_ns < Path(spm).stat().st_mtime_ns
                 and not content_receipt_current
             ):
-                return False, "SPM 변경 후 Repair 보고서가 오래됨 → ② 다시 실행"
+                return False, "SPM 변경 후 Assembly 보고서가 오래됨 → ② 다시 실행"
         except OSError as exc:
             return False, f"텍스처 보고서 시간 확인 실패: {exc}"
         try:
-            report = load_current_repair_pipeline_report(spm)
+            report = load_current_assembly_pipeline_report(spm)
         except (OSError, ValueError, RuntimeError) as exc:
-            if "legacy Repair report" in str(exc):
+            if "legacy Assembly report" in str(exc):
                 return False, (
                     "공통 SpeedTree 계약 정보 없음 → "
-                    "② Blender Repair 다시 실행"
+                    "② Blender Assembly 다시 실행"
                 )
             return False, f"텍스처 정규화 보고서 오류: {exc}"
         normalization = report.get("texture_normalization") or {}
@@ -11650,7 +11650,7 @@ class App:
         )
         handoff = report.get("handoff_preflight")
         if not isinstance(handoff, dict):
-            return False, "② 사전검사 정보 없음 → ② Blender Repair 다시 실행"
+            return False, "② 사전검사 정보 없음 → ② Blender Assembly 다시 실행"
         slots = handoff.get("empty_material_slots") or []
         outputs = handoff.get("missing_outputs") or []
         materials = (
@@ -11686,7 +11686,7 @@ class App:
         if reasons:
             return False, "② 사전검사 차단: " + " | ".join(reasons)
         if handoff.get("status") not in {"ok", "source_review", "blocked"}:
-            return False, "② 사전검사 미완료 → Blender Repair 다시 실행"
+            return False, "② 사전검사 미완료 → Blender Assembly 다시 실행"
         preserved_count = sum(
             1 for item in normalization.get("materials", [])
             if item.get("status") == "preserved_cluster"
@@ -11702,14 +11702,14 @@ class App:
         return True, "머티리얼 준비 완료 · 텍스처 선택 연결"
 
     @staticmethod
-    def _blend_status_from_repair_state(state):
-        """Format one already-computed Repair state for the overview table."""
+    def _blend_status_from_assembly_state(state):
+        """Format one already-computed Assembly state for the overview table."""
         if state["kind"] == "missing_blend":
-            return "생성 필요 — blend 없음 · ② Blender Repair 실행"
+            return "생성 필요 — blend 없음 · ② Blender Assembly 실행"
         if state["kind"] == "stale_content":
             return "Blender 갱신 필요 — SPM이 더 최근에 수정됨 · ② 다시 실행"
         if not state["current"]:
-            return f"Repair 필요 — {state['reason']}"
+            return f"Assembly 필요 — {state['reason']}"
         if state["kind"] == "source_review":
             return "Blend 완료 · 원본 검토 필요 · Unreal Push 차단"
         texture_reason = state.get("texture_reason", "")
@@ -11725,10 +11725,10 @@ class App:
     def _blend_status_text(self, spm):
         """Return the live SK handoff status; never trust a saved UI label."""
         try:
-            state = self._repair_output_state(spm)
+            state = self._assembly_output_state(spm)
         except OSError as exc:
             return f"확인 실패 — {exc}"
-        return self._blend_status_from_repair_state(state)
+        return self._blend_status_from_assembly_state(state)
 
     def _record_live_blend_status(
         self,
@@ -11740,7 +11740,7 @@ class App:
         relation_validated=False,
     ):
         text = (
-            self._blend_status_from_repair_state(repair_state)
+            self._blend_status_from_assembly_state(repair_state)
             if isinstance(repair_state, dict)
             else self._blend_status_text(spm)
         )
@@ -12435,11 +12435,11 @@ class App:
             self.cfg.get("xml_ini")
             or configured_fbx_ini.with_name("Options_HI_Xml.ini")
         ).resolve()
-        # Blender Repair loads the junction-installed add-on. Material
+        # Blender Assembly loads the junction-installed add-on. Material
         # preflight must use that exact helper and its exact preset paths;
         # export cache fingerprints are intentionally path-sensitive. Using
         # the configured source checkout here caused one official-Modeler FBX
-        # export, followed by a second collision-CLI FBX/XML export in BWR.
+        # export, followed by a second collision-CLI FBX/XML export in Assembly.
         installed_addon_dir = Path(ADDON_ENTRY_DIR).absolute()
         try:
             configured_addon_dir = configured_fbx_ini.parents[2]
@@ -12614,7 +12614,7 @@ class App:
                 )
             except (OSError, TypeError, ValueError, RuntimeError) as exc:
                 # Cache publication is an optimization.  The authoritative
-                # just-completed report still proceeds to Blender Repair.
+                # just-completed report still proceeds to Blender Assembly.
                 self.log(
                     "  [캐시 기록 경고] 재질 데이터 준비 결과는 유효하지만 "
                     f"재사용 영수증을 기록하지 못함: {spm.name} · "
@@ -12630,7 +12630,7 @@ class App:
         }
 
     def _refresh_cluster_source_relations(self, spm, item):
-        """Regenerate stale provider outputs without rebuilding current BWR."""
+        """Regenerate stale provider outputs without rebuilding current Assembly."""
         from cluster_blend_sync import (
             run_cluster_relation_transaction,
         )
@@ -12698,7 +12698,7 @@ class App:
                     capture_resolution=int(
                         self.cfg.get("cluster_capture_resolution", 1024)
                     ),
-                    repair_runtime_config=self.cfg,
+                    assembly_runtime_config=self.cfg,
                     timeout=int(
                         self.cfg.get("blender_job_timeout", 3600)
                     ),
@@ -13197,7 +13197,7 @@ class App:
 
     @staticmethod
     def _cluster_receipt_discovery_input_paths(spm):
-        """Discover only contract inputs, never BWR/runtime report JSON."""
+        """Discover only contract inputs, never Assembly/runtime report JSON."""
         spm = Path(spm).resolve()
         owner = spm.parent
         # Runtime source files are launch-time code, not asset inputs. The
@@ -14164,7 +14164,7 @@ class App:
             and live_contract.get("tree_source_identities")
         )
         if not live_contract_actionable:
-            # A clean identity-bound pass-through still has to reach BWR so an
+            # A clean identity-bound pass-through still has to reach Assembly so an
             # older cache cannot reintroduce a removed Cluster relationship.
             self.log(f"Cluster Assembly 영수증 비대상: {spm.name}")
             if (
@@ -15194,7 +15194,7 @@ class App:
         )
         return live_resolution
 
-    def _publish_current_repair_skip(
+    def _publish_current_assembly_skip(
         self,
         iid,
         spm,
@@ -15203,7 +15203,7 @@ class App:
         validated_resume_receipt=None,
         relation_validated=False,
     ):
-        """Publish one exact current Repair result without rediscovering work."""
+        """Publish one exact current Assembly result without rediscovering work."""
         if not isinstance(repair_state, dict) or not repair_state.get("current"):
             return False
         self._record_live_blend_status(
@@ -15218,7 +15218,7 @@ class App:
             if not repair_state.get("push_ready")
             else ""
         )
-        self._publish_repair_stage_contract(
+        self._publish_assembly_stage_contract(
             spm,
             ready=repair_state.get("push_ready") is True,
             reason=repair_state.get("reason"),
@@ -15245,15 +15245,15 @@ class App:
             and not resume_policy
             and not relation_sensitive
         ):
-            # The shared Repair decision already validates the exact SPM,
-            # blend, BWR report, material/wind output and exact dependency
+            # The shared Assembly decision already validates the exact SPM,
+            # blend, Assembly report, material/wind output and exact dependency
             # artifacts.  Consult it before Atlas refresh, consumer audits or
             # material preflight for ordinary non-Cluster rows. Relation rows
             # reach this worker only when their fast receipt was unavailable
             # or changed, so they must refresh the relation once here.
             # Explicit force rebuild deliberately bypasses this fast path.
-            repair_state = self._repair_output_state(spm)
-            if self._publish_current_repair_skip(
+            repair_state = self._assembly_output_state(spm)
+            if self._publish_current_assembly_skip(
                 iid,
                 spm,
                 repair_state,
@@ -15420,7 +15420,7 @@ class App:
                 cluster_receipt_resolution
             )
             saved_pipeline = {}
-            repair_state = self._repair_output_state(
+            repair_state = self._assembly_output_state(
                 spm,
                 pipeline_projection_out=(
                     saved_pipeline if live_contract else None
@@ -15439,7 +15439,7 @@ class App:
                     "kind": "cluster_bark_capture",
                     "reason": (
                         "prepared isolated canonical bark source has not "
-                        "been captured by Blender Repair"
+                        "been captured by Blender Assembly"
                     ),
                 }
                 self.log(
@@ -15451,7 +15451,7 @@ class App:
                     # An actionable live Assembly contract needs a matching
                     # materialized manifest before the old Blend may be
                     # reused.  Pass-through has no Assembly output to embed,
-                    # so missing metadata alone must not manufacture a BWR
+                    # so missing metadata alone must not manufacture a Assembly
                     # rerun.
                     saved_manifest = saved_pipeline.get(
                         "cluster_assembly_manifest"
@@ -15476,7 +15476,7 @@ class App:
                             # A first resume audit may establish that an
                             # ordinary asset still has no Assembly work.  That
                             # is enough to create the skip receipt; it must not
-                            # force a ceremonial BWR rebuild just to persist a
+                            # force a ceremonial Assembly rebuild just to persist a
                             # pass-through manifest.
                             if live_status != "pass_through":
                                 repair_state["current"] = False
@@ -15505,7 +15505,7 @@ class App:
                         TypeError,
                         ValueError,
                     ):
-                        # This is a skip decision only.  Continue through BWR
+                        # This is a skip decision only.  Continue through Assembly
                         # instead of turning relationship metadata into a
                         # separate terminal failure.
                         repair_state["current"] = False
@@ -15528,8 +15528,8 @@ class App:
                             != "pass_through"
                         )
                         if relation_outputs_changed:
-                            repair_state = self._repair_output_state(spm)
-                    if self._publish_current_repair_skip(
+                            repair_state = self._assembly_output_state(spm)
+                    if self._publish_current_assembly_skip(
                         iid,
                         spm,
                         repair_state,
@@ -15537,13 +15537,13 @@ class App:
                     ):
                         return
                     self.log(
-                        "Cluster 관계 산출물 갱신 후 Repair 상태가 변경되어 "
+                        "Cluster 관계 산출물 갱신 후 Assembly 상태가 변경되어 "
                         f"②를 계속 실행: {spm.name}"
                     )
         open_windows = blender_open_file_window_titles(blend)
         if open_windows:
             raise BatchItemError(
-                "Repair 대상 .blend가 대화형 Blender에 열려 있습니다. "
+                "Assembly 대상 .blend가 대화형 Blender에 열려 있습니다. "
                 "저장하거나 닫은 뒤 다시 실행하세요: " + blend.name,
                 kind="manual_required",
                 report={
@@ -15631,17 +15631,17 @@ class App:
             except (OSError, TypeError, ValueError) as exc:
                 raise BatchItemError(
                     "Cluster Assembly live audit contract could not be "
-                    f"embedded for Blender Repair: {spm.name}: {exc}",
+                    f"embedded for Blender Assembly: {spm.name}: {exc}",
                     kind="internal_error",
                     report_file=live_report,
                 ) from exc
         self.log(f"재질 데이터 준비 완료: {spm.name}")
-        self.log(f"Blender repair 시작: {spm.name} (수분 소요될 수 있음)")
-        self.ui_queue.put(("cell", (iid, "blend_status", "Blender repair 중...")))
+        self.log(f"Blender Assembly 시작: {spm.name} (수분 소요될 수 있음)")
+        self.ui_queue.put(("cell", (iid, "blend_status", "Blender Assembly 중...")))
         wind = item["wind_override"]
         if wind == "auto":
             wind = wind_preset_for_spm(spm)
-        job_report = LOG_DIR / f"{spm.stem}_bwr_{stamp}.json"
+        job_report = LOG_DIR / f"{spm.stem}_assembly_{stamp}.json"
         pipeline_report = (
             spm.parent / "reports" /
             f"{spm.stem}_speedtree_assembly_pipeline_report_codex.json"
@@ -15650,7 +15650,7 @@ class App:
             previous_pipeline_report = pipeline_report.read_bytes()
         except OSError:
             previous_pipeline_report = None
-        runtime_receipt = self._repair_runtime_receipt_path(spm)
+        runtime_receipt = self._assembly_runtime_receipt_path(spm)
         try:
             previous_runtime_receipt = runtime_receipt.read_bytes()
         except OSError:
@@ -15660,7 +15660,7 @@ class App:
         cluster_source_build_committed = False
         if cluster_blend_existed:
             cluster_blend_backup = (
-                LOG_DIR / f"{spm.stem}_pre_repair_{stamp}.blend"
+                LOG_DIR / f"{spm.stem}_pre_assembly_{stamp}.blend"
             )
             # Startup retention already cleaned the managed roots.  A repair
             # item must not re-scan every managed artifact while holding the
@@ -15669,12 +15669,12 @@ class App:
             # Blender workers and could fail an item after a 120-second wait.
             shutil.copy2(blend, cluster_blend_backup)
 
-        def restore_cluster_repair_outputs():
-            # This backup belongs only to the raw BWR producer transaction.
-            # Once BWR has committed a ready Cluster source, the downstream
+        def restore_cluster_assembly_outputs():
+            # This backup belongs only to the raw Assembly producer transaction.
+            # Once Assembly has committed a ready Cluster source, the downstream
             # Normalizer/Atlas transaction owns its own snapshots.  Restoring
             # this older backup after that boundary would discard the valid
-            # source blend/report and make the next run rebuild BWR again.
+            # source blend/report and make the next run rebuild Assembly again.
             if cluster_source_build_committed:
                 return []
             restored = []
@@ -15705,7 +15705,7 @@ class App:
 
         cmd = [
             self.cfg["blender_exe"], "--factory-startup", "-b",
-            "--python", str(TOOL_DIR / "jobs" / "bwr_headless_job.py"), "--",
+            "--python", str(TOOL_DIR / "jobs" / "assembly_headless_job.py"), "--",
             "--spm", str(spm),
             "--speedtree-spm", str(speedtree_spm),
             "--blend", str(blend),
@@ -15736,7 +15736,7 @@ class App:
         try:
             code, log_file = self._run_limited(
                 cmd,
-                f"{spm.stem}_bwr_{stamp}.log",
+                f"{spm.stem}_assembly_{stamp}.log",
                 self.cfg.get("blender_job_timeout", 3600),
                 affinity=not parallel,
             )
@@ -15748,10 +15748,10 @@ class App:
         if code != 0 or result.get("status") != "ok":
             if cluster_source:
                 try:
-                    restore_cluster_repair_outputs()
+                    restore_cluster_assembly_outputs()
                 except OSError as exc:
                     self.log(
-                        f"  [Repair rollback warning] {spm.name}: {exc}"
+                        f"  [Assembly rollback warning] {spm.name}: {exc}"
                     )
             if previous_pipeline_report is not None:
                 try:
@@ -15779,7 +15779,7 @@ class App:
             )
             if source_build.get("status") != "ready":
                 try:
-                    restore_cluster_repair_outputs()
+                    restore_cluster_assembly_outputs()
                 except OSError:
                     pass
                 raise BatchItemError(
@@ -15790,11 +15790,11 @@ class App:
                     log_file=log_file,
                     report_file=job_report,
                 )
-            # BWR's source blend and producer report are now durable inputs to
+            # Assembly's source blend and producer report are now durable inputs to
             # the separate Normalizer/Atlas transaction.  That transaction
             # still rolls back SPM/Atlas partial outputs (and restores this
             # exact committed source snapshot), but must never cross back into
-            # the pre-BWR backup.
+            # the pre-Assembly backup.
             cluster_source_build_committed = True
             if cluster_blend_backup is not None:
                 try:
@@ -15830,7 +15830,7 @@ class App:
                                     "cluster_capture_resolution", 1024
                                 )
                             ),
-                            repair_runtime_config=self.cfg,
+                            assembly_runtime_config=self.cfg,
                             timeout=int(
                                 self.cfg.get("blender_job_timeout", 3600)
                             ),
@@ -15854,7 +15854,7 @@ class App:
                     ]
                 except Exception as exc:
                     try:
-                        restored = restore_cluster_repair_outputs()
+                        restored = restore_cluster_assembly_outputs()
                     except OSError as restore_exc:
                         restored = [f"rollback_failed:{restore_exc}"]
                     raise BatchItemError(
@@ -15875,7 +15875,7 @@ class App:
                 "status": "pass_through",
                 "reason": "no_explicit_owner_relation",
                 "targets": [],
-                "repair_mode": "standalone_final_handoff",
+                "assembly_mode": "standalone_final_handoff",
             }
         if cluster_source:
             try:
@@ -15888,7 +15888,7 @@ class App:
         # Written before the handoff check reads it: this run verified the saved
         # outputs against the code now installed, whether or not it had to
         # rewrite the .blend.
-        self._write_repair_runtime_receipt(spm)
+        self._write_assembly_runtime_receipt(spm)
         handoff_state = {}
         handoff_ok, handoff_reason = self._handoff_ready(
             spm,
@@ -15905,15 +15905,15 @@ class App:
             or (result.get("handoff_preflight") or {}).get("status")
             == "source_review"
         )
-        repair_contract_reason = (
+        assembly_contract_reason = (
             "원본/재질 검토 필요 — Unreal Push 차단"
             if source_review
             else handoff_reason
         )
-        self._publish_repair_stage_contract(
+        self._publish_assembly_stage_contract(
             spm,
             ready=handoff_ok and not source_review,
-            reason=repair_contract_reason,
+            reason=assembly_contract_reason,
             kind=(
                 "source_review"
                 if source_review
@@ -15927,10 +15927,10 @@ class App:
         if not handoff_ok and not source_review:
             if cluster_source:
                 try:
-                    restore_cluster_repair_outputs()
+                    restore_cluster_assembly_outputs()
                 except OSError as exc:
                     self.log(
-                        f"  [Repair rollback warning] {spm.name}: {exc}"
+                        f"  [Assembly rollback warning] {spm.name}: {exc}"
                     )
             raise BatchItemError(
                 f"② 완료 후 사전검사 실패: {handoff_reason}",
@@ -15967,7 +15967,7 @@ class App:
                 )
         for warning in result.get("warnings", []):
             self.log(f"  [② 경고] {spm.name}: {warning}")
-        self.log(f"repair 완료: {blend.name}")
+        self.log(f"Assembly 완료: {blend.name}")
 
     def _push_preflight(self, targets):
         """Return (ready items, fatal Unreal reason) after recording all skips."""
@@ -16009,7 +16009,7 @@ class App:
                 save_state(self.state)
             return [], reason
         ready = []
-        reused_repair_contracts = 0
+        reused_assembly_contracts = 0
         for item in targets:
             spm = item["spm"]
             dirty_windows = [
@@ -16034,14 +16034,14 @@ class App:
                 )
                 self.log(f"[준비 제외] {spm.name}: {why}")
                 continue
-            repair_contract = self._repair_stage_contract(spm)
+            repair_contract = self._assembly_stage_contract(spm)
             contract_failure_kind = None
             if repair_contract is None:
                 ok, why = self._handoff_ready(spm)
             else:
                 ok = bool(repair_contract["ready"])
                 why = str(repair_contract["reason"])
-                reused_repair_contracts += 1
+                reused_assembly_contracts += 1
             if ok:
                 ready.append(item)
             else:
@@ -16069,8 +16069,8 @@ class App:
         with self.state_lock:
             save_state(self.state)
         reuse_suffix = (
-            f" · ② 결과 재사용 {reused_repair_contracts}개"
-            if reused_repair_contracts
+            f" · ② 결과 재사용 {reused_assembly_contracts}개"
+            if reused_assembly_contracts
             else ""
         )
         self.log(
@@ -16344,7 +16344,7 @@ class App:
         pass their exact content-identity checks, later exporter-code changes
         cannot retroactively change them.  Recovery records that drift and
         rebinds the existing artifacts to the current Unreal runtime.  The
-        blend and per-asset Repair report remain outside this set, so an actual
+        blend and per-asset Assembly report remain outside this set, so an actual
         source-data change still requires a full Push.
         """
         return list(dict.fromkeys(self._push_dependency_paths()))
@@ -16358,7 +16358,7 @@ class App:
         """
         if spm is None:
             return []
-        return [repair_pipeline_report_path(Path(spm))]
+        return [assembly_pipeline_report_path(Path(spm))]
 
     @staticmethod
     def _push_material_contract(spm):
@@ -16372,7 +16372,7 @@ class App:
             payload = json.loads(repair_report.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             raise RuntimeError(
-                f"SpeedTree Repair contract report could not be read: {exc}"
+                f"SpeedTree Assembly contract report could not be read: {exc}"
             ) from exc
         # Push consumes the current repaired blend and current source paths.
         # A recorded source hash/profile belongs to an earlier diagnostic pass
@@ -16382,7 +16382,7 @@ class App:
             envelope = payload.get("speedtree_pipeline_contract")
         if not isinstance(envelope, dict):
             raise RuntimeError(
-                "SpeedTree Repair report has no readable material contract"
+                "SpeedTree Assembly report has no readable material contract"
             )
         material_source_spm = Path(
             str((((envelope.get("source") or {}).get("spm") or {}).get(
@@ -16403,7 +16403,7 @@ class App:
                     speedtree_output_spm_for(spm).resolve()
                 ),
                 "material_source_spm": str(material_source_spm),
-                "source_repair_report": str(repair_report.resolve()),
+                "source_assembly_report": str(repair_report.resolve()),
                 "historical_identity_fields_are_diagnostic": True,
             },
         )

@@ -27,7 +27,7 @@ from artifact_content_key import sampled_file_content_snapshot  # noqa: E402
 FIXTURE_PATH = (
     Path(__file__).resolve().parent
     / "fixtures"
-    / "issue65_bwr_passthrough_provenance.json"
+    / "issue65_assembly_passthrough_provenance.json"
 )
 
 

@@ -31,7 +31,7 @@ def write_assembly(root_spm, manifest_path, source_blends):
         ),
         encoding="utf-8",
     )
-    report = schedule.repair_pipeline_report_path(root_spm)
+    report = schedule.assembly_pipeline_report_path(root_spm)
     report.parent.mkdir(parents=True, exist_ok=True)
     report.write_text(
         json.dumps(
@@ -235,7 +235,7 @@ def test_current_pass_through_contract_suppresses_relation_dependencies(
     source_spm = cluster_dir / "SK_leaf_pass_through_01.spm"
     root_spm.write_bytes(b"root")
     source_spm.write_bytes(b"cluster")
-    report = schedule.repair_pipeline_report_path(root_spm)
+    report = schedule.assembly_pipeline_report_path(root_spm)
     report.parent.mkdir(parents=True, exist_ok=True)
     report.write_text(
         json.dumps({

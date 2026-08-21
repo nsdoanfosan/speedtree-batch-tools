@@ -1,7 +1,7 @@
-"""Headless Blender job: SPM -> SpeedTree CLI export -> BWR import/repair -> .blend.
+"""Headless Blender job: SPM -> SpeedTree CLI export -> Assembly -> .blend.
 
 Run:
-  blender.exe -b --python bwr_headless_job.py -- --spm X.spm --blend X.blend
+  blender.exe -b --python assembly_headless_job.py -- --spm X.spm --blend X.blend
       --wind TREE|BUSH|WEED|NONE --material-contract preflight.json
       --report result.json
 
@@ -41,7 +41,7 @@ DEFAULT_SPEEDTREE_COLLISION_CLI = (
 
 
 def resolve_speedtree_collision_cli():
-    """Return the version-locked post-collision exporter used by batch repair."""
+    """Return the version-locked post-collision exporter used by Assembly."""
     configured = os.environ.get("SPEEDTREE_COLLISION_CLI_EXE")
     executable = (
         Path(configured).expanduser()
@@ -58,7 +58,7 @@ def resolve_speedtree_collision_cli():
     return executable, hook
 
 from vertex_color_contract import pack_speedtree_vertex_payload
-from repair_push_evidence import export_object_postcondition
+from assembly_export_evidence import export_object_postcondition
 from spm_leaf_handoff_contract import (
     inspect_speedtree_material_export,
     inspect_spm_leaf_contract,
@@ -69,12 +69,12 @@ from speedtree_pipeline_contract import (
     source_identity,
     validate_preflight_report,
 )
-from bwr_atlas_manifest_bridge import install_bwr_atlas_manifest_resolver
+from assembly_atlas_manifest_bridge import install_assembly_atlas_manifest_resolver
 from cluster_assembly_handoff_contract import (
     assembly_source_fbx_resolution,
     build_assembly_handoff,
     build_blender_fbx_inventory,
-    current_assembly_manifest_repair_handoff,
+    current_assembly_manifest_handoff,
     file_fingerprint,
     load_cluster_contract,
     resolve_cluster_receipt_path,
@@ -83,7 +83,7 @@ from cluster_assembly_handoff_contract import (
 from cluster_assembly_builder import build_blender_assembly_inputs
 from spm_audit import is_cluster_normalization_spm
 from job_report_contract import mark_job_failed
-from repair_runtime_contract import ASSEMBLY_OUTPUT_CONTRACT_VERSION
+from assembly_runtime_contract import ASSEMBLY_OUTPUT_CONTRACT_VERSION
 from cluster_export_handoff_contract import (
     capture_cluster_export_snapshot,
     cluster_export_contract_issues as inspect_cluster_export_contract,
@@ -240,7 +240,7 @@ def reusable_preflight_spm_contracts(material_preflight, current_fbx_export):
 def save_cluster_source_mainfile(bpy_module, filepath, report):
     """Save one Cluster source without Blender's redundant version rename.
 
-    The GUI owns a separate pre-repair copy and restores it if this producer
+    The GUI owns a separate pre-assembly copy and restores it if this producer
     transaction fails.  Blender's additional ``.blend -> .blend1`` rename is
     therefore redundant here and can fail when OneDrive briefly holds either
     path.  Change the preference only in memory for this operator call and
@@ -251,7 +251,7 @@ def save_cluster_source_mainfile(bpy_module, filepath, report):
     policy = {
         "status": "applying",
         "policy": (
-            "gui_pre_repair_transaction_authoritative_disable_blender_"
+            "gui_pre_assembly_transaction_authoritative_disable_blender_"
             "version_backup"
         ),
         "scope": "headless_cluster_source_final_save",
@@ -260,7 +260,7 @@ def save_cluster_source_mainfile(bpy_module, filepath, report):
         "effective_save_version": 0,
         "preference_persisted": False,
         "preference_restored": False,
-        "transaction_backup": "sk_batch_gui_pre_repair_copy_and_rollback",
+        "transaction_backup": "sk_batch_gui_pre_assembly_copy_and_rollback",
     }
     report["blend_save_policy"] = policy
     try:
@@ -340,9 +340,9 @@ def export_collection_contract_issues(cluster_source_stem=""):
 
 
 def inspect_cluster_assembly_fbx(receipt_path, spm_path, source_fbx_path):
-    """Import the exact FBX in-memory and reconcile it before BWR can save.
+    """Import the exact FBX in-memory and reconcile it before Assembly saves.
 
-    The later BWR operator clears these tagged objects and performs its normal
+    The Assembly operator clears these tagged objects and performs its normal
     clean import.  If the contract blocks, this background Blender process exits
     without saving, so an existing user-managed Full SK blend stays untouched.
     """
@@ -440,7 +440,7 @@ def require_cluster_assembly_handoff_ready(handoff):
         describe(item) for item in handoff.get("issues") or []
     )
     raise RuntimeError(
-        "PCG Cluster Assembly handoff blocked before Blender Repair: "
+        "PCG Cluster Assembly handoff blocked before Blender Assembly: "
         + (reasons or "unknown contract error")
     )
 
@@ -452,7 +452,7 @@ def select_cluster_assembly_build_handoff(
 ):
     """Prefer every conclusive current-FBX result over persisted fallbacks.
 
-    The PCG receipt describes what was known before the final BWR FBX existed.
+    The PCG receipt describes what was known before the final Assembly FBX.
     Once that FBX has been inspected, both ``ready`` and ``pass_through`` are
     authoritative content decisions.  A production build manifest is only a
     recovery source when current inspection produced no conclusive result; it
@@ -511,13 +511,13 @@ def main():
     # Cluster rows reach this job under their canonical SK_ output identity.
     # ``--speedtree-spm`` can additionally point at an immutable isolated copy
     # when the Assembly receipt requires canonical bark before Atlas capture.
-    # Legacy lineage never affects repair, so do not spend tens of seconds
+    # Legacy lineage never affects Assembly, so do not spend tens of seconds
     # parsing a large SPM solely to populate historical diagnostics.
     source_review_policy = "diagnostic_only"
     report["source_review_policy"] = source_review_policy
     report["legacy_cluster_lineage"] = {
         "status": "diagnostic_not_run",
-        "policy": "legacy_lineage_is_not_a_repair_or_export_input",
+        "policy": "legacy_lineage_is_not_an_assembly_or_export_input",
         "receipt": "",
         "receipt_valid": False,
         "generator_count": 0,
@@ -573,7 +573,7 @@ def main():
         record_stage_duration(report, "input_preflight", preflight_started)
         addon_runtime_started = perf_counter()
         addon_runtime = prepare_runtime(
-            "sk_batch.jobs.bwr_headless_job",
+            "sk_batch.jobs.assembly_headless_job",
             {
                 "speedtree_bone_weight_repair": (
                     "speedtree_export_v1",
@@ -659,6 +659,7 @@ def main():
                 cluster_assembly_source_resolution
             )
 
+        # This is the installed add-on's stable Blender RNA property name.
         settings = bpy.context.scene.speedtree_bwr_settings
         settings.spm_path = str(speedtree_spm)
         collision_cli, collision_hook = resolve_speedtree_collision_cli()
@@ -697,7 +698,7 @@ def main():
         # default_paths anchors out_dir/JSON to bpy.data.filepath. open_mainfile
         # already set it for existing blends, so only a fresh file needs the
         # anchor save — re-saving a multi-GB blend right before the export
-        # rebuilds it was pure disk churn (2x full writes per repair).
+        # rebuilds it was pure disk churn (2x full writes per Assembly).
         if not blend_exists:
             Path(blend_path).parent.mkdir(parents=True, exist_ok=True)
             bpy.ops.wm.save_as_mainfile(filepath=blend_path)
@@ -707,7 +708,7 @@ def main():
         # have two identities, so perform those two existing core stages with
         # explicit stems instead of deriving one by removing ``SK_``.
         report["atlas_manifest_resolution"] = (
-            install_bwr_atlas_manifest_resolver(
+            install_assembly_atlas_manifest_resolver(
                 addon_runtime,
                 speedtree_spm,
             )
@@ -1095,7 +1096,7 @@ def main():
             "status": "diagnostic_not_run",
             "issues": ["missing_pipeline_report"],
         }
-        post_repair_spm_contract_started = perf_counter()
+        post_assembly_spm_contract_started = perf_counter()
         reusable_contracts = reusable_preflight_spm_contracts(
             material_preflight,
             fbx_export,
@@ -1115,8 +1116,8 @@ def main():
             )
         record_stage_duration(
             report,
-            "post_repair_spm_contracts",
-            post_repair_spm_contract_started,
+            "post_assembly_spm_contracts",
+            post_assembly_spm_contract_started,
         )
         report["leaf_reference_contract"] = leaf_reference_contract
         report["material_export_contract"] = material_export_contract
@@ -1154,9 +1155,9 @@ def main():
                 pipeline_data["speedtree_pipeline_contract"] = (
                     material_preflight["speedtree_pipeline_contract"]
                 )
-                # Preserve the exact validated Repair input separately from
+                # Preserve the exact validated Assembly input separately from
                 # the canonical production contract. Cluster providers may be
-                # repaired from an isolated, bark-normalized SPM whose
+                # assembled from an isolated, bark-normalized SPM whose
                 # textures intentionally differ from the untouched authored
                 # source. Later normalization stages may refresh the canonical
                 # envelope, but Push must consume the same content-addressed
@@ -1192,8 +1193,8 @@ def main():
             )
             report["vertex_color_contract"] = vertex_color_contract
 
-        # The repair result is the save authority. Optional handoff diagnostics
-        # must not discard a completed Blender repair.
+        # The Assembly result is the save authority. Optional diagnostics
+        # must not discard a completed Blender Assembly.
         report["blend_resaved"] = False
         if merged_object is not None:
             blend_save_started = perf_counter()
@@ -1210,7 +1211,7 @@ def main():
             report["blend_save_operator_result"] = sorted(save_result)
             if "FINISHED" not in save_result:
                 raise RuntimeError(
-                    "Blender did not commit the repaired source blend: "
+                    "Blender did not commit the assembled source blend: "
                     + ", ".join(sorted(save_result))
                 )
             report["blend_resaved"] = True
@@ -1317,7 +1318,7 @@ def main():
             current_full_fbx = str(
                 (pipeline_data.get("paths") or {}).get("fbx") or ""
             )
-            current_handoff = current_assembly_manifest_repair_handoff(
+            current_handoff = current_assembly_manifest_handoff(
                 canonical_spm,
                 current_full_fbx,
             )
@@ -1362,12 +1363,12 @@ def main():
         ):
             if pipeline_data is None or merged_object is None:
                 raise RuntimeError(
-                    "Cluster Assembly builder requires the final BWR pipeline mesh"
+                    "Cluster Assembly builder requires the final pipeline mesh"
                 )
             final_armature = merged_object.find_armature()
             if final_armature is None:
                 raise RuntimeError(
-                    "Cluster Assembly builder could not resolve the final BWR armature"
+                    "Cluster Assembly builder could not resolve the final armature"
                 )
             full_fbx_path = str((pipeline_data.get("paths") or {}).get("fbx") or "")
             if not full_fbx_path:
@@ -1445,7 +1446,7 @@ def main():
                 )
             if preflight["status"] == "ok":
                 export_postcondition_started = perf_counter()
-                pipeline_data["repair_push_export_postcondition"] = (
+                pipeline_data["assembly_export_postcondition"] = (
                     export_object_postcondition(bpy.data)
                 )
                 record_stage_duration(

@@ -1,7 +1,7 @@
 """Dependency discovery and stable ordering for SK Batch Unreal Push.
 
 Tree assembly manifests already record the exact normalized Cluster ``.blend``
-files used by Blender Repair.  This module turns those records into batch
+files used by Blender Assembly.  This module turns those records into batch
 dependencies without guessing asset names, branch counts, or export suffixes.
 """
 
@@ -21,7 +21,7 @@ from speedtree_pipeline_contract import is_live_spm
 
 
 class PushDependencyError(RuntimeError):
-    """The saved Blender Repair dependency contract cannot be scheduled."""
+    """The saved Blender Assembly dependency contract cannot be scheduled."""
 
     def __init__(
         self,
@@ -57,7 +57,7 @@ def is_cluster_source_spm(spm):
     )
 
 
-def repair_pipeline_report_path(spm):
+def assembly_pipeline_report_path(spm):
     spm = Path(spm)
     return (
         spm.parent
@@ -71,7 +71,7 @@ def load_current_cluster_assembly_manifest(spm):
     spm = Path(spm)
     if is_cluster_source_spm(spm):
         return None
-    report_path = repair_pipeline_report_path(spm)
+    report_path = assembly_pipeline_report_path(spm)
     if not report_path.is_file():
         # The ordinary Push preflight owns the missing-Repair-report message.
         return None
@@ -90,17 +90,17 @@ def load_current_cluster_assembly_manifest(spm):
         manifest_path = Path(str(manifest_record.get("path") or ""))
         if not manifest_path.is_file():
             raise PushDependencyError(
-                "BWR Cluster Assembly manifest file is missing: "
+                "Assembly Cluster Assembly manifest file is missing: "
                 + str(manifest_path)
             )
         validate_file_fingerprint(
-            manifest_record, "BWR Cluster Assembly manifest"
+            manifest_record, "Assembly Cluster Assembly manifest"
         )
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["manifest"] = manifest_record
         if manifest.get("kind") != MANIFEST_KIND:
             raise PushDependencyError(
-                "unsupported BWR Cluster Assembly manifest kind"
+                "unsupported Assembly Cluster Assembly manifest kind"
             )
         validate_manifest_artifacts(manifest)
         return manifest
@@ -159,7 +159,7 @@ def exact_dependency_contract_from_validated_manifest(root_spm, manifest):
         )
     if manifest.get("kind") != MANIFEST_KIND:
         raise PushDependencyError(
-            "unsupported BWR Cluster Assembly manifest kind"
+            "unsupported Assembly Cluster Assembly manifest kind"
         )
     dependencies = _dependency_spms_from_manifest(manifest)
     return {

@@ -4212,14 +4212,14 @@ def export_verify_xml_fbx_bundle(spm_path, cfg, xml_out, fbx_out):
             )
 
 
-_BWR_SPEEDTREE_CLI_MODULE = None
+_ASSEMBLY_SPEEDTREE_CLI_MODULE = None
 
 
-def _load_bwr_speedtree_cli():
+def _load_assembly_speedtree_cli():
     """Load the same junction-installed cache/export helper used by BWR."""
-    global _BWR_SPEEDTREE_CLI_MODULE
-    if _BWR_SPEEDTREE_CLI_MODULE is not None:
-        return _BWR_SPEEDTREE_CLI_MODULE
+    global _ASSEMBLY_SPEEDTREE_CLI_MODULE
+    if _ASSEMBLY_SPEEDTREE_CLI_MODULE is not None:
+        return _ASSEMBLY_SPEEDTREE_CLI_MODULE
     helper_path = Path(ADDON_ENTRY_DIR).absolute() / "speedtree_cli.py"
     spec = importlib.util.spec_from_file_location(
         "sk_batch_stage1_speedtree_cli",
@@ -4237,7 +4237,7 @@ def _load_bwr_speedtree_cli():
             "The junction-installed BWR helper lacks export_bundle: "
             + str(helper_path)
         )
-    _BWR_SPEEDTREE_CLI_MODULE = module
+    _ASSEMBLY_SPEEDTREE_CLI_MODULE = module
     return module
 
 
@@ -4269,7 +4269,7 @@ def export_verify_cluster_production_bundle(spm_path, cfg):
         cfg,
         require_native=True,
     )
-    helper = _load_bwr_speedtree_cli()
+    helper = _load_assembly_speedtree_cli()
     fbx_path = spm_path.parent / "fbx" / f"{spm_path.stem}.fbx"
     xml_path = spm_path.parent / "xml" / f"{spm_path.stem}.xml"
     exports = helper.export_bundle(

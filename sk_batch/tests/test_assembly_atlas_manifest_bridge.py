@@ -13,8 +13,8 @@ for path in (REPO, SK_BATCH):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from bwr_atlas_manifest_bridge import (  # noqa: E402
-    install_bwr_atlas_manifest_resolver,
+from assembly_atlas_manifest_bridge import (  # noqa: E402
+    install_assembly_atlas_manifest_resolver,
 )
 
 
@@ -35,8 +35,8 @@ class FakeAddonRuntime:
         return previous
 
 
-class BwrAtlasManifestBridgeTests(unittest.TestCase):
-    def test_foreign_rolling_global_is_not_exposed_to_exact_bwr_target(self):
+class AssemblyAtlasManifestBridgeTests(unittest.TestCase):
+    def test_foreign_rolling_global_is_not_exposed_to_exact_assembly_target(self):
         fixture_path = (
             REPO
             / "tests"
@@ -76,11 +76,11 @@ class BwrAtlasManifestBridgeTests(unittest.TestCase):
                 legacy_calls.append((source_fbx_path, stmat_material))
                 return [global_path]
 
-            bwr_core = SimpleNamespace(
+            assembly_core = SimpleNamespace(
                 _speedtree_manifest_paths=legacy_paths
             )
-            evidence = install_bwr_atlas_manifest_resolver(
-                FakeAddonRuntime(bwr_core),
+            evidence = install_assembly_atlas_manifest_resolver(
+                FakeAddonRuntime(assembly_core),
                 target,
             )
 
@@ -94,7 +94,7 @@ class BwrAtlasManifestBridgeTests(unittest.TestCase):
                 },
             )
             self.assertEqual(
-                bwr_core._speedtree_manifest_paths(
+                assembly_core._speedtree_manifest_paths(
                     root / "fbx" / f"{target.stem}.fbx"
                 ),
                 [],
@@ -103,18 +103,18 @@ class BwrAtlasManifestBridgeTests(unittest.TestCase):
 
             unrelated = root / "fbx" / "SK_unrelated.fbx"
             self.assertEqual(
-                bwr_core._speedtree_manifest_paths(unrelated),
+                assembly_core._speedtree_manifest_paths(unrelated),
                 [global_path],
             )
             self.assertEqual(len(legacy_calls), 1)
 
-    def test_headless_job_installs_bridge_before_repair(self):
+    def test_headless_job_installs_bridge_before_assembly(self):
         source = (
-            SK_BATCH / "jobs" / "bwr_headless_job.py"
+            SK_BATCH / "jobs" / "assembly_headless_job.py"
         ).read_text(encoding="utf-8")
-        install_at = source.index("install_bwr_atlas_manifest_resolver(")
-        repair_at = source.index("run_import_and_assemble(assembly_settings)")
-        self.assertLess(install_at, repair_at)
+        install_at = source.index("install_assembly_atlas_manifest_resolver(")
+        assembly_at = source.index("run_import_and_assemble(assembly_settings)")
+        self.assertLess(install_at, assembly_at)
 
     def test_provider_disagreement_is_diagnostic_and_export_remains_reachable(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -147,15 +147,15 @@ class BwrAtlasManifestBridgeTests(unittest.TestCase):
                 json.dumps(conflicting), encoding="utf-8"
             )
             export = mock.Mock(return_value={"status": "ok"})
-            bwr_core = SimpleNamespace(
+            assembly_core = SimpleNamespace(
                 _speedtree_manifest_paths=lambda *_args: [],
                 run_speedtree_cli_export=export,
             )
 
-            evidence = install_bwr_atlas_manifest_resolver(
-                FakeAddonRuntime(bwr_core), target
+            evidence = install_assembly_atlas_manifest_resolver(
+                FakeAddonRuntime(assembly_core), target
             )
-            result = bwr_core.run_speedtree_cli_export(target)
+            result = assembly_core.run_speedtree_cli_export(target)
 
             self.assertEqual(result, {"status": "ok"})
             export.assert_called_once_with(target)
@@ -164,7 +164,7 @@ class BwrAtlasManifestBridgeTests(unittest.TestCase):
             self.assertEqual(evidence["selected_manifest_paths"], [])
             self.assertTrue(evidence["conflicting"])
 
-    def test_projected_disjoint_claim_never_reenters_bwr_through_original_path(self):
+    def test_projected_disjoint_claim_never_reenters_assembly_through_original_path(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             target = root / "SK_leaf_disjoint_test_01.spm"
@@ -211,12 +211,12 @@ class BwrAtlasManifestBridgeTests(unittest.TestCase):
             scope_dir.mkdir()
             scope_path = scope_dir / f"provider-b__{target.stem}.json"
             scope_path.write_text(json.dumps(mixed), encoding="utf-8")
-            bwr_core = SimpleNamespace(
+            assembly_core = SimpleNamespace(
                 _speedtree_manifest_paths=lambda *_args: [],
             )
 
-            evidence = install_bwr_atlas_manifest_resolver(
-                FakeAddonRuntime(bwr_core), target
+            evidence = install_assembly_atlas_manifest_resolver(
+                FakeAddonRuntime(assembly_core), target
             )
 
             self.assertIn(
@@ -228,7 +228,7 @@ class BwrAtlasManifestBridgeTests(unittest.TestCase):
                 evidence["selected_manifest_paths"],
             )
             self.assertEqual(
-                bwr_core._speedtree_manifest_paths(
+                assembly_core._speedtree_manifest_paths(
                     root / "fbx" / f"{target.stem}.fbx"
                 ),
                 [],

@@ -35,7 +35,7 @@ from sk_common import (  # noqa: E402
 
 LOG_DIR = SK_BATCH_DIR / "logs"
 PUSH_JOB = SK_BATCH_DIR / "jobs" / "send2ue_push_job.py"
-BWR_JOB = SK_BATCH_DIR / "jobs" / "bwr_headless_job.py"
+ASSEMBLY_JOB = SK_BATCH_DIR / "jobs" / "assembly_headless_job.py"
 UNREAL_INGEST = SK_BATCH_DIR / "unreal_ingest.py"
 GUI_ENTRY = SK_BATCH_DIR / "sk_batch_gui.pyw"
 DEFAULT_BLENDER = Path(
@@ -57,35 +57,35 @@ class ExactPushError(RuntimeError):
     pass
 
 
-def _promote_live_material_contract(command, outputs, repair_report):
-    """Use the contract produced by the repair that immediately precedes Push.
+def _promote_live_material_contract(command, outputs, assembly_report):
+    """Use the contract produced by the assembly that immediately precedes Push.
 
-    Repair can regenerate the exact-target STMAT/FBX contract.  Continuing with
-    the wrapper captured before Repair makes the subsequent Push compare the
+    Assembly can regenerate the exact-target STMAT/FBX contract.  Continuing with
+    the wrapper captured before Assembly makes the subsequent Push compare the
     new source artifacts against stale fingerprints.
     """
-    evidence = repair_report.get("live_material_contract") or {}
+    evidence = assembly_report.get("live_material_contract") or {}
     raw_path = evidence.get("canonical_path") or evidence.get("path")
     if not raw_path:
         raise ExactPushError(
-            "repair report did not publish its live material contract"
+            "assembly report did not publish its live material contract"
         )
     contract_path = Path(raw_path).expanduser().resolve()
     if not contract_path.is_file():
         raise ExactPushError(
-            "repair live material contract is missing: " + str(contract_path)
+            "assembly live material contract is missing: " + str(contract_path)
         )
     expected_size = evidence.get("size")
     if expected_size is not None and contract_path.stat().st_size != int(expected_size):
         raise ExactPushError(
-            "repair live material contract size changed: " + str(contract_path)
+            "assembly live material contract size changed: " + str(contract_path)
         )
     expected_sha256 = str(evidence.get("sha256") or "").strip().casefold()
     if expected_sha256:
         digest = hashlib.sha256(contract_path.read_bytes()).hexdigest()
         if digest != expected_sha256:
             raise ExactPushError(
-                "repair live material contract fingerprint changed: "
+                "assembly live material contract fingerprint changed: "
                 + str(contract_path)
             )
     try:
@@ -139,7 +139,7 @@ def _wait_for_export_disk_space(export_root: Path, expected_bytes: int) -> None:
 
 
 def _write_current_material_contract(spm: Path) -> Path:
-    """Regenerate the single current wrapper from the asset-local Repair report."""
+    """Regenerate the single current wrapper from the asset-local Assembly report."""
     try:
         namespace = runpy.run_path(
             str(GUI_ENTRY),
@@ -156,20 +156,20 @@ def _write_current_material_contract(spm: Path) -> Path:
     return path
 
 
-def build_repair_refresh_command(
+def build_assembly_refresh_command(
     spm: Path,
     *,
     blender: Path,
     material_contract: Path,
     report_path: Path,
 ) -> list[str]:
-    """Refresh the repaired Blend from the current post-collision SPM export."""
+    """Refresh the assembled Blend from the current post-collision SPM export."""
     return [
         str(blender),
         "--factory-startup",
         "--background",
         "--python",
-        str(BWR_JOB),
+        str(ASSEMBLY_JOB),
         "--",
         "--spm",
         str(spm),
@@ -208,13 +208,13 @@ def build_exact_push_command(
     if spm.suffix.casefold() != ".spm" or not spm.is_file():
         raise ExactPushError(f"exact production SPM is missing: {spm}")
     if not blend.is_file():
-        raise ExactPushError(f"repaired Blender source is missing: {blend}")
+        raise ExactPushError(f"assembled Blender source is missing: {blend}")
     if not blender.is_file():
         raise ExactPushError(f"Blender executable is missing: {blender}")
     if not PUSH_JOB.is_file():
         raise ExactPushError(f"production Push job is missing: {PUSH_JOB}")
-    if not BWR_JOB.is_file():
-        raise ExactPushError(f"production Repair job is missing: {BWR_JOB}")
+    if not ASSEMBLY_JOB.is_file():
+        raise ExactPushError(f"production Assembly job is missing: {ASSEMBLY_JOB}")
     transport = str(transport).strip().casefold()
     if transport not in {"headless", "rpc"}:
         raise ExactPushError(f"unsupported exact Push transport: {transport}")
@@ -238,7 +238,7 @@ def build_exact_push_command(
     )
     outputs = {
         "report": prefix.with_suffix(".json"),
-        "repair_report": prefix.with_name(prefix.name + "_repair.json"),
+        "assembly_report": prefix.with_name(prefix.name + "_assembly.json"),
         "manifest": prefix.with_name(prefix.name + "_manifest.json"),
         "checkpoint": prefix.with_name(prefix.name + "_checkpoint.json"),
         "batch_report": prefix.with_name(prefix.name + "_batch.json"),
@@ -411,7 +411,7 @@ def merge_unreal_result(outputs: dict, batch_result: dict) -> dict:
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description=(
-            "Push one exact repaired SK target through headless Unreal or the "
+            "Push one exact assembled SK target through headless Unreal or the "
             "currently open Unreal Editor RPC endpoint"
         ),
     )
@@ -467,41 +467,41 @@ def main(argv=None):
         blend, minimum_bytes=1024**3, multiplier=4
     )
     _wait_for_export_disk_space(outputs["export_root"], expected_export_bytes)
-    repair_command = build_repair_refresh_command(
+    assembly_command = build_assembly_refresh_command(
         args.spm.expanduser().resolve(),
         blender=args.blender.expanduser().resolve(),
         material_contract=outputs["material_contract"],
-        report_path=outputs["repair_report"],
+        report_path=outputs["assembly_report"],
     )
-    print("Refreshing repaired Blend from post-collision SpeedTree export", flush=True)
-    repair_completed = owned_run(
-        repair_command,
-        source="sk_batch.exact_push.blender_repair_refresh",
+    print("Refreshing assembled Blend from post-collision SpeedTree export", flush=True)
+    assembly_completed = owned_run(
+        assembly_command,
+        source="sk_batch.exact_push.blender_assembly_refresh",
         run_factory=subprocess.run,
         check=False,
     )
-    if repair_completed.returncode != 0:
+    if assembly_completed.returncode != 0:
         print(
-            "SK Exact Push repair refresh failed; production report: "
-            + str(outputs["repair_report"]),
+            "SK Exact Push assembly refresh failed; production report: "
+            + str(outputs["assembly_report"]),
             file=sys.stderr,
         )
-        return repair_completed.returncode or 1
+        return assembly_completed.returncode or 1
     try:
-        repair_report = json.loads(
-            outputs["repair_report"].read_text(encoding="utf-8")
+        assembly_report = json.loads(
+            outputs["assembly_report"].read_text(encoding="utf-8")
         )
     except (OSError, ValueError) as exc:
-        print(f"SK Exact Push repair report is unreadable: {exc}", file=sys.stderr)
+        print(f"SK Exact Push assembly report is unreadable: {exc}", file=sys.stderr)
         return 1
-    collision_cli = repair_report.get("speedtree_collision_cli") or {}
+    collision_cli = assembly_report.get("speedtree_collision_cli") or {}
     if (
-        repair_report.get("status") != "ok"
+        assembly_report.get("status") != "ok"
         or collision_cli.get("status") != "required"
     ):
         print(
-            "SK Exact Push repair did not prove the collision CLI contract: "
-            + str(outputs["repair_report"]),
+            "SK Exact Push assembly did not prove the collision CLI contract: "
+            + str(outputs["assembly_report"]),
             file=sys.stderr,
         )
         return 1
@@ -509,16 +509,16 @@ def main(argv=None):
         live_material_contract = _promote_live_material_contract(
             command,
             outputs,
-            repair_report,
+            assembly_report,
         )
     except ExactPushError as exc:
         print(
-            "SK Exact Push repair material contract is invalid: " + str(exc),
+            "SK Exact Push assembly material contract is invalid: " + str(exc),
             file=sys.stderr,
         )
         return 1
     print(
-        "Using repair live material contract: " + str(live_material_contract),
+        "Using assembly live material contract: " + str(live_material_contract),
         flush=True,
     )
     completed = owned_run(

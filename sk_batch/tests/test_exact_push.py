@@ -17,7 +17,7 @@ from exact_push import ExactPushError, build_exact_push_command  # noqa: E402
 
 
 class ExactPushCommandTests(unittest.TestCase):
-    def test_promotes_repair_live_material_contract_into_push_command(self):
+    def test_promotes_assembly_live_material_contract_into_push_command(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             stale = root / "stale.json"
@@ -51,7 +51,7 @@ class ExactPushCommandTests(unittest.TestCase):
             )
             self.assertEqual(outputs["material_contract"], live.resolve())
 
-    def test_rejects_changed_repair_live_material_contract(self):
+    def test_rejects_changed_assembly_live_material_contract(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             live = root / "live.json"
@@ -129,8 +129,6 @@ class ExactPushCommandTests(unittest.TestCase):
                 outputs["material_contract"],
                 material.resolve(),
             )
-            self.assertNotIn("--repair-evidence", command)
-            self.assertNotIn("repair_evidence", outputs)
             self.assertTrue(str(outputs["report"]).endswith("_exact_push_test.json"))
             self.assertEqual(
                 outputs["export_root"],
@@ -180,7 +178,7 @@ class ExactPushCommandTests(unittest.TestCase):
                 d_export / "rpc" / spm.stem / "rpc_test",
             )
 
-    def test_missing_repaired_blend_fails_before_launch(self):
+    def test_missing_assembled_blend_fails_before_launch(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             spm = root / "SK_tree_sample_01.spm"

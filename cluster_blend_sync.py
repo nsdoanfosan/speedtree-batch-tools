@@ -46,7 +46,7 @@ from cluster_spm_pair_contract import (
 from cluster_normalization_sync import (
     ClusterNormalizationSyncError,
     ClusterSourceBuildRequiredError,
-    inspect_bwr_material_assignment_freshness,
+    inspect_assembly_material_assignment_freshness,
     inspect_normalization_source_identity,
     resolve_normalization_recipe,
 )
@@ -399,7 +399,7 @@ def _normalization_artifact_paths(recipe):
             blend.stem
             + "_speedtree_assembly_pipeline_report_codex.json"
         ),
-        report_dir / f"{blend.stem}_repair_runtime_codex.json",
+        report_dir / f"{blend.stem}_assembly_runtime_codex.json",
     ])
 
     first_target = Path(
@@ -1631,14 +1631,14 @@ def _emit_cluster_relation_progress(callback, stage, message):
         return
 
 
-def _write_shared_repair_runtime_receipt(blend, repair_runtime_config):
-    if not repair_runtime_config:
+def _write_shared_assembly_runtime_receipt(blend, assembly_runtime_config):
+    if not assembly_runtime_config:
         return None
-    from sk_batch.repair_runtime_contract import write_repair_runtime_receipt
+    from sk_batch.assembly_runtime_contract import write_assembly_runtime_receipt
 
-    return write_repair_runtime_receipt(
+    return write_assembly_runtime_receipt(
         Path(blend).expanduser().absolute().with_suffix(".spm"),
-        repair_runtime_config,
+        assembly_runtime_config,
     )
 
 
@@ -1708,7 +1708,7 @@ def _inspect_current_cluster_relation_state(
     )
     state["registered"] = True
     material_freshness = (
-        inspect_bwr_material_assignment_freshness(blend)
+        inspect_assembly_material_assignment_freshness(blend)
         if auto_normalize
         else None
     )
@@ -1726,7 +1726,7 @@ def _inspect_current_cluster_relation_state(
             list(state.get("refresh_reason_categories") or [])
             + ["geometry_ownership"]
         ))
-        state["bwr_material_assignment_freshness"] = material_freshness
+        state["assembly_material_assignment_freshness"] = material_freshness
     return state
 
 
@@ -1773,7 +1773,7 @@ def run_cluster_relation_transaction(
     unit_probe_path=None,
     capture_resolution=1024,
     auto_normalize=True,
-    repair_runtime_config=None,
+    assembly_runtime_config=None,
     force_refresh=False,
     progress_callback=None,
     timeout=1800,
@@ -1847,9 +1847,9 @@ def run_cluster_relation_transaction(
                 ),
             }
             try:
-                runtime_receipt = _write_shared_repair_runtime_receipt(
+                runtime_receipt = _write_shared_assembly_runtime_receipt(
                     blend,
-                    repair_runtime_config,
+                    assembly_runtime_config,
                 )
             except OSError as exc:
                 try:
@@ -1879,7 +1879,7 @@ def run_cluster_relation_transaction(
                     + diagnostic_detail
                 ) from exc
             if runtime_receipt is not None:
-                report["repair_runtime_receipt"] = str(runtime_receipt)
+                report["assembly_runtime_receipt"] = str(runtime_receipt)
             _emit_cluster_relation_progress(
                 progress_callback,
                 "already_on_up_to_date",
@@ -2199,11 +2199,11 @@ def run_cluster_relation_transaction(
                 )
                 + rollback(preserve_spm_paths=preserve_spm_paths)
             )
-        if enabled and repair_runtime_config:
+        if enabled and assembly_runtime_config:
             try:
-                runtime_receipt = _write_shared_repair_runtime_receipt(
+                runtime_receipt = _write_shared_assembly_runtime_receipt(
                     blend,
-                    repair_runtime_config,
+                    assembly_runtime_config,
                 )
             except OSError as exc:
                 raise ClusterBlendSyncError(
@@ -2217,7 +2217,7 @@ def run_cluster_relation_transaction(
                     + rollback()
                 ) from exc
             if runtime_receipt is not None:
-                report["repair_runtime_receipt"] = str(runtime_receipt)
+                report["assembly_runtime_receipt"] = str(runtime_receipt)
         if source_preparation is not None:
             report["source_preparation"] = source_preparation
         if preflight_state is not None and not preflight_state["current"]:
@@ -2246,7 +2246,7 @@ def run_cluster_folder_relation_transaction(
     unit_probe_path=None,
     capture_resolution=1024,
     auto_normalize=True,
-    repair_runtime_config=None,
+    assembly_runtime_config=None,
     force_refresh=False,
     progress_callback=None,
     timeout=1800,
@@ -2302,7 +2302,7 @@ def run_cluster_folder_relation_transaction(
         unit_probe_path=unit_probe_path,
         capture_resolution=capture_resolution,
         auto_normalize=auto_normalize,
-        repair_runtime_config=repair_runtime_config,
+        assembly_runtime_config=assembly_runtime_config,
         force_refresh=force_refresh,
         progress_callback=progress_callback,
         timeout=timeout,

@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 SK_BATCH_DIR = Path(__file__).resolve().parents[1]
-JOB_PATH = SK_BATCH_DIR / "jobs" / "bwr_headless_job.py"
+JOB_PATH = SK_BATCH_DIR / "jobs" / "assembly_headless_job.py"
 
 
 def load_save_helper():
@@ -137,7 +137,7 @@ class ClusterSavePolicyTests(unittest.TestCase):
         self.assertFalse(policy["preference_persisted"])
         self.assertEqual(
             policy["transaction_backup"],
-            "sk_batch_gui_pre_repair_copy_and_rollback",
+            "sk_batch_gui_pre_assembly_copy_and_rollback",
         )
 
     def test_cluster_save_restores_preference_after_operator_failure(self):
@@ -174,7 +174,7 @@ class ClusterSavePolicyTests(unittest.TestCase):
     def test_optional_handoff_diagnostics_do_not_prevent_blend_save(self):
         source = JOB_PATH.read_text(encoding="utf-8")
         self.assertIn(
-            "# The repair result is the save authority.",
+            "# The Assembly result is the save authority.",
             source,
         )
         self.assertIn("if merged_object is not None:", source)

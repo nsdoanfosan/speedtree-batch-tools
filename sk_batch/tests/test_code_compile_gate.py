@@ -446,8 +446,8 @@ class CodeCompileGateTests(unittest.TestCase):
     def test_push_reaudit_regression_fails_at_compile_gate(self):
         module = ast.parse(gui_source())
         changed = RenameMethodCall(
-            "_repair_stage_contract",
-            "_repair_stage_contract_disabled",
+            "_assembly_stage_contract",
+            "_assembly_stage_contract_disabled",
         ).visit(module)
         ast.fix_missing_locations(changed)
         with self.assertRaisesRegex(
@@ -477,7 +477,7 @@ class CodeCompileGateTests(unittest.TestCase):
         changed = gui_source().replace(
             "class App:",
             "class App:\n"
-            "    def _validate_repair_stage_contract(self):\n"
+            "    def _validate_assembly_stage_contract(self):\n"
             "        return None\n",
             1,
         )
@@ -539,7 +539,7 @@ class CodeCompileGateTests(unittest.TestCase):
         source = gui_source().replace(
             "    def _job_blender(self, iid, spm, item):\n",
             "    def _job_blender(self, iid, spm, item):\n"
-            "        _read_repair_pipeline_json(Path('repair.json'))\n",
+            "        _read_assembly_pipeline_json(Path('repair.json'))\n",
             1,
         )
         with self.assertRaisesRegex(
@@ -551,7 +551,7 @@ class CodeCompileGateTests(unittest.TestCase):
     def test_pipeline_contract_cleanup_regression_fails_at_compile_gate(self):
         source = gui_source()
         helper_start = source.index("    def _run_full_pipeline_stages(")
-        cleanup_line = '                "_active_repair_stage_contracts",\n'
+        cleanup_line = '                "_active_assembly_stage_contracts",\n'
         cleanup_start = source.rindex(cleanup_line, 0, helper_start)
         source = (
             source[:cleanup_start]

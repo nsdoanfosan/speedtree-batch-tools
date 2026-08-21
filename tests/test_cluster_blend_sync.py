@@ -1130,7 +1130,7 @@ class ClusterBlendSyncTests(unittest.TestCase):
             "automatic_cluster_source_rebuild",
         )
 
-    def test_successful_sync_commits_shared_repair_runtime_receipt(self):
+    def test_successful_sync_commits_shared_assembly_runtime_receipt(self):
         with tempfile.TemporaryDirectory() as temporary:
             owner = Path(temporary) / "Tree_elm"
             cluster = owner / "Cluster"
@@ -1143,7 +1143,7 @@ class ClusterBlendSyncTests(unittest.TestCase):
             blender.touch()
             runtime_receipt = (
                 cluster / "reports"
-                / "SK_branch_elm_01_repair_runtime_codex.json"
+                / "SK_branch_elm_01_assembly_runtime_codex.json"
             )
 
             def complete(command, **_kwargs):
@@ -1160,8 +1160,8 @@ class ClusterBlendSyncTests(unittest.TestCase):
                 "cluster_blend_sync.subprocess.run",
                 side_effect=complete,
             ), mock.patch(
-                "sk_batch.repair_runtime_contract."
-                "write_repair_runtime_receipt",
+                "sk_batch.assembly_runtime_contract."
+                "write_assembly_runtime_receipt",
                 return_value=runtime_receipt,
             ) as write_receipt:
                 result = run_cluster_relation_transaction(
@@ -1170,7 +1170,7 @@ class ClusterBlendSyncTests(unittest.TestCase):
                     enabled=True,
                     blender_exe=blender,
                     auto_normalize=False,
-                    repair_runtime_config={"fbx_ini": "configured.ini"},
+                    assembly_runtime_config={"fbx_ini": "configured.ini"},
                 )
 
             write_receipt.assert_called_once_with(
@@ -1178,7 +1178,7 @@ class ClusterBlendSyncTests(unittest.TestCase):
                 {"fbx_ini": "configured.ini"},
             )
             self.assertEqual(
-                result["repair_runtime_receipt"],
+                result["assembly_runtime_receipt"],
                 str(runtime_receipt),
             )
 
@@ -1246,7 +1246,7 @@ class ClusterBlendSyncTests(unittest.TestCase):
             self.assertTrue(result["source_content_identity"]["current"])
 
             with mock.patch(
-                "cluster_blend_sync._write_shared_repair_runtime_receipt",
+                "cluster_blend_sync._write_shared_assembly_runtime_receipt",
                 side_effect=OSError("receipt sentinel"),
             ):
                 with self.assertRaises(ClusterBlendSyncError) as caught:
@@ -1257,7 +1257,7 @@ class ClusterBlendSyncTests(unittest.TestCase):
                         blender_exe=(
                             Path(temporary) / "missing-blender.exe"
                         ),
-                        repair_runtime_config={"configured": True},
+                        assembly_runtime_config={"configured": True},
                     )
             failure_reports = list(
                 (cluster / "reports").glob(
@@ -1957,7 +1957,7 @@ class ClusterBlendSyncTests(unittest.TestCase):
             )
             pipeline_report.write_bytes(b"clean-pipeline")
             runtime_receipt = reports / (
-                f"{blend.stem}_repair_runtime_codex.json"
+                f"{blend.stem}_assembly_runtime_codex.json"
             )
             runtime_receipt.write_bytes(b"clean-runtime")
 
@@ -2047,14 +2047,14 @@ class ClusterBlendSyncTests(unittest.TestCase):
                     blend,
                     enabled=True,
                     blender_exe=blender,
-                    repair_runtime_config={"fbx_ini": "configured.ini"},
+                    assembly_runtime_config={"fbx_ini": "configured.ini"},
                 )
             self.assertEqual(
                 apply.call_args.args[1],
                 [first.absolute(), second.absolute()],
             )
             self.assertEqual(
-                apply.call_args.kwargs["repair_runtime_config"],
+                apply.call_args.kwargs["assembly_runtime_config"],
                 {"fbx_ini": "configured.ini"},
             )
 

@@ -53,7 +53,7 @@ class BlenderResumeReceiptTests(unittest.TestCase):
                 spm,
                 tracked_paths=[blend],
                 settings=settings,
-                repair_state=state,
+                assembly_state=state,
             )
 
             self.assertEqual(
@@ -87,7 +87,7 @@ class BlenderResumeReceiptTests(unittest.TestCase):
                 spm,
                 tracked_paths=[],
                 settings={"wind_override": "TREE"},
-                repair_state={
+                assembly_state={
                     "current": True,
                     "push_ready": True,
                     "kind": "ready",
@@ -119,7 +119,7 @@ class BlenderResumeReceiptTests(unittest.TestCase):
                 spm,
                 tracked_paths=[optional],
                 settings=settings,
-                repair_state={
+                assembly_state={
                     "current": True,
                     "push_ready": True,
                     "kind": "ready",
@@ -155,7 +155,7 @@ class BlenderResumeReceiptTests(unittest.TestCase):
                 relation_paths=[dependency],
                 relation_signature=relation_signature,
                 settings=settings,
-                repair_state={
+                assembly_state={
                     "current": True,
                     "push_ready": True,
                     "kind": "ready",
@@ -186,7 +186,7 @@ class BlenderResumeReceiptTests(unittest.TestCase):
                 tracked_paths=[],
                 relation_signature={"status": "absent"},
                 settings=settings,
-                repair_state={
+                assembly_state={
                     "current": True,
                     "push_ready": True,
                     "kind": "ready",
@@ -220,7 +220,7 @@ class BlenderResumeReceiptTests(unittest.TestCase):
                 tracked_paths=[blend],
                 relation_paths=[blend],
                 settings=settings,
-                repair_state={
+                assembly_state={
                     "current": True,
                     "push_ready": True,
                     "kind": "ready",
@@ -285,7 +285,7 @@ class BlenderResumeQueueTests(unittest.TestCase):
                     BlenderResumeReceiptError("missing"),
                 ]
             )
-            app._publish_current_repair_skip = mock.Mock(return_value=True)
+            app._publish_current_assembly_skip = mock.Mock(return_value=True)
             app._job_blender = mock.Mock()
 
             with mock.patch.object(
@@ -305,7 +305,7 @@ class BlenderResumeQueueTests(unittest.TestCase):
             pending,
             targets[1],
         )
-        app._publish_current_repair_skip.assert_called_once_with(
+        app._publish_current_assembly_skip.assert_called_once_with(
             str(completed),
             completed,
             mock.ANY,
@@ -458,7 +458,7 @@ class BlenderResumeQueueTests(unittest.TestCase):
                 spm,
                 item=item,
             )
-            repair_state = {
+            assembly_state = {
                 "current": True,
                 "push_ready": True,
                 "kind": "ready",
@@ -469,7 +469,7 @@ class BlenderResumeQueueTests(unittest.TestCase):
                 tracked_paths=[blend],
                 relation_signature=relation_signature,
                 settings=settings,
-                repair_state=repair_state,
+                assembly_state=assembly_state,
             )
 
             with mock.patch.object(
@@ -494,7 +494,7 @@ class BlenderResumeQueueTests(unittest.TestCase):
                     receipt,
                 )
 
-        self.assertEqual(validated, repair_state)
+        self.assertEqual(validated, assembly_state)
 
     def test_second_identical_run_schedules_zero_blender_workers(self):
         gui = load_gui_module()
@@ -514,7 +514,7 @@ class BlenderResumeQueueTests(unittest.TestCase):
                 "kind": "ready",
                 "reason": "ready",
             })
-            app._publish_current_repair_skip = mock.Mock(return_value=True)
+            app._publish_current_assembly_skip = mock.Mock(return_value=True)
             app._job_blender = mock.Mock(
                 side_effect=AssertionError("completed row must not get a worker")
             )
@@ -532,7 +532,7 @@ class BlenderResumeQueueTests(unittest.TestCase):
 
         self.assertTrue(result)
         app._job_blender.assert_not_called()
-        app._publish_current_repair_skip.assert_called_once_with(
+        app._publish_current_assembly_skip.assert_called_once_with(
             str(spm),
             spm,
             mock.ANY,
@@ -553,7 +553,7 @@ class BlenderResumeQueueTests(unittest.TestCase):
             root.mkdir(parents=True)
             spm = root / "SK_tree_elm_01.spm"
             blend = spm.with_suffix(".blend")
-            report = gui.repair_pipeline_report_path(spm)
+            report = gui.assembly_pipeline_report_path(spm)
             wind = (
                 root
                 / "JSON"
@@ -580,10 +580,10 @@ class BlenderResumeQueueTests(unittest.TestCase):
                 "blend_status_kind": "ok",
                 "live_texture_paths": [],
             }
-            app._repair_output_state = mock.Mock(
+            app._assembly_output_state = mock.Mock(
                 side_effect=AssertionError("stat migration must not audit SPM")
             )
-            app._publish_current_repair_skip = mock.Mock(return_value=True)
+            app._publish_current_assembly_skip = mock.Mock(return_value=True)
 
             with mock.patch.object(
                 Path,
@@ -606,8 +606,8 @@ class BlenderResumeQueueTests(unittest.TestCase):
 
         self.assertEqual(runnable, [])
         self.assertEqual(skipped, [item])
-        app._repair_output_state.assert_not_called()
-        published = app._publish_current_repair_skip.call_args
+        app._assembly_output_state.assert_not_called()
+        published = app._publish_current_assembly_skip.call_args
         self.assertEqual(published.args[:2], (iid, spm))
         self.assertIsInstance(
             published.kwargs["validated_resume_receipt"],
@@ -624,7 +624,7 @@ class BlenderResumeQueueTests(unittest.TestCase):
         app._live_poll_active = True
         app.items = {iid: {"spm": spm}}
         app.state = {iid: {}}
-        app._repair_output_state = mock.Mock(
+        app._assembly_output_state = mock.Mock(
             side_effect=AssertionError("unchanged poll must not parse SPM")
         )
         snapshot = [
@@ -641,7 +641,7 @@ class BlenderResumeQueueTests(unittest.TestCase):
         ):
             app._poll_live_file_status_worker(3, snapshot)
 
-        app._repair_output_state.assert_not_called()
+        app._assembly_output_state.assert_not_called()
         self.assertNotIn("blend_resume_receipt", app.state[iid])
         self.assertNotIn("blend_resume_receipt", app.items[iid])
 
