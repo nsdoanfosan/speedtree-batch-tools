@@ -198,35 +198,57 @@ def validate_assembly_result(report_path, target):
         }
     manifest_path = Path(target["manifest"])
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    placement = (
-        (manifest.get("placement_contract") or {}).get(
-            "authored_node_assignment"
-        )
-        or {}
-    )
+    placement = manifest.get("placement_contract") or {}
+    attachment_bones = manifest.get("attachment_bone_contract") or {}
     base = manifest.get("base") or {}
     preserved = list(manifest.get("preserved_render_components") or [])
     parts = list(manifest.get("parts") or [])
     problems = []
     if report.get("status") != "ok":
         problems.append("assembly_not_ok")
-    if placement.get("policy") != (
-        "deterministic_state_mesh_then_global_position_recovery_"
-        "shared_components_v4"
+    if (
+        placement.get("version") != 2
+        or placement.get("identity_policy")
+        != "exact_render_attachment_correspondence_v1"
+        or placement.get("translation_source")
+        != "exact_target_attachment_vertex"
+        or placement.get("approximate_node_matching_present") is not False
     ):
         problems.append("assembly_binding_policy_not_current")
-    if int(placement.get("unmatched_count") or 0) != 0:
-        problems.append(
-            "unmatched_bindings:"
-            + str(int(placement.get("unmatched_count") or 0))
+    if any(
+        key in placement
+        for key in (
+            "authored_node_assignment",
+            "authored_node_match_threshold_meters",
+            "claimed_authored_node_count",
+            "degraded_authored_card_binding_count",
         )
-    if int(
-        (manifest.get("placement_contract") or {}).get(
-            "degraded_authored_card_binding_count"
+    ):
+        problems.append("approximate_node_matching_contract_present")
+    placement_spm = placement.get("source_spm") or {}
+    attachment_spm = attachment_bones.get("source_spm") or {}
+    attachment_rows = list(attachment_bones.get("bones") or [])
+    try:
+        declared_attachment_bone_count = int(
+            attachment_bones.get("bone_count") or 0
         )
-        or 0
-    ) != 0:
-        problems.append("degraded_bindings_remain")
+    except (TypeError, ValueError):
+        declared_attachment_bone_count = -1
+    if (
+        attachment_bones.get("version") != 1
+        or attachment_bones.get("status") != "ready"
+        or attachment_bones.get("identity_policy")
+        != "exact_speedtree_xml_bone_id_parent_id_v1"
+        or declared_attachment_bone_count != len(attachment_rows)
+        or not attachment_rows
+        or len(str(attachment_bones.get("lineage_sha256") or "")) != 64
+        or not (attachment_bones.get("source_xml") or {}).get("sha256")
+        or str(placement_spm.get("path") or "")
+        != str(attachment_spm.get("path") or "")
+        or str(placement_spm.get("sha256") or "").casefold()
+        != str(attachment_spm.get("sha256") or "").casefold()
+    ):
+        problems.append("exact_attachment_bone_lineage_contract_missing")
     preserved_polygons = sum(
         int(row.get("polygon_count") or 0) for row in preserved
     )
@@ -243,14 +265,22 @@ def validate_assembly_result(report_path, target):
     )
     if not parts or binding_count <= 0:
         problems.append("assembly_manifest_has_no_parts_or_bindings")
+    exact_binding_count = int(
+        placement.get("exact_render_attachment_binding_count") or 0
+    )
+    if exact_binding_count != binding_count:
+        problems.append(
+            "exact_attachment_binding_count_mismatch:"
+            f"{exact_binding_count}!={binding_count}"
+        )
     return {
         "ok": not problems,
         "problems": problems,
-        "policy": placement.get("policy"),
+        "policy": placement.get("identity_policy"),
         "parts": len(parts),
         "bindings": binding_count,
-        "assigned": int(placement.get("assigned_count") or 0),
-        "unmatched": int(placement.get("unmatched_count") or 0),
+        "assigned": exact_binding_count,
+        "unmatched": 0,
         "preserved_role_polygons_removed": removed_preserved,
         "preserved_role_polygons_kept": preserved_polygons,
         "role_demotions": role_demotions,

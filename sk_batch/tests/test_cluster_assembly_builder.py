@@ -17,6 +17,7 @@ if str(SK_BATCH) not in sys.path:
 
 from cluster_assembly_builder import (  # noqa: E402
     ClusterAssemblyBuildError,
+    ROLE_ORDER,
     attachment_locked_safe_transform,
     build_blender_assembly_inputs,
     build_unreal_ingest_plan,
@@ -29,6 +30,8 @@ from cluster_assembly_builder import (  # noqa: E402
     gate_assembly_transform_residuals,
     lowest_common_ancestor,
     make_skeleton_snapshot,
+    make_speedtree_xml_bone_lineage,
+    parse_speedtree_xml_bone_lineage,
     scope_material_pipeline_for_destination,
     scope_material_pipeline_to_codex_tests,
     _attachment_vertex_correspondence,
@@ -45,7 +48,7 @@ from cluster_assembly_builder import (  # noqa: E402
     _component_signature,
     _current_unreal_skeleton_diagnostic,
     _expected_normalized_bounds_for_variant,
-    _exact_component_anchor_influences,
+    _exact_attachment_anchor_influences,
     _exact_source_bone_influences,
     _export_selected_fbx,
     _generated_material_sidecar,
@@ -67,6 +70,45 @@ from cluster_assembly_builder import (  # noqa: E402
     validate_wind_json_against_skeleton,
     validate_persisted_residual_gate,
 )
+
+
+def exact_xml_lineage(*rows):
+    return make_speedtree_xml_bone_lineage(
+        [
+            {"id": bone_id, "parent_id": parent_id, "generator": generator}
+            for bone_id, parent_id, generator in rows
+        ],
+        source_spm={"path": "C:/target.spm", "sha256": "a" * 64},
+        source_xml={"path": "C:/target.xml", "sha256": "b" * 64},
+    )
+
+
+def exact_bone_skeleton(*rows):
+    identity = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+    bones = [{
+        "index": 0,
+        "name": "Root",
+        "parent_index": -1,
+        "parent_name": None,
+        "bind_matrix": identity,
+    }]
+    index_by_name = {"Root": 0}
+    for name, parent_name in rows:
+        index = len(bones)
+        bones.append({
+            "index": index,
+            "name": name,
+            "parent_index": index_by_name[parent_name],
+            "parent_name": parent_name,
+            "bind_matrix": identity,
+        })
+        index_by_name[name] = index
+    return make_skeleton_snapshot(bones)
 
 
 class AssemblyBuildCacheTests(unittest.TestCase):
@@ -412,7 +454,53 @@ class ExactSourceBoneInfluenceTests(unittest.TestCase):
             )
 
 
-class ExactComponentAnchorInfluenceTests(unittest.TestCase):
+class SpeedTreeXmlBoneLineageTests(unittest.TestCase):
+    def test_parser_preserves_exact_id_parent_and_generator(self):
+        xml = """<Root><Bones>
+        <Bone ID="17" ParentID="-1" Generator="Trunk" />
+        <Bone ID="407" ParentID="17" Generator="Branch" />
+        </Bones></Root>"""
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "target.xml"
+            path.write_text(xml, encoding="utf-8")
+            lineage = parse_speedtree_xml_bone_lineage(
+                path,
+                source_spm={"path": "target.spm", "sha256": "a" * 64},
+            )
+
+        self.assertEqual(lineage["root_bone_ids"], [17])
+        self.assertEqual(
+            lineage["bones"],
+            [
+                {"id": 17, "parent_id": -1, "generator": "Trunk"},
+                {"id": 407, "parent_id": 17, "generator": "Branch"},
+            ],
+        )
+        self.assertEqual(
+            lineage["identity_policy"],
+            "exact_speedtree_xml_bone_id_parent_id_v1",
+        )
+
+    def test_rejects_duplicate_missing_parent_and_cycle(self):
+        invalid_rows = (
+            [
+                {"id": 1, "parent_id": -1},
+                {"id": 1, "parent_id": -1},
+            ],
+            [{"id": 1, "parent_id": 99}],
+            [
+                {"id": 1, "parent_id": 2},
+                {"id": 2, "parent_id": 1},
+            ],
+        )
+        for rows in invalid_rows:
+            with self.subTest(rows=rows), self.assertRaises(
+                ClusterAssemblyBuildError
+            ):
+                make_speedtree_xml_bone_lineage(rows)
+
+
+class ExactAttachmentAnchorInfluenceTests(unittest.TestCase):
     @staticmethod
     def _object(group_names, vertex_weights):
         return SimpleNamespace(
@@ -430,86 +518,208 @@ class ExactComponentAnchorInfluenceTests(unittest.TestCase):
             ),
         )
 
-    def test_collapses_parent_and_child_weights_to_exact_authored_anchor(self):
-        snapshot = skeleton_snapshot()
-        skeleton_by_name = {
-            row["name"]: row for row in snapshot["bones"]
-        }
-        obj = self._object(
-            ["Branch_A", "Leaf_A"],
-            [[(0, 0.4), (1, 0.6)], [(0, 0.2), (1, 0.8)]],
-        )
-
-        influences, source = _exact_component_anchor_influences(
+    def _resolve(self, obj, vertex_index, snapshot, lineage, context):
+        return _exact_attachment_anchor_influences(
             obj,
-            {"vertices": [0, 1]},
+            vertex_index,
+            {"policy": "exact_attachment_uv_vertex_v1"},
+            lineage,
             snapshot,
-            skeleton_by_name,
-            "test branch component",
+            {row["name"]: row for row in snapshot["bones"]},
+            context,
         )
 
-        self.assertEqual(influences, [{"bone": "Branch_A", "weight": 1.0}])
+    def test_uses_exact_skeleton_and_xml_hierarchy_not_weight_magnitude(self):
+        snapshot = exact_bone_skeleton(
+            ("Bone_1_Start", "Root"),
+            ("Bone_2_Start", "Bone_1_Start"),
+        )
+        lineage = exact_xml_lineage(
+            (0, -1, "Branch"),
+            (1, 0, "Leaf"),
+        )
+        obj = self._object(
+            ["Bone_1_Start", "Bone_2_Start"],
+            [[(0, 0.01), (1, 0.99)]],
+        )
+
+        influences, source = self._resolve(
+            obj, 0, snapshot, lineage, "test rendered attachment"
+        )
+
+        self.assertEqual(
+            influences,
+            [{"bone": "Bone_1_Start", "weight": 1.0}],
+        )
         self.assertEqual(
             source["policy"],
-            "exact_render_component_skeleton_lca_v2",
+            "exact_render_attachment_vertex_spm_xml_hierarchy_v4",
         )
-        self.assertTrue(source["anchor_authored_on_component"])
         self.assertEqual(
-            source["authored_component_bones"],
-            ["Leaf_A", "Branch_A"],
+            source["spm_xml_lineage"]["anchor_xml_bone_id"],
+            0,
+        )
+        self.assertTrue(
+            source["spm_xml_lineage"][
+                "final_skeleton_xml_lineage_agreement"
+            ]
+        )
+        self.assertFalse(source["weight_magnitude_used_for_identity"])
+        self.assertFalse(source["spatial_proximity_used_for_identity"])
+        self.assertFalse(source["component_hierarchy_used_for_identity"])
+
+    def test_uses_exact_target_vertex_not_unrelated_component_lca(self):
+        snapshot = exact_bone_skeleton(
+            ("Bone_1_Start", "Root"),
+            ("Bone_2_Start", "Root"),
+        )
+        lineage = exact_xml_lineage(
+            (0, -1, "Branch"),
+            (1, -1, "Branch"),
+        )
+        obj = self._object(
+            ["Bone_1_Start", "Bone_2_Start"],
+            [[(0, 1.0)], [(1, 1.0)]],
         )
 
-    def test_rejects_component_bone_missing_from_final_skeleton(self):
-        snapshot = skeleton_snapshot()
-        skeleton_by_name = {
-            row["name"]: row for row in snapshot["bones"]
-        }
-        obj = self._object(["Branch_Missing"], [[(0, 1.0)]])
+        influences, source = self._resolve(
+            obj, 1, snapshot, lineage, "test rendered leaf_side attachment"
+        )
+
+        self.assertEqual(
+            influences,
+            [{"bone": "Bone_2_Start", "weight": 1.0}],
+        )
+        self.assertEqual(source["anchor_bone"], "Bone_2_Start")
+        self.assertEqual(source["target_attachment_vertex_index"], 1)
+        self.assertEqual(
+            source["identity_source"],
+            "exact_target_attachment_vertex_groups_plus_spm_xml_lineage",
+        )
+
+    def test_applies_single_exact_attachment_bone_to_every_rendered_role(self):
+        snapshot = exact_bone_skeleton(("Bone_7_Start", "Root"))
+        lineage = exact_xml_lineage((6, -1, "Branch"))
+        obj = self._object(["Bone_7_Start"], [[(0, 1.0)]])
+
+        for role in ROLE_ORDER:
+            with self.subTest(role=role):
+                influences, source = self._resolve(
+                    obj,
+                    0,
+                    snapshot,
+                    lineage,
+                    f"test rendered {role} attachment",
+                )
+                self.assertEqual(
+                    influences,
+                    [{"bone": "Bone_7_Start", "weight": 1.0}],
+                )
+                self.assertEqual(source["anchor_bone"], "Bone_7_Start")
+
+    def test_rejects_attachment_bone_missing_from_final_skeleton(self):
+        snapshot = exact_bone_skeleton(("Bone_1_Start", "Root"))
+        lineage = exact_xml_lineage((8, -1, "Branch"))
+        obj = self._object(["Bone_9_Start"], [[(0, 1.0)]])
 
         with self.assertRaisesRegex(
             ClusterAssemblyBuildError,
-            "vertex-group bones missing from final skeleton: Branch_Missing",
+            "attachment vertex-group bones missing from final skeleton: "
+            "Bone_9_Start",
         ):
-            _exact_component_anchor_influences(
-                obj,
-                {"vertices": [0]},
-                snapshot,
-                skeleton_by_name,
-                "test branch component",
+            self._resolve(
+                obj, 0, snapshot, lineage, "test rendered attachment"
             )
 
-    def test_uses_exact_skeleton_lca_for_sibling_component_weights(self):
-        snapshot = skeleton_snapshot()
-        skeleton_by_name = {
-            row["name"]: row for row in snapshot["bones"]
-        }
-        skeleton_by_name["Branch_B"] = {
-            "name": "Branch_B",
-            "parent_name": "Trunk",
-        }
+    def test_does_not_invent_unweighted_lca_on_attachment_vertex(self):
+        snapshot = exact_bone_skeleton(
+            ("Bone_1_Start", "Root"),
+            ("Bone_2_Start", "Bone_1_Start"),
+            ("Bone_3_Start", "Bone_1_Start"),
+        )
+        lineage = exact_xml_lineage(
+            (0, -1, "Branch"),
+            (1, 0, "Branch"),
+            (2, 0, "Branch"),
+        )
         obj = self._object(
-            ["Branch_A", "Branch_B"],
+            ["Bone_2_Start", "Bone_3_Start"],
             [[(0, 0.5), (1, 0.5)]],
         )
 
-        influences, source = _exact_component_anchor_influences(
-            obj,
-            {"vertices": [0]},
-            snapshot,
-            skeleton_by_name,
-            "test branch component",
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "common ancestor Bone_1_Start is not authored on the attachment vertex",
+        ):
+            self._resolve(
+                obj, 0, snapshot, lineage, "test rendered attachment"
+            )
+
+    def test_rejects_final_skeleton_xml_lineage_disagreement(self):
+        snapshot = exact_bone_skeleton(
+            ("Bone_1_Start", "Root"),
+            ("Bone_2_Start", "Bone_1_Start"),
+        )
+        lineage = exact_xml_lineage(
+            (0, -1, "Branch"),
+            (1, -1, "Branch"),
+        )
+        obj = self._object(
+            ["Bone_1_Start", "Bone_2_Start"],
+            [[(0, 0.5), (1, 0.5)]],
         )
 
-        self.assertEqual(influences, [{"bone": "Trunk", "weight": 1.0}])
-        self.assertEqual(
-            source["policy"],
-            "exact_render_component_skeleton_lca_v2",
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "do not share an authored ancestor",
+        ):
+            self._resolve(
+                obj, 0, snapshot, lineage, "test rendered attachment"
+            )
+
+    def test_black_locust_shape_selects_attachment_bone_not_component_lca(self):
+        snapshot = exact_bone_skeleton(
+            ("Bone_17_End", "Root"),
+            ("Bone_407_End", "Bone_17_End"),
+            ("Bone_512_End", "Bone_17_End"),
         )
-        self.assertFalse(source["anchor_authored_on_component"])
-        self.assertEqual(
-            source["authored_component_bones"],
-            ["Branch_A", "Branch_B"],
+        lineage = exact_xml_lineage(
+            (16, -1, "Trunk"),
+            (406, 16, "Branch"),
+            (511, 16, "Branch"),
         )
+        obj = self._object(
+            ["Bone_407_End", "Bone_512_End"],
+            [[(0, 1.0)], [(1, 1.0)]],
+        )
+
+        influences, source = self._resolve(
+            obj, 0, snapshot, lineage, "test rendered cluster attachment"
+        )
+
+        self.assertEqual(
+            influences,
+            [{"bone": "Bone_407_End", "weight": 1.0}],
+        )
+        self.assertEqual(source["anchor_bone"], "Bone_407_End")
+        self.assertNotEqual(source["anchor_bone"], "Bone_17_End")
+        self.assertEqual(
+            source["spm_xml_lineage"]["anchor_xml_bone_id"],
+            406,
+        )
+
+    def test_rejects_negative_target_attachment_vertex_index(self):
+        snapshot = exact_bone_skeleton(("Bone_1_Start", "Root"))
+        lineage = exact_xml_lineage((0, -1, "Branch"))
+        obj = self._object(["Bone_1_Start"], [[(0, 1.0)]])
+
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "has no valid target attachment vertex",
+        ):
+            self._resolve(
+                obj, -1, snapshot, lineage, "test rendered attachment"
+            )
 
 
 class BaseExportParentChainTests(unittest.TestCase):
@@ -3219,7 +3429,7 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
             transform["similarity_relative_rms"],
         )
 
-    def test_endpoint_frame_locks_authored_pivot_and_preserves_rigid_plan(self):
+    def test_endpoint_frame_locks_exact_attachment_pivot_and_preserves_rigid_plan(self):
         source = [
             [0.0, 0.0, 0.0],
             [2.0, 0.0, 0.0],
@@ -3243,7 +3453,7 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
         self.assertLess(transform["similarity_relative_rms"], 1.0e-12)
         self.assertEqual(
             transform["construction_mode"],
-            "authored_absolute_pivot_plus_surviving_root_tip_frame_v1",
+            "exact_attachment_pivot_plus_surviving_root_tip_frame_v2",
         )
 
     def test_endpoint_frame_does_not_move_pivot_to_fit_nonrigid_curl(self):

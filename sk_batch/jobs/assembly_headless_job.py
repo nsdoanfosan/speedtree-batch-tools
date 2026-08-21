@@ -1383,6 +1383,7 @@ def main():
                 Path(blend_dir) / "assembly",
                 full_fbx_path,
                 report["dynamic_wind_json"],
+                target_xml_path=xml_export.get("path"),
             )
             record_stage_duration(
                 report, "cluster_assembly_build", assembly_started

@@ -29,6 +29,38 @@ from cluster_fleet_push import (  # noqa: E402
 )
 
 
+def exact_identity_contract(binding_count):
+    source_spm = {
+        "path": "C:/target.spm",
+        "sha256": "a" * 64,
+    }
+    return {
+        "placement_contract": {
+            "version": 2,
+            "identity_policy": "exact_render_attachment_correspondence_v1",
+            "translation_source": "exact_target_attachment_vertex",
+            "approximate_node_matching_present": False,
+            "exact_render_attachment_binding_count": binding_count,
+            "source_spm": source_spm,
+        },
+        "attachment_bone_contract": {
+            "version": 1,
+            "status": "ready",
+            "identity_policy": "exact_speedtree_xml_bone_id_parent_id_v1",
+            "source_spm": source_spm,
+            "source_xml": {
+                "path": "C:/target.xml",
+                "sha256": "b" * 64,
+            },
+            "bone_count": 1,
+            "bones": [
+                {"id": 7, "parent_id": -1, "generator": "Branch"}
+            ],
+            "lineage_sha256": "c" * 64,
+        },
+    }
+
+
 class ClusterFleetPushTests(unittest.TestCase):
     def test_provider_dependencies_are_ordered_before_roots_and_deduplicated(self):
         root_a = Path("D:/trees/tree_a/SK_tree_a_01.spm")
@@ -285,24 +317,14 @@ class ClusterFleetPushTests(unittest.TestCase):
                 str(contract),
             )
 
-    def test_assembly_result_requires_complete_v4_binding_and_preserves_unmatched_geometry(self):
+    def test_assembly_result_requires_exact_attachment_bindings(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             report = root / "assembly_report.json"
             manifest = root / "assembly.json"
             report.write_text(json.dumps({"status": "ok"}), encoding="utf-8")
             manifest.write_text(json.dumps({
-                "placement_contract": {
-                    "authored_node_assignment": {
-                        "policy": (
-                            "deterministic_state_mesh_then_global_position_"
-                            "recovery_shared_components_v4"
-                        ),
-                        "assigned_count": 2,
-                        "unmatched_count": 0,
-                    },
-                    "degraded_authored_card_binding_count": 0,
-                },
+                **exact_identity_contract(2),
                 "base": {
                     "unmatched_role_components_removed_from_base": 0,
                 },
@@ -317,6 +339,37 @@ class ClusterFleetPushTests(unittest.TestCase):
             self.assertTrue(result["ok"])
             self.assertEqual(result["bindings"], 2)
             self.assertEqual(result["preserved_role_polygons_kept"], 3)
+
+    def test_assembly_result_rejects_spatial_node_recovery_contract(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report = root / "assembly_report.json"
+            manifest = root / "assembly.json"
+            report.write_text(json.dumps({"status": "ok"}), encoding="utf-8")
+            manifest.write_text(json.dumps({
+                "placement_contract": {
+                    "version": 1,
+                    "authored_node_assignment": {
+                        "policy": (
+                            "deterministic_state_mesh_then_global_position_"
+                            "recovery_shared_components_v4"
+                        ),
+                        "assigned_count": 1,
+                        "unmatched_count": 0,
+                    },
+                    "degraded_authored_card_binding_count": 0,
+                },
+                "base": {"unmatched_role_components_removed_from_base": 0},
+                "parts": [{"bindings": [{"id": 1}]}],
+            }), encoding="utf-8")
+
+            result = validate_assembly_result(report, {"manifest": manifest})
+
+            self.assertFalse(result["ok"])
+            self.assertIn(
+                "approximate_node_matching_contract_present",
+                result["problems"],
+            )
 
     def test_assembly_result_accepts_current_pass_through_without_stale_manifest(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -378,17 +431,7 @@ class ClusterFleetPushTests(unittest.TestCase):
                 },
             }), encoding="utf-8")
             manifest.write_text(json.dumps({
-                "placement_contract": {
-                    "authored_node_assignment": {
-                        "policy": (
-                            "deterministic_state_mesh_then_global_position_"
-                            "recovery_shared_components_v4"
-                        ),
-                        "assigned_count": 1,
-                        "unmatched_count": 0,
-                    },
-                    "degraded_authored_card_binding_count": 0,
-                },
+                **exact_identity_contract(1),
                 "base": {
                     "unmatched_role_components_removed_from_base": 0,
                 },
