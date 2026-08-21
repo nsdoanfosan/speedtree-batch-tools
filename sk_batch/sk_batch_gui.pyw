@@ -3177,7 +3177,7 @@ class App:
         return any(marker in text for marker in (
             "검증 중",
             "상태 확인 대기",
-            "재질 데이터 준비 중",
+            "SpeedTree FBX/XML 준비 중",
             "blender assembly 중",
         ))
 
@@ -11908,7 +11908,7 @@ class App:
             )
             if cached is not None:
                 self.log(
-                    "기존 재질 데이터 준비 결과를 재사용 영수증으로 등록: "
+                    "기존 SpeedTree FBX/XML 결과를 재사용 캐시로 등록: "
                     f"{Path(spm).name}"
                 )
                 return cached
@@ -11998,7 +11998,7 @@ class App:
             )
             if cached is not None:
                 self.log(
-                    "재질 데이터 준비 재사용 (동일 입력 성공 영수증): "
+                    "SpeedTree FBX/XML 재사용 (동일 입력 캐시 적중): "
                     f"{spm.name}"
                 )
                 return {
@@ -12032,7 +12032,7 @@ class App:
         ]
         last_progress = {
             "bucket": -1,
-            "phase": "프로세스 시작",
+            "phase": "선행 작업 시작",
             "failure_logged": False,
         }
         phase_markers = (
@@ -12056,7 +12056,7 @@ class App:
                         and not last_progress["failure_logged"]
                     ):
                         self.log(
-                            "재질 데이터 준비 child 실패 단계 보고: "
+                            "SpeedTree FBX/XML child 실패 단계 보고: "
                             f"{spm.name} · {latest_line}"
                         )
                         last_progress["failure_logged"] = True
@@ -12073,8 +12073,8 @@ class App:
                 reported_phase=phase,
             )
             self.log(
-                f"재질 데이터 준비 heartbeat: {spm.name} · {phase} "
-                f"· 총 {int(elapsed)}초"
+                f"SpeedTree FBX/XML 상태: {spm.name} · {phase} "
+                f"· 시작 후 누적 {int(elapsed)}초"
             )
 
         material_code, material_log = self._run_limited(
@@ -12112,8 +12112,8 @@ class App:
                 # Cache publication is an optimization.  The authoritative
                 # just-completed report still proceeds to Blender Assembly.
                 self.log(
-                    "  [캐시 기록 경고] 재질 데이터 준비 결과는 유효하지만 "
-                    f"재사용 영수증을 기록하지 못함: {spm.name} · "
+                    "  [캐시 기록 경고] SpeedTree FBX/XML 결과는 유효하지만 "
+                    f"재사용 캐시를 기록하지 못함: {spm.name} · "
                     f"{compact_error_message(exc)}"
                 )
         return {
@@ -15238,10 +15238,10 @@ class App:
                 },
             )
         entry = self.state.setdefault(iid, {})
-        self.log(f"재질 데이터 준비 시작: {spm.name} (Blender 실행 전)")
+        self.log(f"SpeedTree FBX/XML 준비 시작: {spm.name} (Blender 실행 전)")
         self.ui_queue.put((
             "cell",
-            (iid, "blend_status", "재질 데이터 준비 중..."),
+            (iid, "blend_status", "SpeedTree FBX/XML 준비 중..."),
         ))
         artifact = self._execute_material_preflight(
             spm,
@@ -15319,7 +15319,7 @@ class App:
                     kind="internal_error",
                     report_file=live_report,
                 ) from exc
-        self.log(f"재질 데이터 준비 완료: {spm.name}")
+        self.log(f"SpeedTree FBX/XML 준비 완료: {spm.name}")
         self.log(f"Blender Assembly 시작: {spm.name} (수분 소요될 수 있음)")
         self.ui_queue.put(("cell", (iid, "blend_status", "Blender Assembly 중...")))
         wind = item["wind_override"]

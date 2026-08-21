@@ -2,12 +2,12 @@
 
 The material preflight is intentionally expensive: it may export FBX/STMAT,
 inspect the live SPM and resolve the current Cluster handoff.  A later Blender
-failure must not make that already successful inspection disappear.  This
-module keeps one content-bound report per exact canonical/source SPM pair.
+Assembly failure must not make that already successful inspection disappear.
+This module keeps one content-bound report per exact canonical/source SPM pair.
 
 A cache miss is only permission to run the existing preflight again.  It is
 never an asset failure and never relaxes the validation performed by Blender
-Repair when it consumes the report.
+Assembly when it consumes the report.
 """
 
 from __future__ import annotations
@@ -184,7 +184,7 @@ def _reusable_report(report, canonical_spm, speedtree_spm):
     persistence = reusable.get("cluster_assembly_receipt_persistence")
     if isinstance(persistence, dict):
         # A run-specific live-audit marker must not remain authoritative across
-        # jobs.  Blender Repair will resolve the hash-current persisted receipt
+        # jobs.  Blender Assembly will resolve the hash-current persisted receipt
         # (or the existing exact recovery route) for this new run.
         persistence = copy.deepcopy(persistence)
         persistence["live_audit_complete"] = False
