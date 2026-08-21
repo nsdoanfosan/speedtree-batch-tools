@@ -41,16 +41,23 @@ def emit_progress_marker(marker, **fields):
         pass
 
 
-def material_preflight_inactivity_rules(stage_timeout, queue_timeout):
-    """Delegate SpeedTree execution timeout to the child CLI only."""
+def material_preflight_inactivity_rules(
+    stage_timeout,
+    queue_timeout,
+    execution_timeout,
+):
+    """Bound queue wait and acquired execution as separate phases.
+
+    The child still owns its native-process timeout and produces the detailed
+    export failure.  The parent limit is a slightly larger process-tree safety
+    boundary for child fallback/retry code that otherwise keeps the one global
+    SpeedTree slot indefinitely after the native process has stalled.
+    """
     return {
         MATERIAL_PREFLIGHT_START_MARKER: stage_timeout,
         MATERIAL_PREFLIGHT_STATIC_DONE_MARKER: stage_timeout,
         SPEEDTREE_SLOT_WAIT_MARKER: queue_timeout,
-        # speedtree_material_preflight.py passes its exact --timeout to
-        # speedtree_cli.export_target.  A second parent 900+grace deadline
-        # would race that authoritative child result.
-        SPEEDTREE_SLOT_ACQUIRED_MARKER: None,
+        SPEEDTREE_SLOT_ACQUIRED_MARKER: execution_timeout,
         MATERIAL_PREFLIGHT_EXPORT_DONE_MARKER: stage_timeout,
         MATERIAL_PREFLIGHT_INSPECTION_DONE_MARKER: stage_timeout,
         MATERIAL_PREFLIGHT_CONTRACT_DONE_MARKER: stage_timeout,

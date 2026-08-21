@@ -30,7 +30,7 @@ $hookOutput = Join-Path $outputDirectory "speedtree_collision_hook.dll"
 $launcherOutput = Join-Path $outputDirectory "speedtree_collision_cli.exe"
 $hookObject = Join-Path $outputDirectory "hook.obj"
 $launcherObject = Join-Path $outputDirectory "launcher.obj"
-$capabilityContract = "SPEEDTREE_COLLISION_CLI_CONTRACT=native-bundle-single-bake-v4"
+$capabilityContract = "SPEEDTREE_COLLISION_CLI_CONTRACT=native-bundle-single-bake-v5"
 
 if ($IfNeeded -and
     (Test-Path -LiteralPath $hookOutput -PathType Leaf) -and

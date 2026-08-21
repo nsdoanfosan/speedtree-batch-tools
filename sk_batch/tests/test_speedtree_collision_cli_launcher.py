@@ -63,7 +63,7 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         launcher = LAUNCHER_SOURCE.read_text(encoding="utf-8")
         contract = (
             "SPEEDTREE_COLLISION_CLI_CONTRACT="
-            "native-bundle-single-bake-v4"
+            "native-bundle-single-bake-v5"
         )
 
         self.assertIn(contract, launcher)
@@ -150,6 +150,8 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         self.assertIn("FileWriteTime(logPath)", source)
         self.assertIn("kProgressStallExitCode", source)
         self.assertIn("no meaningful CPU, I/O, memory, or hook-log", source)
+        self.assertIn("SPEEDTREE_COLLISION_WRAPPER_TIMEOUT_MS", source)
+        self.assertIn("const DWORD processWaitMs = timeoutMs;", source)
 
     def test_modeler_child_uses_the_shortest_rlm_connect_window(self):
         source = LAUNCHER_SOURCE.read_text(encoding="utf-8")

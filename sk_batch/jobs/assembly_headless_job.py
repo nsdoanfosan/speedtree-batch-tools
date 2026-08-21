@@ -12,6 +12,7 @@ is a clean idempotent update (the operator wipes its previous build).
 """
 import argparse
 import copy
+import hashlib
 import json
 import os
 import shutil
@@ -241,6 +242,95 @@ def reusable_preflight_spm_contracts(material_preflight, current_fbx_export):
     if not isinstance(leaf, dict) or not isinstance(material, dict):
         return None
     return copy.deepcopy(leaf), copy.deepcopy(material)
+
+
+def reusable_preflight_export_bundle(material_preflight, speedtree_spm):
+    """Return the exact preflight FBX/XML without reacquiring SpeedTree.
+
+    ``validate_preflight_report`` has already proven that the report belongs to
+    the current SPM/STMAT snapshot.  This final check hashes every recorded
+    producer artifact so Assembly cannot reuse an output that changed after
+    preflight.  A missing historical field or any drift falls back to the
+    installed export helper and its normal cache/producer validation.
+    """
+    if not isinstance(material_preflight, dict):
+        return None
+    if material_preflight.get("status") != "ok":
+        return None
+
+    spm = Path(speedtree_spm).resolve()
+    expected_paths = {
+        "fbx": (spm.parent / "fbx" / f"{spm.stem}.fbx").resolve(),
+        "xml": (spm.parent / "xml" / f"{spm.stem}.xml").resolve(),
+    }
+    recorded = {
+        "fbx": material_preflight.get("speedtree_export"),
+        "xml": material_preflight.get("speedtree_xml_export"),
+    }
+
+    def sha256_file(path):
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    exports = {}
+    for format_name, expected_path in expected_paths.items():
+        export = recorded.get(format_name)
+        if not isinstance(export, dict):
+            return None
+        recorded_path_value = str(export.get("path") or "")
+        input_fingerprint = str(export.get("input_fingerprint") or "")
+        artifacts = export.get("artifacts")
+        if (
+            not recorded_path_value
+            or not input_fingerprint
+            or not isinstance(artifacts, list)
+            or not artifacts
+        ):
+            return None
+        try:
+            recorded_path = Path(recorded_path_value).resolve()
+        except (OSError, RuntimeError):
+            return None
+        if recorded_path != expected_path or not expected_path.is_file():
+            return None
+
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                return None
+            relative_path = str(artifact.get("relative_path") or "")
+            recorded_size = int(artifact.get("size") or 0)
+            recorded_sha256 = str(artifact.get("sha256") or "").casefold()
+            if not relative_path or recorded_size <= 0 or not recorded_sha256:
+                return None
+            try:
+                artifact_path = (recorded_path.parent / relative_path).resolve()
+                artifact_path.relative_to(recorded_path.parent)
+            except (OSError, RuntimeError, ValueError):
+                return None
+            if not artifact_path.is_file():
+                return None
+            try:
+                if artifact_path.stat().st_size != recorded_size:
+                    return None
+                if sha256_file(artifact_path).casefold() != recorded_sha256:
+                    return None
+            except OSError:
+                return None
+
+        reused = copy.deepcopy(export)
+        reused["cache_hit"] = True
+        reused["assembly_preflight_reuse"] = True
+        exports[format_name] = reused
+
+    return {
+        "status": "ok",
+        "exports": exports,
+        "process_started": False,
+        "assembly_preflight_reuse": True,
+    }
 
 
 def save_cluster_source_mainfile(bpy_module, filepath, report):
@@ -721,21 +811,31 @@ def main():
 
         export_settings = settings.as_dict()
         speedtree_export_started = perf_counter()
-        speedtree_export = run_speedtree_cli_export(
-            str(speedtree_spm),
-            speedtree_exe_path=export_settings["speedtree_exe_path"],
-            export_options_path=export_settings["speedtree_export_options_path"],
-            fbx_export_options_path=export_settings[
-                "speedtree_fbx_export_options_path"
-            ],
-            xml_export_options_path=export_settings[
-                "speedtree_xml_export_options_path"
-            ],
-            output_root=export_settings["speedtree_output_root"],
-            name_stem=speedtree_spm.stem,
-            export_fbx=export_settings["speedtree_export_fbx"],
-            export_xml=export_settings["speedtree_export_xml"],
+        speedtree_export = reusable_preflight_export_bundle(
+            material_preflight,
+            speedtree_spm,
         )
+        if speedtree_export is None:
+            speedtree_export = run_speedtree_cli_export(
+                str(speedtree_spm),
+                speedtree_exe_path=export_settings["speedtree_exe_path"],
+                export_options_path=export_settings[
+                    "speedtree_export_options_path"
+                ],
+                fbx_export_options_path=export_settings[
+                    "speedtree_fbx_export_options_path"
+                ],
+                xml_export_options_path=export_settings[
+                    "speedtree_xml_export_options_path"
+                ],
+                output_root=export_settings["speedtree_output_root"],
+                name_stem=speedtree_spm.stem,
+                export_fbx=export_settings["speedtree_export_fbx"],
+                export_xml=export_settings["speedtree_export_xml"],
+            )
+            report["speedtree_export_source"] = "export_helper"
+        else:
+            report["speedtree_export_source"] = "validated_material_preflight"
         record_stage_duration(
             report,
             "speedtree_export_bundle",

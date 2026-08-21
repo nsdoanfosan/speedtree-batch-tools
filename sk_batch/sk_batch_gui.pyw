@@ -12012,11 +12012,17 @@ class App:
         export_timeout = max(1, int(
             self.cfg.get("speedtree_material_preflight_timeout", 900)
         ))
+        native_process_timeout = max(1, min(export_timeout, int(
+            self.cfg.get("speedtree_native_process_timeout", 180)
+        )))
         stage_timeout = max(1, int(
             self.cfg.get("child_stage_inactivity_timeout", 180)
         ))
         queue_timeout = max(1, int(
             self.cfg.get("speedtree_material_preflight_queue_timeout", 3600)
+        ))
+        execution_timeout = export_timeout + max(5, int(
+            self.cfg.get("speedtree_material_preflight_cleanup_grace", 30)
         ))
         material_cmd = [
             sys.executable,
@@ -12029,10 +12035,12 @@ class App:
             "--speedtree-cli", str(speedtree_cli),
             "--report", str(material_report),
             "--timeout", str(export_timeout),
+            "--native-process-timeout", str(native_process_timeout),
         ]
         last_progress = {
             "bucket": -1,
             "phase": "선행 작업 시작",
+            "phase_started": 0.0,
             "failure_logged": False,
         }
         phase_markers = (
@@ -12050,7 +12058,9 @@ class App:
         def report_material_progress(elapsed, latest_line):
             for marker, label in phase_markers:
                 if latest_line.startswith(marker):
-                    last_progress["phase"] = label
+                    if last_progress["phase"] != label:
+                        last_progress["phase"] = label
+                        last_progress["phase_started"] = elapsed
                     if (
                         marker == MATERIAL_PREFLIGHT_FAILED_MARKER
                         and not last_progress["failure_logged"]
@@ -12074,15 +12084,15 @@ class App:
             )
             self.log(
                 f"SpeedTree FBX/XML 상태: {spm.name} · {phase} "
-                f"· 시작 후 누적 {int(elapsed)}초"
+                f"· 단계 {int(max(0.0, elapsed - last_progress['phase_started']))}초 "
+                f"· 전체 {int(elapsed)}초"
             )
 
         material_code, material_log = self._run_limited(
             material_cmd,
             material_log_name,
-            # The child export timeout starts only after the machine-wide gate.
-            # Parent safety is therefore phase inactivity, never one combined
-            # queue+execution wall-clock deadline.
+            # Queue wait and acquired execution have independent marker-based
+            # deadlines; there is intentionally no combined whole-job limit.
             None,
             # Honor the configured CPU budget even when several item workers
             # are active. Duplicate audits are eliminated separately; letting
@@ -12091,7 +12101,7 @@ class App:
             progress_callback=report_material_progress,
             inactivity_timeout=stage_timeout,
             inactivity_timeout_by_marker=material_preflight_inactivity_rules(
-                stage_timeout, queue_timeout
+                stage_timeout, queue_timeout, execution_timeout
             ),
         )
         material_result = load_job_report(material_report)
