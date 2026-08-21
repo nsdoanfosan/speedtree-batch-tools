@@ -63,7 +63,7 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         launcher = LAUNCHER_SOURCE.read_text(encoding="utf-8")
         contract = (
             "SPEEDTREE_COLLISION_CLI_CONTRACT="
-            "native-bundle-single-bake-v3"
+            "native-bundle-single-bake-v4"
         )
 
         self.assertIn(contract, launcher)
@@ -150,6 +150,37 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         self.assertIn("FileWriteTime(logPath)", source)
         self.assertIn("kProgressStallExitCode", source)
         self.assertIn("no meaningful CPU, I/O, memory, or hook-log", source)
+
+    def test_modeler_child_uses_the_shortest_rlm_connect_window(self):
+        source = LAUNCHER_SOURCE.read_text(encoding="utf-8")
+        hook = HOOK_SOURCE.read_text(encoding="utf-8")
+
+        self.assertIn(
+            'SetTemporaryEnvironment(\n'
+            '            L"RLM_CONNECT_TIMEOUT",\n'
+            '            L"1")',
+            source,
+        )
+        self.assertIn(
+            "RestoreEnvironment(restoreRlmConnectTimeout);",
+            source,
+        )
+        self.assertIn('L"SPEEDTREE_COLLISION_RLM_FAIL_FAST"', source)
+        self.assertIn('L"SPEEDTREE_COLLISION_RLM_FAIL_FAST"', hook)
+        self.assertIn(
+            "kRlmConnectAttemptLimitImmediateRva = 0x1831689",
+            hook,
+        )
+        self.assertIn("SetRlmConnectFailFastPatch(true)", hook)
+        self.assertIn("SetRlmConnectFailFastPatch(false)", hook)
+        self.assertLess(
+            source.index('L"RLM_CONNECT_TIMEOUT"'),
+            source.index("CreateProcessW("),
+        )
+        self.assertGreater(
+            source.index("RestoreEnvironment(restoreRlmConnectTimeout);"),
+            source.index("CreateProcessW("),
+        )
 
     def test_native_cli_can_bundle_a_second_export_in_one_process(self):
         launcher = LAUNCHER_SOURCE.read_text(encoding="utf-8")

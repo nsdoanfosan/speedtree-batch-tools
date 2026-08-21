@@ -50,6 +50,7 @@ constexpr std::uintptr_t kGenerateShadeVolumeRva = 0x2FE10;
 constexpr std::uintptr_t kScheduleCollisionRva = 0x3BF790;
 constexpr std::uintptr_t kApplicationControllerPointerRva = 0x22A0BF8;
 constexpr std::uintptr_t kCollisionThreadVtableRva = 0x19DA008;
+constexpr std::uintptr_t kRlmConnectAttemptLimitImmediateRva = 0x1831689;
 constexpr std::ptrdiff_t kTreeWindowModelOffset = 0x68;
 constexpr std::ptrdiff_t kCoreModelCollisionQualityOffset = 0x9BD8;
 constexpr std::ptrdiff_t kEmbeddedCollisionThreadOffset = 0x9C70;
@@ -462,6 +463,8 @@ bool gGuiBakeMode = false;
 bool gGuiGameExport = false;
 bool gSessionServerMode = false;
 bool gVerificationOnly = false;
+bool gRlmConnectFailFast = false;
+bool gRlmConnectFailFastPatchInstalled = false;
 std::atomic<bool> gSessionJobActive{false};
 std::atomic<bool> gSessionJobComplete{false};
 std::atomic<DWORD> gSessionJobStatus{ERROR_SUCCESS};
@@ -1524,6 +1527,30 @@ bool SetFbxDeformRootPatch(bool enabled) {
     return true;
 }
 
+bool SetRlmConnectFailFastPatch(bool enabled) {
+    // RLM checks a five-attempt budget immediately before calling connect().
+    // Set only that budget to zero so it follows its existing exhausted-retry
+    // error path without opening a server socket.  The connection failure and
+    // cached-license paths remain otherwise untouched.
+    constexpr unsigned char original[] = {0x05};
+    constexpr unsigned char failFast[] = {0x00};
+    if (!ReplaceModelUpdateBranch(
+            kRlmConnectAttemptLimitImmediateRva,
+            enabled ? original : failFast,
+            enabled ? failFast : original,
+            sizeof(original))) {
+        Log(enabled
+                ? "RLM connect fail-fast patch rejected: supported bytes do not match"
+                : "RLM connect fail-fast patch could not be restored");
+        return false;
+    }
+    gRlmConnectFailFastPatchInstalled = enabled;
+    Log(enabled
+            ? "RLM server connection-attempt budget reduced to zero for this CLI process"
+            : "RLM server connection-attempt budget restored");
+    return true;
+}
+
 void RemoveCommonHooks() {
     RemoveHook(gInsertExportBoneHook);
     RemoveHook(gExportVertexWeightsHook);
@@ -1534,6 +1561,9 @@ void RemoveCommonHooks() {
     RemoveHook(gQThreadStartHook);
     if (gFbxDeformRootPatchInstalled) {
         SetFbxDeformRootPatch(false);
+    }
+    if (gRlmConnectFailFastPatchInstalled) {
+        SetRlmConnectFailFastPatch(false);
     }
 }
 
@@ -4602,6 +4632,13 @@ bool ReadConfiguration() {
             static_cast<DWORD>(std::size(verificationText))) > 0) {
         gVerificationOnly = std::wcscmp(verificationText, L"1") == 0;
     }
+    wchar_t rlmFailFastText[16]{};
+    if (GetEnvironmentVariableW(
+            L"SPEEDTREE_COLLISION_RLM_FAIL_FAST",
+            rlmFailFastText,
+            static_cast<DWORD>(std::size(rlmFailFastText))) > 0) {
+        gRlmConnectFailFast = std::wcscmp(rlmFailFastText, L"1") == 0;
+    }
     wchar_t serverModeText[16]{};
     if (GetEnvironmentVariableW(
             L"SPEEDTREE_COLLISION_CLI_SESSION_SERVER",
@@ -4753,7 +4790,13 @@ bool InstallHooks() {
         return false;
     }
 
+    if (gRlmConnectFailFast && !SetRlmConnectFailFastPatch(true)) {
+        return false;
+    }
     if (!SetFbxDeformRootPatch(true)) {
+        if (gRlmConnectFailFastPatchInstalled) {
+            SetRlmConnectFailFastPatch(false);
+        }
         return false;
     }
     if (!InstallHook(

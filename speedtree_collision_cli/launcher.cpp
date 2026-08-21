@@ -25,7 +25,7 @@
 namespace {
 
 constexpr wchar_t kCapabilityContract[] =
-    L"SPEEDTREE_COLLISION_CLI_CONTRACT=native-bundle-single-bake-v3";
+    L"SPEEDTREE_COLLISION_CLI_CONTRACT=native-bundle-single-bake-v4";
 
 constexpr wchar_t kDefaultModelerPath[] =
     L"C:\\Program Files\\SpeedTree\\SpeedTree Modeler v10.1.0\\win64\\SpeedTree_Modeler.exe";
@@ -900,6 +900,16 @@ int wmain(int argc, wchar_t** argv) {
         const auto restoreTimeout = SetTemporaryEnvironment(
             L"SPEEDTREE_COLLISION_CLI_TIMEOUT_MS",
             std::to_wstring(timeoutMs));
+        // Keep the shortest supported timeout as a fallback, while the injected
+        // CLI hook sends the unavailable endpoint directly through RLM's normal
+        // exhausted-retry path. Restore both launch settings immediately after
+        // CreateProcessW so they remain child-only.
+        const auto restoreRlmConnectTimeout = SetTemporaryEnvironment(
+            L"RLM_CONNECT_TIMEOUT",
+            L"1");
+        const auto restoreRlmFailFast = SetTemporaryEnvironment(
+            L"SPEEDTREE_COLLISION_RLM_FAIL_FAST",
+            L"1");
         const auto restoreGuiBake = SetTemporaryEnvironment(
             L"SPEEDTREE_COLLISION_CLI_GUI_BAKE",
             nativeCli ? L"0" : L"1");
@@ -994,6 +1004,8 @@ int wmain(int argc, wchar_t** argv) {
         RestoreEnvironment(restoreOutput);
         RestoreEnvironment(restoreVerificationOnly);
         RestoreEnvironment(restoreGuiBake);
+        RestoreEnvironment(restoreRlmFailFast);
+        RestoreEnvironment(restoreRlmConnectTimeout);
         RestoreEnvironment(restoreTimeout);
         RestoreEnvironment(restoreLog);
 
