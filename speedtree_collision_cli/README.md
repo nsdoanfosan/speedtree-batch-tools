@@ -39,7 +39,7 @@ hook으로 보완합니다. 끊긴 record마다 Modeler가 이미 파싱한 다�
 
 target branch와 BaseRef의 역참조가 정확히 일치할 때만 원본 resolver가 반환한
 parent ID를 기록합니다. 가장 가까운 본, 좌표 tolerance, 이름 유사도, scale 추정,
-기존 repair mapping은 사용하지 않습니다. 참조 체인이나 anchor record가 불완전하거나
+외부 mapping은 사용하지 않습니다. 참조 체인이나 anchor record가 불완전하거나
 resolver가 유효한 ID를 반환하지 못하면 export를 실패시키며 근사값으로 진행하지
 않습니다.
 
@@ -101,35 +101,9 @@ FBX와 XML이 모두 필요하면 한 Modeler 프로세스에서 연속 내보�
   -export "D:\out\tree.fbx"
 ```
 
-Blender Bone Weight Repair add-on은 두 산출물이 동시에 stale일 때 이 묶음
-경로를 자동 사용합니다. 각 산출물의 content cache는 독립적으로 유지되므로
-한쪽만 stale이면 그 파일만 내보냅니다.
 두 형식을 함께 내보낼 때 High Collision/Prune 계산과 generator commit은 첫
 산출물에서 한 번만 수행합니다. 두 번째 serializer는 변경되지 않은 committed
 model을 그대로 사용하므로 XML을 위해 같은 Collision thread를 다시 돌리지 않습니다.
-
-SK Batch의 ① 뼈 검증처럼 임시 FBX/XML에서 뼈와 geometry 존재 여부만
-확인하는 경로는 `--verification-only`를 사용합니다. 이 옵션은 원래 CLI
-직렬화와 한 프로세스 이중 출력은 유지하지만, 최종 자산에서만 필요한
-Collision/Prune 재계산은 수행하지 않습니다. 생산 FBX 내보내기에는 이 옵션을
-사용하지 않으므로 High Collision/Prune 계약에는 영향이 없습니다.
-
-## SPM 정규화
-
-SK Batch의 `spm_audit.py`는 재질 `M_` 이름 보정과 같은 비-bone 변환 단계에서
-새 SPM을 다음 값으로 한 번 정규화합니다.
-
-- `<m_eCollisionQuality>3</m_eCollisionQuality>`
-- `<m_bShadePruning>true</m_bShadePruning>`
-
-기존 전체 폴더를 Modeler 실행 없이 정규화할 수도 있습니다. 변경 전 원본은
-각 폴더의 `_spm_backups`에 보존됩니다.
-
-```powershell
-python .\sk_batch\spm_audit.py `
-  --normalize-collision-pruning-only `
-  --recursive-root "D:\OneDrive\Forestportfolio\02_nature\Tree"
-```
 
 CLI hook은 SPM의 이전 on/off 값을 신뢰하지 않고 런타임에도 동일 값을 강제합니다.
 따라서 아직 정규화되지 않은 입력도 잘못된 unpruned FBX로 성공 처리되지 않습니다.

@@ -1,6 +1,6 @@
 """Shared config/helpers for the SK batch pipeline tool.
 
-Pure Python (no bpy). Used by the GUI and by spm_audit; the Blender-side job
+Pure Python (no bpy). Used by the GUI; the Blender-side job
 scripts under jobs/ are self-contained on purpose (they run inside Blender).
 """
 import configparser
@@ -118,65 +118,13 @@ DEFAULT_CONFIG = {
     "speedtree_exe": r"C:\Program Files\SpeedTree\SpeedTree Modeler v10.1.0\win64\SpeedTree_Modeler.exe",
     "fbx_ini": str(PRESET_DIR / "Options_MA_Fbx.ini"),
     "xml_ini": str(PRESET_DIR / "Options_HI_Xml.ini"),
-    # SPM bone calibration (size-aware, total-budget):
-    # probe(Absolute/1) counts total branches, then ONE Relative value is solved
-    # so total bones ~= min(branches x per_branch, max_total). Small plants land
-    # near per_branch; big trees hit the cap, leaving tiny twigs at 0-1 bone.
-    "target_bones_per_branch": 2.0,   # small-plant target (bones per branch)
-    "max_total_bones": 1500,          # hard cap on a tree's total bones
-    "total_window_low": 0.6,          # accept total in [low, high] x target
-    "total_window_high": 1.5,
-    "seed_relative_value": 0.5,       # first Relative value tried
-    "value_cap": 64.0,
-    "value_floor": 0.02,
-    "max_calibration_rounds": 4,
-    "probe_cache_enabled": True,
-    # ① SPM bone verification must use the repository's headless native CLI.
-    # The BAT launcher builds/diagnoses it and publishes the exact path through
-    # SPEEDTREE_COLLISION_CLI_EXE.  The old direct Modeler path remains only as
-    # the installed-modeler identity consumed by the wrapper.
-    "require_native_speedtree_cli": True,
-    # When one authored SPM state needs both XML bone inventory and FBX mesh
-    # verification, serialize both before the same hidden Modeler process exits.
-    "bundle_bone_verification": True,
-    # Cluster ① writes and verifies the exact durable collision/prune FBX+XML
-    # bundle that linked ② consumes. This replaces a discarded verification
-    # export plus a later production export with one cache-backed invocation.
-    "cluster_production_export_handoff": True,
-    # Positive bone receipts are independent of the large GUI state JSON.
-    # Keeping them in one ignored tool cache avoids sidecars in asset folders.
-    "spm_calibration_receipt_dir": str(TOOL_DIR / "cache" / "spm_calibration"),
-    # Cluster prototype SPMs use exactly one Absolute bone on the first
-    # renderable structural Branch below each Tree root. Meshless placement
-    # Trunks and terminal needle/leaf spines stay at Absolute/0 and never reach
-    # Blender as long pivot bones or hundreds of Start/End pairs.
-    "cluster_root_only_bones": True,
     "rename_materials": True,    # checklist item 2: M_ prefix
-    # Global SpeedTree post settings are normalized once at the same cheap,
-    # format-preserving stage as material names.  Quality 3 is Collision On / High;
-    # shade pruning is the branch/leaf removal pass used by the final FBX.
-    "normalize_collision_pruning": True,
-    # Direct leaf-parent Branches receive R=0 at the root and R=1 at the tip.
-    # This is tree-only and preserves the established G channel contract.
-    "tree_leaf_parent_red_gradient": True,
     "backup_spm": True,
-    # SpeedTree startup is expensive, so independent SPMs run concurrently.
-    # A single slow export is bounded separately by spm_verify_timeout.
-    "spm_parallel_jobs": 4,
     "check_parallel_jobs": 8,
     "blender_parallel_jobs": 2,
     # resource limits (checklist "background + cpu limit")
     "priority": "belownormal",   # idle | belownormal | normal
     "cpu_cores": max(1, (os.cpu_count() or 8) // 2),
-    "spm_verify_timeout": 120,
-    # Default to the shared owned-streaming Modeler contract. Set false only
-    # as an operational fallback to the former regular-temp-file path while a
-    # full production calibration batch is being observed end to end.
-    "spm_stream_modeler_output": True,
-    # Whole-worker lifetime includes waiting for the machine-wide serialized
-    # SpeedTree exporter.  The per-export timeout above starts only after the
-    # worker owns that gate.
-    "spm_job_timeout": 7200,
     "blender_job_timeout": 3600,
     "speedtree_material_preflight_timeout": 900,
     # These are inactivity budgets, not one queue+runtime wall-clock budget.
@@ -222,11 +170,6 @@ PRIORITY_FLAGS = {
     "normal": 0x00000020,      # NORMAL_PRIORITY_CLASS
 }
 CREATE_NO_WINDOW = 0x08000000
-CALIBRATION_CACHE_VERSION = 2
-# Bump only when the semantic skeleton selection/calibration result changes.
-# Ordinary diagnostics, exporter presets and timeout changes are not bone
-# contracts and must not schedule every SPM again.
-SPM_BONE_CONTRACT_VERSION = 1
 _JSON_WRITE_LOCK = threading.RLock()
 
 
@@ -859,95 +802,6 @@ def _dependency_identity(path, hash_content=False, include_hashed_stat=False):
         return {"path": str(candidate), "error": str(exc)}
 
 
-def _legacy_calibration_settings_signature(cfg):
-    """Return the pre-semantic signature for one-time GUI-state migration."""
-    setting_keys = (
-        "target_bones_per_branch",
-        "max_total_bones",
-        "total_window_low",
-        "total_window_high",
-        "seed_relative_value",
-        "value_cap",
-        "value_floor",
-        "max_calibration_rounds",
-        "probe_cache_enabled",
-        "cluster_root_only_bones",
-        "spm_verify_timeout",
-        "rename_materials",
-        "tree_leaf_parent_red_gradient",
-    )
-    payload = {
-        "version": CALIBRATION_CACHE_VERSION,
-        "settings": {key: cfg.get(key) for key in setting_keys},
-        # Last broad-signature producer before the semantic contract split.
-        # Keeping its exact content identity lets the current in-progress
-        # estate migrate once even though this module now imports the durable
-        # receipt fast-path.
-        "spm_audit": {
-            "path": str((TOOL_DIR / "spm_audit.py").resolve()),
-            "fingerprint": "d45ea6e72c0b1e506b4f07d97c6d7610",
-        },
-        "xml_ini": _dependency_identity(
-            cfg.get("xml_ini"),
-            hash_content=True,
-            include_hashed_stat=False,
-        ),
-        "fbx_ini": _dependency_identity(
-            cfg.get("fbx_ini"),
-            hash_content=True,
-            include_hashed_stat=False,
-        ),
-        # Hashing the large executable would erase the speed win; size+mtime
-        # changes whenever the installed SpeedTree build is replaced.
-        "speedtree_exe": _dependency_identity(cfg.get("speedtree_exe")),
-    }
-    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    return hashlib.blake2b(encoded, digest_size=16).hexdigest()
-
-
-def calibration_settings_signature(cfg):
-    """Hash only settings that can change the semantic skeleton result."""
-    setting_keys = (
-        "target_bones_per_branch",
-        "max_total_bones",
-        "total_window_low",
-        "total_window_high",
-        "seed_relative_value",
-        "value_cap",
-        "value_floor",
-        "max_calibration_rounds",
-        "cluster_root_only_bones",
-    )
-    payload = {
-        "bone_contract_version": SPM_BONE_CONTRACT_VERSION,
-        "settings": {key: cfg.get(key) for key in setting_keys},
-    }
-    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    return hashlib.blake2b(encoded, digest_size=16).hexdigest()
-
-
-def legacy_calibration_settings_signature(cfg):
-    """Return the former broad signature so current state migrates once."""
-    return _legacy_calibration_settings_signature(cfg)
-
-
-def calibration_cache_matches(
-    cache,
-    spm_fingerprint,
-    settings_signature,
-    legacy_settings_signature=None,
-):
-    accepted_signatures = {settings_signature}
-    if legacy_settings_signature:
-        accepted_signatures.add(legacy_settings_signature)
-    return bool(
-        isinstance(cache, dict)
-        and cache.get("version") == CALIBRATION_CACHE_VERSION
-        and cache.get("spm_fingerprint") == spm_fingerprint
-        and cache.get("settings_signature") in accepted_signatures
-    )
-
-
 def load_job_report(path):
     """Best-effort job JSON loader; malformed/missing reports stay diagnosable."""
     report_path = Path(path)
@@ -1146,48 +1000,9 @@ def summarize_job_failure(report=None, log_path=None, max_chars=100):
     return compact_error_message(report.get("_report_error") or "원인 확인 불가", max_chars)
 
 
-BACKUP_SUBDIR = "_spm_backups"
-MANUAL_BONES_SUFFIX = ".skbatch_manual_bones.json"
 # Older runs used a per-tool folder name; still skip it so stragglers never
 # reappear in the working list.
 LEGACY_BACKUP_SUBDIRS = ("_skbatch_backup", "_pcgtex_backups")
-
-
-def manual_bones_marker_path(spm_path):
-    """Persistent marker stored beside the SPM backups, outside the scan list."""
-    spm = Path(spm_path)
-    return spm.parent / BACKUP_SUBDIR / f"{spm.stem}{MANUAL_BONES_SUFFIX}"
-
-
-def is_manual_bones_locked(spm_path, state_entry=None):
-    """State is the fast local cache; the marker survives GUI/repo moves."""
-    if state_entry and state_entry.get("manual_bones_locked", False):
-        return True
-    return manual_bones_marker_path(spm_path).exists()
-
-
-def set_manual_bones_marker(spm_path, locked):
-    marker = manual_bones_marker_path(spm_path)
-    if locked:
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(
-            json.dumps(
-                {
-                    "version": 1,
-                    "spm": str(Path(spm_path)),
-                    "manual_bones_locked": True,
-                    "note": "Preserve user-authored SpeedTree bone settings; skip automatic calibration.",
-                },
-                indent=2,
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
-    elif marker.exists():
-        marker.unlink()
-    return marker
-
-
 def scan_sk_spms(root):
     """Non-Cluster SK inputs; Cluster canonical rows come from pair inventory.
 
@@ -1441,15 +1256,72 @@ def blender_open_file_window_titles(blend_path):
     return titles
 
 
-def set_process_affinity(pid, cores):
-    """Limit a process to the first `cores` logical CPUs (inherited by children)."""
+_AFFINITY_RESERVATION_LOCK = threading.Lock()
+_AFFINITY_RESERVATIONS = []
+_AFFINITY_CANDIDATE_CURSOR = 0
+
+
+def _affinity_candidate_masks(total, cores):
+    """Return evenly rotated CPU masks instead of always using CPUs 0..N-1."""
+    total = max(1, int(total))
+    cores = max(1, min(int(cores), total))
+    if cores >= total:
+        return ()
+    masks = []
+    for offset in range(0, total, cores):
+        mask = 0
+        for index in range(cores):
+            mask |= 1 << ((offset + index) % total)
+        if mask not in masks:
+            masks.append(mask)
+    return tuple(masks)
+
+
+def _reserve_process_affinity(proc, cores, total=None):
+    """Choose the least-overlapping mask among children that are still alive."""
+    global _AFFINITY_CANDIDATE_CURSOR
+
+    total = int(total or os.cpu_count() or 1)
+    candidates = _affinity_candidate_masks(total, cores)
+    if not candidates:
+        return None
+    with _AFFINITY_RESERVATION_LOCK:
+        active = []
+        for active_proc, active_mask in _AFFINITY_RESERVATIONS:
+            try:
+                running = active_proc.poll() is None
+            except (AttributeError, OSError):
+                running = False
+            if running:
+                active.append((active_proc, active_mask))
+        _AFFINITY_RESERVATIONS[:] = active
+
+        start = _AFFINITY_CANDIDATE_CURSOR % len(candidates)
+        ranked = []
+        for relative_index in range(len(candidates)):
+            candidate_index = (start + relative_index) % len(candidates)
+            candidate = candidates[candidate_index]
+            overlap = sum(
+                (candidate & active_mask).bit_count()
+                for _active_proc, active_mask in active
+            )
+            ranked.append((overlap, relative_index, candidate_index, candidate))
+        _overlap, _relative, selected_index, selected = min(ranked)
+        _AFFINITY_CANDIDATE_CURSOR = (selected_index + 1) % len(candidates)
+        _AFFINITY_RESERVATIONS.append((proc, selected))
+        return selected
+
+
+def set_process_affinity(pid, cores, mask=None):
+    """Limit a process to a selected logical-CPU set (inherited by children)."""
     import ctypes
 
     total = os.cpu_count() or 1
     cores = max(1, min(int(cores), total))
     if cores >= total:
         return False
-    mask = (1 << cores) - 1
+    if mask is None:
+        mask = (1 << cores) - 1
     PROCESS_SET_INFORMATION = 0x0200
     PROCESS_QUERY_INFORMATION = 0x0400
     kernel32 = ctypes.windll.kernel32
@@ -1497,10 +1369,9 @@ def launch_limited(
     Priority class and affinity are inherited by grandchildren (Blender ->
     SpeedTree CLI), so one launch covers the whole job tree. Returns Popen.
 
-    affinity=False leaves the child free to use every core: use this when the
-    caller runs several children at once, where the whole point is to spread
-    the (cold-start-bound) SpeedTree exports across all cores. Priority alone
-    keeps the machine responsive.
+    Concurrent limited children are assigned the least-overlapping CPU masks,
+    so two 8-core jobs on a 16-core machine use opposite halves instead of both
+    being pinned to CPUs 0..7.
     """
     flags = PRIORITY_FLAGS.get(cfg.get("priority", "belownormal"), PRIORITY_FLAGS["belownormal"])
     flags |= CREATE_NO_WINDOW
@@ -1531,7 +1402,10 @@ def launch_limited(
     attach_process_kill_job(proc)
     try:
         if affinity:
-            set_process_affinity(proc.pid, cfg.get("cpu_cores", os.cpu_count()))
+            cores = cfg.get("cpu_cores", os.cpu_count())
+            mask = _reserve_process_affinity(proc, cores)
+            if mask is not None:
+                set_process_affinity(proc.pid, cores, mask=mask)
     except Exception:
         pass
     return proc
@@ -1542,7 +1416,7 @@ def terminate_process_tree(proc, wait_seconds=5.0):
 
     Killing only the Python wrapper leaves SpeedTree_Modeler.exe orphaned on
     Windows. Repeated stop/retry cycles then accumulate multi-GB workers and
-    make later calibration batches appear hung.
+    make later export batches appear hung.
 
     Returns True when Windows confirms the tree kill (or the process was already
     gone). A direct-process kill remains as a last resort, but returns False

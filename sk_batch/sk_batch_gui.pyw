@@ -1,14 +1,10 @@
-"""SK Vegetation Batch — SPM 본 캘리브레이션 + Blender Assembly + Unreal Push GUI.
+"""SK Vegetation Batch — native SpeedTree Assembly + Unreal Push GUI.
 
 단계 (왼쪽부터, 빠른 것 → 느린 것):
-  🔍 검사        : 아무것도 수정하지 않고 상태만 표에 채움 (SPM 본 세팅 상태,
-                   M_ 머티리얼, blend 최신 여부, 핸드오프 JSON 준비 여부)
-  ① SPM 본 세팅 : 가지 수를 실측(프로브 익스포트)해서 "가지당 목표 본 수"에
-                   맞게 Relative 값을 자동 계산. 파일당 수십초~수분. 실패해도
-                   백업에서 자동 복원되므로 여기서 전부 끝내고 ②로 넘어가면 됨.
-  ② Blender Assembly : 헤드리스 Blender로 import/assembly 후 SPM 옆에 .blend 저장.
+  🔍 검사        : 아무것도 수정하지 않고 Assembly/Push 산출물 상태만 확인.
+  ① Blender Assembly : 정확한 native FBX/XML을 import/assembly 후 .blend 저장.
                    파일당 수분~수십분(느림). 이미 최신인 blend는 건너뜀.
-  ③ Unreal Push : 보내기 전에 준비 검사(blend/JSON 존재, 언리얼 실행 여부)를
+  ② Unreal Push : 보내기 전에 준비 검사(blend/JSON 존재, 언리얼 실행 여부)를
                    먼저 전부 통과시킨 뒤에만 실제 push 시작.
 
 모든 무거운 작업은 낮은 우선순위 + CPU 코어 제한이 걸린 백그라운드 프로세스로
@@ -16,6 +12,7 @@
 """
 import copy
 import ctypes
+from ctypes import wintypes
 import hashlib
 import json
 import os
@@ -28,7 +25,6 @@ import time
 import tkinter as tk
 import traceback
 import uuid
-import xml.etree.ElementTree as ET
 from collections import deque
 from concurrent.futures import (
     Future,
@@ -57,6 +53,97 @@ from code_compile_gate import (
     validate_production_source_revision_report,
 )
 _PROCESS_PRODUCTION_SOURCE_MANIFEST = production_source_manifest(REPO_DIR)
+CLUSTER_LIVE_AUDIT_CACHE_KIND = "sk_batch_cluster_live_audit_cache"
+CLUSTER_LIVE_AUDIT_CACHE_VERSION = 2
+
+
+class _WindowsFileBasicInfo(ctypes.Structure):
+    _fields_ = (
+        ("creation_time", ctypes.c_longlong),
+        ("last_access_time", ctypes.c_longlong),
+        ("last_write_time", ctypes.c_longlong),
+        ("change_time", ctypes.c_longlong),
+        ("file_attributes", wintypes.DWORD),
+    )
+
+
+if os.name == "nt":
+    _KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _CREATE_FILE_W = _KERNEL32.CreateFileW
+    _CREATE_FILE_W.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    _CREATE_FILE_W.restype = wintypes.HANDLE
+    _GET_FILE_INFORMATION_BY_HANDLE_EX = (
+        _KERNEL32.GetFileInformationByHandleEx
+    )
+    _GET_FILE_INFORMATION_BY_HANDLE_EX.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    _GET_FILE_INFORMATION_BY_HANDLE_EX.restype = wintypes.BOOL
+    _CLOSE_HANDLE = _KERNEL32.CloseHandle
+    _CLOSE_HANDLE.argtypes = (wintypes.HANDLE,)
+    _CLOSE_HANDLE.restype = wintypes.BOOL
+
+
+def _windows_file_change_token(path):
+    """Return NTFS' non-user-timestamp change counter for a file or folder."""
+    if os.name != "nt":
+        return None
+    handle = _CREATE_FILE_W(
+        str(Path(path)),
+        0x0080,  # FILE_READ_ATTRIBUTES
+        0x00000001 | 0x00000002 | 0x00000004,
+        None,
+        3,  # OPEN_EXISTING
+        0x02000000,  # FILE_FLAG_BACKUP_SEMANTICS (also accepts directories)
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle == invalid_handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        info = _WindowsFileBasicInfo()
+        if not _GET_FILE_INFORMATION_BY_HANDLE_EX(
+            handle,
+            0,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return int(info.change_time)
+    finally:
+        _CLOSE_HANDLE(handle)
+
+
+def _fast_file_change_identity(path, stat_result=None):
+    """Cheap exact-change identity used only to reuse an existing digest."""
+    candidate = Path(path)
+    stat_result = stat_result or candidate.stat()
+    try:
+        change_token = (
+            _windows_file_change_token(candidate)
+            if os.name == "nt"
+            else int(stat_result.st_ctime_ns)
+        )
+    except OSError:
+        change_token = None
+    return {
+        "size": int(stat_result.st_size),
+        "mtime_ns": int(stat_result.st_mtime_ns),
+        "device": int(stat_result.st_dev),
+        "file_id": int(stat_result.st_ino),
+        "change_token": change_token,
+    }
 from batch_ui_common import CheckedRowController, copy_selected_row_paths
 from shared_queue_runtime import SharedQueueRuntime, WaitCancelled
 from exact_target_command import (
@@ -140,6 +227,9 @@ from retry_planning import (
     planning_input_signature,
 )
 from artifact_content_key import (
+    LEGACY_FINGERPRINT_ALGORITHM,
+    SAMPLED_FINGERPRINT_ALGORITHM,
+    SHA256_ALGORITHM,
     artifact_record_content_key,
     file_content_key_snapshot,
     sampled_file_content_snapshot,
@@ -150,38 +240,29 @@ from artifact_retention import (
 
 from sk_common import (
     ADDON_ENTRY_DIR,
-    CALIBRATION_CACHE_VERSION,
     LOG_DIR,
     PUSH_ABORT_KINDS,
     PUSH_MANIFEST_SCHEMA_VERSION,
     PUSH_SOURCE_FINGERPRINT_CACHE_VERSION,
-    SPM_BONE_CONTRACT_VERSION,
     atomic_write_bytes,
     atomic_write_json,
     blend_path_for,
-    cached_file_content_snapshot,
     cached_push_source_fingerprint,
-    calibration_cache_matches,
-    calibration_settings_signature,
     classify_push_failure,
     close_process_kill_job,
     compact_error_message,
     file_content_snapshot,
-    is_manual_bones_locked,
-    legacy_calibration_settings_signature,
     launch_limited,
     load_config,
     load_job_report,
     load_state,
     manifest_item_files_match,
-    manual_bones_marker_path,
     push_source_cache_matches_snapshot,
     save_config,
     save_state,
     scan_cluster_spm_sources,
     scan_sk_spms,
     send2ue_export_cache_root,
-    set_manual_bones_marker,
     push_source_snapshot,
     prepare_cluster_spm_pair_for_job,
     summarize_job_failure,
@@ -264,13 +345,6 @@ from blender_resume_receipt import (
     build_blender_resume_receipt,
     validate_blender_resume_receipt,
 )
-from spm_audit import (
-    cluster_root_logical_postcondition,
-    current_bone_semantic_fingerprint,
-    read_spm,
-)
-from spm_calibration_receipt import write_positive_calibration_receipt
-
 WIND_OPTIONS = (
     ("자동 (식생 종류 기준)", "auto"),
     ("TREE", "TREE"),
@@ -278,7 +352,6 @@ WIND_OPTIONS = (
     ("WEED", "WEED"),
     ("NONE", "NONE"),
 )
-BONE_MODE_OPTIONS = (("자동 계산", "auto"), ("수동 본 유지", "manual"))
 PLANNED_EXCLUSION_KINDS = frozenset({
     "dependency_blocked",
     "manual_required",
@@ -295,7 +368,6 @@ STATUS_COLUMNS = ("spm_status", "blend_status", "push_status")
 BLENDER_RESUME_CONFIG_KEYS = (
     "fbx_ini",
     "rename_materials",
-    "tree_leaf_parent_red_gradient",
     "cluster_unit_probe",
     "cluster_capture_resolution",
 )
@@ -421,40 +493,6 @@ def is_cluster_source_spm(spm):
 def should_refresh_canonical_atlas_manifests(spm):
     """Return whether this SPM is an Atlas-producing Cluster source."""
     return is_cluster_source_spm(spm)
-
-
-def current_cluster_root_postcondition(spm):
-    if not is_cluster_source_spm(spm):
-        return {"ok": True, "mode": "not_cluster_source"}
-    try:
-        return cluster_root_logical_postcondition(read_spm(spm))
-    except (OSError, ValueError, RuntimeError) as exc:
-        return {"ok": False, "error": str(exc)}
-
-
-def validate_spm_audit_result(spm, report, final_snapshot):
-    if not isinstance(final_snapshot, dict):
-        raise RuntimeError("본 세팅 후 최종 SPM 지문을 계산하지 못함")
-    reported_fingerprint = str(report.get("final_spm_fingerprint") or "")
-    if reported_fingerprint != final_snapshot.get("fingerprint"):
-        raise RuntimeError(
-            "본 세팅 결과 보고서의 최종 SPM 지문이 실제 파일과 "
-            f"일치하지 않음: {Path(spm).name}"
-        )
-    if is_cluster_source_spm(spm):
-        reported_postcondition = (
-            report.get("cluster_root_logical_postcondition") or {}
-        )
-        actual_postcondition = current_cluster_root_postcondition(spm)
-        if (
-            reported_postcondition.get("ok") is not True
-            or actual_postcondition.get("ok") is not True
-        ):
-            raise RuntimeError(
-                "Cluster SPM 최종 root-bone 정규화 조건이 충족되지 않음: "
-                f"{reported_postcondition or actual_postcondition}"
-            )
-    return True
 
 
 def manifest_item_requires_unreal_asset_verification(item):
@@ -1980,21 +2018,6 @@ def expand_blender_assembly_targets(selected_targets, all_items):
     )
 
 
-def should_calibrate_spm(item):
-    """Return whether stage ① may normalize this row's SPM bone contract.
-
-    Only Cluster providers require the dedicated first-renderable-root
-    Absolute/1 contract. Owner Tree rows pass directly to later stages instead
-    of spending batch time in the whole-tree density solver.
-    """
-    spm = item.get("spm")
-    return (
-        not item.get("source_read_only")
-        and spm is not None
-        and is_cluster_source_spm(spm)
-    )
-
-
 def sk_batch_folder_chain(root, spm):
     """Return the owner/Cluster hierarchy used by the SK Batch table."""
     root = Path(root)
@@ -2016,152 +2039,15 @@ def _normalized_path(path):
     return os.path.normcase(os.path.abspath(str(path)))
 
 
-def _sha256_snapshot(path):
-    """Read a stable SHA-256 snapshot without changing the source file."""
-    candidate = Path(path)
-    for _attempt in range(2):
-        before = candidate.stat()
-        digest = hashlib.sha256()
-        with candidate.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        after = candidate.stat()
-        if (before.st_size, before.st_mtime_ns) == (
-            after.st_size,
-            after.st_mtime_ns,
-        ):
-            return {
-                "sha256": digest.hexdigest(),
-                "size": after.st_size,
-            }
-    raise OSError(f"File changed while reading: {candidate}")
-
-
-def current_speedtree_bone_measurement(spm):
-    """Return a verified exported bone count for the current SPM, or None.
-
-    The XML is accepted only when its artifact hash matches the export receipt.
-    The receipt's SPM input hash marks the count as current or last-measured.
-    This is deliberately read-only and content-based: a timestamp-only change
-    cannot schedule or invalidate work.
-    """
-    spm = Path(spm)
-    xml_path = spm.parent / "xml" / f"{spm.stem}.xml"
-    receipt_path = (
-        xml_path.parent / ".speedtree_export_cache" / f"{xml_path.name}.json"
-    )
-    try:
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        source = receipt["inputs"]["spm"]
-        if _normalized_path(source["path"]) != _normalized_path(spm):
-            return None
-        source_snapshot = _sha256_snapshot(spm)
-        source_current = not (
-            source_snapshot["size"] != int(source["size"])
-            or source_snapshot["sha256"].lower()
-            != str(source["sha256"]).lower()
-        )
-
-        artifact = next(
-            item
-            for item in receipt["artifacts"]
-            if item.get("relative_path") == xml_path.name
-        )
-        xml_snapshot = _sha256_snapshot(xml_path)
-        if (
-            xml_snapshot["size"] != int(artifact["size"])
-            or xml_snapshot["sha256"].lower()
-            != str(artifact["sha256"]).lower()
-        ):
-            return None
-
-        root = ET.parse(xml_path).getroot()
-        xml_source = root.get("Source")
-        if xml_source and _normalized_path(xml_source) != _normalized_path(spm):
-            return None
-        bones = root.find(".//Bones")
-        if bones is None:
-            return None
-        actual_count = len(bones.findall("Bone"))
-        declared_count = int(bones.get("Count", actual_count))
-        if declared_count != actual_count:
-            return None
-        return {
-            "count": actual_count,
-            "current": source_current,
-            "xml_path": xml_path,
-            "receipt_path": receipt_path,
-        }
-    except (ET.ParseError, OSError, TypeError, ValueError, KeyError, StopIteration):
-        return None
-
-
-def manual_bone_status_text(spm):
-    measurement = current_speedtree_bone_measurement(spm)
-    if measurement is None:
-        return "수동 본 유지 🔒 · 본 수 미측정 (검증된 SpeedTree XML 없음)"
-    if not measurement["current"]:
-        return (
-            f"수동 본 유지 🔒 · 최근 실측 본 {measurement['count']}개 "
-            "(SPM 변경 후 미재검증)"
-        )
-    return (
-        f"수동 본 유지 🔒 · SpeedTree 본 {measurement['count']}개 "
-        "(현재 SPM과 일치하는 XML)"
-    )
-
-
 def selected_row_detail_text(spm, statuses):
     return "\n".join(
         (
             f"경로  {spm}",
-            f"① SPM  {statuses.get('spm_status', '-')}",
-            f"② Blender  {statuses.get('blend_status', '-')}",
-            f"③ Unreal  {statuses.get('push_status', '-')}",
+            f"Source  {statuses.get('spm_status', '-')}",
+            f"① Blender  {statuses.get('blend_status', '-')}",
+            f"② Unreal  {statuses.get('push_status', '-')}",
         )
     )
-
-
-def spm_check_status_parts(audit):
-    """Return human-readable SPM settings without implying a failure."""
-    generators = audit.get("generators") or []
-    fixed = sum(
-        1
-        for generator in generators
-        if generator.get("style") == 0.0
-        and (generator.get("bones") or 0) > 0
-    )
-    relative = sum(
-        1 for generator in generators if generator.get("style") == 1.0
-    )
-    disabled = sum(
-        1
-        for generator in generators
-        if generator.get("style") == 0.0
-        and (generator.get("bones") or 0) == 0
-    )
-    material_renames = sum(
-        1 for material in (audit.get("materials") or [])
-        if material.get("needs_prefix")
-    )
-    parts = []
-    if fixed:
-        parts.append(f"고정 본(Absolute) {fixed}개")
-    if relative:
-        parts.append(f"자동 본(Relative) {relative}개")
-    if disabled:
-        parts.append(f"본 꺼짐 {disabled}개")
-    if material_renames:
-        parts.append(f"M_ 필요 {material_renames}개")
-    graph = audit.get("bone_graph") or {}
-    if graph.get("root_target_generator_count"):
-        parts.append(
-            f"자동 대상 {graph['root_target_generator_count']} / "
-            f"Base 제외 {graph['base_excluded_generator_count']}"
-        )
-    if graph.get("unknown_base_generators"):
-        parts.append(f"Base 미분류 {len(graph['unknown_base_generators'])}")
-    return parts
 
 
 def cluster_issue_summary(issues, limit=5):
@@ -2436,12 +2322,7 @@ class App:
         self.scan_worker = None
         self._live_poll_active = False
         self._live_poll_after_id = None
-        self.spm_calibration_signature = calibration_settings_signature(self.cfg)
-        self.legacy_spm_calibration_signature = (
-            legacy_calibration_settings_signature(self.cfg)
-        )
-
-        root.title("SK Vegetation Batch — 검사 → 본 세팅 → Blender → Unreal")
+        root.title("SK Vegetation Batch — 검사 → Assembly → Unreal")
         root.geometry("1460x840")
         self._build_ui()
         self._restore_latest_retry_progress()
@@ -2494,7 +2375,7 @@ class App:
             padding=6,
         )
         transport_opts.pack(fill="x", padx=6, pady=(4, 0))
-        ttk.Label(transport_opts, text="③ Unreal Push:").pack(side="left")
+        ttk.Label(transport_opts, text="② Unreal Push:").pack(side="left")
         self.transport_var = tk.StringVar(
             value=self.cfg.get("push_transport", "headless")
         )
@@ -2525,9 +2406,9 @@ class App:
             night_check,
             "켜면 목록 전체 자동의 마지막 Push는 열린 Unreal 없이 headless로 실행합니다. "
             "단, Unreal Wait를 선택하면 전체 자동에서도 이를 덮어쓰지 않고 "
-            "영구 대기 상태로 남깁니다. 단독 ③ Push도 왼쪽 transport 선택을 따릅니다.",
+            "영구 대기 상태로 남깁니다. 단독 ② Push도 왼쪽 transport 선택을 따릅니다.",
         )
-        ttk.Label(transport_opts, text="② Assembly·③ export 동시:").pack(
+        ttk.Label(transport_opts, text="① Assembly·② export 동시:").pack(
             side="left", padx=(18, 0)
         )
         self.blender_parallel_var = tk.IntVar(
@@ -2547,32 +2428,6 @@ class App:
             "기본값 2는 시작 비용을 겹치되 메모리 사용량을 제한합니다.",
         )
 
-        lbl = ttk.Label(opts, text="가지당 목표 본 수:")
-        lbl.pack(side="left")
-        self.target_var = tk.DoubleVar(value=float(self.cfg.get("target_bones_per_branch", 2.0)))
-        spin = ttk.Spinbox(opts, from_=1, to=6, increment=0.5, textvariable=self.target_var, width=5)
-        spin.pack(side="left", padx=4)
-        tip = ("① SPM 본 세팅에서 '작은 식물'의 목표입니다.\n"
-               "가지(spline) 수를 실제 익스포트로 세고, 총 본 수가 대략 '가지 수 × 이 값'이 "
-               "되도록 SpeedTree의 Relative 값을 자동 계산합니다.\n"
-               "· 작은 풀: 가지 하나당 이 개수 근처의 본이 들어감\n"
-               "· 큰 나무: '가지 수 × 이 값'이 아래 '최대 총 본 수'를 넘으면 "
-               "Base 소속 본을 먼저 끄고, 그래도 넘을 때만 Tree 밀도를 낮춤\n"
-               "Relative 스타일이라 가지 길이(=Size scalar 포함)에 비례해 본이 배분됩니다.")
-        Tooltip(lbl, tip); Tooltip(spin, tip)
-
-        lbl2 = ttk.Label(opts, text="최대 총 본 수:")
-        lbl2.pack(side="left", padx=(10, 0))
-        self.maxtotal_var = tk.IntVar(value=int(self.cfg.get("max_total_bones", 1500)))
-        spin2 = ttk.Spinbox(opts, from_=200, to=8000, increment=100, textvariable=self.maxtotal_var, width=6)
-        spin2.pack(side="left", padx=4)
-        tip2 = ("한 나무의 총 본 수 상한입니다 (본 폭증 방지의 핵심).\n"
-                "큰 나무는 가지가 수천~수만 개라 '가지당 목표'를 그대로 적용하면 본이 폭발합니다"
-                "(예: elm_03은 가지 15,234개 → 예전 방식 80,000본).\n"
-                "이 상한이 걸리면 Base 소속 자동 대상부터 Absolute/0으로 끕니다. "
-                "그래도 초과할 때만 Tree/트렁크의 Relative 밀도를 낮춥니다.")
-        Tooltip(lbl2, tip2); Tooltip(spin2, tip2)
-
         lbl4 = ttk.Label(opts, text="우선순위:")
         lbl4.pack(side="left", padx=(14, 0))
         self.priority_var = tk.StringVar(value=self.cfg.get("priority", "belownormal"))
@@ -2590,19 +2445,9 @@ class App:
         self.cores_var = tk.IntVar(value=int(self.cfg.get("cpu_cores", 4)))
         spin5 = ttk.Spinbox(opts, from_=1, to=64, textvariable=self.cores_var, width=5)
         spin5.pack(side="left", padx=4)
-        tip5 = ("백그라운드 작업이 사용할 수 있는 CPU 코어 수 제한입니다 (순차 실행 시). "
-                "동시 실행이 2 이상이면 이 제한은 무시하고 모든 코어에 분산합니다.")
+        tip5 = ("백그라운드 작업이 사용할 수 있는 CPU 코어 수 제한입니다. "
+                "동시 실행 중에도 각 자식 프로세스가 이 제한을 지킵니다.")
         Tooltip(lbl5, tip5); Tooltip(spin5, tip5)
-
-        lbl6 = ttk.Label(opts, text="동시 실행:")
-        lbl6.pack(side="left", padx=(10, 0))
-        self.parallel_var = tk.IntVar(value=int(self.cfg.get("spm_parallel_jobs", 4)))
-        spin6 = ttk.Spinbox(opts, from_=1, to=16, textvariable=self.parallel_var, width=4)
-        spin6.pack(side="left", padx=4)
-        tip6 = ("① SPM 본 세팅을 몇 개 파일 동시에 처리할지.\n"
-                "기본값 4로 독립 SPM을 병렬 처리합니다. 한 번의 SpeedTree 익스포트가 "
-                "2분을 넘는 파일은 원본을 복원하고 수동 처리로 넘깁니다.")
-        Tooltip(lbl6, tip6); Tooltip(spin6, tip6)
 
         self.force_var = tk.BooleanVar(value=False)
         chk = ttk.Checkbutton(
@@ -2611,9 +2456,8 @@ class App:
             variable=self.force_var,
         )
         chk.pack(side="left", padx=12)
-        Tooltip(chk, ("② Blender Assembly에서, 이미 SPM보다 최신인 .blend가 있는 항목은 기본적으로 "
-                      "건너뜁니다. ① SPM 본 세팅도 동일 SPM/옵션 캐시를 기본 사용합니다. "
-                      "이 옵션을 켜면 ①② 모두 강제로 다시 실행합니다.\n"
+        Tooltip(chk, ("① Blender Assembly에서, 이미 정확한 현재 산출물이 있는 항목은 기본적으로 "
+                      "건너뜁니다. 이 옵션을 켜면 Assembly를 강제로 다시 실행합니다.\n"
                       "판정 기준은 '작업이 성공했는가'가 아니라 '.blend가 SPM보다 최신인가' "
                       "입니다. 그래서 export가 게이트에 막혀 산출물이 안 나온 항목도 "
                       "이전 .blend가 남아 있으면 기본적으로 건너뜁니다.\n"
@@ -2626,37 +2470,26 @@ class App:
                                     command=lambda: self.start_batch("check"))
         self.btn_check.pack(side="left")
         Tooltip(self.btn_check, ("아무것도 수정하지 않습니다.\n"
-                                 "SPM 본 세팅 상태 / M_ 머티리얼 / blend 최신 여부 / 핸드오프 JSON "
+                                 "native FBX/XML / 머티리얼 / blend 최신 여부 / 핸드오프 JSON "
                                  "준비 여부를 빠르게 확인해서 표에 채웁니다.\n"
-                                 "'고정 본(Absolute)'은 자동 보정 실패가 아니라 가지마다 고정된 "
-                                 "본 수를 쓰는 Generator이고, '자동 본(Relative)'은 가지 길이에 따라 "
-                                 "본 밀도가 계산되는 Generator입니다.\n"
-                                 "수동 본 유지 항목은 검증된 최근 XML의 실제 SpeedTree 본 수를 "
-                                 "표시하고, 이후 SPM이 바뀌었으면 미재검증으로 구분합니다. "
+                                 "본 계층은 고쳐진 native exporter가 FBX/XML에 함께 기록하므로 "
+                                 "검사 단계에서 SPM을 다시 파싱하지 않습니다. "
                                  "검사 결과는 파일이나 실행 캐시에 저장하지 않습니다.\n"
-                                 "오래 걸리는 ①②③을 돌리기 전에 먼저 눌러보세요."))
-        self.btn_spm = ttk.Button(actions, text="① SPM 본 세팅 (빠름)",
-                                  command=lambda: self.start_batch("spm"))
-        self.btn_spm.pack(side="left", padx=6)
-        Tooltip(self.btn_spm, ("SPM만 수정합니다 (blend/언리얼은 건드리지 않음).\n"
-                               "가지 수를 실측해서 '가지당 목표 본 수'에 맞게 본 값을 자동 계산하고, "
-                               "머티리얼에 M_ 프리픽스를 붙입니다.\n"
-                               "수정 전 _spm_backups\\ 에 백업이 남고, 실패하면 자동 복원됩니다.\n"
-                               "느린 ②로 넘어가기 전에 여기서 전부 끝내고 결과를 확인하세요."))
-        self.btn_blender = ttk.Button(actions, text="② Blender Assembly (느림)",
+                                 "오래 걸리는 ①②를 돌리기 전에 먼저 눌러보세요."))
+        self.btn_blender = ttk.Button(actions, text="① Blender Assembly",
                                       command=lambda: self.start_batch("blender"))
         self.btn_blender.pack(side="left", padx=6)
-        Tooltip(self.btn_blender, ("① SPM 본 세팅을 먼저 실행한 뒤 ② Blender Assembly를 실행합니다.\n"
-                                   "헤드리스 Blender로 SpeedTree 익스포트→임포트→본/웨이트 수리를 돌리고 "
+        Tooltip(self.btn_blender, ("헤드리스 Blender로 정확한 SpeedTree FBX/XML을 export/import한 뒤 "
+                                   "재질·메시·Export 구조를 Assembly하고 "
                                    "SPM 옆에 같은 이름의 .blend와 wind JSON을 저장합니다.\n"
                                    "완료 전에 T_ 6종 또는 보존 Cluster 텍스처, 빈 머티리얼 슬롯까지 검사합니다.\n"
                                    "파일당 수분~수십분. 이미 최신인 blend는 건너뜁니다("
                                    "'완료된 항목도 다시 실행'으로 강제 가능)."))
-        self.btn_push = ttk.Button(actions, text="③ Unreal Push",
+        self.btn_push = ttk.Button(actions, text="② Unreal Push",
                                    command=lambda: self.start_batch("push"))
         self.btn_push.pack(side="left", padx=6)
-        Tooltip(self.btn_push, ("① SPM 본 세팅→② Blender Assembly를 먼저 실행한 뒤 "
-                                "③ Unreal Push를 실행합니다.\n"
+        Tooltip(self.btn_push, ("① Blender Assembly를 먼저 실행한 뒤 "
+                                "② Unreal Push를 실행합니다.\n"
                                 "push 전에 준비 검사를 먼저 전부 통과시킵니다:\n"
                                 "· .blend 존재 + SPM보다 최신인지\n"
                                 "· 텍스처 세트와 Assembly 사전검사(빈 머티리얼 슬롯 포함)\n"
@@ -2685,10 +2518,10 @@ class App:
             self.btn_retry_failed,
             "체크 상태와 무관하게 현재 목록 전체의 실패/stale 이력을 "
             "원인별로 나눠 재시도합니다.\n"
-            "· Repair reason code: exact PCG 텍스처 또는 Generator/Cluster를 "
+            "· 자동 복구 reason code: exact PCG 텍스처 또는 Generator/Cluster를 "
             "자동 복구하고 fresh 재검증 후 Blender/Unreal 재시도\n"
-            "· Blender/Send2UE export 실패: ② Blender부터 export를 다시 만들고 "
-            "③ Unreal Push까지 실행\n"
+            "· Blender/Send2UE export 실패: ① Blender부터 export를 다시 만들고 "
+            "② Unreal Push까지 실행\n"
             "· Unreal ingest 실패: Blender를 다시 돌리지 않고 기존 FBX·JSON·Assembly "
             "산출물과 입력 identity를 검증한 뒤 현재 Unreal 코드로만 재시도\n"
             "BAT로 해결할 수 없거나 fresh 재검증에 실패한 항목만 최종 실패로 "
@@ -2707,16 +2540,15 @@ class App:
         )
         self.btn_all = ttk.Button(
             actions,
-            text="🌙 목록 전체 자동 ①→②→③",
+            text="🌙 목록 전체 자동 ①→②",
             command=self.start_full_pipeline,
         )
         self.btn_all.pack(side="left", padx=(10, 4))
         Tooltip(
             self.btn_all,
             "체크 상태와 무관하게 현재 목록의 모든 항목을 밤새 순서대로 처리합니다.\n"
-            "① SPM 본 세팅 전체 완료 → ② Blender Assembly 전체 완료 → "
-            "③ Unreal Push 순서입니다.\n"
-            "개별 ①/②/③ 버튼만 체크된 항목을 대상으로 합니다.\n"
+            "① Blender Assembly 전체 완료 → ② Unreal Push 순서입니다.\n"
+            "개별 ①/② 버튼은 체크된 항목만 대상으로 합니다.\n"
             "개별 실패·수동 처리 항목은 기록하고 나머지 파일은 계속 진행합니다.",
         )
         self.btn_stop = ttk.Button(actions, text="중지", command=self.stop_batch, state="disabled")
@@ -2781,8 +2613,8 @@ class App:
             anchor="w",
         ).pack(fill="x")
 
-        cols = ("bone_mode", "wind", "spm_status", "blend_status", "push_status", "folder")
-        visible_cols = ("bone_mode", "wind", "spm_status", "blend_status", "push_status")
+        cols = ("wind", "spm_status", "blend_status", "push_status", "folder")
+        visible_cols = ("wind", "spm_status", "blend_status", "push_status")
         tablef = ttk.LabelFrame(
             self.root,
             text="파일 목록 (표는 요약 · 행을 선택하면 아래에 전체 내용 표시)",
@@ -2801,11 +2633,10 @@ class App:
         self.tree.heading("#0", text="파일 (첫 클릭=이 행만 활성 · Ctrl+C=SPM 경로)")
         self.tree.column("#0", width=300, minwidth=220, anchor="w")
         headers = {
-            "bone_mode": ("본 모드 (▼)", 125),
             "wind": ("Wind (▼)", 110),
-            "spm_status": ("① SPM", 205),
-            "blend_status": ("② Blender", 245),
-            "push_status": ("③ Unreal", 190),
+            "spm_status": ("Source", 205),
+            "blend_status": ("① Blender", 245),
+            "push_status": ("② Unreal", 190),
             "folder": ("폴더", 0),
         }
         for key, (label, width) in headers.items():
@@ -3207,7 +3038,7 @@ class App:
         if selected and selected[0] in folder_rows:
             text = f"경로 복사 전용 폴더 행\n{folder_rows[selected[0]]}"
         elif not selected or selected[0] not in self.items:
-            text = "행을 선택하면 전체 경로와 ①②③ 상태가 여기에 표시됩니다."
+            text = "행을 선택하면 전체 경로와 Source/①/② 상태가 여기에 표시됩니다."
         else:
             iid = selected[0]
             statuses = {
@@ -3302,19 +3133,8 @@ class App:
         self.root.after(150, self._drain_ui_queue)
 
     # ------------------------------------------------------------------ scan
-    @staticmethod
-    def _snapshot_spm(task):
-        spm, cached_snapshot = task
-        try:
-            snapshot, cache_hit = cached_file_content_snapshot(
-                spm, cached_snapshot
-            )
-            return str(spm), snapshot, None, cache_hit
-        except OSError as exc:
-            return str(spm), None, str(exc), False
-
     @classmethod
-    def _collect_scan_result(cls, root, snapshot_caches):
+    def _collect_scan_result(cls, root, _snapshot_caches=None):
         spms = [
             spm
             for spm in scan_sk_spms(root)
@@ -3325,111 +3145,20 @@ class App:
             for row in scan_cluster_spm_sources(root)
             if is_live_spm(row.get("authoring_spm"), require_file=False)
         ]
-        # The population scan above can cold-parse hundreds of SPMs. Persist
-        # that shared analysis immediately instead of waiting for a later
-        # live-status change that may never occur before process exit.
+        # Persist the bounded relationship inventory once. Native FBX/XML owns
+        # the skeleton contract, so list discovery never hashes every SPM.
         save_leaf_contract_cache()
-        all_spms = list(spms)
-        snapshot_aliases = {}
-        for row in cluster_sources:
-            canonical = row["authoring_spm"]
-            snapshot_source = (
-                canonical if canonical.is_file() else row["output_spm"]
-            )
-            all_spms.append(snapshot_source)
-            snapshot_aliases[str(snapshot_source)] = str(canonical)
-        snapshots = {}
-        errors = []
-        cache_hits = 0
-        if all_spms:
-            tasks = [
-                (spm, snapshot_caches.get(str(spm))) for spm in all_spms
-            ]
-            with ThreadPoolExecutor(max_workers=min(8, len(all_spms))) as pool:
-                for iid, snapshot, error, cache_hit in pool.map(
-                    cls._snapshot_spm, tasks
-                ):
-                    result_iid = snapshot_aliases.get(iid, iid)
-                    if snapshot:
-                        snapshots[result_iid] = snapshot
-                        cache_hits += int(cache_hit)
-                    elif error:
-                        errors.append((result_iid, error))
         return {
             "spms": spms,
             "cluster_sources": cluster_sources,
-            "snapshots": snapshots,
-            "errors": errors,
-            "snapshot_cache_hits": cache_hits,
         }
-
-    @staticmethod
-    def _migrate_restored_marker_calibration_cache(
-        spm, calibration_cache, current_snapshot
-    ):
-        """Retarget a cache produced from this tool's former cosmetic marker.
-
-        The cleanup receipt must prove that the current SPM is the exact
-        pre-marker backup and the cached SPM fingerprint is the exact marked
-        recovery backup. Ordinary user edits cannot pass both checks.
-        """
-        if (
-            not isinstance(calibration_cache, dict)
-            or calibration_cache.get("version") != CALIBRATION_CACHE_VERSION
-            or calibration_cache.get("status") not in {"calibrated", "already-ok"}
-            or not isinstance(current_snapshot, dict)
-        ):
-            return False
-        spm = Path(spm)
-        receipt_path = (
-            spm.parent
-            / "reports"
-            / f"{spm.stem}_material_problem_node_markers.json"
-        )
-        try:
-            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-            receipt_spm = os.path.normcase(
-                os.path.abspath(str(receipt.get("spm") or ""))
-            )
-            if (
-                receipt.get("status") != "restored"
-                or receipt.get("restore_preserved_original_timestamp") is not True
-                or receipt_spm
-                != os.path.normcase(os.path.abspath(str(spm)))
-            ):
-                return False
-            restore_source = Path(receipt.get("restore_source") or "")
-            recovery_rows = [
-                row
-                for row in (receipt.get("backups") or [])
-                if isinstance(row, dict)
-                and row.get("reason") == "before_exact_marker_cleanup_restore"
-            ]
-            if not restore_source.is_file() or not recovery_rows:
-                return False
-            original_snapshot = file_content_snapshot(restore_source)
-            marked_snapshot = file_content_snapshot(recovery_rows[-1]["path"])
-        except (OSError, ValueError, TypeError, KeyError):
-            return False
-        if (
-            original_snapshot.get("fingerprint")
-            != current_snapshot.get("fingerprint")
-            or marked_snapshot.get("fingerprint")
-            != calibration_cache.get("spm_fingerprint")
-        ):
-            return False
-        calibration_cache["spm_fingerprint"] = current_snapshot["fingerprint"]
-        calibration_cache["marker_restore_cache_migrated_at"] = (
-            datetime.now().isoformat(timespec="seconds")
-        )
-        return True
 
     @staticmethod
     def _quick_blend_status_text(spm):
         """Paint a non-running placeholder; live validation follows."""
         blend = blend_path_for(spm)
         if not blend.exists():
-            return "생성 필요 — blend 없음 → ② Blender Assembly"
+            return "생성 필요 — blend 없음 → ① Blender Assembly"
         return "상태 확인 대기…"
 
     @staticmethod
@@ -3455,7 +3184,7 @@ class App:
     def _set_scan_controls(self, scanning):
         state = "disabled" if scanning else "normal"
         for name in (
-            "btn_check", "btn_spm", "btn_blender", "btn_push",
+            "btn_check", "btn_blender", "btn_push",
             "btn_retry_failed", "btn_all",
             "btn_pick_root", "btn_scan", "btn_select_all", "btn_clear_all",
             "btn_recent_24h",
@@ -3478,17 +3207,7 @@ class App:
             root = self.root_var.get()
             self.cfg = self._collect_cfg()
             self.cfg["root"] = root
-            self.spm_calibration_signature = calibration_settings_signature(self.cfg)
-            self.legacy_spm_calibration_signature = (
-                legacy_calibration_settings_signature(self.cfg)
-            )
             save_config(self.cfg)
-            with self.state_lock:
-                snapshot_caches = {
-                    iid: entry.get("spm_snapshot_cache")
-                    for iid, entry in self.state.items()
-                    if isinstance(entry, dict)
-                }
 
             if hasattr(self, "root") and hasattr(self.root, "after"):
                 self._set_scan_controls(True)
@@ -3497,7 +3216,7 @@ class App:
 
                 def worker():
                     try:
-                        result = self._collect_scan_result(root, snapshot_caches)
+                        result = self._collect_scan_result(root)
                         error = None
                     except Exception as exc:
                         result, error = None, exc
@@ -3508,7 +3227,7 @@ class App:
                 self.scan_worker = threading.Thread(target=worker, daemon=True)
                 self.scan_worker.start()
                 return
-            prepared = self._collect_scan_result(root, snapshot_caches)
+            prepared = self._collect_scan_result(root)
         elif generation != getattr(self, "_scan_generation", 0):
             return
         else:
@@ -3546,7 +3265,6 @@ class App:
         ] + [
             row["authoring_spm"] for row in cluster_sources
         ]
-        snapshots = prepared["snapshots"]
 
         def ensure_folder_row(folder, parent=""):
             folder = Path(folder)
@@ -3576,11 +3294,6 @@ class App:
             self.row_copy_paths[folder_iid] = [folder]
             return folder_iid
 
-        for iid, snapshot_error in prepared.get("errors", []):
-            self.log(
-                f"[경고] SPM 지문 계산 실패: {Path(iid).name}: "
-                f"{snapshot_error}"
-            )
         for spm in spms:
             iid = str(spm)
             cluster_source = cluster_by_source.get(_normalized_path(spm))
@@ -3614,45 +3327,10 @@ class App:
                 entry.pop("live_texture_paths", None)
                 if self._transient_blend_status(cached_blend_status):
                     entry.pop("blend_status", None)
-            if snapshots.get(iid):
-                entry["spm_snapshot_cache"] = snapshots[iid]
-                calibration_cache = entry.get("calibration_cache")
-                self._migrate_restored_marker_calibration_cache(
-                    spm, calibration_cache, snapshots[iid]
-                )
-                if (
-                    isinstance(calibration_cache, dict)
-                    and calibration_cache.get("settings_signature")
-                    == getattr(self, "legacy_spm_calibration_signature", None)
-                    and calibration_cache_matches(
-                        calibration_cache,
-                        snapshots[iid]["fingerprint"],
-                        self.spm_calibration_signature,
-                        getattr(
-                            self, "legacy_spm_calibration_signature", None
-                        ),
-                    )
-                ):
-                    # Migrate a still-current legacy stat-bearing signature at
-                    # scan time.  From now on a touch-only INI/audit timestamp
-                    # change cannot schedule this SPM again.
-                    calibration_cache["settings_signature"] = (
-                        self.spm_calibration_signature
-                    )
             saved_wind_override = entry.get("wind_override", "auto")
             wind_override = normalize_wind_override(saved_wind_override)
             if wind_override != saved_wind_override:
                 entry["wind_override"] = wind_override
-            manual_bones_locked = is_manual_bones_locked(spm, entry)
-            if manual_bones_locked:
-                entry["manual_bones_locked"] = True
-                self.state[iid] = entry
-                marker = manual_bones_marker_path(spm)
-                if not marker.exists():
-                    try:
-                        set_manual_bones_marker(spm, True)
-                    except OSError as exc:
-                        self.log(f"[경고] 수동 본 marker 저장 실패: {spm.name}: {exc}")
             self.items[iid] = {
                 "spm": spm,
                 "display_name": (
@@ -3679,9 +3357,6 @@ class App:
                 "blend_path": blend_path_for(spm),
                 "checked": True,
                 "wind_override": wind_override,
-                "bone_mode": "manual" if manual_bones_locked else "auto",
-                "manual_bones_locked": manual_bones_locked,
-                "spm_snapshot": snapshots.get(iid),
                 "live_texture_paths": cached_texture_paths,
                 "live_status_signature": cached_live_signature,
                 "blend_resume_receipt": copy.deepcopy(
@@ -3691,8 +3366,6 @@ class App:
             spm_status = (
                 f"Output 규격 · {cluster_source['pair_status']}"
                 if cluster_source
-                else manual_bone_status_text(spm)
-                if manual_bones_locked
                 else entry.get("spm_status", "-")
             )
             push_status = self._current_push_status_text(iid, spm)
@@ -3705,7 +3378,6 @@ class App:
                 parent_iid, "end", iid=iid,
                 text=self._item_label(iid),
                 values=(
-                    self._bone_mode_label(iid),
                     self._wind_label(iid),
                     self._table_display_value(iid, "spm_status", spm_status),
                     self._table_display_value(iid, "blend_status", blend_status),
@@ -3716,30 +3388,17 @@ class App:
             self.row_copy_paths[iid] = [spm]
         self.checked_rows.sync_after_reload()
         save_state(self.state)
-        cache_count = sum(
-            1
-            for iid, item in self.items.items()
-            if should_calibrate_spm(item)
-            and item.get("spm_snapshot")
-            and calibration_cache_matches(
-                self.state.get(iid, {}).get("calibration_cache"),
-                item["spm_snapshot"]["fingerprint"],
-                self.spm_calibration_signature,
-                getattr(self, "legacy_spm_calibration_signature", None),
-            )
-        )
         self.log(
-            f"스캔 완료: SK SPM {len(spms)}개 · 본 세팅 캐시 {cache_count}개. "
+            f"스캔 완료: SK SPM {len(spms)}개. "
             "먼저 [🔍 검사]로 상태를 확인해보세요."
         )
 
         if hasattr(self, "progress_var"):
             self.progress_var.set(
-                f"스캔 완료 · SPM {len(spms)}개 · "
-                f"지문 재사용 {prepared.get('snapshot_cache_hits', 0)}개"
+                f"스캔 완료 · SPM {len(spms)}개"
             )
         if hasattr(self, "root") and hasattr(self.root, "after"):
-            # Do not let ①→②→③ start while the first live status audit is
+            # Do not let ①→② start while the first live status audit is
             # unresolved. This used to leave every existing blend painted as
             # "검증 중" even though no Blender process existed.
             self._initial_live_status_generation = generation
@@ -3813,9 +3472,6 @@ class App:
         return {
             "wind_override": normalize_wind_override(
                 item.get("wind_override", "auto")
-            ),
-            "manual_bones_locked": bool(
-                item.get("manual_bones_locked", False)
             ),
             "config": {
                 key: self.cfg.get(key)
@@ -4259,9 +3915,6 @@ class App:
                     copy.deepcopy(item.get("blend_resume_receipt")),
                     {
                         "wind_override": item.get("wind_override", "auto"),
-                        "manual_bones_locked": item.get(
-                            "manual_bones_locked", False
-                        ),
                     },
                 )
                 for iid, item in list(self.items.items())
@@ -4441,17 +4094,11 @@ class App:
     def _item_label(self, iid):
         item = self.items[iid]
         mark = CHECK_ON if item["checked"] else CHECK_OFF
-        lock = "🔒 " if item.get("manual_bones_locked", False) else ""
         name = item.get("display_name") or item["spm"].name
-        return f"{mark} {lock}{name}"
+        return f"{mark} {name}"
 
     def _redraw_checked_row(self, iid, _item):
         self.tree.item(iid, text=self._item_label(iid))
-
-    def _bone_mode_label(self, iid):
-        if self.items[iid].get("manual_bones_locked", False):
-            return "수동 본 유지 🔒  ▼"
-        return "자동 계산  ▼"
 
     def _wind_label(self, iid):
         item = self.items[iid]
@@ -4531,18 +4178,6 @@ class App:
             return "break"
         column = self.tree.identify_column(event.x)
         if column == "#1":
-            current = self.items[iid].get("bone_mode", "auto")
-            self.root.after_idle(
-                lambda: self._open_cell_dropdown(
-                    iid,
-                    "bone_mode",
-                    BONE_MODE_OPTIONS,
-                    current,
-                    lambda value: self._set_bone_mode(iid, value),
-                )
-            )
-            return "break"
-        if column == "#2":
             current = self.items[iid].get("wind_override", "auto")
             self.root.after_idle(
                 lambda: self._open_cell_dropdown(
@@ -4701,57 +4336,6 @@ class App:
 
         threading.Thread(target=run, daemon=True).start()
 
-    def _set_bone_mode(self, iid, mode):
-        if iid not in self.items or mode not in {"auto", "manual"}:
-            return
-        item = self.items[iid]
-        locked = mode == "manual"
-        spm = Path(item["spm"])
-
-        def apply():
-            marker = set_manual_bones_marker(spm, locked)
-            state_lock = getattr(
-                self, "state_lock", threading.RLock()
-            )
-            with state_lock:
-                entry = self.state.setdefault(iid, {})
-                if locked:
-                    entry["manual_bones_locked"] = True
-                    entry["spm_status"] = manual_bone_status_text(spm)
-                else:
-                    entry.pop("manual_bones_locked", None)
-                    entry["spm_status"] = "자동 계산 대상"
-                    entry.pop("spm_summary", None)
-                save_state(self.state)
-                status = entry["spm_status"]
-            return marker, status
-
-        def done(result):
-            marker, status = result
-            current = self.items.get(iid)
-            if current is None:
-                return
-            current["bone_mode"] = mode
-            current["manual_bones_locked"] = locked
-            self.tree.item(iid, text=self._item_label(iid))
-            self.tree.set(iid, "bone_mode", self._bone_mode_label(iid))
-            self._set_table_cell(iid, "spm_status", status)
-            self.log(
-                f"{'수동 본 유지 설정' if locked else '자동 계산 복귀'}: "
-                f"{spm.name} ({marker})"
-            )
-
-        self._start_shared_setting_job(
-            f"본 모드 · {spm.name}",
-            {
-                "operation": "bone_mode",
-                "spm": str(spm),
-                "mode": mode,
-            },
-            apply,
-            done,
-        )
-
     def _set_wind_override(self, iid, value):
         valid_values = {option_value for _label, option_value in WIND_OPTIONS}
         if iid not in self.items or value not in valid_values:
@@ -4796,9 +4380,6 @@ class App:
         try:
             cfg["priority"] = self.priority_var.get()
             cfg["cpu_cores"] = int(self.cores_var.get())
-            cfg["target_bones_per_branch"] = float(self.target_var.get())
-            cfg["max_total_bones"] = int(self.maxtotal_var.get())
-            cfg["spm_parallel_jobs"] = max(1, int(self.parallel_var.get()))
             cfg["blender_parallel_jobs"] = max(
                 1, min(4, int(self.blender_parallel_var.get()))
             )
@@ -4812,64 +4393,6 @@ class App:
         except (AttributeError, tk.TclError):
             pass
         return cfg
-
-    @staticmethod
-    def _snapshot_still_current(spm, snapshot):
-        if not snapshot:
-            return False
-        try:
-            stat = Path(spm).stat()
-        except OSError:
-            return False
-        return (
-            snapshot.get("size") == stat.st_size
-            and snapshot.get("mtime_ns") == stat.st_mtime_ns
-        )
-
-    def _current_spm_snapshot(self, item):
-        snapshot = item.get("spm_snapshot")
-        if not self._snapshot_still_current(item["spm"], snapshot):
-            snapshot = file_content_snapshot(item["spm"])
-            item["spm_snapshot"] = snapshot
-            with self.state_lock:
-                self.state.setdefault(str(item["spm"]), {})[
-                    "spm_snapshot_cache"
-                ] = snapshot
-        return snapshot
-
-    def _spm_cache_matches(self, item):
-        snapshot = self._current_spm_snapshot(item)
-        entry = self.state.get(str(item["spm"]), {})
-        return calibration_cache_matches(
-            entry.get("calibration_cache"),
-            snapshot["fingerprint"],
-            self.spm_calibration_signature,
-            getattr(self, "legacy_spm_calibration_signature", None),
-        )
-
-    def _spm_schedule_key(self, item):
-        if not should_calibrate_spm(item):
-            return (0, 0.0, item["spm"].name.lower())
-        if item.get("manual_bones_locked", False):
-            return (0, 0.0, item["spm"].name.lower())
-        try:
-            cache_matches = (
-                not self.force_rerun
-                and self._spm_cache_matches(item)
-            )
-        except OSError:
-            # A row can become stale after the table scan (deleted, renamed,
-            # disconnected drive, and so on).  Scheduling must remain total:
-            # let the normal per-item worker record that row's data error
-            # instead of aborting the entire queued batch during sorting.
-            cache_matches = False
-        if cache_matches:
-            return (1, 0.0, item["spm"].name.lower())
-        entry = self.state.get(str(item["spm"]), {})
-        duration = float(entry.get("spm_last_duration_seconds", 0.0) or 0.0)
-        # Longest predicted jobs start first after all zero-cost work has been
-        # resolved, which avoids a single slow tree becoming the final tail.
-        return (2, -duration, item["spm"].name.lower())
 
     @staticmethod
     def _snapshot_batch_item(item):
@@ -4937,7 +4460,7 @@ class App:
         # captured and queued. Root replacement/rescan would invalidate the
         # visible inventory, so only those controls are frozen.
         for name in (
-            "btn_check", "btn_spm", "btn_blender", "btn_push",
+            "btn_check", "btn_blender", "btn_push",
             "btn_waiting_import",
             "btn_retry_failed", "btn_retry_checked", "btn_all",
             "btn_select_all", "btn_clear_all", "btn_recent_24h",
@@ -5030,12 +4553,6 @@ class App:
         job = self.pending_batch_jobs.popleft()
         self.active_batch_job = job
         self.cfg = dict(job["cfg"])
-        self.spm_calibration_signature = calibration_settings_signature(
-            self.cfg
-        )
-        self.legacy_spm_calibration_signature = (
-            legacy_calibration_settings_signature(self.cfg)
-        )
         self.force_rerun = job["force_rerun"]
         # Retrying a failed stage does not grant full-rebuild semantics.
         # Only the operator's explicit force checkbox bypasses reusable
@@ -5082,14 +4599,12 @@ class App:
 
         if str(job.get("mode") or "") == "pipeline":
             columns = {
-                "spm": ("spm_status",),
                 "blender": ("spm_status", "blend_status"),
                 "push": STATUS_COLUMNS,
             }.get(str(job.get("terminal_phase") or "push"), STATUS_COLUMNS)
         else:
             columns = {
                 "check": ("spm_status",),
-                "spm": ("spm_status",),
                 "blender": ("blend_status",),
                 "push": ("push_status",),
             }.get(str(job.get("phase") or ""), STATUS_COLUMNS)
@@ -5202,45 +4717,81 @@ class App:
                 )
             )
         self._active_production_source_manifest = manifest
+        self._active_production_source_fast_identity = (
+            self._production_source_fast_identity(manifest)
+        )
         self.log(
             "Production source revision 고정: "
             f"{manifest.content_hash} · {manifest.source_count} files"
         )
         return manifest
 
+    @staticmethod
+    def _production_source_fast_identity(manifest):
+        """Stat known production files without Git discovery or content reads."""
+        records = []
+        for source in manifest.files:
+            path = REPO_DIR / source.path
+            try:
+                identity = _fast_file_change_identity(path)
+            except OSError:
+                identity = {"missing": True}
+            records.append((source.path, identity))
+        return tuple(records)
+
     def _assert_active_production_source_manifest(self):
-        expected = getattr(
-            self,
-            "_active_production_source_manifest",
-            None,
+        lock = self.__dict__.setdefault(
+            "_production_source_identity_lock",
+            threading.Lock(),
         )
-        if expected is None:
-            if getattr(self, "active_batch_job", None) is not None:
-                raise BatchItemError(
-                    "Active batch has no pinned production source manifest",
-                    kind="internal_error",
-                )
-            expected = _PROCESS_PRODUCTION_SOURCE_MANIFEST
-        try:
-            current = production_source_manifest(REPO_DIR)
-            validate_production_source_manifest(
-                expected,
-                current,
-                label="Parent production source",
+        with lock:
+            expected = getattr(
+                self,
+                "_active_production_source_manifest",
+                None,
             )
-        except CompileGateError as exc:
-            self._present_code_revision_restart_required(
-                CodeRevisionRestartRequired(
-                    exc,
-                    context=(
-                        "Production source revision changed during the active "
-                        "batch; continuing with the current source set"
-                    ),
-                )
+            if expected is None:
+                if getattr(self, "active_batch_job", None) is not None:
+                    raise BatchItemError(
+                        "Active batch has no pinned production source manifest",
+                        kind="internal_error",
+                    )
+                expected = _PROCESS_PRODUCTION_SOURCE_MANIFEST
+            current_fast = self._production_source_fast_identity(expected)
+            expected_fast = getattr(
+                self,
+                "_active_production_source_fast_identity",
+                None,
             )
-            self._active_production_source_manifest = current
-            return current
-        return expected
+            if expected_fast is None:
+                self._active_production_source_fast_identity = current_fast
+                return expected
+            if current_fast == expected_fast:
+                return expected
+            try:
+                current = production_source_manifest(REPO_DIR)
+                validate_production_source_manifest(
+                    expected,
+                    current,
+                    label="Parent production source",
+                )
+            except CompileGateError as exc:
+                self._present_code_revision_restart_required(
+                    CodeRevisionRestartRequired(
+                        exc,
+                        context=(
+                            "Production source revision changed during the active "
+                            "batch; continuing with the current source set"
+                        ),
+                    )
+                )
+                self._active_production_source_manifest = current
+                self._active_production_source_fast_identity = (
+                    self._production_source_fast_identity(current)
+                )
+                return current
+            self._active_production_source_fast_identity = current_fast
+            return expected
 
     def _require_child_production_source_manifest(
         self,
@@ -5778,9 +5329,8 @@ class App:
         inventory, targets = self._snapshot_batch_request(target_iids)
         phase_labels = {
             "check": "검사",
-            "spm": "① SPM 본 세팅",
-            "blender": "② Blender Assembly 연계 ①→②",
-            "push": "③ Unreal Push 연계 ①→②→③",
+            "blender": "① Blender Assembly",
+            "push": "② Unreal Push 연계 ①→②",
         }
         job = {
             "label": f"{phase_labels[phase]} · 선택 {len(targets)}개",
@@ -8870,7 +8420,7 @@ class App:
             )
         )
         job = {
-            "label": f"목록 전체 자동 ①→②→③ · {len(targets)}개",
+            "label": f"목록 전체 자동 ①→② · {len(targets)}개",
             "mode": "pipeline",
             "phase": "push",
             "terminal_phase": "push",
@@ -9361,7 +8911,6 @@ class App:
         """Project the latest durable phase state without relabeling it failed."""
         phase_columns = {
             "check": ("spm_status",),
-            "spm": ("spm_status",),
             "blender": ("blend_status", "spm_status"),
             "push": ("push_status", "blend_status", "spm_status"),
         }
@@ -9761,9 +9310,8 @@ class App:
                 )
             )
         phase_labels = {
-            "spm": "① SPM 본 세팅",
-            "blender": "② Blender Assembly",
-            "push": "③ Unreal Push",
+            "blender": "① Blender Assembly",
+            "push": "② Unreal Push",
         }
         cluster_targets = [
             item for item in targets
@@ -9774,25 +9322,21 @@ class App:
             if not is_cluster_source_spm(item["spm"])
         ]
         schedule = []
-        if cluster_targets:
+        if cluster_targets and terminal_phase in {"blender", "push"}:
             schedule.append(
-                ("spm", cluster_targets, "Cluster ① SPM 본 세팅")
-            )
-            if terminal_phase in {"blender", "push"}:
-                schedule.append(
-                    (
-                        "blender",
-                        cluster_targets,
-                        "Cluster ② Blender/Normalizer",
-                    )
+                (
+                    "blender",
+                    cluster_targets,
+                    "Cluster ① Blender/Normalizer",
                 )
+            )
         if downstream_targets:
             if terminal_phase in {"blender", "push"}:
                 schedule.append(
                     (
                         "blender",
                         downstream_targets,
-                        "Tree ② Blender Assembly",
+                        "Tree ① Blender Assembly",
                     )
                 )
         if terminal_phase == "push":
@@ -10253,10 +9797,9 @@ class App:
         return f"실패: {reason}"
 
     def _run_batch(self, phase, targets, emit_done=True):
-        # SPM and Blender state writes are UI/progress snapshots.  They can be
-        # committed once at the phase boundary. Item failures stay immediate;
-        # deferred cancellation rows are committed by the final flush.
-        if phase not in {"spm", "blender"}:
+        # Blender state writes are UI/progress snapshots committed once at the
+        # phase boundary. Item failures stay immediate.
+        if phase != "blender":
             return self._run_batch_impl(phase, targets, emit_done=emit_done)
         self._begin_phase_state_save_batch()
         try:
@@ -10276,8 +9819,6 @@ class App:
         self._active_push_dependency_map = {}
         self._active_push_auto_added_ids = set()
         preflight_skipped = set()
-        if phase == "spm":
-            targets = sorted(targets, key=self._spm_schedule_key)
         if phase == "push":
             requested_ids = {
                 str(item["spm"]) for item in requested_targets
@@ -10624,8 +10165,8 @@ class App:
                     self.ui_queue.put(("progress", "대기"))
                     self.ui_queue.put(("done", None))
                 return True
-        titles = {"check": "검사", "spm": "SPM 본 세팅", "blender": "Blender Assembly", "push": "Unreal Push"}
-        column_by_phase = {"check": "spm_status", "spm": "spm_status",
+        titles = {"check": "검사", "blender": "Blender Assembly", "push": "Unreal Push"}
+        column_by_phase = {"check": "spm_status",
                            "blender": "blend_status", "push": "push_status"}
         if (
             phase == "push"
@@ -10683,8 +10224,6 @@ class App:
             try:
                 if phase == "check":
                     self._job_check(iid, spm)
-                elif phase == "spm":
-                    self._job_spm(iid, spm)
                 elif phase == "blender":
                     self._job_blender(iid, spm, item)
                 else:
@@ -10791,9 +10330,7 @@ class App:
         # cannot change after a downstream Assembly receipt is written.
         # RPC Push stays serial; headless Push parallelizes only its Blender
         # export stage below.
-        if phase == "spm":
-            workers = self.cfg.get("spm_parallel_jobs", 1)
-        elif phase == "check":
+        if phase == "check":
             workers = self.cfg.get("check_parallel_jobs", 8)
         elif phase == "blender":
             workers = self.cfg.get("blender_parallel_jobs", 2)
@@ -10808,7 +10345,7 @@ class App:
         if phase == "blender" and len(waves) > 1:
             self.log(
                 "Blender Assembly 의존성: Cluster 소스를 먼저 완료한 뒤 "
-                "루트/Assembly Repair를 시작합니다."
+                "루트/Assembly 재생성을 시작합니다."
             )
         for wave_index, wave in enumerate(waves):
             if self.stop_flag.is_set() or phase_abort.is_set():
@@ -11292,7 +10829,7 @@ class App:
         try:
             state = self._assembly_runtime_code_state(addon_dir)
         except OSError as exc:
-            self.log(f"  [② 경고] Assembly 런타임 지문 계산 실패: {spm.name}: {exc}")
+            self.log(f"  [① 경고] Assembly 런타임 지문 계산 실패: {spm.name}: {exc}")
             return
         if not state:
             return
@@ -11305,13 +10842,13 @@ class App:
                 blend=blend_path_for(spm),
             )
         except OSError as exc:
-            self.log(f"  [② 경고] Assembly 런타임 기록 실패: {spm.name}: {exc}")
+            self.log(f"  [① 경고] Assembly 런타임 기록 실패: {spm.name}: {exc}")
 
     def _assembly_runtime_fresh(self, spm, content_contract_out=None):
         """Gate only on an explicit saved-output contract revision.
 
         Producer source hashes are retained in the receipt for diagnostics,
-        but ordinary code edits must not invalidate every completed Repair.
+        but ordinary code edits must not invalidate every completed Assembly.
         The live SPM/report/artifact contracts below remain authoritative for
         content freshness.
         """
@@ -11335,7 +10872,7 @@ class App:
             content_contract_out["current"] = content_contract_current
         # Cleanup/output-contract versions and runtime receipts are diagnostic.
         # Push performs the current in-memory material/slot normalization and
-        # must not demand another Repair solely to refresh this metadata.
+        # must not demand another Assembly solely to refresh this metadata.
         return True, ""
 
     def _assembly_output_state(self, spm, pipeline_projection_out=None):
@@ -11356,7 +10893,7 @@ class App:
             return state
 
     def _assembly_output_state_scoped(self, spm):
-        """One semantic decision shared by row status and the ② queue gate."""
+        """One semantic decision shared by row status and the ① queue gate."""
         speedtree_spm = speedtree_output_spm_for(spm)
         leaf_projection = {}
         leaf_ok, leaf_reason = self._leaf_reference_ready(
@@ -11377,7 +10914,7 @@ class App:
                 "current": False,
                 "push_ready": False,
                 "kind": "missing_blend",
-                "reason": "생성 필요 — blend 없음 → ② Blender Assembly",
+                "reason": "생성 필요 — blend 없음 → ① Blender Assembly",
             }
         content_contract_probe = {}
         runtime_fresh, runtime_reason = self._assembly_runtime_fresh(
@@ -11422,7 +10959,7 @@ class App:
                 "kind": "stale_content",
                 "reason": (
                     "Blender 갱신 필요 — SPM이 더 최근에 수정됨 "
-                    "→ ② Blender Assembly"
+                    "→ ① Blender Assembly"
                 ),
             }
 
@@ -11468,7 +11005,7 @@ class App:
                 "current": False,
                 "push_ready": False,
                 "kind": "missing_wind",
-                "reason": "wind JSON 없음 → ② 필요",
+                "reason": "wind JSON 없음 → ① 필요",
             }
         wind_ready, wind_reason = dynamic_wind_skeleton_contract_ready(
             wind_json
@@ -11480,7 +11017,7 @@ class App:
                 "kind": "wind_contract",
                 "reason": (
                     f"{wind_reason} — "
-                    "② Blender Assembly에서 자동 재생성"
+                    "① Blender Assembly에서 자동 재생성"
                 ),
             }
         texture_ok, texture_reason = self._texture_normalization_ready(
@@ -11531,7 +11068,7 @@ class App:
         push_dependency_contract=None,
         evidence_bundle=None,
     ):
-        """Publish ②'s final result for ③ in the same pipeline only."""
+        """Publish ①'s final result for ② in the same pipeline only."""
         contracts = getattr(self, "_active_assembly_stage_contracts", None)
         if not isinstance(contracts, dict):
             return
@@ -11551,7 +11088,7 @@ class App:
             contracts[key] = value
 
     def _assembly_stage_contract(self, spm):
-        """Read a job-scoped ② result without accepting persisted state."""
+        """Read a job-scoped ① result without accepting persisted state."""
         contracts = getattr(self, "_active_assembly_stage_contracts", None)
         if not isinstance(contracts, dict):
             return None
@@ -11590,27 +11127,27 @@ class App:
             return True, "SpeedTree 재질 export 정상"
         missing = list(exported.get("missing_materials") or [])
         if status == "missing_stmat":
-            return False, "SpeedTree .stmat 없음 → ② Blender Assembly"
+            return False, "SpeedTree .stmat 없음 → ① Blender Assembly"
         if status == "invalid_stmat":
             return False, (
                 "SpeedTree .stmat 파싱 실패 — "
                 + str(exported.get("error") or "파일 확인")
             )
         if status == "stale":
-            return False, "SPM 변경 후 SpeedTree .stmat이 오래됨 → ② 다시 실행"
+            return False, "SPM 변경 후 SpeedTree .stmat이 오래됨 → ① 다시 실행"
         if missing:
             return False, (
                 "현재 내보내는 노드의 재질이 SpeedTree FBX에서 빠짐 — "
                 + ", ".join(missing)
                 + " → 표시된 SpeedTree 노드의 재질/텍스처 확인"
             )
-        return False, "SpeedTree 재질 export 사전검사 실패 → ② 확인"
+        return False, "SpeedTree 재질 export 사전검사 실패 → ① 확인"
 
     @staticmethod
     def _texture_normalization_ready(spm, content_receipt_current=None):
         report_path = assembly_pipeline_report_path(spm)
         if not report_path.is_file():
-            return False, "텍스처 정규화 정보 없음 → ② 필요"
+            return False, "텍스처 정규화 정보 없음 → ① 필요"
         if content_receipt_current is None:
             content_receipt_current = App._assembly_contract_current(spm)
         try:
@@ -11618,7 +11155,7 @@ class App:
                 report_path.stat().st_mtime_ns < Path(spm).stat().st_mtime_ns
                 and not content_receipt_current
             ):
-                return False, "SPM 변경 후 Assembly 보고서가 오래됨 → ② 다시 실행"
+                return False, "SPM 변경 후 Assembly 보고서가 오래됨 → ① 다시 실행"
         except OSError as exc:
             return False, f"텍스처 보고서 시간 확인 실패: {exc}"
         try:
@@ -11627,7 +11164,7 @@ class App:
             if "legacy Assembly report" in str(exc):
                 return False, (
                     "공통 SpeedTree 계약 정보 없음 → "
-                    "② Blender Assembly 다시 실행"
+                    "① Blender Assembly 다시 실행"
                 )
             return False, f"텍스처 정규화 보고서 오류: {exc}"
         normalization = report.get("texture_normalization") or {}
@@ -11650,7 +11187,7 @@ class App:
         )
         handoff = report.get("handoff_preflight")
         if not isinstance(handoff, dict):
-            return False, "② 사전검사 정보 없음 → ② Blender Assembly 다시 실행"
+            return False, "① 사전검사 정보 없음 → ① Blender Assembly 다시 실행"
         slots = handoff.get("empty_material_slots") or []
         outputs = handoff.get("missing_outputs") or []
         materials = (
@@ -11684,9 +11221,9 @@ class App:
         if leaf_contract.get("status") in {"blocked", "replacement_needed"}:
             reasons.append("SPM leaf 참조 실패")
         if reasons:
-            return False, "② 사전검사 차단: " + " | ".join(reasons)
+            return False, "① 사전검사 차단: " + " | ".join(reasons)
         if handoff.get("status") not in {"ok", "source_review", "blocked"}:
-            return False, "② 사전검사 미완료 → Blender Assembly 다시 실행"
+            return False, "① 사전검사 미완료 → Blender Assembly 다시 실행"
         preserved_count = sum(
             1 for item in normalization.get("materials", [])
             if item.get("status") == "preserved_cluster"
@@ -11705,9 +11242,9 @@ class App:
     def _blend_status_from_assembly_state(state):
         """Format one already-computed Assembly state for the overview table."""
         if state["kind"] == "missing_blend":
-            return "생성 필요 — blend 없음 · ② Blender Assembly 실행"
+            return "생성 필요 — blend 없음 · ① Blender Assembly 실행"
         if state["kind"] == "stale_content":
-            return "Blender 갱신 필요 — SPM이 더 최근에 수정됨 · ② 다시 실행"
+            return "Blender 갱신 필요 — SPM이 더 최근에 수정됨 · ① 다시 실행"
         if not state["current"]:
             return f"Assembly 필요 — {state['reason']}"
         if state["kind"] == "source_review":
@@ -11744,6 +11281,12 @@ class App:
             if isinstance(repair_state, dict)
             else self._blend_status_text(spm)
         )
+        self.ui_queue.put(("cell", (iid, "blend_status", text)))
+        # A read-only Check used to build and hash a durable resume receipt and
+        # then throw it away.  That repeated the most expensive status work
+        # for every row despite persist=False.
+        if not persist:
+            return text
         resume_receipt = None
         texture_paths = ()
         live_signature = None
@@ -11784,12 +11327,10 @@ class App:
                     ValueError,
                 ) as exc:
                     self.log(
-                        "  [② 재개 영수증 경고] "
+                        "  [① 재개 영수증 경고] "
                         f"{Path(spm).name}: {compact_error_message(exc)}"
                     )
-        self.ui_queue.put(("cell", (iid, "blend_status", text)))
-        if persist:
-            with self.state_lock:
+        with self.state_lock:
                 entry = self.state.setdefault(iid, {})
                 entry["blend_status"] = text
                 if (
@@ -11822,27 +11363,6 @@ class App:
         return text
 
     def _job_check(self, iid, spm):
-        from spm_audit import audit_spm, inspect_interrupted_calibration, sk_readiness
-
-        interrupted = inspect_interrupted_calibration(spm)
-        if interrupted["status"] not in {"clean", "interrupted_but_intact"}:
-            # ① restores automatically on its next run; say so instead of
-            # reporting bone numbers read out of a half-rewritten source.
-            recoverable = (
-                "① 실행 시 자동 복원"
-                if interrupted.get("backup_available")
-                else "백업 없음 · 수동 확인 필요"
-            )
-            text = f"⚠ 중단된 캘리브레이션 흔적 · {recoverable}"
-            self.ui_queue.put(("cell", (iid, "spm_status", text)))
-            self.log(
-                f"  [① 중단 흔적] {Path(spm).name}: {interrupted['marker']} "
-                f"({recoverable})"
-            )
-            self._record_live_blend_status(iid, spm, persist=False)
-            return
-
-        entry = self.state.get(iid, {})
         item = self._batch_job_item(iid)
         pair_status = item.get("cluster_pair_status")
         if pair_status == "bootstrap_ready":
@@ -11856,60 +11376,33 @@ class App:
             text = f"오류: Cluster pair {pair_status}"
             self.ui_queue.put(("cell", (iid, "spm_status", text)))
             return
-        manual_bones_locked = item.get("manual_bones_locked", False)
-        summary = entry.get("spm_summary", "")
-        if manual_bones_locked:
-            text = manual_bone_status_text(spm)
-        else:
-            audit = audit_spm(spm, analyze_bone_graph=True)
-            readiness = sk_readiness(audit)
-            parts = spm_check_status_parts(audit)
-            if not readiness["ready"]:
-                disabled = ", ".join(
-                    f"{item['generator']}({item['style']:g}/{item['bones']:g})"
-                    for item in readiness["disabled_generators"]
-                )
-                text = f"오류: SK 미제작 · {disabled}"
-            else:
-                text = " · ".join(parts) if parts else "본 설정 없음"
-        if not manual_bones_locked and summary and summary not in text:
-            text += f" | {summary}"
+        # The version-locked native exporter now emits one exact bone graph to
+        # both FBX and XML. A read-only status pass must not parse the SPM again
+        # or attempt to classify/repair authored bone-generator settings.
+        text = "Native FBX/XML 본 계약 · SPM 재파싱 없음"
         self.ui_queue.put(("cell", (iid, "spm_status", text)))
 
-        self._record_live_blend_status(iid, spm, persist=False)
-
-        ok, why = self._handoff_ready(spm)
+        try:
+            assembly_state = self._assembly_output_state(spm)
+        except OSError as exc:
+            why = f"확인 실패 — {exc}"
+            ok = False
+            self.ui_queue.put(("cell", (iid, "blend_status", why)))
+        else:
+            self._record_live_blend_status(
+                iid,
+                spm,
+                persist=False,
+                repair_state=assembly_state,
+            )
+            ok = bool(
+                assembly_state.get("current")
+                and assembly_state.get("push_ready")
+            )
+            why = str(assembly_state.get("reason") or "준비 안 됨")
         pushed = self._current_push_status_text(iid, spm)
         push_text = why if not pushed or not ok else f"{why} | {pushed}"
         self.ui_queue.put(("cell", (iid, "push_status", push_text)))
-
-    @staticmethod
-    def _spm_report_summary(rep):
-        if rep.get("cached_display_summary"):
-            return str(rep["cached_display_summary"])
-        total = rep.get("total_bones")
-        meta = rep.get("calibration") or {}
-        branches = meta.get("total_branches")
-        if rep.get("status") == "not-sk-ready":
-            return "SK 미제작"
-        if rep.get("status") == "manual-required":
-            return "수동 처리 필요"
-        if total is not None and branches:
-            if meta.get("base_priority_applied"):
-                disabled = meta.get("disabled_base_generator_count", 0)
-                tag = f" [상한·Base {disabled}개 OFF]"
-            else:
-                tag = " [상한]" if meta.get("capped") else ""
-            graph_tag = ""
-            if meta.get("root_target_generator_count") is not None:
-                graph_tag = (
-                    f" · 대상 {meta['root_target_generator_count']}"
-                    f"/Base제외 {meta.get('base_excluded_generator_count', 0)}"
-                )
-            return f"본 {total} / 가지 {branches}{tag}{graph_tag}"
-        if meta.get("mode") == "no_branch_generators":
-            return "SpeedTree 본 없음 → rigid 1본 폴백"
-        return rep.get("status", "?")
 
     def _prepare_pair_for_job(self, spm):
         try:
@@ -12591,7 +12084,10 @@ class App:
             # Parent safety is therefore phase inactivity, never one combined
             # queue+execution wall-clock deadline.
             None,
-            affinity=False,
+            # Honor the configured CPU budget even when several item workers
+            # are active. Duplicate audits are eliminated separately; letting
+            # every child escape affinity only creates machine-wide spikes.
+            affinity=True,
             progress_callback=report_material_progress,
             inactivity_timeout=stage_timeout,
             inactivity_timeout_by_marker=material_preflight_inactivity_rules(
@@ -12740,271 +12236,6 @@ class App:
         self.log(f"Cluster Normalizer/Atlas 갱신 완료: {Path(spm).name}")
         return result
 
-    def _migrate_cached_positive_spm_receipt(
-        self,
-        spm,
-        snapshot,
-        cache,
-        summary,
-    ):
-        """Write a durable positive receipt once without reparsing an SPM.
-
-        A GUI calibration cache is already bound to the exact full-file
-        fingerprint in ``snapshot``. Fresh reports retain the semantic bone
-        fingerprint produced for those same final bytes, so later cache hits
-        can migrate the small durable receipt without opening a large SPM
-        again. Legacy cache rows fall back to one semantic read and then
-        retain that result for future hits in this session.
-        """
-
-        status = str((cache or {}).get("status") or "")
-        if status not in {"calibrated", "already-ok"}:
-            return
-        semantic_fingerprint = str(
-            (cache or {}).get("bone_semantic_fingerprint") or ""
-        ).strip()
-        try:
-            if not semantic_fingerprint:
-                semantic_fingerprint = current_bone_semantic_fingerprint(spm)
-                cache["bone_semantic_fingerprint"] = semantic_fingerprint
-            receipt_key = (
-                _normalized_path(spm),
-                str(snapshot["fingerprint"]),
-                str(self.spm_calibration_signature),
-                str(SPM_BONE_CONTRACT_VERSION),
-                semantic_fingerprint,
-            )
-            with self.state_lock:
-                written = self.__dict__.setdefault(
-                    "_positive_calibration_receipt_memo",
-                    set(),
-                )
-                if receipt_key in written:
-                    return
-            receipt = write_positive_calibration_receipt(
-                spm,
-                getattr(self, "cfg", {}).get("spm_calibration_receipt_dir")
-                or (TOOL_DIR / "cache" / "spm_calibration"),
-                bone_semantic_fingerprint_value=semantic_fingerprint,
-                settings_signature=self.spm_calibration_signature,
-                bone_contract_version=SPM_BONE_CONTRACT_VERSION,
-                report={
-                    "status": status,
-                    "cached_display_summary": summary,
-                    "calibration": {
-                        "mode": "migrated_positive_gui_cache",
-                    },
-                },
-            )
-            if receipt is not None:
-                with self.state_lock:
-                    self.__dict__.setdefault(
-                        "_positive_calibration_receipt_memo",
-                        set(),
-                    ).add(receipt_key)
-        except Exception as exc:
-            self.log(
-                "  [캐시 경고] SPM bone receipt migration failed: "
-                f"{Path(spm).name}: {exc}"
-            )
-
-    def _job_spm(self, iid, spm):
-        spm = Path(spm)
-        entry = self.state.setdefault(iid, {})
-        item = self._batch_job_item(iid)
-        if not should_calibrate_spm(item):
-            read_only = item.get("source_read_only")
-            summary = (
-                "건너뜀 · 읽기 전용 SPM"
-                if read_only
-                else "건너뜀 · 일반 SPM 본 세팅 제외"
-            )
-            self.ui_queue.put(("cell", (iid, "spm_status", summary)))
-            with self.state_lock:
-                entry["spm_status"] = summary
-                self._save_state_after_phase_update()
-            reason = "source read-only" if read_only else "Cluster 전용 정책"
-            self.log(f"SPM 본 보정 건너뜀 ({reason}): {spm.name}")
-            return
-        spm = self._prepare_pair_for_job(spm)
-        if item.get("manual_bones_locked", False):
-            summary = f"{manual_bone_status_text(spm)} · ① 전체 건너뜀"
-            self.ui_queue.put(("cell", (iid, "spm_status", summary)))
-            with self.state_lock:
-                entry["spm_status"] = summary
-                self._save_state_after_phase_update()
-            self.log(f"본 세팅 건너뜀 (수동 본 유지): {spm.name}")
-            return
-
-        snapshot = self._current_spm_snapshot(item)
-        cache = entry.get("calibration_cache")
-        cluster_postcondition = current_cluster_root_postcondition(spm)
-        if (
-            not self.force_rerun
-            and calibration_cache_matches(
-                cache,
-                snapshot["fingerprint"],
-                self.spm_calibration_signature,
-                getattr(self, "legacy_spm_calibration_signature", None),
-            )
-            and (
-                not is_cluster_source_spm(spm)
-                or bool((cluster_postcondition or {}).get("ok"))
-            )
-        ):
-            summary = cache.get("summary", cache.get("status", "캐시"))
-            cached_text = f"{summary} ✓ (변경 없음)"
-            if cache.get("status") == "not-sk-ready":
-                raise RuntimeError(f"SK 미제작: {cache.get('error', '본 설정 필요')} (캐시)")
-            self._migrate_cached_positive_spm_receipt(
-                spm,
-                snapshot,
-                cache,
-                summary,
-            )
-            self.ui_queue.put(("cell", (iid, "spm_status", cached_text)))
-            with self.state_lock:
-                cache["settings_signature"] = self.spm_calibration_signature
-                entry["spm_status"] = cached_text
-                entry["spm_summary"] = summary
-                self._save_state_after_phase_update()
-            self.log(f"본 세팅 건너뜀 (SPM/옵션 변경 없음): {spm.name}")
-            return
-
-        started = time.perf_counter()
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.log(f"SPM 본 세팅 시작: {spm.name}")
-        self.ui_queue.put(("cell", (iid, "spm_status", "캘리브레이션 중...")))
-        report_path = LOG_DIR / f"{spm.stem}_spm_{stamp}.json"
-        cmd = [sys.executable.replace("pythonw.exe", "python.exe"), "-X", "utf8", "-u",
-               str(TOOL_DIR / "spm_audit.py"), str(spm), "--report", str(report_path)]
-        if self.force_rerun:
-            cmd.append("--force-rerun")
-        # In parallel mode, don't pin every worker to the same core subset.
-        parallel = self.cfg.get("spm_parallel_jobs", 1) > 1
-        progress_state = {"stage": "준비 중", "stage_started": 0.0}
-
-        def report_progress(total_elapsed, latest_line):
-            if "[SpeedTree]" in latest_line:
-                stage = latest_line.split("[SpeedTree]", 1)[1].strip()
-                if stage != progress_state["stage"]:
-                    progress_state["stage"] = stage
-                    progress_state["stage_started"] = total_elapsed
-            stage_elapsed = max(0.0, total_elapsed - progress_state["stage_started"])
-            limit = int(self.cfg.get("spm_verify_timeout", 120))
-            remaining = max(0, limit - int(stage_elapsed))
-            elapsed_text = time.strftime("%M:%S", time.gmtime(stage_elapsed))
-            text = (
-                f"{progress_state['stage']} · {elapsed_text} "
-                f"(수동 전환까지 {remaining}s)"
-            )
-            self.ui_queue.put(("cell", (iid, "spm_status", text)))
-
-        try:
-            code, log_file = self._run_limited(
-                cmd,
-                f"{spm.stem}_spm_{stamp}.log",
-                max(
-                    self.cfg.get("spm_verify_timeout", 120) * 5,
-                    self.cfg.get("spm_job_timeout", 7200),
-                ),
-                affinity=not parallel,
-                progress_callback=report_progress,
-            )
-        except BatchItemError:
-            raise
-        except Exception as exc:
-            raise BatchItemError(
-                f"본 세팅 실행 실패: {exc}",
-                kind="internal_error",
-                report_file=report_path,
-            ) from exc
-        if not report_path.exists():
-            raise BatchItemError(
-                f"본 세팅 실패 — 실행 보고서 없음 — 로그: {log_file}",
-                kind="internal_error",
-                log_file=log_file,
-                report_file=report_path,
-            )
-        try:
-            report_rows = json.loads(
-                report_path.read_text(encoding="utf-8")
-            )
-            rep = report_rows[0]
-            if not isinstance(rep, dict):
-                raise ValueError("first SPM report row is not an object")
-        except (OSError, ValueError, TypeError, IndexError) as exc:
-            raise BatchItemError(
-                f"본 세팅 실패 — 실행 보고서 손상: {exc} — 로그: {log_file}",
-                kind="internal_error",
-                log_file=log_file,
-                report_file=report_path,
-            ) from exc
-        status = rep.get("status")
-        if status == "failed" or (code != 0 and status != "not-sk-ready"):
-            raise BatchItemError(
-                f"본 세팅 실패: {rep.get('error', '?')} — 로그: {log_file}",
-                kind=rep.get("failure_kind") or "data_error",
-                report=rep,
-                log_file=log_file,
-                report_file=report_path,
-            )
-        summary = self._spm_report_summary(rep)
-        warn = " ⚠" if rep.get("warnings") else ""
-        duration = time.perf_counter() - started
-        try:
-            final_snapshot = file_content_snapshot(spm)
-            item["spm_snapshot"] = final_snapshot
-        except OSError as exc:
-            final_snapshot = None
-            self.log(f"  [캐시 경고] 최종 SPM 지문 계산 실패: {spm.name}: {exc}")
-        validate_spm_audit_result(spm, rep, final_snapshot)
-        cacheable = status in {"calibrated", "already-ok", "manual-required", "not-sk-ready"}
-        chained_repair = (
-            getattr(self, "_active_pipeline_terminal_phase", None)
-            in {"blender", "push"}
-        )
-        blend_status = (
-            "② 대기 · ① 완료"
-            if chained_repair
-            else self._blend_status_text(spm)
-        )
-        with self.state_lock:
-            if cacheable and final_snapshot:
-                calibration_cache = {
-                    "version": CALIBRATION_CACHE_VERSION,
-                    "spm_fingerprint": final_snapshot["fingerprint"],
-                    "settings_signature": self.spm_calibration_signature,
-                    "status": status,
-                    "summary": summary,
-                    "error": rep.get("error", ""),
-                    "probe_cache_hit": bool((rep.get("calibration") or {}).get("probe_cache_hit")),
-                    "completed_at": datetime.now().isoformat(timespec="seconds"),
-                }
-                semantic_fingerprint = str(
-                    rep.get("bone_semantic_fingerprint") or ""
-                ).strip()
-                if semantic_fingerprint:
-                    calibration_cache["bone_semantic_fingerprint"] = (
-                        semantic_fingerprint
-                    )
-                entry["calibration_cache"] = calibration_cache
-            entry["spm_last_duration_seconds"] = round(duration, 3)
-            entry["spm_status"] = f"{summary}{warn}"
-            entry["spm_summary"] = summary
-            entry["blend_status"] = blend_status
-            self._save_state_after_phase_update()
-        self.ui_queue.put(("cell", (iid, "blend_status", entry["blend_status"])))
-        if status == "not-sk-ready":
-            raise RuntimeError(f"SK 미제작: {rep.get('error', '보이는 Branch의 본 설정이 모두 꺼져 있음')}")
-        self.ui_queue.put(("cell", (iid, "spm_status", f"{summary}{warn}")))
-        for warning in rep.get("warnings", []):
-            self.log(f"  [경고] {spm.name}: {warning}")
-        if status == "manual-required":
-            self.log(f"자동 본 세팅 건너뜀: {spm.name} — 수동 처리 필요 (원본 복원됨)")
-        else:
-            self.log(f"본 세팅 완료: {spm.name} — {summary}")
-
     def _reset_cluster_receipt_refresh_memo(self):
         """Discard the process-local Cluster live-audit memo.
 
@@ -13021,6 +12252,134 @@ class App:
     def _ensure_cluster_receipt_refresh_memo(self):
         if not hasattr(self, "_cluster_receipt_refresh_memo_lock"):
             self._reset_cluster_receipt_refresh_memo()
+
+    @staticmethod
+    def _cluster_live_audit_cache_paths(scope):
+        digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()
+        directory = LOG_DIR.parent / "cache" / "cluster_live_audit"
+        base = directory / f"cluster_live_audit_{digest}"
+        return base.with_suffix(".json"), base.with_name(
+            base.name + "_report.json"
+        )
+
+    @staticmethod
+    def _cluster_live_audit_cache_digest(payload):
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _load_cluster_live_audit_cache(
+        self,
+        scope,
+        production_source_revision,
+    ):
+        """Load an exact prior observation; current bytes are checked later."""
+        cache_path, report_path = self._cluster_live_audit_cache_paths(scope)
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            recorded_digest = str(payload.pop("cache_sha256"))
+        except (OSError, TypeError, ValueError, KeyError):
+            return None
+        if (
+            payload.get("kind") != CLUSTER_LIVE_AUDIT_CACHE_KIND
+            or payload.get("version") != CLUSTER_LIVE_AUDIT_CACHE_VERSION
+            or payload.get("scope") != scope
+            or payload.get("production_source_revision")
+            != production_source_revision
+            or recorded_digest != self._cluster_live_audit_cache_digest(payload)
+        ):
+            return None
+        raw_audit = payload.get("raw_audit")
+        live_artifact_paths = payload.get("live_artifact_paths")
+        input_records = payload.get("input_records")
+        discovery_records = payload.get("discovery_records")
+        if (
+            not isinstance(raw_audit, dict)
+            or not isinstance(raw_audit.get("payload"), dict)
+            or not isinstance(live_artifact_paths, list)
+            or not all(isinstance(path, str) for path in live_artifact_paths)
+            or not isinstance(input_records, list)
+            or not all(isinstance(record, dict) for record in input_records)
+            or not isinstance(discovery_records, list)
+            or not all(
+                isinstance(record, dict) for record in discovery_records
+            )
+            or not str(payload.get("input_fingerprint") or "")
+            or not str(payload.get("discovery_fingerprint") or "")
+        ):
+            return None
+        raw_audit = copy.deepcopy(raw_audit)
+        # The stable report copy is diagnostic only; the cache envelope owns
+        # the immutable payload and all positive reuse is revalidated below.
+        raw_audit["audit_report"] = str(
+            report_path if report_path.is_file() else cache_path
+        )
+        return {
+            "production_source_revision": production_source_revision,
+            "input_fingerprint": payload["input_fingerprint"],
+            "discovery_fingerprint": payload["discovery_fingerprint"],
+            "live_artifact_paths": tuple(live_artifact_paths),
+            "input_records": copy.deepcopy(input_records),
+            "discovery_records": copy.deepcopy(discovery_records),
+            "raw_audit": raw_audit,
+            "_cache_origin": "durable",
+        }
+
+    def _store_cluster_live_audit_cache(
+        self,
+        scope,
+        production_manifest,
+        cache_entry,
+    ):
+        """Persist only a child report proven to match this exact code tree."""
+        raw_audit = copy.deepcopy(cache_entry.get("raw_audit"))
+        if not isinstance(raw_audit, dict):
+            return False
+        child_payload = raw_audit.get("payload")
+        try:
+            validate_production_source_revision_report(
+                child_payload,
+                production_manifest,
+            )
+        except (CompileGateError, OSError, TypeError, ValueError):
+            return False
+        cache_path, report_path = self._cluster_live_audit_cache_paths(scope)
+        raw_audit["audit_report"] = str(report_path)
+        payload = {
+            "kind": CLUSTER_LIVE_AUDIT_CACHE_KIND,
+            "version": CLUSTER_LIVE_AUDIT_CACHE_VERSION,
+            "scope": scope,
+            "production_source_revision": str(
+                production_manifest.content_hash
+            ),
+            "input_fingerprint": str(cache_entry["input_fingerprint"]),
+            "discovery_fingerprint": str(
+                cache_entry["discovery_fingerprint"]
+            ),
+            "live_artifact_paths": list(
+                cache_entry.get("live_artifact_paths") or ()
+            ),
+            "input_records": copy.deepcopy(
+                cache_entry.get("input_records") or []
+            ),
+            "discovery_records": copy.deepcopy(
+                cache_entry.get("discovery_records") or []
+            ),
+            "raw_audit": raw_audit,
+        }
+        payload["cache_sha256"] = self._cluster_live_audit_cache_digest(
+            payload
+        )
+        try:
+            atomic_write_json(report_path, child_payload)
+            atomic_write_json(cache_path, payload)
+        except (OSError, TypeError, ValueError):
+            return False
+        return True
 
     def _cluster_receipt_owner_lock(self, spm):
         self._ensure_cluster_receipt_refresh_memo()
@@ -13146,51 +12505,183 @@ class App:
         return tuple(sorted(paths))
 
     @classmethod
-    def _cluster_receipt_live_artifacts_match(cls, payload):
-        """Verify that report evidence still describes the current files."""
+    def _cluster_receipt_live_artifact_seed_records(cls, payload):
+        """Normalize child-produced digests for immediate parent adoption."""
+        grouped = {}
+        for record in cls._cluster_receipt_live_artifact_records(payload):
+            key = os.path.normcase(
+                os.path.abspath(str(Path(record["path"]).expanduser()))
+            )
+            grouped.setdefault(key, []).append(record)
+        seeds = []
+        algorithm_priority = (
+            SAMPLED_FINGERPRINT_ALGORITHM,
+            SHA256_ALGORITHM,
+            LEGACY_FINGERPRINT_ALGORITHM,
+        )
+        for path_key, records in grouped.items():
+            sizes = {
+                int(record["size"])
+                for record in records
+                if record.get("size") is not None
+            }
+            mtimes = {
+                int(record["mtime_ns"])
+                for record in records
+                if record.get("mtime_ns") is not None
+            }
+            if len(sizes) != 1 or len(mtimes) != 1:
+                continue
+            by_algorithm = {}
+            for record in records:
+                try:
+                    content_key = artifact_record_content_key(record)
+                except (TypeError, ValueError):
+                    continue
+                if content_key is None:
+                    continue
+                by_algorithm.setdefault(content_key["algorithm"], set()).add(
+                    content_key["digest"].casefold()
+                )
+            selected = next(
+                (
+                    (algorithm, next(iter(by_algorithm[algorithm])))
+                    for algorithm in algorithm_priority
+                    if len(by_algorithm.get(algorithm) or ()) == 1
+                ),
+                None,
+            )
+            if selected is None:
+                continue
+            algorithm, digest = selected
+            seeds.append({
+                "path": path_key,
+                "exists": True,
+                "fingerprint": digest,
+                "fingerprint_algorithm": algorithm,
+                "size": next(iter(sizes)),
+                "mtime_ns": next(iter(mtimes)),
+            })
+        return tuple(seeds)
+
+    @classmethod
+    def _cluster_receipt_live_artifacts_match(
+        cls,
+        payload,
+        *,
+        verified_records=(),
+    ):
+        """Verify each physical artifact once, even if the report repeats it."""
         errors = []
+        verified_by_path = {
+            str(record.get("path")): record
+            for record in verified_records or ()
+            if isinstance(record, dict) and record.get("path")
+        }
+        grouped = {}
         for record in cls._cluster_receipt_live_artifact_records(payload):
             candidate = Path(record["path"]).expanduser()
+            key = os.path.normcase(os.path.abspath(str(candidate)))
+            grouped.setdefault(key, []).append(record)
+        for path_key, records in grouped.items():
+            candidate = Path(path_key)
             exists = candidate.exists()
-            if (
-                "exists" in record
-                and bool(record.get("exists")) != exists
-            ):
+            expected_exists = {
+                bool(record.get("exists"))
+                for record in records
+                if "exists" in record
+            }
+            if len(expected_exists) > 1:
+                errors.append(f"conflicting exists evidence: {candidate}")
+                continue
+            if expected_exists and next(iter(expected_exists)) != exists:
                 errors.append(f"exists changed: {candidate}")
                 continue
             if not exists:
                 continue
             try:
                 stat = candidate.stat()
-                if (
-                    record.get("size") is not None
-                    and int(record["size"]) != stat.st_size
-                ):
+                expected_sizes = {
+                    int(record["size"])
+                    for record in records
+                    if record.get("size") is not None
+                }
+                if len(expected_sizes) > 1:
+                    errors.append(f"conflicting size evidence: {candidate}")
+                    continue
+                if expected_sizes and next(iter(expected_sizes)) != stat.st_size:
                     errors.append(f"size changed: {candidate}")
                     continue
+                expected_mtimes = {
+                    int(record["mtime_ns"])
+                    for record in records
+                    if record.get("mtime_ns") is not None
+                }
+                if len(expected_mtimes) > 1:
+                    errors.append(f"conflicting mtime evidence: {candidate}")
+                    continue
                 if (
-                    record.get("mtime_ns") is not None
-                    and int(record["mtime_ns"]) != stat.st_mtime_ns
+                    expected_mtimes
+                    and next(iter(expected_mtimes)) != stat.st_mtime_ns
                 ):
                     errors.append(f"mtime changed: {candidate}")
                     continue
-                content_key = artifact_record_content_key(record)
-                if content_key is None:
-                    errors.append(
-                        f"content digest missing: {candidate}"
+                expected_by_algorithm = {}
+                fields_by_algorithm = {}
+                for record in records:
+                    content_key = artifact_record_content_key(record)
+                    if content_key is None:
+                        errors.append(f"content digest missing: {candidate}")
+                        continue
+                    algorithm = content_key["algorithm"]
+                    expected_by_algorithm.setdefault(algorithm, set()).add(
+                        content_key["digest"].casefold()
                     )
-                    continue
-                current_key = file_content_key_snapshot(
-                    candidate,
-                    content_key["algorithm"],
-                )
-                if (
-                    content_key["digest"].casefold()
-                    != current_key["digest"].casefold()
+                    fields_by_algorithm.setdefault(
+                        algorithm,
+                        content_key["field"],
+                    )
+                if any(
+                    len(expected_digests) != 1
+                    for expected_digests in expected_by_algorithm.values()
                 ):
-                    errors.append(
-                        f"{content_key['field']} changed: {candidate}"
+                    errors.append(f"conflicting content evidence: {candidate}")
+                    continue
+                verified = verified_by_path.get(path_key)
+                if isinstance(verified, dict):
+                    verified_identity = _fast_file_change_identity(
+                        candidate,
+                        stat,
                     )
+                    if (
+                        verified.get("exists") is True
+                        and verified.get("change_token") is not None
+                        and all(
+                            verified.get(field)
+                            == verified_identity.get(field)
+                            for field in (
+                                "size",
+                                "mtime_ns",
+                                "device",
+                                "file_id",
+                                "change_token",
+                            )
+                        )
+                    ):
+                        continue
+                for algorithm, expected_digests in expected_by_algorithm.items():
+                    current_key = file_content_key_snapshot(
+                        candidate,
+                        algorithm,
+                    )
+                    if (
+                        next(iter(expected_digests))
+                        != current_key["digest"].casefold()
+                    ):
+                        errors.append(
+                            f"{fields_by_algorithm[algorithm]} changed: "
+                            f"{candidate}"
+                        )
             except (OSError, RuntimeError, TypeError, ValueError) as exc:
                 errors.append(f"identity unavailable: {candidate}: {exc}")
         return not errors, tuple(errors)
@@ -13218,42 +12709,63 @@ class App:
                 for part in relative.parts
             )
 
-        for candidate in owner.rglob("*.spm"):
-            if (
-                is_live_spm(candidate)
-                and not is_temporary_contract_path(candidate)
-            ):
-                paths.add(candidate.resolve())
-
-        input_json_patterns = (
-            "*.atlas_leaf_targets.json",
-            "*_auto_capture_manifest.json",
-            "*_normalization_manifest.json",
-            "bark_normalization_manifest.json",
-            "*_bark_source_manifest.json",
-        )
-        for pattern in input_json_patterns:
-            for candidate in owner.rglob(pattern):
+        for current_root, directories, filenames in os.walk(owner):
+            current = Path(current_root)
+            relative_parts = {
+                part.casefold()
+                for part in current.relative_to(owner).parts
+            }
+            if relative_parts & {
+                "_spm_backups",
+                ".sk_batch_isolated_bark",
+            }:
+                directories[:] = []
+                continue
+            directories[:] = [
+                name
+                for name in directories
+                if name.casefold()
+                not in {"_spm_backups", ".sk_batch_isolated_bark"}
+            ]
+            in_atlas_identity_folder = current.name.casefold() in {
+                ".atlas_leaf_speedtree_scopes",
+                ".atlas_leaf_speedtree_targets",
+            }
+            for filename in filenames:
+                candidate = current / filename
+                folded = filename.casefold()
+                if folded.endswith(".spm"):
+                    if is_live_spm(candidate):
+                        paths.add(candidate.resolve())
+                    continue
+                if not folded.endswith(".json"):
+                    continue
                 if (
-                    candidate.is_file()
-                    and not is_temporary_contract_path(candidate)
+                    folded == "speedtree_import_manifest.json"
+                    or folded.endswith(".atlas_leaf_targets.json")
+                    or folded.endswith("_auto_capture_manifest.json")
+                    or folded.endswith("_normalization_manifest.json")
+                    or folded == "bark_normalization_manifest.json"
+                    or folded.endswith("_bark_source_manifest.json")
+                    or in_atlas_identity_folder
                 ):
                     paths.add(candidate.resolve())
-
-        import_manifest = owner / "speedtree_import_manifest.json"
-        if import_manifest.is_file():
-            paths.add(import_manifest.resolve())
-        for folder_name in (
-            ".atlas_leaf_speedtree_scopes",
-            ".atlas_leaf_speedtree_targets",
-        ):
-            folder = owner / folder_name
-            if not folder.is_dir():
-                continue
-            for candidate in folder.glob("*.json"):
-                if candidate.is_file():
-                    paths.add(candidate.resolve())
         return paths
+
+    @classmethod
+    def _cluster_receipt_records_fingerprint(cls, spm, records):
+        envelope = {
+            "version": 4,
+            "scope": cls._cluster_receipt_refresh_scope(spm),
+            "files": records,
+        }
+        encoded = json.dumps(
+            envelope,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.blake2b(encoded, digest_size=16).hexdigest()
 
     def _cluster_receipt_refresh_input_fingerprint(
         self,
@@ -13261,6 +12773,9 @@ class App:
         *,
         live_artifact_paths=(),
         _records_out=None,
+        _discovery_records_out=None,
+        _cached_records=(),
+        _trusted_records=(),
     ):
         """Fingerprint every owner input and live artifact by current bytes.
 
@@ -13273,6 +12788,16 @@ class App:
         """
         spm = Path(spm).resolve()
         content_paths = self._cluster_receipt_discovery_input_paths(spm)
+        cached_by_path = {
+            str(record.get("path")): record
+            for record in _cached_records or ()
+            if isinstance(record, dict) and record.get("path")
+        }
+        trusted_by_path = {
+            str(record.get("path")): record
+            for record in _trusted_records or ()
+            if isinstance(record, dict) and record.get("path")
+        }
 
         live_paths = {
             Path(path).resolve()
@@ -13280,6 +12805,10 @@ class App:
         }
         all_paths = set(live_paths)
         all_paths.update(content_paths)
+        all_paths.update(
+            Path(record["path"])
+            for record in cached_by_path.values()
+        )
         records = []
         for candidate in sorted(
             all_paths,
@@ -13291,32 +12820,120 @@ class App:
             except FileNotFoundError:
                 records.append({"path": key, "exists": False})
                 continue
-            snapshot = (
-                file_content_snapshot(candidate)
-                if candidate in content_paths
-                else sampled_file_content_snapshot(candidate)
+            identity = _fast_file_change_identity(candidate, stat)
+            cached_record = cached_by_path.get(key)
+            trusted_record = trusted_by_path.get(key)
+            cache_identity_matches = bool(
+                isinstance(cached_record, dict)
+                and cached_record.get("exists") is True
+                and identity.get("change_token") is not None
+                and all(
+                    cached_record.get(field) == identity.get(field)
+                    for field in (
+                        "size",
+                        "mtime_ns",
+                        "device",
+                        "file_id",
+                        "change_token",
+                    )
+                )
             )
+            trusted_identity_matches = bool(
+                isinstance(trusted_record, dict)
+                and trusted_record.get("exists") is True
+                and trusted_record.get("fingerprint")
+                and trusted_record.get("size") == identity.get("size")
+                and trusted_record.get("mtime_ns") == identity.get("mtime_ns")
+            )
+            reusable_record = (
+                cached_record
+                if cache_identity_matches
+                else trusted_record if trusted_identity_matches else None
+            )
+            reused_cached_snapshot = False
+            if candidate in content_paths:
+                content_reusable_record = (
+                    cached_record
+                    if cache_identity_matches
+                    else (
+                        trusted_record
+                        if (
+                            trusted_identity_matches
+                            and trusted_record.get("fingerprint_algorithm")
+                            == LEGACY_FINGERPRINT_ALGORITHM
+                        )
+                        else None
+                    )
+                )
+                if content_reusable_record is not None:
+                    snapshot = {
+                        "fingerprint": content_reusable_record["fingerprint"],
+                        "size": identity["size"],
+                        "mtime_ns": identity["mtime_ns"],
+                    }
+                    if (
+                        content_reusable_record.get("fingerprint_algorithm")
+                        and content_reusable_record.get(
+                            "fingerprint_algorithm"
+                        )
+                        != LEGACY_FINGERPRINT_ALGORITHM
+                    ):
+                        snapshot["fingerprint_algorithm"] = reusable_record[
+                            "fingerprint_algorithm"
+                        ]
+                    reused_cached_snapshot = True
+                else:
+                    snapshot = file_content_snapshot(candidate)
+            elif (
+                reusable_record is not None
+                and reusable_record.get("fingerprint_algorithm")
+            ):
+                snapshot = {
+                    "fingerprint": reusable_record["fingerprint"],
+                    "fingerprint_algorithm": reusable_record[
+                        "fingerprint_algorithm"
+                    ],
+                    "size": identity["size"],
+                    "mtime_ns": identity["mtime_ns"],
+                }
+                reused_cached_snapshot = True
+            else:
+                snapshot = sampled_file_content_snapshot(candidate)
+            if reused_cached_snapshot:
+                final_identity = identity
+            else:
+                final_stat = candidate.stat()
+                final_identity = _fast_file_change_identity(
+                    candidate,
+                    final_stat,
+                )
+            if (
+                snapshot.get("size") != final_identity["size"]
+                or snapshot.get("mtime_ns") != final_identity["mtime_ns"]
+            ):
+                raise RuntimeError(f"File changed while fingerprinting: {candidate}")
             records.append({
                 "path": key,
                 "exists": True,
                 **snapshot,
+                "device": final_identity["device"],
+                "file_id": final_identity["file_id"],
+                "change_token": final_identity["change_token"],
             })
 
         if _records_out is not None:
             _records_out[:] = copy.deepcopy(records)
-
-        envelope = {
-            "version": 3,
-            "scope": self._cluster_receipt_refresh_scope(spm),
-            "files": records,
-        }
-        encoded = json.dumps(
-            envelope,
-            sort_keys=True,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        return hashlib.blake2b(encoded, digest_size=16).hexdigest()
+        if _discovery_records_out is not None:
+            content_keys = {
+                os.path.normcase(os.path.abspath(str(path)))
+                for path in content_paths
+            }
+            _discovery_records_out[:] = copy.deepcopy([
+                record
+                for record in records
+                if record.get("path") in content_keys
+            ])
+        return self._cluster_receipt_records_fingerprint(spm, records)
 
     @staticmethod
     def _cluster_receipt_changed_input_paths(before_records, after_records):
@@ -13371,6 +12988,9 @@ class App:
         self,
         spm,
         stamp,
+        *,
+        _raw_only=False,
+        _persist_receipt=True,
     ):
         """Reuse one hash-current live audit within this GUI session.
 
@@ -13390,7 +13010,16 @@ class App:
             )
 
         self._ensure_cluster_receipt_refresh_memo()
-        scope = self._cluster_receipt_refresh_scope(spm)
+        asset_scope = self._cluster_receipt_refresh_scope(spm)
+        # A normalization observation deliberately disables receipt writes.
+        # Do not let it suppress a later owner audit that is expected to
+        # publish one, while still allowing input/output observations to share
+        # the same exact live result when no asset byte changed between them.
+        scope = (
+            asset_scope
+            if _persist_receipt
+            else asset_scope + "\nreceipt_persistence=disabled"
+        )
         cached_hit = False
         cached_raw_audit = None
         while True:
@@ -13400,21 +13029,34 @@ class App:
                     if force_rerun
                     else self._cluster_receipt_refresh_memo.get(scope)
                 )
+                if cached is None and not force_rerun:
+                    cached = self._load_cluster_live_audit_cache(
+                        scope,
+                        production_source_revision,
+                    )
+                    if cached is not None:
+                        self._cluster_receipt_refresh_memo[scope] = cached
                 cached_live_artifact_paths = (
                     (cached or {}).get("live_artifact_paths") or ()
                 )
+            pre_input_records = []
             pre_discovery_records = []
             try:
                 current_cache_fingerprint = (
                     self._cluster_receipt_refresh_input_fingerprint(
                         spm,
                         live_artifact_paths=cached_live_artifact_paths,
+                        _records_out=pre_input_records,
+                        _discovery_records_out=pre_discovery_records,
+                        _cached_records=(cached or {}).get(
+                            "input_records"
+                        ) or (),
                     )
                 )
                 pre_discovery_fingerprint = (
-                    self._cluster_receipt_refresh_input_fingerprint(
+                    self._cluster_receipt_records_fingerprint(
                         spm,
-                        _records_out=pre_discovery_records,
+                        pre_discovery_records,
                     )
                 )
             except (OSError, RuntimeError) as exc:
@@ -13425,11 +13067,23 @@ class App:
                 ) from exc
             cached_artifacts_match = False
             if cached is not None:
-                cached_artifacts_match, _cached_artifact_errors = (
-                    self._cluster_receipt_live_artifacts_match(
-                        (cached.get("raw_audit") or {}).get("payload") or {}
+                if (
+                    cached.get("input_fingerprint")
+                    == current_cache_fingerprint
+                    and cached.get("discovery_fingerprint")
+                    == pre_discovery_fingerprint
+                ):
+                    # Every recorded path retained the exact file/change token
+                    # that authorized reuse of its prior content digest.  The
+                    # fresh-audit publish gate already checked every payload
+                    # artifact, so repeating 758 report rows here is redundant.
+                    cached_artifacts_match = True
+                else:
+                    cached_artifacts_match, _cached_artifact_errors = (
+                        self._cluster_receipt_live_artifacts_match(
+                            (cached.get("raw_audit") or {}).get("payload") or {}
+                        )
                     )
-                )
             with self._cluster_receipt_refresh_memo_lock:
                 # Another owner-equivalent caller may have published a newer
                 # immutable cache entry while hashes were calculated. Validate
@@ -13484,18 +13138,29 @@ class App:
 
         if cached_hit:
             if hasattr(self, "log"):
-                self.log(
-                    "Cluster Assembly live audit memo hit: "
-                    f"{spm.name}"
-                )
+                if cached.get("_cache_origin") == "durable":
+                    self.log(
+                        "Cluster Assembly live audit exact cache hit: "
+                        f"{spm.name}"
+                    )
+                else:
+                    self.log(
+                        "Cluster Assembly live audit memo hit: "
+                        f"{spm.name}"
+                    )
+            cached_raw_audit = copy.deepcopy(cached_raw_audit)
+            if _raw_only:
+                return cached_raw_audit
             return self._evaluate_cluster_receipt_live_audit(
                 spm,
-                copy.deepcopy(cached_raw_audit),
+                cached_raw_audit,
             )
         if not owns_flight:
             raw_audit = copy.deepcopy(
                 self._wait_cluster_receipt_refresh_flight(flight, spm)
             )
+            if _raw_only:
+                return raw_audit
             return self._evaluate_cluster_receipt_live_audit(
                 spm,
                 raw_audit,
@@ -13517,6 +13182,7 @@ class App:
                         spm,
                         audit_stamp,
                         _raw_only=True,
+                        _persist_receipt=_persist_receipt,
                     )
                 except InlineAtlasRepairRequested as repair_request:
                     self._run_inline_atlas_manifest_repair(
@@ -13532,17 +13198,39 @@ class App:
                         spm,
                         f"{audit_stamp}_atlas_repaired",
                         _raw_only=True,
+                        _persist_receipt=_persist_receipt,
                     )
+                live_artifact_paths = (
+                    self._cluster_receipt_live_artifact_paths(
+                        raw_audit.get("payload") or {},
+                    )
+                )
+                child_artifact_seeds = (
+                    self._cluster_receipt_live_artifact_seed_records(
+                        raw_audit.get("payload") or {},
+                    )
+                )
+                post_input_records = []
                 post_discovery_records = []
-                post_discovery_fingerprint = (
+                post_cache_fingerprint = (
                     self._cluster_receipt_refresh_input_fingerprint(
                         spm,
-                        _records_out=post_discovery_records,
+                        live_artifact_paths=live_artifact_paths,
+                        _records_out=post_input_records,
+                        _discovery_records_out=post_discovery_records,
+                        _trusted_records=child_artifact_seeds,
+                    )
+                )
+                post_discovery_fingerprint = (
+                    self._cluster_receipt_records_fingerprint(
+                        spm,
+                        post_discovery_records,
                     )
                 )
                 artifacts_match, artifact_errors = (
                     self._cluster_receipt_live_artifacts_match(
-                        raw_audit.get("payload") or {}
+                        raw_audit.get("payload") or {},
+                        verified_records=post_input_records,
                     )
                 )
                 fingerprint_changed = (
@@ -13555,27 +13243,30 @@ class App:
                 )
                 observed_discovery_records = post_discovery_records
                 if stable:
-                    live_artifact_paths = (
-                        self._cluster_receipt_live_artifact_paths(
-                            raw_audit.get("payload") or {},
-                            report_path=raw_audit.get("audit_report"),
-                        )
-                    )
-                    post_cache_fingerprint = (
+                    final_input_records = []
+                    final_discovery_records = []
+                    final_cache_fingerprint = (
                         self._cluster_receipt_refresh_input_fingerprint(
                             spm,
                             live_artifact_paths=live_artifact_paths,
+                            _records_out=final_input_records,
+                            _discovery_records_out=final_discovery_records,
+                            _cached_records=post_input_records,
                         )
                     )
-                    final_discovery_records = []
                     final_discovery_fingerprint = (
-                        self._cluster_receipt_refresh_input_fingerprint(
+                        self._cluster_receipt_records_fingerprint(
                             spm,
-                            _records_out=final_discovery_records,
+                            final_discovery_records,
                         )
                     )
                     final_artifacts_match, final_artifact_errors = (
-                        self._cluster_receipt_live_artifacts_match(
+                        (
+                            True,
+                            (),
+                        )
+                        if final_cache_fingerprint == post_cache_fingerprint
+                        else self._cluster_receipt_live_artifacts_match(
                             raw_audit.get("payload") or {}
                         )
                     )
@@ -13600,11 +13291,13 @@ class App:
                                 "production_source_revision": (
                                     production_source_revision
                                 ),
-                                "input_fingerprint": post_cache_fingerprint,
+                                "input_fingerprint": final_cache_fingerprint,
                                 "discovery_fingerprint": (
                                     final_discovery_fingerprint
                                 ),
                                 "live_artifact_paths": live_artifact_paths,
+                                "input_records": final_input_records,
+                                "discovery_records": final_discovery_records,
                                 "raw_audit": copy.deepcopy(raw_audit),
                             }
                         elif final_revision != production_source_revision:
@@ -13690,6 +13383,14 @@ class App:
 
         if publish_error is not None:
             raise publish_error
+        if cache_entry is not None and not force_rerun:
+            self._store_cluster_live_audit_cache(
+                scope,
+                production_manifest,
+                cache_entry,
+            )
+        if _raw_only:
+            return raw_audit
         return self._evaluate_cluster_receipt_live_audit(
             spm,
             raw_audit,
@@ -13717,26 +13418,27 @@ class App:
         spm = Path(spm).resolve()
         with self._cluster_receipt_owner_lock(spm):
             owner_has_cluster = (spm.parent / "Cluster").is_dir()
-            try:
-                cached_resolution = cluster_assembly_receipt_resolution(spm)
-                if not owner_has_cluster:
-                    return cached_resolution
-                self.log(f"Cluster Assembly live contract 확인: {spm.name}")
-            except FileNotFoundError:
-                if not owner_has_cluster:
+            if not owner_has_cluster:
+                try:
+                    return cluster_assembly_receipt_resolution(spm)
+                except FileNotFoundError:
                     return None
-                self.log(
-                    f"Cluster Assembly 영수증 탐색: {spm.name} "
-                    "(저장된 영수증 없음; 현재 폴더 감사)"
-                )
-            except (
-                ClusterAssemblyReceiptStaleError,
-                ClusterAssemblyReceiptAmbiguityError,
-            ):
-                self.log(
-                    f"Cluster Assembly 영수증 갱신: {spm.name} "
-                    f"(현재 산출물 해시 재감사)"
-                )
+                except (
+                    ClusterAssemblyReceiptStaleError,
+                    ClusterAssemblyReceiptAmbiguityError,
+                ):
+                    # A removed Cluster folder can still have an old actionable
+                    # receipt. Run one live pass-through audit to retire that
+                    # relationship instead of accepting the stale snapshot.
+                    self.log(
+                        "Cluster Assembly removed-relation live 감사: "
+                        f"{spm.name}"
+                    )
+            else:
+                # A live audit is authoritative for owners. Resolving an old
+                # persisted receipt here used to hash ~675 MB before launching
+                # the audit that was going to replace that evidence anyway.
+                self.log(f"Cluster Assembly live contract 감사: {spm.name}")
 
             scope_hash = hashlib.blake2b(
                 self._cluster_receipt_refresh_scope(spm).encode("utf-8"),
@@ -13816,6 +13518,10 @@ class App:
                                 f"{fields.get('total', '?')}"
                             )
                         break
+                # Healthy audits finish in roughly 1-2 seconds. Do not turn
+                # those normal completions into noisy per-item heartbeats.
+                if elapsed < 5.0:
+                    return
                 bucket = int(elapsed // 30)
                 if (
                     bucket == audit_progress["bucket"]
@@ -13839,7 +13545,7 @@ class App:
                 # A multi-folder audit may run longer than one folder budget as
                 # long as the child keeps publishing real progress.
                 None,
-                affinity=False,
+                affinity=True,
                 progress_callback=report_live_audit_progress,
                 inactivity_timeout=stage_timeout,
                 inactivity_timeout_by_marker={
@@ -14196,25 +13902,14 @@ class App:
             return None
 
         persistence_error = str(persistence.get("error") or "")
-        persisted_resolution = None
-        ignored_stale = []
-        cache_resolution_error = ""
-        try:
-            persisted_resolution = cluster_assembly_receipt_resolution(spm)
-        except (
-            FileNotFoundError,
-            ClusterAssemblyReceiptStaleError,
-            ClusterAssemblyReceiptAmbiguityError,
-        ) as exc:
-            cache_resolution_error = str(exc)
-            ignored_stale.append({
-                "path": "",
-                "error": cache_resolution_error,
-            })
+        persisted_paths = list(persistence.get("written") or ()) + list(
+            persistence.get("unchanged") or ()
+        )
+        if persistence_error:
             self.log(
                 "Cluster Assembly live audit 사용 "
                 f"(영수증은 캐시 경고): {spm.name}: "
-                + (persistence_error or cache_resolution_error)
+                + persistence_error
             )
         else:
             self.log(
@@ -14232,24 +13927,13 @@ class App:
                 raw_audit.get("nonblocking_maintenance_issues") or []
             ),
             "persisted_receipt": (
-                (persisted_resolution or {}).get("selected_receipt")
+                persisted_paths[0] if persisted_paths else None
             ),
-            "current_candidates": (
-                (persisted_resolution or {}).get("current_candidates", [])
-            ),
-            "superseded_current_receipts": (
-                (persisted_resolution or {}).get(
-                    "superseded_current_receipts", []
-                )
-            ),
-            "ignored_stale_candidates": (
-                (persisted_resolution or {}).get(
-                    "ignored_stale_candidates", []
-                )
-                + ignored_stale
-            ),
+            "current_candidates": [],
+            "superseded_current_receipts": [],
+            "ignored_stale_candidates": [],
             "receipt_persistence_warning": (
-                persistence_error or cache_resolution_error
+                persistence_error
             ),
         }
 
@@ -14272,7 +13956,7 @@ class App:
         """
         target = Path(target_spm).resolve()
         producer = Path(producer_spm).resolve()
-        raw_audit = self._refresh_stale_cluster_receipt_uncached(
+        raw_audit = self._refresh_stale_cluster_receipt(
             target,
             stamp,
             _raw_only=True,
@@ -15538,7 +15222,7 @@ class App:
                         return
                     self.log(
                         "Cluster 관계 산출물 갱신 후 Assembly 상태가 변경되어 "
-                        f"②를 계속 실행: {spm.name}"
+                        f"①을 계속 실행: {spm.name}"
                     )
         open_windows = blender_open_file_window_titles(blend)
         if open_windows:
@@ -15713,11 +15397,6 @@ class App:
             "--material-contract", str(material_report),
             "--report", str(job_report),
         ]
-        if item.get("manual_bones_locked", False):
-            cmd.insert(
-                cmd.index("--material-contract"),
-                "--manual-bones-locked",
-            )
         if (
             bark_source_resolution
             and bark_source_resolution.get("manifest")
@@ -15731,14 +15410,13 @@ class App:
                 cmd.index("--material-contract"),
                 "--cluster-source-build-only",
             )
-        parallel = self.cfg.get("blender_parallel_jobs", 2) > 1
         self._assert_active_production_source_manifest()
         try:
             code, log_file = self._run_limited(
                 cmd,
                 f"{spm.stem}_assembly_{stamp}.log",
                 self.cfg.get("blender_job_timeout", 3600),
-                affinity=not parallel,
+                affinity=True,
             )
         finally:
             # A code change while Blender is running is a restart route, never
@@ -15757,11 +15435,11 @@ class App:
                 try:
                     atomic_write_bytes(pipeline_report, previous_pipeline_report)
                     self.log(
-                        f"  [② 복구] 실패 전 최신성 보고서 보존: {spm.name}"
+                        f"  [① 복구] 실패 전 최신성 보고서 보존: {spm.name}"
                     )
                 except OSError as exc:
                     self.log(
-                        f"  [② 복구 경고] 이전 보고서 복원 실패: "
+                        f"  [① 복구 경고] 이전 보고서 복원 실패: "
                         f"{spm.name}: {exc}"
                     )
             reason = summarize_job_failure(result, log_file)
@@ -15933,7 +15611,7 @@ class App:
                         f"  [Assembly rollback warning] {spm.name}: {exc}"
                     )
             raise BatchItemError(
-                f"② 완료 후 사전검사 실패: {handoff_reason}",
+                f"① 완료 후 사전검사 실패: {handoff_reason}",
                 kind="data_error",
                 report=result,
                 log_file=log_file,
@@ -15947,7 +15625,7 @@ class App:
                 entry["push_status_kind"] = "source_review"
                 save_state(self.state)
             self.log(
-                f"② 완료 · source review 필요 · Unreal Push 차단: "
+                f"① 완료 · source review 필요 · Unreal Push 차단: "
                 f"{spm.name} ({handoff_reason})"
             )
         else:
@@ -15966,7 +15644,7 @@ class App:
                     f"  [backup cleanup warning] {spm.name}: {exc}"
                 )
         for warning in result.get("warnings", []):
-            self.log(f"  [② 경고] {spm.name}: {warning}")
+            self.log(f"  [① 경고] {spm.name}: {warning}")
         self.log(f"Assembly 완료: {blend.name}")
 
     def _push_preflight(self, targets):
@@ -16069,7 +15747,7 @@ class App:
         with self.state_lock:
             save_state(self.state)
         reuse_suffix = (
-            f" · ② 결과 재사용 {reused_assembly_contracts}개"
+            f" · ① 결과 재사용 {reused_assembly_contracts}개"
             if reused_assembly_contracts
             else ""
         )
@@ -16662,7 +16340,7 @@ class App:
                 cmd,
                 export_log_name,
                 None,
-                affinity=self.cfg.get("blender_parallel_jobs", 2) <= 1,
+                affinity=True,
                 inactivity_timeout=disk_export_timeout,
                 inactivity_timeout_by_marker=send2ue_inactivity_rules(
                     stage_timeout, disk_export_timeout

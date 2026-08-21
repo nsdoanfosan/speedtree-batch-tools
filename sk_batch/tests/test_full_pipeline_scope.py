@@ -48,7 +48,6 @@ class FullPipelineScopeTests(unittest.TestCase):
         app.batch_progress_var = FakeVar()
         app.progress_var = FakeVar()
         app.btn_check = mock.Mock()
-        app.btn_spm = mock.Mock()
         app.btn_blender = mock.Mock()
         app.btn_push = mock.Mock()
         app.btn_all = mock.Mock()
@@ -68,10 +67,6 @@ class FullPipelineScopeTests(unittest.TestCase):
         worker = mock.Mock()
 
         with mock.patch.object(
-            gui, "calibration_settings_signature", return_value="current"
-        ), mock.patch.object(
-            gui, "legacy_calibration_settings_signature", return_value="legacy"
-        ), mock.patch.object(
             app, "_production_source_revision_precheck", return_value=None
         ), mock.patch.object(gui, "save_config"), mock.patch.object(
             gui.threading, "Thread", return_value=worker
@@ -102,10 +97,6 @@ class FullPipelineScopeTests(unittest.TestCase):
         worker = mock.Mock()
 
         with mock.patch.object(
-            gui, "calibration_settings_signature", return_value="current"
-        ), mock.patch.object(
-            gui, "legacy_calibration_settings_signature", return_value="legacy"
-        ), mock.patch.object(
             app, "_production_source_revision_precheck", return_value=None
         ), mock.patch.object(gui, "save_config"), mock.patch.object(
             gui.threading, "Thread", return_value=worker
@@ -119,20 +110,13 @@ class FullPipelineScopeTests(unittest.TestCase):
     def test_numbered_buttons_route_to_their_required_phase_chain(self):
         gui = load_gui_module()
         for phase, expected_mode, chained in (
-            ("spm", "phase", False),
             ("blender", "pipeline", True),
             ("push", "pipeline", True),
         ):
             with self.subTest(phase=phase):
                 app, checked, _unchecked = self.make_start_app(gui)
                 worker = mock.Mock()
-                with mock.patch.object(
-                    gui, "calibration_settings_signature", return_value="current"
-                ), mock.patch.object(
-                    gui,
-                    "legacy_calibration_settings_signature",
-                    return_value="legacy",
-                ), mock.patch.object(gui, "save_config"), mock.patch.object(
+                with mock.patch.object(gui, "save_config"), mock.patch.object(
                     gui.threading, "Thread", return_value=worker
                 ) as thread:
                     app.start_batch(phase)
@@ -181,23 +165,19 @@ class FullPipelineScopeTests(unittest.TestCase):
         app._collect_cfg = mock.Mock(side_effect=cfg_values)
         workers = [mock.Mock(), mock.Mock(), mock.Mock()]
 
-        with mock.patch.object(
-            gui, "calibration_settings_signature", return_value="current"
-        ), mock.patch.object(
-            gui, "legacy_calibration_settings_signature", return_value="legacy"
-        ), mock.patch.object(gui, "save_config"), mock.patch.object(
+        with mock.patch.object(gui, "save_config"), mock.patch.object(
             gui.threading, "Thread", side_effect=workers
         ) as thread:
-            app.start_batch("spm")
+            app.start_batch("blender")
             first = app.active_batch_job
 
             app.items[str(paths[0])]["checked"] = False
             app.items[str(paths[1])]["checked"] = True
-            app.start_batch("blender")
+            app.start_batch("push")
 
             app.items[str(paths[1])]["checked"] = False
             app.items[str(paths[2])]["checked"] = True
-            app.start_batch("push")
+            app.start_batch("blender")
 
             self.assertEqual(thread.call_count, 1)
             self.assertEqual(
@@ -215,7 +195,7 @@ class FullPipelineScopeTests(unittest.TestCase):
                 [job["cfg"]["tag"] for job in app.pending_batch_jobs],
                 ["B", "C"],
             )
-            app.btn_spm.configure.assert_any_call(state="normal")
+            app.btn_blender.configure.assert_any_call(state="normal")
             app.btn_select_all.configure.assert_any_call(state="normal")
             app.btn_scan.configure.assert_any_call(state="disabled")
             app.root_entry.configure.assert_any_call(state="disabled")

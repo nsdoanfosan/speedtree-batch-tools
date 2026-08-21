@@ -782,7 +782,7 @@ void __fastcall HookedInsertExportBone(
                                 targetBranch) {
                             AbortExport(
                                 kHookRuntimeFailureExitCode,
-                                "BaseRef bone repair rejected an incomplete parsed reference chain");
+                                "BaseRef bone serialization rejected an incomplete parsed reference chain");
                         }
 
                         const std::int16_t anchorIndex =
@@ -803,7 +803,7 @@ void __fastcall HookedInsertExportBone(
                                     requiredBytes) {
                                 AbortExport(
                                     kHookRuntimeFailureExitCode,
-                                    "BaseRef bone repair rejected an invalid parsed anchor record");
+                                    "BaseRef bone serialization rejected an invalid parsed anchor record");
                             }
                             anchorPosition = *reinterpret_cast<const float*>(
                                 anchorBegin + static_cast<std::size_t>(anchorIndex) * 24);
@@ -820,7 +820,7 @@ void __fastcall HookedInsertExportBone(
                         if (resolvedParentId <= 0 || resolvedParentId == boneId) {
                             AbortExport(
                                 kHookRuntimeFailureExitCode,
-                                "BaseRef bone repair could not resolve an exact parent bone ID");
+                                "BaseRef bone serialization could not resolve an exact parent bone ID");
                         }
                         parentId = resolvedParentId;
                         char message[384]{};
@@ -843,7 +843,7 @@ void __fastcall HookedInsertExportBone(
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             AbortExport(
                 kHookRuntimeFailureExitCode,
-                "BaseRef bone repair raised an exception while reading parsed data");
+                "BaseRef bone serialization raised an exception while reading parsed data");
         }
     }
     gOriginalInsertExportBone(exportData, sourceBoneRecord, sourceBranch);

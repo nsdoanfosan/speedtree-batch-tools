@@ -143,7 +143,7 @@ class SourceReviewPolicyTests(unittest.TestCase):
         assembly_inspection_lines = call_lines(
             tree, "inspect_cluster_assembly_fbx"
         )
-        repair_lines = call_lines(tree, "run_import_and_assemble")
+        assembly_lines = call_lines(tree, "run_import_and_assemble")
 
         self.assertEqual(len(export_lines), 2)
         self.assertEqual(len(material_validation_lines), 1)
@@ -152,13 +152,13 @@ class SourceReviewPolicyTests(unittest.TestCase):
         self.assertGreater(exact_export_refresh_lines[0], max(export_lines))
         self.assertEqual(len(assembly_inspection_lines), 1)
         self.assertGreater(assembly_inspection_lines[0], max(export_lines))
-        self.assertEqual(len(repair_lines), 1)
+        self.assertEqual(len(assembly_lines), 1)
         self.assertLess(
             max(exact_export_refresh_lines[0], assembly_inspection_lines[0]),
-            repair_lines[0],
+            assembly_lines[0],
         )
 
-    def test_only_secondary_assembly_geometry_export_allows_boneless_spm(self):
+    def test_all_assembly_exports_use_native_bones(self):
         calls = sorted(
             (
                 node
@@ -178,13 +178,9 @@ class SourceReviewPolicyTests(unittest.TestCase):
             key=lambda node: node.lineno,
         )
         self.assertEqual(len(calls), 2)
-        primary_keywords = {item.arg: item.value for item in calls[0].keywords}
-        secondary_keywords = {item.arg: item.value for item in calls[1].keywords}
-        self.assertNotIn("allow_boneless", primary_keywords)
-        self.assertIsInstance(
-            secondary_keywords.get("allow_boneless"), ast.Constant
-        )
-        self.assertIs(secondary_keywords["allow_boneless"].value, True)
+        for call in calls:
+            keywords = {item.arg: item.value for item in call.keywords}
+            self.assertNotIn("allow_boneless", keywords)
 
 
 if __name__ == "__main__":

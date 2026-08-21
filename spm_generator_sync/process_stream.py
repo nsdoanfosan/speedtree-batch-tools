@@ -8,11 +8,9 @@ resumed so descendants cannot escape through the spawn/assign race.
 This is the shared safe PIPE contract for SpeedTree Modeler.  Modeler can exit
 while a descendant still holds an inherited stdout/stderr handle, so PIPE is
 safe here only because both channels are drained concurrently, the descendant
-tree is owned, and the post-root-exit EOF wait is bounded.  The converged
-``sk_batch.spm_audit.run_speedtree_export`` caller uses this path by default;
-its temporary-file fallback and the repair add-on's
-``speedtree_cli._run_process`` implement the same rule by avoiding PIPE EOF
-altogether.  Plain ``subprocess.run(capture_output=True)`` is not equivalent.
+tree is owned, and the post-root-exit EOF wait is bounded.  The add-on's
+``speedtree_cli._run_process`` uses regular files instead.  Plain
+``subprocess.run(capture_output=True)`` is not equivalent.
 """
 
 from __future__ import annotations

@@ -173,7 +173,6 @@ REGISTERED_BACKUP_MANIFEST_PRODUCERS = frozenset(
         "atlas_cluster_normalization",
         "cluster_card_metadata_repair",
         "pcg_texture_audit",
-        "spm_audit",
         "spm_generator_sync",
         "spm_legacy_cluster_marker",
         "spm_problem_node_marker",

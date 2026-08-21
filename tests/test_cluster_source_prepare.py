@@ -132,7 +132,7 @@ class ClusterSourcePrepareTests(unittest.TestCase):
             {"normalization_required": True},
         )
 
-    def test_build_runs_bone_setup_before_material_and_blender(self):
+    def test_build_runs_material_preflight_before_blender(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             spm = root / "Cluster" / "SK_branch_01.spm"
@@ -157,7 +157,6 @@ class ClusterSourcePrepareTests(unittest.TestCase):
                 "fbx_ini": str(fbx_ini),
                 "speedtree_exe": str(root / "SpeedTree.exe"),
                 "blender_exe": str(root / "blender.exe"),
-                "spm_verify_timeout": 1,
                 "speedtree_material_preflight_timeout": 1,
                 "blender_job_timeout": 1,
             }
@@ -172,27 +171,18 @@ class ClusterSourcePrepareTests(unittest.TestCase):
                     str(command[command.index("--report") + 1])
                 )
                 report_path.parent.mkdir(parents=True, exist_ok=True)
-                payload = (
-                    [{
-                        "status": "already-ok",
-                        "final_spm_fingerprint":
-                            source_prepare.file_content_fingerprint(spm),
-                        "cluster_root_logical_postcondition": {"ok": True},
-                    }]
-                    if stage == "spm_bone_setup"
-                    else {
-                        "status": "ok",
-                        **(
-                            {
-                                "cluster_source_build_contract": {
-                                    "status": "ready"
-                                }
+                payload = {
+                    "status": "ok",
+                    **(
+                        {
+                            "cluster_source_build_contract": {
+                                "status": "ready"
                             }
-                            if stage == "cluster_source_build"
-                            else {}
-                        ),
-                    }
-                )
+                        }
+                        if stage == "cluster_source_build"
+                        else {}
+                    ),
+                }
                 report_path.write_text(
                     json.dumps(payload),
                     encoding="utf-8",
@@ -229,12 +219,11 @@ class ClusterSourcePrepareTests(unittest.TestCase):
         self.assertEqual(
             stages,
             [
-                "spm_bone_setup",
                 "material_preflight",
                 "cluster_source_build",
             ],
         )
-        self.assertEqual(result["spm_bone_setup"]["status"], "already-ok")
+        self.assertNotIn("spm_bone_setup", result)
         self.assertEqual(result["cluster_source_build"]["status"], "ok")
         material_command = next(
             command for stage, command in commands
@@ -249,113 +238,6 @@ class ClusterSourcePrepareTests(unittest.TestCase):
             if stage == "cluster_source_build"
         )
         self.assertIn("--cluster-source-build-only", cluster_command)
-
-    def test_failed_bone_setup_stops_before_material_or_blender(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            spm = root / "Cluster" / "SK_branch_01.spm"
-            blend = spm.with_suffix(".blend")
-            spm.parent.mkdir(parents=True)
-            spm.write_bytes(b"spm")
-            blend.write_bytes(b"blend")
-            cfg = {
-                "spm_verify_timeout": 1,
-            }
-
-            def fail_bones(command, log_file, *, timeout, stage):
-                del log_file, timeout
-                self.assertEqual(stage, "spm_bone_setup")
-                report_path = Path(
-                    str(command[command.index("--report") + 1])
-                )
-                report_path.parent.mkdir(parents=True, exist_ok=True)
-                report_path.write_text(
-                    json.dumps([
-                        {
-                            "status": "manual-required",
-                            "error": "bone setup needs authoring",
-                        }
-                    ]),
-                    encoding="utf-8",
-                )
-                return SimpleNamespace(returncode=0)
-
-            with mock.patch.object(
-                source_prepare,
-                "blender_open_file_window_titles",
-                return_value=[],
-            ), mock.patch.object(
-                source_prepare,
-                "LOG_DIR",
-                root / "logs",
-            ), mock.patch.object(
-                source_prepare,
-                "_run_stage",
-                side_effect=fail_bones,
-            ) as run:
-                with self.assertRaises(
-                    source_prepare.ClusterSourcePreparationError
-                ) as caught:
-                    source_prepare._build_cluster_source(
-                        spm,
-                        blend,
-                        cfg=cfg,
-                    )
-
-        self.assertEqual(caught.exception.stage, "spm_bone_setup")
-        self.assertEqual(run.call_count, 1)
-
-    def test_stale_bone_report_fingerprint_stops_before_blender(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            spm = root / "Cluster" / "SK_branch_01.spm"
-            blend = spm.with_suffix(".blend")
-            spm.parent.mkdir(parents=True)
-            spm.write_bytes(b"spm")
-            blend.write_bytes(b"blend")
-
-            def stale_report(command, log_file, *, timeout, stage):
-                del log_file, timeout
-                self.assertEqual(stage, "spm_bone_setup")
-                report_path = Path(
-                    str(command[command.index("--report") + 1])
-                )
-                report_path.parent.mkdir(parents=True, exist_ok=True)
-                report_path.write_text(
-                    json.dumps([{
-                        "status": "already-ok",
-                        "final_spm_fingerprint": "stale",
-                        "cluster_root_logical_postcondition": {"ok": True},
-                    }]),
-                    encoding="utf-8",
-                )
-                return SimpleNamespace(returncode=0)
-
-            with mock.patch.object(
-                source_prepare,
-                "blender_open_file_window_titles",
-                return_value=[],
-            ), mock.patch.object(
-                source_prepare,
-                "LOG_DIR",
-                root / "logs",
-            ), mock.patch.object(
-                source_prepare,
-                "_run_stage",
-                side_effect=stale_report,
-            ) as run:
-                with self.assertRaises(
-                    source_prepare.ClusterSourcePreparationError
-                ) as caught:
-                    source_prepare._build_cluster_source(
-                        spm,
-                        blend,
-                        cfg={"spm_verify_timeout": 1},
-                    )
-
-        self.assertEqual(caught.exception.stage, "spm_bone_setup")
-        self.assertIn("SPM changed", str(caught.exception))
-        self.assertEqual(run.call_count, 1)
 
     def test_blocked_source_build_restores_previous_pipeline_report(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -391,7 +273,6 @@ class ClusterSourcePrepareTests(unittest.TestCase):
                 "fbx_ini": str(fbx_ini),
                 "speedtree_exe": str(root / "SpeedTree.exe"),
                 "blender_exe": str(root / "blender.exe"),
-                "spm_verify_timeout": 1,
                 "speedtree_material_preflight_timeout": 1,
                 "blender_job_timeout": 1,
             }

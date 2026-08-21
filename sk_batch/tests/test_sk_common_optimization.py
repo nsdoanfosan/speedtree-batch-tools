@@ -15,15 +15,11 @@ sys.path.insert(0, str(SK_BATCH_DIR))
 
 import sk_common
 from sk_common import (
-    CALIBRATION_CACHE_VERSION,
     attach_process_kill_job,
-    calibration_cache_matches,
-    calibration_settings_signature,
     cached_file_content_snapshot,
     cached_push_source_fingerprint,
     close_process_kill_job,
     file_content_snapshot,
-    legacy_calibration_settings_signature,
     manifest_item_files_match,
     scan_sk_spms,
     terminate_process_tree,
@@ -94,6 +90,41 @@ def _load_state_pause_after_prune(
 
 
 class SkCommonOptimizationTests(unittest.TestCase):
+    def test_affinity_reservations_spread_two_eight_core_jobs(self):
+        first = mock.Mock()
+        second = mock.Mock()
+        first.poll.return_value = None
+        second.poll.return_value = None
+        with sk_common._AFFINITY_RESERVATION_LOCK:
+            sk_common._AFFINITY_RESERVATIONS.clear()
+            sk_common._AFFINITY_CANDIDATE_CURSOR = 0
+
+        first_mask = sk_common._reserve_process_affinity(first, 8, total=16)
+        second_mask = sk_common._reserve_process_affinity(second, 8, total=16)
+
+        self.assertEqual(first_mask.bit_count(), 8)
+        self.assertEqual(second_mask.bit_count(), 8)
+        self.assertEqual(first_mask & second_mask, 0)
+        self.assertEqual(first_mask | second_mask, (1 << 16) - 1)
+
+    def test_affinity_reservation_reuses_finished_job_slice(self):
+        first = mock.Mock()
+        second = mock.Mock()
+        first.poll.return_value = None
+        second.poll.return_value = None
+        with sk_common._AFFINITY_RESERVATION_LOCK:
+            sk_common._AFFINITY_RESERVATIONS.clear()
+            sk_common._AFFINITY_CANDIDATE_CURSOR = 0
+
+        first_mask = sk_common._reserve_process_affinity(first, 8, total=16)
+        first.poll.return_value = 0
+        second_mask = sk_common._reserve_process_affinity(second, 8, total=16)
+
+        self.assertEqual(second_mask.bit_count(), 8)
+        self.assertIn(second_mask, sk_common._affinity_candidate_masks(16, 8))
+        self.assertEqual(len(sk_common._AFFINITY_RESERVATIONS), 1)
+        self.assertNotEqual(first_mask, 0)
+
     def test_job_attachment_shim_only_accepts_preassigned_shared_job(self):
         proc = mock.Mock()
         proc.speedtree_lifecycle_tree_job = None
@@ -502,108 +533,6 @@ class SkCommonOptimizationTests(unittest.TestCase):
                 receipt = json.loads(reference_path.read_text(encoding="utf-8"))
                 self.assertEqual(len(receipt["items"]), 1)
                 self.assertEqual(receipt["items"][0]["queue_id"], str(pending))
-
-    def test_content_cache_requires_same_file_and_settings_signature(self):
-        cache = {
-            "version": CALIBRATION_CACHE_VERSION,
-            "spm_fingerprint": "file-a",
-            "settings_signature": "settings-a",
-        }
-        self.assertTrue(calibration_cache_matches(cache, "file-a", "settings-a"))
-        self.assertFalse(calibration_cache_matches(cache, "file-b", "settings-a"))
-        self.assertFalse(calibration_cache_matches(cache, "file-a", "settings-b"))
-        self.assertTrue(
-            calibration_cache_matches(
-                cache,
-                "file-a",
-                "settings-b",
-                legacy_settings_signature="settings-a",
-            )
-        )
-
-    def test_snapshot_and_settings_signature_invalidate_on_real_changes(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            spm = root / "SK_test.spm"
-            xml_ini = root / "Options.xml.ini"
-            fbx_ini = root / "Options.fbx.ini"
-            exe = root / "SpeedTree.exe"
-            spm.write_bytes(b"one")
-            xml_ini.write_text("xml-a", encoding="utf-8")
-            fbx_ini.write_text("fbx-a", encoding="utf-8")
-            exe.write_bytes(b"exe")
-            cfg = {
-                "target_bones_per_branch": 3.0,
-                "max_total_bones": 2000,
-                "probe_cache_enabled": True,
-                "xml_ini": str(xml_ini),
-                "fbx_ini": str(fbx_ini),
-                "speedtree_exe": str(exe),
-            }
-
-            first_snapshot = file_content_snapshot(spm)
-            first_signature = calibration_settings_signature(cfg)
-            spm.write_bytes(b"two")
-            cfg["target_bones_per_branch"] = 4.0
-            second_snapshot = file_content_snapshot(spm)
-            second_signature = calibration_settings_signature(cfg)
-
-            self.assertNotEqual(first_snapshot["fingerprint"], second_snapshot["fingerprint"])
-            self.assertNotEqual(first_signature, second_signature)
-
-    def test_settings_signature_ignores_non_semantic_export_dependencies(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            xml_ini = root / "Options.xml.ini"
-            fbx_ini = root / "Options.fbx.ini"
-            exe = root / "SpeedTree.exe"
-            xml_ini.write_text("xml-a", encoding="utf-8")
-            fbx_ini.write_text("fbx-a", encoding="utf-8")
-            exe.write_bytes(b"exe")
-            cfg = {
-                "target_bones_per_branch": 3.0,
-                "max_total_bones": 2000,
-                "probe_cache_enabled": True,
-                "xml_ini": str(xml_ini),
-                "fbx_ini": str(fbx_ini),
-                "speedtree_exe": str(exe),
-            }
-
-            content_signature = calibration_settings_signature(cfg)
-            for path in (xml_ini, fbx_ini):
-                stat = path.stat()
-                os.utime(
-                    path,
-                    ns=(stat.st_atime_ns + 1_000_000, stat.st_mtime_ns + 1_000_000),
-                )
-
-            self.assertEqual(calibration_settings_signature(cfg), content_signature)
-            fbx_ini.write_text("fbx-b", encoding="utf-8")
-            xml_ini.write_text("xml-b", encoding="utf-8")
-            exe.write_bytes(b"new-exporter")
-            cfg["spm_verify_timeout"] = 999
-            cfg["probe_cache_enabled"] = False
-            cfg["rename_materials"] = False
-            cfg["tree_leaf_parent_red_gradient"] = False
-            self.assertEqual(calibration_settings_signature(cfg), content_signature)
-
-            cfg["cluster_root_only_bones"] = False
-            self.assertNotEqual(calibration_settings_signature(cfg), content_signature)
-
-    def test_settings_signature_changes_only_on_explicit_contract_version_bump(self):
-        cfg = {
-            "target_bones_per_branch": 2.0,
-            "max_total_bones": 1500,
-            "cluster_root_only_bones": True,
-        }
-        current = calibration_settings_signature(cfg)
-        with mock.patch.object(
-            sk_common,
-            "SPM_BONE_CONTRACT_VERSION",
-            sk_common.SPM_BONE_CONTRACT_VERSION + 1,
-        ):
-            bumped = calibration_settings_signature(cfg)
-        self.assertNotEqual(current, bumped)
 
     def test_push_source_fingerprint_reuses_unchanged_stat_cache(self):
         with tempfile.TemporaryDirectory() as tmp:

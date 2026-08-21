@@ -15,7 +15,7 @@ import sys
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from sk_batch.spm_audit import read_spm, write_spm  # noqa: E402
+from sk_batch.spm_document import read_spm, write_spm  # noqa: E402
 from process_lifecycle import owned_run  # noqa: E402
 
 

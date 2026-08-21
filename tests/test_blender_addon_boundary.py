@@ -1,4 +1,5 @@
 import ast
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -25,16 +26,19 @@ def external_root(module_name):
 class BlenderAddonBoundaryTests(unittest.TestCase):
     def test_only_gateway_imports_or_enables_external_addons(self):
         violations = []
-        for path in sorted(REPO_ROOT.rglob("*.py")):
+        paths = []
+        excluded_directories = {".git", ".claude", ".codex", "__pycache__", "tests"}
+        for root, directories, files in os.walk(REPO_ROOT):
+            directories[:] = [
+                name for name in directories if name not in excluded_directories
+            ]
+            paths.extend(
+                Path(root) / name for name in files if name.endswith(".py")
+            )
+        for path in sorted(paths):
             if path == ALLOWED_IMPLEMENTATION_FILE:
                 continue
             relative = path.relative_to(REPO_ROOT)
-            if (
-                ".git" in relative.parts
-                or "__pycache__" in relative.parts
-                or "tests" in relative.parts
-            ):
-                continue
             try:
                 tree = ast.parse(path.read_text(encoding="utf-8"))
             except (SyntaxError, UnicodeDecodeError) as exc:

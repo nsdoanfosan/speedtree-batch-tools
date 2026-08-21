@@ -3345,8 +3345,7 @@ def verify_speedtree_export(
             raise SyncError(str(exc)) from exc
         try:
             # Shared Modeler rule: PIPE is used only through process_stream's
-            # drain-thread + owned-tree + bounded-EOF contract.  sk_batch's
-            # spm_audit uses this same path by default; the repair add-on's
+            # drain-thread + owned-tree + bounded-EOF contract.  The add-on's
             # speedtree_cli._run_process uses regular files instead.  Neither
             # safe implementation is equivalent to capture_output=True.
             result = run_streaming_process(

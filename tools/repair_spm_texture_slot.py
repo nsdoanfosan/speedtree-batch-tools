@@ -14,7 +14,7 @@ REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from sk_batch.spm_audit import read_spm, write_spm  # noqa: E402
+from sk_batch.spm_document import read_spm, write_spm  # noqa: E402
 
 
 def parse_args():

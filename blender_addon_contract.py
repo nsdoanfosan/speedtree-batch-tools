@@ -74,9 +74,6 @@ ADDONS = {
         "minimum_native_api_version": None,
         "source_environment": "SPEEDTREE_BWR_ADDON_DIR",
         "capabilities": {
-            "spm_sk_preflight_v1": {
-                "operations": ["require_spm_sk_ready"],
-            },
             "speedtree_export_v1": {
                 "operations": ["run_speedtree_cli_export"],
             },
@@ -95,9 +92,6 @@ ADDONS = {
             },
         },
         "operations": {
-            "require_spm_sk_ready": (
-                "speedtree_bone_weight_repair.core:require_spm_sk_ready"
-            ),
             "run_speedtree_cli_export": (
                 "speedtree_bone_weight_repair.core:run_speedtree_cli_export"
             ),

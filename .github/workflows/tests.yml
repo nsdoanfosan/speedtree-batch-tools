@@ -150,17 +150,11 @@ jobs:
       # runner's CPU allocation. Method-level scheduling avoids one very large
       # file becoming the tail of the whole job.
       #
-      # The calibration module is also separate below. It verifies sub-second
-      # process deadlines and CPU progress; co-scheduling it with four loaded
-      # workers can spend its 0.25-second absolute budget before the fake child
-      # gets CPU. Running those 41 tests serially takes about eight seconds and
-      # keeps that timing test meaningful instead of weakening its deadline.
       - name: parallel test suites
         timeout-minutes: 12
         run: >-
           python -m pytest -q -n 4 --dist load --import-mode=importlib
           --durations=10
-          --ignore=sk_batch/tests/test_spm_calibration.py
           --ignore=sk_batch/tests/test_retry_progress.py
           --ignore=tests/test_launch_guard.py
           --ignore=tests/test_process_lifecycle.py
@@ -199,9 +193,6 @@ jobs:
       # timing contract in one unloaded pytest interpreter.
       - name: Retry progress process tests
         run: python -m pytest -q --import-mode=importlib sk_batch/tests/test_retry_progress.py
-
-      - name: SpeedTree calibration timing tests
-        run: python -m unittest sk_batch.tests.test_spm_calibration
 
       # Generator Sync's Tk cache tests intentionally share one interpreter and
       # are order-sensitive under pytest collection; the established unittest
@@ -243,6 +234,11 @@ jobs:
   # coverage, but isolate it from the unit-test worker pool and process one
   # pair per worker while the ordinary tests run in the job above.
   real-xml-acceptance:
+    # These large PCG projection fixtures protect offline authoring behavior,
+    # not the runtime code merged by an ordinary PR. Keep the acceptance run on
+    # every main commit and on explicit dispatch without making contributors
+    # wait another 2.5 minutes before a PR can merge.
+    if: github.event_name != 'pull_request'
     runs-on: windows-latest
     timeout-minutes: 10
     steps:

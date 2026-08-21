@@ -81,7 +81,6 @@ from cluster_assembly_handoff_contract import (
     role_identity_aliases_from_contract,
 )
 from cluster_assembly_builder import build_blender_assembly_inputs
-from spm_audit import is_cluster_normalization_spm
 from job_report_contract import mark_job_failed
 from assembly_runtime_contract import ASSEMBLY_OUTPUT_CONTRACT_VERSION
 from cluster_export_handoff_contract import (
@@ -100,6 +99,14 @@ from cluster_bark_source_resolution import (
 from blender_addon_gateway import prepare_runtime
 
 
+def is_cluster_normalization_spm(spm_path):
+    path = Path(spm_path)
+    return (
+        path.parent.name.casefold() == "cluster"
+        or path.stem.casefold().startswith("sk_cluster_")
+    )
+
+
 def parse_args():
     argv = sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else []
     parser = argparse.ArgumentParser()
@@ -115,7 +122,6 @@ def parse_args():
     parser.add_argument("--material-contract", required=True)
     parser.add_argument("--bark-normalization-manifest", default="")
     parser.add_argument("--cluster-source-build-only", action="store_true")
-    parser.add_argument("--manual-bones-locked", action="store_true")
     parser.add_argument("--report", required=True)
     return parser.parse_args(argv)
 
@@ -505,7 +511,6 @@ def main():
         "speedtree_spm": str(speedtree_spm),
         "blend": args.blend,
         "wind": args.wind,
-        "manual_bones_locked": bool(args.manual_bones_locked),
         "status": "failed",
     }
     # Cluster rows reach this job under their canonical SK_ output identity.
@@ -730,10 +735,6 @@ def main():
             name_stem=speedtree_spm.stem,
             export_fbx=export_settings["speedtree_export_fbx"],
             export_xml=export_settings["speedtree_export_xml"],
-            # A user-authored manual-bones marker is an explicit preservation
-            # contract. Keep the normal FBX preset (including authored bones)
-            # while bypassing only the automatic Branch-generator gate.
-            allow_manual_bones=bool(args.manual_bones_locked),
         )
         record_stage_duration(
             report,
@@ -819,11 +820,8 @@ def main():
                     name_stem=source_spm_path.stem,
                     export_fbx=export_settings["speedtree_export_fbx"],
                     export_xml=export_settings["speedtree_export_xml"],
-                    # This secondary SPM contributes Assembly geometry only.
-                    # Its authored Branch bones are not the final SK skeleton,
-                    # so export it with the bundled no-bones preset when all
-                    # visible Branch generators are Absolute/0.
-                    allow_boneless=True,
+                    # This secondary SPM contributes Assembly geometry through
+                    # the same exact native FBX/XML serialization contract.
                 )
             report["cluster_assembly_source_export"] = assembly_source_export
             assembly_fbx_export = (
