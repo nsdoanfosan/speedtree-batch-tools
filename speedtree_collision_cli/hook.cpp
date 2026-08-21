@@ -32,6 +32,11 @@ constexpr std::uintptr_t kNativeExportBuildRva = 0xAA530;
 constexpr std::uintptr_t kNativeModelUpdateRva = 0x3D1170;
 constexpr std::uintptr_t kNativeExportFinalizeGeometryRva = 0xA7580;
 constexpr std::uintptr_t kNativeExportFinalizeDocumentRva = 0xB1510;
+#ifdef SPEEDTREE_BONE_FORENSICS
+constexpr std::uintptr_t kVfxExportBoneRva = 0x6BAC60;
+#endif
+constexpr std::uintptr_t kResolveBranchBoneIdRva = 0x4B5C00;
+constexpr std::uintptr_t kInsertExportBoneRva = 0x37D4A0;
 constexpr std::uintptr_t kTreeDocumentPrepareRva = 0x728F00;
 constexpr std::uintptr_t kTreeDocumentModelStageRva = 0x366AC0;
 constexpr std::uintptr_t kGenerateShadeVolumeRva = 0x2FE10;
@@ -117,6 +122,20 @@ constexpr unsigned char kQDialogExecPrologue[12] = {
     0x48, 0x8b, 0x79, 0x08,
 };
 
+#ifdef SPEEDTREE_BONE_FORENSICS
+constexpr unsigned char kVfxExportBonePrologue[12] = {
+    0x48, 0x89, 0x5c, 0x24, 0x18,
+    0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55,
+};
+#endif
+
+constexpr unsigned char kInsertExportBonePrologue[15] = {
+    0x48, 0x8b, 0xc4,
+    0x48, 0x89, 0x58, 0x08,
+    0x48, 0x89, 0x68, 0x10,
+    0x48, 0x89, 0x70, 0x18,
+};
+
 constexpr int kQMessageBoxQuestionIcon = 4;
 constexpr int kQMessageBoxNoButton = 0x00010000;
 
@@ -154,6 +173,19 @@ using NativeExportBuildFn = void(__fastcall*)(void* exportBuilder);
 using NativeModelUpdateFn = bool(__fastcall*)(void* model, int variation);
 using NativeExportFinalizeGeometryFn = void(__fastcall*)(void* exportBuilder, bool separate);
 using NativeExportFinalizeDocumentFn = void(__fastcall*)(void* exportBuilder);
+#ifdef SPEEDTREE_BONE_FORENSICS
+using VfxExportBoneFn = void(__fastcall*)(
+    void* exporter,
+    void* bone,
+    void* parentBone,
+    void* parentStartNode,
+    void* parentEndNode);
+#endif
+using ResolveBranchBoneIdFn = int(__fastcall*)(void* branch, float position, int section);
+using InsertExportBoneFn = void(__fastcall*)(
+    void* exportData,
+    void* sourceBoneRecord,
+    void* sourceBranch);
 using TreeDocumentPrepareFn = void(__fastcall*)(void* treeDocument);
 using TreeDocumentModelStageFn = void(__fastcall*)(void* modelInterface);
 using ScheduleCollisionFn = void(__fastcall*)(void* model, bool force);
@@ -253,6 +285,11 @@ NativeExportBuildFn gOriginalNativeExportBuild = nullptr;
 NativeModelUpdateFn gOriginalNativeModelUpdate = nullptr;
 NativeExportFinalizeGeometryFn gOriginalNativeExportFinalizeGeometry = nullptr;
 NativeExportFinalizeDocumentFn gOriginalNativeExportFinalizeDocument = nullptr;
+#ifdef SPEEDTREE_BONE_FORENSICS
+VfxExportBoneFn gOriginalVfxExportBone = nullptr;
+#endif
+ResolveBranchBoneIdFn gResolveBranchBoneId = nullptr;
+InsertExportBoneFn gOriginalInsertExportBone = nullptr;
 SpeedTreeExportFn gNativeSpeedTreeExport = nullptr;
 MainWindowIdleFn gOriginalMainWindowOnIdle = nullptr;
 MainWindowIdleFn gOriginalMainWindowOnIdleDraw = nullptr;
@@ -300,6 +337,10 @@ HookRecord gNativeExportBuildHook;
 HookRecord gNativeModelUpdateHook;
 HookRecord gNativeExportFinalizeGeometryHook;
 HookRecord gNativeExportFinalizeDocumentHook;
+#ifdef SPEEDTREE_BONE_FORENSICS
+HookRecord gVfxExportBoneHook;
+#endif
+HookRecord gInsertExportBoneHook;
 HookRecord gMainWindowOnIdleHook;
 HookRecord gMainWindowOnIdleDrawHook;
 HookRecord gNotifyInternalHook;
@@ -307,6 +348,15 @@ HookRecord gMainWindowConfirmDiscardHook;
 HookRecord gMainWindowRecoveryCheckHook;
 HookRecord gQDialogExecHook;
 HookRecord gMainWindowOpenFileListHook;
+#ifdef SPEEDTREE_BONE_FORENSICS
+struct BoneProbeObservation {
+    void* bone = nullptr;
+    void* sourceBranch = nullptr;
+    int id = -1;
+};
+std::vector<BoneProbeObservation> gBoneProbeObservations;
+void* gBoneProbeExporter = nullptr;
+#endif
 NativeStateProbe gNativeStateProbes[] = {
     {0x135A59, "native export probe 135A59"},
     {0x135A9D, "native export probe 135A9D"},
@@ -478,6 +528,8 @@ bool IsCollisionThread(const void* object) {
     }
 }
 
+[[noreturn]] void AbortExport(DWORD exitCode, const char* reason);
+
 const char* ReadSpeedTreeRttiName(const void* object) {
     if (object == nullptr || gSpeedTreeBase == 0 || gSpeedTreeImageSize == 0) {
         return nullptr;
@@ -502,6 +554,416 @@ const char* ReadSpeedTreeRttiName(const void* object) {
         return nullptr;
     }
 }
+
+void __fastcall HookedInsertExportBone(
+    void* exportData,
+    void* sourceBoneRecord,
+    void* sourceBranch) {
+    if (sourceBoneRecord != nullptr && sourceBranch != nullptr) {
+        __try {
+            auto* recordBytes = static_cast<unsigned char*>(sourceBoneRecord);
+            const int boneId = *reinterpret_cast<const int*>(recordBytes);
+            int& parentId = *reinterpret_cast<int*>(recordBytes + 0x04);
+            if (boneId != 1 && parentId == 0) {
+                const char* sourceType = ReadSpeedTreeRttiName(sourceBranch);
+                if (sourceType != nullptr &&
+                    std::strcmp(sourceType, ".?AVCBranchNode@@") == 0) {
+                    const auto* sourceBytes =
+                        static_cast<const unsigned char*>(sourceBranch);
+                    void* baseNode = *reinterpret_cast<void* const*>(
+                        sourceBytes + 0x98);
+                    const char* baseType = ReadSpeedTreeRttiName(baseNode);
+                    if (baseType != nullptr &&
+                        std::strcmp(baseType, ".?AVCBaseNode@@") == 0) {
+                        const auto* baseBytes =
+                            static_cast<const unsigned char*>(baseNode);
+                        void* targetBranch = *reinterpret_cast<void* const*>(
+                            baseBytes + 0x2C8);
+                        void* baseRef = *reinterpret_cast<void* const*>(
+                            baseBytes + 0x2D0);
+                        const char* targetType = ReadSpeedTreeRttiName(targetBranch);
+                        const char* baseRefType = ReadSpeedTreeRttiName(baseRef);
+                        if (targetType == nullptr ||
+                            std::strcmp(targetType, ".?AVCBranchNode@@") != 0 ||
+                            baseRefType == nullptr ||
+                            std::strcmp(baseRefType, ".?AVCBaseRefNode@@") != 0 ||
+                            *reinterpret_cast<void* const*>(
+                                static_cast<const unsigned char*>(baseRef) + 0x98) !=
+                                targetBranch) {
+                            AbortExport(
+                                kHookRuntimeFailureExitCode,
+                                "BaseRef bone repair rejected an incomplete parsed reference chain");
+                        }
+
+                        const std::int16_t anchorIndex =
+                            *reinterpret_cast<const std::int16_t*>(sourceBytes + 0x1B8);
+                        float anchorPosition = 0.0f;
+                        if (anchorIndex != -1) {
+                            const auto* anchorBegin =
+                                *reinterpret_cast<const unsigned char* const*>(
+                                    sourceBytes + 0x1D8);
+                            const auto* anchorEnd =
+                                *reinterpret_cast<const unsigned char* const*>(
+                                    sourceBytes + 0x1E0);
+                            const std::size_t requiredBytes =
+                                (static_cast<std::size_t>(anchorIndex) + 1) * 24;
+                            if (anchorIndex < 0 || anchorBegin == nullptr ||
+                                anchorEnd < anchorBegin ||
+                                static_cast<std::size_t>(anchorEnd - anchorBegin) <
+                                    requiredBytes) {
+                                AbortExport(
+                                    kHookRuntimeFailureExitCode,
+                                    "BaseRef bone repair rejected an invalid parsed anchor record");
+                            }
+                            anchorPosition = *reinterpret_cast<const float*>(
+                                anchorBegin + static_cast<std::size_t>(anchorIndex) * 24);
+                        }
+
+                        const float branchOffset =
+                            *reinterpret_cast<const float*>(sourceBytes + 0x144);
+                        const int section =
+                            *reinterpret_cast<const int*>(sourceBytes + 0x140);
+                        const int resolvedParentId = gResolveBranchBoneId(
+                            targetBranch,
+                            anchorPosition + branchOffset,
+                            section);
+                        if (resolvedParentId <= 0 || resolvedParentId == boneId) {
+                            AbortExport(
+                                kHookRuntimeFailureExitCode,
+                                "BaseRef bone repair could not resolve an exact parent bone ID");
+                        }
+                        parentId = resolvedParentId;
+                        char message[384]{};
+                        _snprintf_s(
+                            message,
+                            sizeof(message),
+                            _TRUNCATE,
+                            "BaseRef bone graph restored child=%d parent=%d "
+                            "target_branch=%p anchor_index=%d position=%.9g section=%d",
+                            boneId,
+                            resolvedParentId,
+                            targetBranch,
+                            static_cast<int>(anchorIndex),
+                            static_cast<double>(anchorPosition + branchOffset),
+                            section);
+                        Log(message);
+                    }
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            AbortExport(
+                kHookRuntimeFailureExitCode,
+                "BaseRef bone repair raised an exception while reading parsed data");
+        }
+    }
+    gOriginalInsertExportBone(exportData, sourceBoneRecord, sourceBranch);
+}
+
+#ifdef SPEEDTREE_BONE_FORENSICS
+// Optional disassembly-validation probe retained for future version ports.
+// Production builds leave it disabled and only install the shared graph hook.
+void __fastcall HookedVfxExportBone(
+    void* exporter,
+    void* bone,
+    void* parentBone,
+    void* parentStartNode,
+    void* parentEndNode) {
+    if (bone != nullptr) {
+        __try {
+            if (gBoneProbeExporter != exporter) {
+                gBoneProbeExporter = exporter;
+                gBoneProbeObservations.clear();
+            }
+            const auto* bytes = static_cast<const unsigned char*>(bone);
+            gBoneProbeObservations.push_back({
+                bone,
+                *reinterpret_cast<void* const*>(bytes + 0x08),
+                *reinterpret_cast<const int*>(bytes),
+            });
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("bone observation capture raised an exception");
+        }
+    }
+    if (bone != nullptr && parentBone == nullptr) {
+        __try {
+            const auto* bytes = static_cast<const unsigned char*>(bone);
+            const int id = *reinterpret_cast<const int*>(bytes);
+            void* source = *reinterpret_cast<void* const*>(bytes + 0x08);
+            const char* sourceType = ReadSpeedTreeRttiName(source);
+            const auto* childBegin = *reinterpret_cast<const int* const*>(bytes + 0x30);
+            const auto* childEnd = *reinterpret_cast<const int* const*>(bytes + 0x38);
+            const std::ptrdiff_t childCount =
+                childBegin != nullptr && childEnd >= childBegin ? childEnd - childBegin : -1;
+            char message[512]{};
+            _snprintf_s(
+                message,
+                sizeof(message),
+                _TRUNCATE,
+                "bone probe top-level id=%d record=%p source=%p source_rtti=%s "
+                "start=(%.9g,%.9g,%.9g) end=(%.9g,%.9g,%.9g) children=%lld",
+                id,
+                bone,
+                source,
+                sourceType == nullptr ? "<none>" : sourceType,
+                static_cast<double>(*reinterpret_cast<const float*>(bytes + 0x10)),
+                static_cast<double>(*reinterpret_cast<const float*>(bytes + 0x14)),
+                static_cast<double>(*reinterpret_cast<const float*>(bytes + 0x18)),
+                static_cast<double>(*reinterpret_cast<const float*>(bytes + 0x1C)),
+                static_cast<double>(*reinterpret_cast<const float*>(bytes + 0x20)),
+                static_cast<double>(*reinterpret_cast<const float*>(bytes + 0x24)),
+                static_cast<long long>(childCount));
+            Log(message);
+            if (id != 1 && source != nullptr) {
+                void* baseNode = *reinterpret_cast<void* const*>(
+                    static_cast<const unsigned char*>(source) + 0x98);
+                void* baseRef = baseNode == nullptr
+                    ? nullptr
+                    : *reinterpret_cast<void* const*>(
+                          static_cast<const unsigned char*>(baseNode) + 0x2D0);
+                void* targetBranch = baseRef == nullptr
+                    ? nullptr
+                    : *reinterpret_cast<void* const*>(
+                          static_cast<const unsigned char*>(baseRef) + 0x98);
+                const auto* sourceBytes = static_cast<const unsigned char*>(source);
+                const std::int16_t anchorIndex =
+                    *reinterpret_cast<const std::int16_t*>(sourceBytes + 0x1B8);
+                float anchorPosition = 0.0f;
+                if (anchorIndex != -1) {
+                    const auto* anchorRecords = *reinterpret_cast<const unsigned char* const*>(
+                        sourceBytes + 0x1D8);
+                    if (anchorRecords == nullptr) {
+                        Log("bone probe exact resolver found a non-null anchor index without records");
+                    } else {
+                        anchorPosition = *reinterpret_cast<const float*>(
+                            anchorRecords + static_cast<std::size_t>(anchorIndex) * 24);
+                    }
+                }
+                const float branchOffset =
+                    *reinterpret_cast<const float*>(sourceBytes + 0x144);
+                const int section = *reinterpret_cast<const int*>(sourceBytes + 0x140);
+                const int resolvedParentId =
+                    targetBranch != nullptr && gResolveBranchBoneId != nullptr
+                    ? gResolveBranchBoneId(
+                          targetBranch,
+                          anchorPosition + branchOffset,
+                          section)
+                    : 0;
+                int targetFirst = -1;
+                int targetLast = -1;
+                int targetCount = 0;
+                bool targetContainsResolvedParent = false;
+                for (const auto& observation : gBoneProbeObservations) {
+                    if (observation.sourceBranch != targetBranch) {
+                        continue;
+                    }
+                    if (targetFirst < 0) {
+                        targetFirst = observation.id;
+                    }
+                    targetLast = observation.id;
+                    ++targetCount;
+                    targetContainsResolvedParent =
+                        targetContainsResolvedParent || observation.id == resolvedParentId;
+                }
+                char edgeMessage[768]{};
+                _snprintf_s(
+                    edgeMessage,
+                    sizeof(edgeMessage),
+                    _TRUNCATE,
+                    "bone probe parsed edge child=%d base=%p base_ref=%p "
+                    "target_branch=%p target_count=%d target_first=%d target_last=%d "
+                    "anchor_index=%d anchor_position=%.9g branch_offset=%.9g "
+                    "position=%.9g section=%d resolved_parent=%d target_contains=%d",
+                    id,
+                    baseNode,
+                    baseRef,
+                    targetBranch,
+                    targetCount,
+                    targetFirst,
+                    targetLast,
+                    static_cast<int>(anchorIndex),
+                    static_cast<double>(anchorPosition),
+                    static_cast<double>(branchOffset),
+                    static_cast<double>(anchorPosition + branchOffset),
+                    section,
+                    resolvedParentId,
+                    targetContainsResolvedParent ? 1 : 0);
+                Log(edgeMessage);
+            }
+            if (id == 508 && source != nullptr) {
+                const auto logPointers = [](const char* label, void* object, std::size_t bytes) {
+                    const auto* objectBytes = static_cast<const unsigned char*>(object);
+                    for (std::size_t offset = 0; offset < bytes; offset += sizeof(void*)) {
+                        void* candidate = *reinterpret_cast<void* const*>(objectBytes + offset);
+                        const char* candidateType = ReadSpeedTreeRttiName(candidate);
+                        if (candidateType == nullptr ||
+                            (std::strstr(candidateType, "Node@@") == nullptr &&
+                             std::strstr(candidateType, "Generator@@") == nullptr &&
+                             std::strstr(candidateType, "Link@@") == nullptr)) {
+                            continue;
+                        }
+                        char pointerMessage[256]{};
+                        _snprintf_s(
+                            pointerMessage,
+                            sizeof(pointerMessage),
+                            _TRUNCATE,
+                            "bone probe %s+0x%zX=%p rtti=%s",
+                            label,
+                            offset,
+                            candidate,
+                            candidateType);
+                        Log(pointerMessage);
+                    }
+                };
+                logPointers("source", source, 0x800);
+                void* parentNode = *reinterpret_cast<void* const*>(
+                    static_cast<const unsigned char*>(source) + 0x98);
+                if (parentNode != nullptr) {
+                    logPointers("base_parent", parentNode, 0x400);
+                    void* baseRef = *reinterpret_cast<void* const*>(
+                        static_cast<const unsigned char*>(parentNode) + 0x2D0);
+                    const char* baseRefType = ReadSpeedTreeRttiName(baseRef);
+                    if (baseRefType != nullptr &&
+                        std::strstr(baseRefType, "CBaseRefNode") != nullptr) {
+                        void* targetBranch = *reinterpret_cast<void* const*>(
+                            static_cast<const unsigned char*>(baseRef) + 0x98);
+                        void* evaluatedBranch = *reinterpret_cast<void* const*>(
+                            static_cast<const unsigned char*>(parentNode) + 0x2C8);
+                        char referenceMessage[512]{};
+                        const auto* refBytes = static_cast<const unsigned char*>(baseRef);
+                        _snprintf_s(
+                            referenceMessage,
+                            sizeof(referenceMessage),
+                            _TRUNCATE,
+                            "bone probe exact base=%p base_ref=%p target_branch=%p "
+                            "ref_u32[248..25c]=%u,%u,%u,%u,%u,%u",
+                            parentNode,
+                            baseRef,
+                            targetBranch,
+                            *reinterpret_cast<const unsigned int*>(refBytes + 0x248),
+                            *reinterpret_cast<const unsigned int*>(refBytes + 0x24C),
+                            *reinterpret_cast<const unsigned int*>(refBytes + 0x250),
+                            *reinterpret_cast<const unsigned int*>(refBytes + 0x254),
+                            *reinterpret_cast<const unsigned int*>(refBytes + 0x258),
+                            *reinterpret_cast<const unsigned int*>(refBytes + 0x25C));
+                        Log(referenceMessage);
+                        const auto logNodeState = [](const char* label, void* object) {
+                            if (object == nullptr) {
+                                return;
+                            }
+                            const auto* nodeBytes = static_cast<const unsigned char*>(object);
+                            const auto* listBegin = *reinterpret_cast<void* const* const*>(
+                                nodeBytes + 0x1D8);
+                            const auto* listEnd = *reinterpret_cast<void* const* const*>(
+                                nodeBytes + 0x1E0);
+                            char nodeMessage[512]{};
+                            _snprintf_s(
+                                nodeMessage,
+                                sizeof(nodeMessage),
+                                _TRUNCATE,
+                                "bone probe node %s=%p rtti=%s parent=%p generator=%p "
+                                "pos=(%.9g,%.9g,%.9g) anchor=%d aux=%d list=%p..%p",
+                                label,
+                                object,
+                                ReadSpeedTreeRttiName(object),
+                                *reinterpret_cast<void* const*>(nodeBytes + 0x98),
+                                *reinterpret_cast<void* const*>(nodeBytes + 0x128),
+                                static_cast<double>(*reinterpret_cast<const float*>(nodeBytes + 0x110)),
+                                static_cast<double>(*reinterpret_cast<const float*>(nodeBytes + 0x114)),
+                                static_cast<double>(*reinterpret_cast<const float*>(nodeBytes + 0x118)),
+                                *reinterpret_cast<const int*>(nodeBytes + 0x1F8),
+                                *reinterpret_cast<const int*>(nodeBytes + 0x1F4),
+                                listBegin,
+                                listEnd);
+                            Log(nodeMessage);
+                        };
+                        logNodeState("child_branch", source);
+                        logNodeState("base", parentNode);
+                        logNodeState("evaluated_branch", evaluatedBranch);
+                        logNodeState("base_ref", baseRef);
+                        logNodeState("target_branch", targetBranch);
+
+                        struct NamedPointer {
+                            const char* name;
+                            void* value;
+                        };
+                        const NamedPointer knownPointers[] = {
+                            {"child_branch", source},
+                            {"base", parentNode},
+                            {"evaluated_branch", evaluatedBranch},
+                            {"base_ref", baseRef},
+                            {"target_branch", targetBranch},
+                        };
+                        const auto logExactPointerMatches = [&knownPointers](
+                            const char* ownerName,
+                            void* owner,
+                            std::size_t byteCount) {
+                            if (owner == nullptr) {
+                                return;
+                            }
+                            const auto* ownerBytes = static_cast<const unsigned char*>(owner);
+                            for (std::size_t offset = 0; offset + sizeof(void*) <= byteCount;
+                                 offset += sizeof(void*)) {
+                                void* value = *reinterpret_cast<void* const*>(ownerBytes + offset);
+                                if (value == nullptr) {
+                                    continue;
+                                }
+                                for (const auto& known : knownPointers) {
+                                    if (value != known.value) {
+                                        continue;
+                                    }
+                                    char matchMessage[256]{};
+                                    _snprintf_s(
+                                        matchMessage,
+                                        sizeof(matchMessage),
+                                        _TRUNCATE,
+                                        "bone probe pointer match %s+0x%zX -> %s=%p",
+                                        ownerName,
+                                        offset,
+                                        known.name,
+                                        known.value);
+                                    Log(matchMessage);
+                                }
+                            }
+                        };
+                        logExactPointerMatches("child_branch", source, 0x1000);
+                        logExactPointerMatches("base", parentNode, 0x400);
+                        logExactPointerMatches("evaluated_branch", evaluatedBranch, 0x1000);
+                        logExactPointerMatches("base_ref", baseRef, 0x300);
+                        logExactPointerMatches("target_branch", targetBranch, 0x1000);
+                        for (const auto& observation : gBoneProbeObservations) {
+                            if (observation.sourceBranch != targetBranch) {
+                                continue;
+                            }
+                            char targetMessage[192]{};
+                            _snprintf_s(
+                                targetMessage,
+                                sizeof(targetMessage),
+                                _TRUNCATE,
+                                "bone probe exact target record id=%d bone=%p",
+                                observation.id,
+                                observation.bone);
+                            Log(targetMessage);
+                        }
+                    }
+                }
+                void* ownerGenerator = *reinterpret_cast<void* const*>(
+                    static_cast<const unsigned char*>(source) + 0x128);
+                if (ownerGenerator != nullptr) {
+                    logPointers("source_generator", ownerGenerator, 0x1000);
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("bone probe raised an exception");
+        }
+    }
+    gOriginalVfxExportBone(
+        exporter,
+        bone,
+        parentBone,
+        parentStartNode,
+        parentEndNode);
+}
+#endif
 
 void LogCollisionInputTypes(const char* phase, void* model) {
     if (model == nullptr) {
@@ -682,6 +1144,16 @@ void WriteAbsoluteJump(unsigned char* destination, const void* target) {
     destination[11] = 0xe0;
 }
 
+void WriteRipIndirectJump(unsigned char* destination, const void* target) {
+    // jmp qword ptr [rip]; <64-bit address>. This preserves every register,
+    // including RAX when a relocated prologue keeps the entry RSP there.
+    destination[0] = 0xff;
+    destination[1] = 0x25;
+    *reinterpret_cast<std::uint32_t*>(destination + 2) = 0;
+    *reinterpret_cast<std::uintptr_t*>(destination + 6) =
+        reinterpret_cast<std::uintptr_t>(target);
+}
+
 template <std::size_t PrologueBytes>
 bool InstallHook(
     HookRecord& record,
@@ -734,6 +1206,58 @@ bool InstallHook(
     return true;
 }
 
+template <std::size_t PrologueBytes>
+bool InstallRegisterPreservingHook(
+    HookRecord& record,
+    void* target,
+    const void* replacement,
+    const unsigned char (&expectedPrologue)[PrologueBytes],
+    void** originalFunction) {
+    static_assert(PrologueBytes >= 14 && PrologueBytes <= 32);
+    if (std::memcmp(target, expectedPrologue, PrologueBytes) != 0) {
+        Log("hook rejected: target prologue does not match the supported build");
+        return false;
+    }
+
+    record.target = target;
+    record.originalBytes = PrologueBytes;
+    std::memcpy(record.original, target, record.originalBytes);
+    record.trampoline = VirtualAlloc(
+        nullptr,
+        record.originalBytes + 14,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_EXECUTE_READWRITE);
+    if (record.trampoline == nullptr) {
+        Log("hook rejected: trampoline allocation failed");
+        return false;
+    }
+
+    auto* trampolineBytes = static_cast<unsigned char*>(record.trampoline);
+    std::memcpy(trampolineBytes, record.original, record.originalBytes);
+    WriteRipIndirectJump(
+        trampolineBytes + record.originalBytes,
+        static_cast<unsigned char*>(target) + record.originalBytes);
+
+    unsigned char patch[PrologueBytes]{};
+    std::memset(patch, 0x90, sizeof(patch));
+    WriteRipIndirectJump(patch, replacement);
+    DWORD oldProtection = 0;
+    if (!VirtualProtect(target, sizeof(patch), PAGE_EXECUTE_READWRITE, &oldProtection)) {
+        VirtualFree(record.trampoline, 0, MEM_RELEASE);
+        record.trampoline = nullptr;
+        Log("hook rejected: VirtualProtect failed");
+        return false;
+    }
+    std::memcpy(target, patch, sizeof(patch));
+    FlushInstructionCache(GetCurrentProcess(), target, sizeof(patch));
+    DWORD ignoredProtection = 0;
+    VirtualProtect(target, sizeof(patch), oldProtection, &ignoredProtection);
+
+    record.installed = true;
+    *originalFunction = record.trampoline;
+    return true;
+}
+
 void RemoveHook(HookRecord& record) {
     if (!record.installed || record.target == nullptr) {
         return;
@@ -751,6 +1275,14 @@ void RemoveHook(HookRecord& record) {
         VirtualFree(record.trampoline, 0, MEM_RELEASE);
         record.trampoline = nullptr;
     }
+}
+
+void RemoveCommonHooks() {
+    RemoveHook(gInsertExportBoneHook);
+#ifdef SPEEDTREE_BONE_FORENSICS
+    RemoveHook(gVfxExportBoneHook);
+#endif
+    RemoveHook(gQThreadStartHook);
 }
 
 void RemovePersistentSessionHooks() {
@@ -848,7 +1380,6 @@ bool __fastcall HookedMainWindowConfirmDiscard(void* mainWindow) {
 
 void LogCollisionResultState(const char* phase, void* model);
 std::ptrdiff_t GeneratedCollisionInputCount(void* model);
-[[noreturn]] void AbortExport(DWORD exitCode, const char* reason);
 
 void LogCollisionScheduleState(const char* phase, void* model) {
     if (model == nullptr) {
@@ -3946,6 +4477,8 @@ bool InstallHooks() {
         gSpeedTreeBase + kMainWindowOnIdleDrawRva);
     gNativeSpeedTreeExport = reinterpret_cast<SpeedTreeExportFn>(
         gSpeedTreeBase + kSpeedTreeExportRva);
+    gResolveBranchBoneId = reinterpret_cast<ResolveBranchBoneIdFn>(
+        gSpeedTreeBase + kResolveBranchBoneIdRva);
     if (qThreadStart == nullptr || qNotifyInternal == nullptr ||
         gQThreadWait == nullptr || gQThreadIsRunning == nullptr ||
         gProcessEvents == nullptr || gSendPostedEvents == nullptr || gQObjectChildren == nullptr ||
@@ -3970,11 +4503,31 @@ bool InstallHooks() {
             reinterpret_cast<void**>(&gOriginalQThreadStart))) {
         return false;
     }
+#ifdef SPEEDTREE_BONE_FORENSICS
+    if (!InstallHook(
+            gVfxExportBoneHook,
+            reinterpret_cast<void*>(gSpeedTreeBase + kVfxExportBoneRva),
+            HookedVfxExportBone,
+            kVfxExportBonePrologue,
+            reinterpret_cast<void**>(&gOriginalVfxExportBone))) {
+        RemoveCommonHooks();
+        return false;
+    }
+#endif
+    if (!InstallRegisterPreservingHook(
+            gInsertExportBoneHook,
+            reinterpret_cast<void*>(gSpeedTreeBase + kInsertExportBoneRva),
+            HookedInsertExportBone,
+            kInsertExportBonePrologue,
+            reinterpret_cast<void**>(&gOriginalInsertExportBone))) {
+        RemoveCommonHooks();
+        return false;
+    }
     if (gGuiBakeMode) {
         if (!gSessionServerMode &&
             (gGuiExportPath[0] == L'\0' || gGuiExportOptionsPath[0] == L'\0')) {
             Log("initialization failed: GUI bake output or export-options path is empty");
-            RemoveHook(gQThreadStartHook);
+            RemoveCommonHooks();
             return false;
         }
         if (gSessionServerMode && !InstallHook(
@@ -3983,7 +4536,7 @@ bool InstallHooks() {
                 HookedMainWindowConfirmDiscard,
                 kMainWindowConfirmDiscardPrologue,
                 reinterpret_cast<void**>(&gOriginalMainWindowConfirmDiscard))) {
-            RemoveHook(gQThreadStartHook);
+            RemoveCommonHooks();
             return false;
         }
         if (!InstallHook(
@@ -3993,7 +4546,7 @@ bool InstallHooks() {
                 kMainWindowRecoveryCheckPrologue,
                 reinterpret_cast<void**>(&gOriginalMainWindowRecoveryCheck))) {
             RemoveHook(gMainWindowConfirmDiscardHook);
-            RemoveHook(gQThreadStartHook);
+            RemoveCommonHooks();
             return false;
         }
         if (!InstallHook(
@@ -4004,7 +4557,7 @@ bool InstallHooks() {
                 reinterpret_cast<void**>(&gOriginalQDialogExec))) {
             RemoveHook(gMainWindowRecoveryCheckHook);
             RemoveHook(gMainWindowConfirmDiscardHook);
-            RemoveHook(gQThreadStartHook);
+            RemoveCommonHooks();
             return false;
         }
         if (gSessionServerMode && !InstallHook(
@@ -4015,7 +4568,7 @@ bool InstallHooks() {
                 reinterpret_cast<void**>(&gOriginalMainWindowOpenFileList))) {
             RemoveHook(gMainWindowConfirmDiscardHook);
             RemovePersistentSessionHooks();
-            RemoveHook(gQThreadStartHook);
+            RemoveCommonHooks();
             return false;
         }
         if (gSessionServerMode && !InstallHook(
@@ -4026,7 +4579,7 @@ bool InstallHooks() {
                 reinterpret_cast<void**>(&gOriginalNotifyInternal))) {
             RemoveHook(gMainWindowConfirmDiscardHook);
             RemovePersistentSessionHooks();
-            RemoveHook(gQThreadStartHook);
+            RemoveCommonHooks();
             return false;
         }
         if (!InstallHook(
@@ -4038,7 +4591,7 @@ bool InstallHooks() {
             RemoveHook(gNotifyInternalHook);
             RemoveHook(gMainWindowConfirmDiscardHook);
             RemovePersistentSessionHooks();
-            RemoveHook(gQThreadStartHook);
+            RemoveCommonHooks();
             return false;
         }
         if (!InstallHook(
@@ -4051,7 +4604,7 @@ bool InstallHooks() {
             RemoveHook(gNotifyInternalHook);
             RemoveHook(gMainWindowConfirmDiscardHook);
             RemovePersistentSessionHooks();
-            RemoveHook(gQThreadStartHook);
+            RemoveCommonHooks();
             return false;
         }
         if (!InstallHook(
@@ -4065,7 +4618,7 @@ bool InstallHooks() {
             RemoveHook(gNotifyInternalHook);
             RemoveHook(gMainWindowConfirmDiscardHook);
             RemovePersistentSessionHooks();
-            RemoveHook(gQThreadStartHook);
+            RemoveCommonHooks();
             return false;
         }
         Log("GUI bake hooks installed for SpeedTree Modeler 10.1.0 / Qt 6.6.0");
@@ -4084,7 +4637,7 @@ bool InstallHooks() {
                 RemoveHook(gNotifyInternalHook);
                 RemoveHook(gMainWindowConfirmDiscardHook);
                 RemovePersistentSessionHooks();
-                RemoveHook(gQThreadStartHook);
+                RemoveCommonHooks();
                 return false;
             }
             CloseHandle(driverThread);
@@ -4109,7 +4662,7 @@ bool InstallHooks() {
                 HookedNativeModelUpdate,
                 kNativeModelUpdatePrologue,
                 reinterpret_cast<void**>(&gOriginalNativeModelUpdate))) {
-            RemoveHook(gQThreadStartHook);
+            RemoveCommonHooks();
             return false;
         }
         if (!InstallHook(
@@ -4119,7 +4672,7 @@ bool InstallHooks() {
                 kSpeedTreeExportPrologue,
                 reinterpret_cast<void**>(&gOriginalSpeedTreeExport))) {
             RemoveHook(gNativeModelUpdateHook);
-            RemoveHook(gQThreadStartHook);
+            RemoveCommonHooks();
             return false;
         }
         Log("native CLI collision hooks installed for SpeedTree Modeler 10.1.0");
@@ -4143,7 +4696,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
         RemoveHook(gMainWindowOnIdleHook);
         RemoveHook(gSpeedTreeExportHook);
         RemoveHook(gNativeModelUpdateHook);
-        RemoveHook(gQThreadStartHook);
+        RemoveCommonHooks();
     }
     return TRUE;
 }
