@@ -89,14 +89,16 @@ def reconcile_transient_cluster_export_root(
     source_identity_path,
     before_snapshot,
 ):
-    """Move one proven current-run Assembly Export hierarchy out of Send2UE.
+    """Normalize or relocate one proven current-run Assembly Export hierarchy.
 
     A standalone Cluster blend may already contain normalized ordinal pivots.
     Assembly additionally builds a Full-SK reference hierarchy for the current FBX;
-    that hierarchy belongs in ``SpeedTree_Source``, not alongside the persisted
-    pivots in ``Export``.  Reconciliation is fail-closed unless the unsuffixed
-    root and every connected Export member are new and carry both the exact
-    current FBX ownership tag and stable source-SPM identity.
+    when persisted pivots exist, that extra hierarchy belongs in
+    ``SpeedTree_Source``.  When no persisted pivot exists, the new hierarchy is
+    the first real export unit and is normalized in place instead of being
+    removed from ``Export``.  Reconciliation is fail-closed unless the
+    unsuffixed root and every connected Export member are new and carry both
+    the exact current FBX ownership tag and stable source-SPM identity.
     """
 
     export_collection = blender_data.collections.get("Export")
@@ -106,6 +108,7 @@ def reconcile_transient_cluster_export_root(
         "source_fbx": str(source_fbx_path or ""),
         "source_identity": str(source_identity_path or ""),
         "moved_export_objects": [],
+        "normalized_export_pivot": None,
         "issues": [],
     }
     if export_collection is None:
@@ -195,16 +198,46 @@ def reconcile_transient_cluster_export_root(
             source_identity_path=source_identity_path,
         )
     ]
-    if ambiguous or source_collection is None:
+    if ambiguous:
         base_report.update(
             {
                 "status": "blocked",
-                "reason": (
-                    "missing_source_collection"
-                    if source_collection is None
-                    else "ambiguous_unsuffixed_export_hierarchy"
-                ),
+                "reason": "ambiguous_unsuffixed_export_hierarchy",
                 "ambiguous_objects": sorted(obj.name for obj in ambiguous),
+                "issues": [
+                    f"cluster_unsuffixed_export_unit:{root.name}"
+                ],
+            }
+        )
+        return base_report
+
+    persisted_pivots = [
+        obj
+        for obj in objects
+        if obj is not root
+        and obj.type == "EMPTY"
+        and obj.children
+        and bool(obj.get("speedtree_cluster_generated"))
+        and obj.get("speedtree_cluster_asset_role") == "send2ue_pivot"
+    ]
+    if not persisted_pivots:
+        root.name = f"{cluster_source_stem}_01"
+        root["speedtree_cluster_generated"] = True
+        root["speedtree_cluster_asset_role"] = "send2ue_pivot"
+        base_report.update(
+            {
+                "status": "normalized",
+                "reason": "first_exact_assembly_hierarchy_promoted_to_export_pivot",
+                "normalized_export_pivot": root.name,
+            }
+        )
+        return base_report
+
+    if source_collection is None:
+        base_report.update(
+            {
+                "status": "blocked",
+                "reason": "missing_source_collection",
                 "issues": [
                     f"cluster_unsuffixed_export_unit:{root.name}"
                 ],

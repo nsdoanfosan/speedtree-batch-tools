@@ -11698,7 +11698,7 @@ class App:
             return canonical_refresh
 
     def _refresh_canonical_atlas_manifests(self, spm):
-        """Synchronize canonical PCG output into Atlas before Blender starts."""
+        """Synchronize canonical PCG output for an explicit PCG repair action."""
         spm = Path(spm)
         if not should_refresh_canonical_atlas_manifests(spm):
             return {
@@ -14931,8 +14931,8 @@ class App:
         ):
             # The shared Assembly decision already validates the exact SPM,
             # blend, Assembly report, material/wind output and exact dependency
-            # artifacts.  Consult it before Atlas refresh, consumer audits or
-            # material preflight for ordinary non-Cluster rows. Relation rows
+            # artifacts.  Consult it before relation audits or material
+            # preflight for ordinary non-Cluster rows. Relation rows
             # reach this worker only when their fast receipt was unavailable
             # or changed, so they must refresh the relation once here.
             # Explicit force rebuild deliberately bypasses this fast path.
@@ -14943,7 +14943,10 @@ class App:
                 repair_state,
             ):
                 return
-        self._refresh_canonical_atlas_manifests(spm)
+        # Canonical PCG publication is owned by the PCG pipeline (or its
+        # explicit repair action).  A Blender assembly job consumes the live
+        # SPM/FBX/material inputs and must not be blocked by unrelated Atlas
+        # publication metadata before those inputs are even inspected.
         producer_spm = speedtree_output_spm_for(spm)
         speedtree_spm = producer_spm
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
