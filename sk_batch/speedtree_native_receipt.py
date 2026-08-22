@@ -67,6 +67,7 @@ def load_native_export_receipt(path, *, source_spm=None):
         "legacy_unreported",
         "native_exact_bone_record",
         "omitted_no_exact_bone_record",
+        "not_applicable_boneless_export",
     }:
         raise NativeReceiptError(
             "native SpeedTree ID-0 cluster-write contract is unsupported"
@@ -88,7 +89,10 @@ def load_native_export_receipt(path, *, source_spm=None):
             raise NativeReceiptError("native SpeedTree receipt source identity is stale")
 
     geometries = list(payload.get("geometries") or [])
-    if int(payload.get("geometry_count") or -1) != len(geometries):
+    geometry_count = payload.get("geometry_count")
+    if int(geometry_count if geometry_count is not None else -1) != len(
+        geometries
+    ):
         raise NativeReceiptError("native SpeedTree geometry count is inconsistent")
     checked_geometries = []
     for expected_ordinal, row in enumerate(geometries):

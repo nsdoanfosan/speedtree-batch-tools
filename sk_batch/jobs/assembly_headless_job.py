@@ -244,7 +244,12 @@ def reusable_preflight_spm_contracts(material_preflight, current_fbx_export):
     return copy.deepcopy(leaf), copy.deepcopy(material)
 
 
-def reusable_preflight_export_bundle(material_preflight, speedtree_spm):
+def reusable_preflight_export_bundle(
+    material_preflight,
+    speedtree_spm,
+    collision_cli,
+    collision_hook,
+):
     """Return the exact preflight FBX/XML without reacquiring SpeedTree.
 
     ``validate_preflight_report`` has already proven that the report belongs to
@@ -295,6 +300,68 @@ def reusable_preflight_export_bundle(material_preflight, speedtree_spm):
                 digest.update(chunk)
         return digest.hexdigest()
 
+    def current_binary_identity(path, *, include_hash):
+        path = Path(path).resolve()
+        stat = path.stat()
+        identity = {
+            "path": str(path),
+            "size": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+        }
+        if include_hash:
+            identity["sha256"] = sha256_file(path)
+        return identity
+
+    def same_binary_identity(recorded, current):
+        if not isinstance(recorded, dict):
+            return False
+        try:
+            return bool(
+                str(Path(str(recorded.get("path") or "")).resolve()).casefold()
+                == str(current["path"]).casefold()
+                and int(recorded.get("size") or -1) == current["size"]
+                and int(recorded.get("mtime_ns") or -1)
+                == current["mtime_ns"]
+                and (
+                    not current.get("sha256")
+                    or str(recorded.get("sha256") or "").casefold()
+                    == current["sha256"].casefold()
+                )
+            )
+        except (OSError, TypeError, ValueError):
+            return False
+
+    current_cli = current_binary_identity(
+        collision_cli,
+        include_hash=False,
+    )
+    current_hook = current_binary_identity(
+        collision_hook,
+        include_hash=True,
+    )
+
+    def export_cache_has_current_producer(export):
+        cache_path_value = str(export.get("cache_path") or "")
+        if not cache_path_value:
+            return False
+        try:
+            cache = json.loads(
+                Path(cache_path_value).read_text(encoding="utf-8")
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+        inputs = cache.get("inputs") or {}
+        return bool(
+            int(cache.get("version") or 0) >= 2
+            and str(cache.get("input_fingerprint") or "")
+            == str(export.get("input_fingerprint") or "")
+            and same_binary_identity(inputs.get("speedtree_exe"), current_cli)
+            and same_binary_identity(
+                inputs.get("speedtree_hook"),
+                current_hook,
+            )
+        )
+
     exports = {}
     for format_name, expected_path in expected_paths.items():
         export = recorded.get(format_name)
@@ -308,6 +375,7 @@ def reusable_preflight_export_bundle(material_preflight, speedtree_spm):
             or not input_fingerprint
             or not isinstance(artifacts, list)
             or not artifacts
+            or not export_cache_has_current_producer(export)
         ):
             return None
         try:
@@ -835,6 +903,8 @@ def main():
         speedtree_export = reusable_preflight_export_bundle(
             material_preflight,
             speedtree_spm,
+            collision_cli,
+            collision_hook,
         )
         if speedtree_export is None:
             speedtree_export = run_speedtree_cli_export(

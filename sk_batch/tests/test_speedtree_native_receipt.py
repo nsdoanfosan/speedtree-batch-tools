@@ -80,6 +80,30 @@ class NativeSpeedTreeReceiptTests(unittest.TestCase):
             "CapturedNode",
         )
 
+    def test_loads_explicit_boneless_export_with_zero_geometries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spm, receipt_path = self._write(Path(temporary))
+            payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+            payload["id_zero_cluster_write"] = (
+                "not_applicable_boneless_export"
+            )
+            payload["geometry_count"] = 0
+            payload["geometries"] = []
+            payload["bones"] = []
+            payload["generated_instances"] = []
+            receipt_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            receipt = load_native_export_receipt(
+                receipt_path,
+                source_spm=spm,
+            )
+
+        self.assertEqual(receipt["geometry_count"], 0)
+        self.assertEqual(
+            receipt["id_zero_cluster_write"],
+            "not_applicable_boneless_export",
+        )
+
     def test_clipped_subset_requires_one_exact_intersecting_owner(self):
         with tempfile.TemporaryDirectory() as temporary:
             spm, receipt_path = self._write(Path(temporary))
