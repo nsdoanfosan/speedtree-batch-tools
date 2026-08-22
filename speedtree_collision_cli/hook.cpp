@@ -322,7 +322,6 @@ NativeExportFinalizeDocumentFn gOriginalNativeExportFinalizeDocument = nullptr;
 ResolveBranchBoneIdFn gResolveBranchBoneId = nullptr;
 InsertExportBoneFn gOriginalInsertExportBone = nullptr;
 ExportVertexWeightsFn gOriginalExportVertexWeights = nullptr;
-ExportVertexWeightsFn gOriginalExportVertexWeightsCall = nullptr;
 FindExportBoneMappingFn gFindExportBoneMapping = nullptr;
 FbxClusterAddControlPointFn gUnusedOriginalFbxClusterAddControlPoint = nullptr;
 FbxClusterAppendIndexFn gFbxClusterAppendIndex = nullptr;
@@ -331,7 +330,6 @@ FbxNodeCreateFn gOriginalFbxNodeCreate = nullptr;
 void* gCurrentExportSourceVertexRecord = nullptr;
 void* gCurrentExportGeometry = nullptr;
 void* gExportVertexWeightsEntryStub = nullptr;
-void* gExportVertexWeightsOriginalCallStub = nullptr;
 SpeedTreeExportFn gNativeSpeedTreeExport = nullptr;
 MainWindowIdleFn gOriginalMainWindowOnIdle = nullptr;
 MainWindowIdleFn gOriginalMainWindowOnIdleDraw = nullptr;
@@ -915,7 +913,7 @@ void CaptureNativeReceiptProxy(
             probe.suppressWrite = true;
             FbxWeightExportContext* previousContext = gFbxWeightExportContext;
             gFbxWeightExportContext = &probe;
-            gOriginalExportVertexWeightsCall(
+            gOriginalExportVertexWeights(
                 exporter,
                 authoredSolver,
                 sourceBoneId,
@@ -1008,7 +1006,7 @@ void __fastcall HookedExportVertexWeights(
     FbxWeightExportContext primary{};
     FbxWeightExportContext* previousContext = gFbxWeightExportContext;
     gFbxWeightExportContext = &primary;
-    gOriginalExportVertexWeightsCall(
+    gOriginalExportVertexWeights(
         exporter,
         position,
         sourceBoneId,
@@ -1083,7 +1081,7 @@ void __fastcall HookedExportVertexWeights(
         root.overrideWeight = true;
         root.replacementWeight = static_cast<double>(rootWeight);
         gFbxWeightExportContext = &root;
-        gOriginalExportVertexWeightsCall(
+        gOriginalExportVertexWeights(
             exporter,
             position,
             0,
@@ -1156,75 +1154,7 @@ bool BuildExportVertexWeightsEntryStub() {
     return true;
 }
 
-bool BuildExportVertexWeightsOriginalCallStub() {
-    if (gExportVertexWeightsOriginalCallStub != nullptr) {
-        return true;
-    }
-    if (gOriginalExportVertexWeights == nullptr) {
-        Log("FBX original vertex-weight call stub has no trampoline target");
-        return false;
-    }
-    auto* stub = static_cast<unsigned char*>(VirtualAlloc(
-        nullptr,
-        64,
-        MEM_RESERVE | MEM_COMMIT,
-        PAGE_EXECUTE_READWRITE));
-    if (stub == nullptr) {
-        Log("FBX original vertex-weight call stub allocation failed");
-        return false;
-    }
-
-    // The stock routine has an undocumented dependency on the FBX caller's
-    // nonvolatile RBX vertex-record pointer. Compiled C++ may repurpose RBX
-    // inside HookedExportVertexWeights, so restore that exact captured value
-    // around every trampoline call. Also forward the fifth stack argument.
-    stub[0] = 0x53;              // push rbx
-    stub[1] = 0x48;
-    stub[2] = 0x83;
-    stub[3] = 0xEC;
-    stub[4] = 0x20;              // sub rsp, 0x20
-    stub[5] = 0x48;
-    stub[6] = 0x8B;
-    stub[7] = 0x44;
-    stub[8] = 0x24;
-    stub[9] = 0x50;              // mov rax, [rsp+0x50]
-    stub[10] = 0x48;
-    stub[11] = 0x89;
-    stub[12] = 0x44;
-    stub[13] = 0x24;
-    stub[14] = 0x20;             // mov [rsp+0x20], rax
-    stub[15] = 0x48;
-    stub[16] = 0xB8;
-    *reinterpret_cast<std::uintptr_t*>(stub + 17) =
-        reinterpret_cast<std::uintptr_t>(&gCurrentExportSourceVertexRecord);
-    stub[25] = 0x48;
-    stub[26] = 0x8B;
-    stub[27] = 0x18;             // mov rbx, [rax]
-    stub[28] = 0x48;
-    stub[29] = 0xB8;
-    *reinterpret_cast<std::uintptr_t*>(stub + 30) =
-        reinterpret_cast<std::uintptr_t>(gOriginalExportVertexWeights);
-    stub[38] = 0xFF;
-    stub[39] = 0xD0;             // call rax
-    stub[40] = 0x48;
-    stub[41] = 0x83;
-    stub[42] = 0xC4;
-    stub[43] = 0x20;             // add rsp, 0x20
-    stub[44] = 0x5B;             // pop rbx
-    stub[45] = 0xC3;             // ret
-    FlushInstructionCache(GetCurrentProcess(), stub, 46);
-    gExportVertexWeightsOriginalCallStub = stub;
-    gOriginalExportVertexWeightsCall =
-        reinterpret_cast<ExportVertexWeightsFn>(stub);
-    return true;
-}
-
 void FreeExportVertexWeightsEntryStub() {
-    if (gExportVertexWeightsOriginalCallStub != nullptr) {
-        VirtualFree(gExportVertexWeightsOriginalCallStub, 0, MEM_RELEASE);
-        gExportVertexWeightsOriginalCallStub = nullptr;
-    }
-    gOriginalExportVertexWeightsCall = nullptr;
     if (gExportVertexWeightsEntryStub != nullptr) {
         VirtualFree(gExportVertexWeightsEntryStub, 0, MEM_RELEASE);
         gExportVertexWeightsEntryStub = nullptr;
@@ -5229,8 +5159,7 @@ bool InstallHooks() {
             reinterpret_cast<void*>(gSpeedTreeBase + kExportVertexWeightsRva),
             gExportVertexWeightsEntryStub,
             kExportVertexWeightsPrologue,
-            reinterpret_cast<void**>(&gOriginalExportVertexWeights)) ||
-        !BuildExportVertexWeightsOriginalCallStub()) {
+            reinterpret_cast<void**>(&gOriginalExportVertexWeights))) {
         FreeExportVertexWeightsEntryStub();
         RemoveCommonHooks();
         return false;
