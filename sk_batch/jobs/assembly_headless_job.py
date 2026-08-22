@@ -59,10 +59,6 @@ def resolve_speedtree_collision_cli():
 
 from vertex_color_contract import pack_speedtree_vertex_payload
 from assembly_export_evidence import export_object_postcondition
-from spm_leaf_handoff_contract import (
-    inspect_speedtree_material_export,
-    inspect_spm_leaf_contract,
-)
 from speedtree_pipeline_contract import (
     refresh_preflight_report_after_exact_export,
     reuse_preflight_report_after_unchanged_export,
@@ -979,19 +975,45 @@ def main():
             raise RuntimeError(
                 "SpeedTree Assembly did not return a pipeline report"
             )
-        native_skin_steps = [
-            step
-            for step in result.get("steps", [])
-            if isinstance(step, dict) and step.get("name") == "merge_export"
-        ]
-        if (
-            len(native_skin_steps) != 1
-            or native_skin_steps[0].get("native_skin_passthrough") is not True
-        ):
-            raise RuntimeError(
-                "SpeedTree Assembly did not prove native skin passthrough"
+        empty_after_dummy_cleanup = bool(
+            result.get("status") == "empty_after_dummy_cleanup"
+            and (result.get("empty_asset_disposition") or {}).get("reason")
+            == "all_renderable_geometry_removed_as_authorized_dummy"
+            and (result.get("unassigned_geometry_cleanup") or {}).get(
+                "cleanup_authorized"
             )
-        result["native_skin_passthrough"] = True
+            is True
+            and int(
+                (result.get("unassigned_geometry_cleanup") or {}).get(
+                    "removed_face_count"
+                )
+                or 0
+            )
+            > 0
+            and (result.get("renderable_geometry_after_cleanup") or {}).get(
+                "status"
+            )
+            == "empty"
+        )
+        if empty_after_dummy_cleanup:
+            result["native_skin_passthrough"] = False
+            report["empty_asset_disposition"] = result[
+                "empty_asset_disposition"
+            ]
+        else:
+            native_skin_steps = [
+                step
+                for step in result.get("steps", [])
+                if isinstance(step, dict) and step.get("name") == "merge_export"
+            ]
+            if (
+                len(native_skin_steps) != 1
+                or native_skin_steps[0].get("native_skin_passthrough") is not True
+            ):
+                raise RuntimeError(
+                    "SpeedTree Assembly did not prove native skin passthrough"
+                )
+            result["native_skin_passthrough"] = True
         result["assembly_output_contract_version"] = (
             ASSEMBLY_OUTPUT_CONTRACT_VERSION
         )
@@ -1100,11 +1122,17 @@ def main():
             fbx_export,
         )
         if reusable_contracts is None:
-            leaf_reference_contract = inspect_spm_leaf_contract(speedtree_spm)
-            material_export_contract = inspect_speedtree_material_export(
-                speedtree_spm, leaf_reference_contract
+            leaf_reference_contract = {
+                "status": "not_applicable",
+                "reason": "post_export_spm_reparse_removed",
+            }
+            material_export_contract = {
+                "status": "not_applicable",
+                "reason": "native_export_artifacts_are_authoritative",
+            }
+            report["spm_contract_inspection_source"] = (
+                "native_export_receipt_without_spm_reparse"
             )
-            report["spm_contract_inspection_source"] = "live_fallback"
         else:
             leaf_reference_contract, material_export_contract = (
                 reusable_contracts
@@ -1194,7 +1222,7 @@ def main():
         # The Assembly result is the save authority. Optional diagnostics
         # must not discard a completed Blender Assembly.
         report["blend_resaved"] = False
-        if merged_object is not None:
+        if merged_object is not None or empty_after_dummy_cleanup:
             blend_save_started = perf_counter()
             if is_cluster_source:
                 save_result = save_cluster_source_mainfile(
@@ -1219,7 +1247,7 @@ def main():
                 blend_save_started,
             )
 
-        missing_outputs = [
+        missing_outputs = [] if empty_after_dummy_cleanup else [
             report[key]
             for key in ("megaplant_json", "dynamic_wind_json")
             if not os.path.exists(report[key])
@@ -1235,7 +1263,9 @@ def main():
             or missing_outputs
             or vertex_payload_contract.get("status") == "blocked"
         )
-        if cluster_export_pending:
+        if empty_after_dummy_cleanup:
+            handoff_status = "empty_after_dummy_cleanup"
+        elif cluster_export_pending:
             handoff_status = "cluster_export_pending"
         else:
             handoff_status = "ok"
@@ -1381,7 +1411,10 @@ def main():
                 Path(blend_dir) / "assembly",
                 full_fbx_path,
                 report["dynamic_wind_json"],
-                target_xml_path=xml_export.get("path"),
+                target_native_receipt_path=(
+                    speedtree_export.get("native_receipt")
+                    or fbx_export.get("native_receipt")
+                ),
             )
             record_stage_duration(
                 report, "cluster_assembly_build", assembly_started

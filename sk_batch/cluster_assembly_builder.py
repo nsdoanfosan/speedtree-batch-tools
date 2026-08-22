@@ -6,7 +6,7 @@ not an Assembly switch or a standalone tool: a reconciled
 or fails closed.
 
 The Blender half derives a base mesh and rigid part prototypes from the final
-BWR armature/merged mesh.  The Unreal half consumes those generated assets with
+native-export armature/merged mesh. The Unreal half consumes those assets with
 ``NaniteAssemblySkeletalMeshBuilder`` while preserving the existing Full
 Skeletal Mesh.  Both outputs are checked against the same final-skeleton and
 newly-generated wind JSON contract; production DynamicWind data is never
@@ -26,7 +26,6 @@ import re
 import statistics
 import subprocess
 import sys
-import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from copy import deepcopy
 from collections import Counter, defaultdict
@@ -39,6 +38,12 @@ if str(REPO_DIR) not in sys.path:
 from process_lifecycle import owned_run
 from artifact_content_key import (
     artifact_record_content_key,
+)
+from speedtree_native_receipt import (
+    NativeReceiptError,
+    exact_generated_instance,
+    exact_geometry_ordinal,
+    load_native_export_receipt,
 )
 
 from nanite_assembly_materials import (
@@ -59,7 +64,7 @@ MAX_SPEEDTREE_RENDER_FACE_MULTIPLICITY = 2
 # and ambiguous in the next.
 MIN_FBX_COORDINATE_TOLERANCE_METERS = 1.0e-6
 PASS_THROUGH_PROVENANCE_SCHEMA_VERSION = 1
-ASSEMBLY_BUILD_CACHE_VERSION = 5
+ASSEMBLY_BUILD_CACHE_VERSION = 6
 PASS_THROUGH_PROVENANCE_REASON = (
     "selected_target_contract_handoff_pass_through"
 )
@@ -72,11 +77,6 @@ MATERIAL_PIPELINE_EXPECTED_MESH_PATTERN = re.compile(
     r"(?P<prefix>\bexpected_mesh_name\s*=\s*)"
     r"(?P<quote>['\"])(?P<mesh_name>[^'\"]+)(?P=quote)"
 )
-SPEEDTREE_FINAL_BONE_NAME_PATTERN = re.compile(
-    r"^Bone_(?P<final_bone_ordinal>[0-9]+)(?:_(?P<endpoint>Start|End))?$"
-)
-
-
 class ClusterAssemblyBuildError(RuntimeError):
     """Raised when a content or hierarchy invariant is not proven."""
 
@@ -338,6 +338,8 @@ def file_fingerprint(path):
 
 def validate_file_fingerprint(record, label):
     """Require the current artifact; treat a recorded identity as diagnostic."""
+    if isinstance(record, (str, os.PathLike)):
+        record = {"path": os.fspath(record)}
     if not isinstance(record, dict) or not record.get("path"):
         raise ClusterAssemblyBuildError(f"{label} path is missing")
     actual = file_fingerprint(record["path"])
@@ -355,116 +357,6 @@ def validate_file_fingerprint(record, label):
         and str(actual.get("sha256") or "").casefold() == expected_sha256
     )
     return actual
-
-
-def make_speedtree_xml_bone_lineage(
-    bones,
-    *,
-    source_spm=None,
-    source_xml=None,
-):
-    """Validate exact SpeedTree Bone ID/ParentID/Generator lineage."""
-
-    normalized = []
-    seen = set()
-    for raw in bones or []:
-        try:
-            bone_id = int(raw.get("id", raw.get("ID")))
-            parent_value = raw.get("parent_id", raw.get("ParentID", -1))
-            parent_id = -1 if parent_value in (None, "") else int(parent_value)
-        except (AttributeError, TypeError, ValueError) as exc:
-            raise ClusterAssemblyBuildError(
-                "SpeedTree XML contains an invalid Bone ID or ParentID"
-            ) from exc
-        if bone_id < 0 or bone_id in seen:
-            raise ClusterAssemblyBuildError(
-                f"SpeedTree XML contains an invalid or duplicate Bone ID: {bone_id}"
-            )
-        if parent_id == bone_id:
-            raise ClusterAssemblyBuildError(
-                f"SpeedTree XML Bone {bone_id} is its own parent"
-            )
-        normalized.append({
-            "id": bone_id,
-            "parent_id": parent_id,
-            "generator": str(
-                raw.get("generator", raw.get("Generator", "")) or ""
-            ),
-        })
-        seen.add(bone_id)
-    if not normalized:
-        raise ClusterAssemblyBuildError("SpeedTree XML contains no Bone lineage")
-    normalized.sort(key=lambda row: row["id"])
-    by_id = {row["id"]: row for row in normalized}
-    for row in normalized:
-        parent_id = row["parent_id"]
-        if parent_id != -1 and parent_id not in by_id:
-            raise ClusterAssemblyBuildError(
-                f"SpeedTree XML Bone {row['id']} has missing ParentID {parent_id}"
-            )
-        visited = set()
-        cursor = row
-        while cursor is not None:
-            cursor_id = cursor["id"]
-            if cursor_id in visited:
-                raise ClusterAssemblyBuildError(
-                    f"SpeedTree XML Bone lineage contains a cycle at {cursor_id}"
-                )
-            visited.add(cursor_id)
-            parent_id = cursor["parent_id"]
-            cursor = by_id.get(parent_id) if parent_id != -1 else None
-    lineage_sha256 = _sha256_bytes(
-        _canonical_json(normalized).encode("utf-8")
-    )
-    return {
-        "version": 1,
-        "status": "ready",
-        "identity_policy": "exact_speedtree_xml_bone_id_parent_id_v1",
-        "source_spm": deepcopy(source_spm),
-        "source_xml": deepcopy(source_xml),
-        "bone_count": len(normalized),
-        "root_bone_ids": [
-            row["id"] for row in normalized if row["parent_id"] == -1
-        ],
-        "bones": normalized,
-        "lineage_sha256": lineage_sha256,
-    }
-
-
-def parse_speedtree_xml_bone_lineage(xml_path, *, source_spm=None):
-    """Parse the authoritative XML exported from the current target SPM."""
-
-    if not xml_path:
-        raise ClusterAssemblyBuildError(
-            "target SpeedTree XML for exact attachment lineage is missing"
-        )
-    xml_fingerprint = validate_file_fingerprint(
-        file_fingerprint(xml_path),
-        "target SpeedTree XML exact attachment lineage",
-    )
-    if xml_fingerprint.get("exists") is not True:
-        raise ClusterAssemblyBuildError(
-            "target SpeedTree XML for exact attachment lineage is missing: "
-            + str(xml_fingerprint.get("path") or xml_path)
-        )
-    try:
-        root = ET.parse(xml_fingerprint["path"]).getroot()
-    except (OSError, ET.ParseError) as exc:
-        raise ClusterAssemblyBuildError(
-            "target SpeedTree XML for exact attachment lineage is invalid"
-        ) from exc
-    return make_speedtree_xml_bone_lineage(
-        [
-            {
-                "id": element.get("ID"),
-                "parent_id": element.get("ParentID", -1),
-                "generator": element.get("Generator", ""),
-            }
-            for element in root.findall(".//Bone")
-        ],
-        source_spm=source_spm,
-        source_xml=xml_fingerprint,
-    )
 
 
 def _artifact_cache_identity(record):
@@ -486,7 +378,7 @@ def _assembly_build_input_signature(
     handoff,
     full_fbx,
     wind_json,
-    target_xml=None,
+    native_receipt=None,
 ):
     role_rows = []
     for row in (handoff.get("assembly") or {}).get(
@@ -506,13 +398,13 @@ def _assembly_build_input_signature(
     payload = {
         "cache_version": ASSEMBLY_BUILD_CACHE_VERSION,
         # Blender's FBX writer does not produce byte-identical files for an
-        # unchanged scene.  Assembly is derived from the in-memory repaired
+        # unchanged scene.  Assembly is derived from the in-memory native
         # mesh; its stable source assets below are the cache authority.  The
         # generated Full FBX is still required to exist, but its changing byte
         # hash must not force a complete Assembly rebuild on every retry.
         "full_fbx_path": str((full_fbx or {}).get("path") or ""),
         "wind_json": _artifact_cache_identity(wind_json),
-        "target_xml": _artifact_cache_identity(target_xml),
+        "native_receipt": _artifact_cache_identity(native_receipt),
         "spm": _artifact_cache_identity(handoff.get("spm")),
         "actual_fbx": _artifact_cache_identity(handoff.get("actual_fbx")),
         "roles": sorted(
@@ -1382,7 +1274,6 @@ def validate_normalized_prototype_unit_contract(manifest):
     variants = list((manifest or {}).get("registered_variants") or [])
     placement_contract = (manifest or {}).get("placement_contract")
     placement_v2 = placement_contract is not None
-    attachment_lineage_sha256 = None
     if placement_v2:
         try:
             residual_gate_contract = (
@@ -1404,11 +1295,9 @@ def validate_normalized_prototype_unit_contract(manifest):
             placement_contract.get("version") != PLACEMENT_CONTRACT_VERSION
             or placement_contract.get("status") != "ready"
             or placement_contract.get("identity_policy")
-            != "exact_render_attachment_correspondence_v1"
+            != "native_modeler_authored_position_receipt_v1"
             or placement_contract.get("translation_source")
-            != "exact_target_attachment_vertex"
-            or placement_contract.get("approximate_node_matching_present")
-            is not False
+            != "native_modeler_runtime_receipt"
             or any(
                 key in placement_contract
                 for key in (
@@ -1433,19 +1322,22 @@ def validate_normalized_prototype_unit_contract(manifest):
             raise ClusterAssemblyBuildError(
                 "Assembly placement contract is invalid or ungated"
             )
-        try:
-            checked_attachment_lineage, _xml_by_id = (
-                _speedtree_xml_bone_maps(
-                    (manifest or {}).get("attachment_bone_contract")
-                )
-            )
-        except ClusterAssemblyBuildError as exc:
+        checked_attachment_lineage = (
+            manifest or {}
+        ).get("attachment_bone_contract") or {}
+        if (
+            checked_attachment_lineage.get("status") != "ready"
+            or checked_attachment_lineage.get("policy")
+            != "native_modeler_runtime_receipt_v1"
+            or not isinstance(checked_attachment_lineage.get("receipt"), dict)
+            or int(checked_attachment_lineage.get("bone_count") or 0) <= 0
+            or int(
+                checked_attachment_lineage.get("generated_instance_count") or 0
+            ) <= 0
+        ):
             raise ClusterAssemblyBuildError(
-                "Assembly exact attachment Bone lineage contract is invalid"
-            ) from exc
-        attachment_lineage_sha256 = checked_attachment_lineage[
-            "lineage_sha256"
-        ]
+                "Assembly native attachment receipt contract is invalid"
+            )
         placement_spm = placement_contract.get("source_spm") or {}
         lineage_spm = checked_attachment_lineage.get("source_spm") or {}
         if (
@@ -1588,7 +1480,7 @@ def validate_normalized_prototype_unit_contract(manifest):
                 )
                 if (
                     placement_source
-                    != "exact_render_attachment_correspondence__"
+                    != "native_modeler_authored_position__"
                     "surviving_root_tip_rotation_uniform_scale"
                     or transform.get("authored_node") is not None
                     or "authored_node_match_warning" in transform
@@ -1600,54 +1492,21 @@ def validate_normalized_prototype_unit_contract(manifest):
                     )
                 influence_source = binding.get("bone_influence_source") or {}
                 influence_policy = str(influence_source.get("policy") or "")
-                influences = list(binding.get("bone_influences") or [])
-                try:
-                    rigid_weight = float(
-                        influences[0].get("weight") or 0.0
-                    )
-                except (AttributeError, TypeError, ValueError, IndexError):
-                    rigid_weight = 0.0
-                rigid_single_bone = bool(
-                    len(influences) == 1
-                    and rigid_weight == 1.0
-                    and str(influences[0].get("bone") or "")
-                    == str(binding.get("anchor_bone") or "")
-                )
-                if not rigid_single_bone:
-                    raise ClusterAssemblyBuildError(
-                        "normalized rendered Assembly binding is not rigidly "
-                        "bound to one exact bone"
-                    )
-                if influence_policy == (
-                    "exact_render_attachment_vertex_spm_xml_hierarchy_v4"
-                ):
-                    binding_lineage = influence_source.get(
-                        "spm_xml_lineage"
-                    ) or {}
-                    if (
-                        binding_lineage.get("lineage_sha256")
-                        != attachment_lineage_sha256
-                        or binding_lineage.get(
-                            "final_skeleton_xml_lineage_agreement"
-                        ) is not True
-                        or influence_source.get(
-                            "weight_magnitude_used_for_identity"
-                        ) is not False
-                        or influence_source.get(
-                            "spatial_proximity_used_for_identity"
-                        ) is not False
-                        or influence_source.get(
-                            "component_hierarchy_used_for_identity"
-                        ) is not False
-                    ):
-                        raise ClusterAssemblyBuildError(
-                            "normalized rendered Assembly binding lacks exact "
-                            "attachment vertex/SPM XML identity evidence"
-                        )
-                elif influence_policy != "exact_normalized_source_bone_v1":
+                if influence_policy != "native_modeler_authored_proxy_weights_v1":
                     raise ClusterAssemblyBuildError(
                         "normalized rendered Assembly binding used a non-exact "
                         "bone identity policy"
+                    )
+                if (
+                    influence_source.get("owner_selection_policy")
+                    != "sole_exact_native_range_intersection_v1"
+                    or not influence_source.get("native_vertex_indices")
+                    or not influence_source.get("node_guid")
+                    or not influence_source.get("receipt")
+                ):
+                    raise ClusterAssemblyBuildError(
+                        "normalized rendered Assembly binding does not preserve "
+                        "the native authored proxy weights"
                     )
         prototype_rows[key] = part
         prototype_ids.add(prototype_id)
@@ -1981,7 +1840,7 @@ def validate_manifest_artifacts(manifest):
     """Validate only materialized files consumed by export or Unreal import.
 
     Authoring SPMs, source blends, and PCG receipts are provenance.  They may
-    legitimately change or disappear after Repair has produced the assembly,
+    legitimately change or disappear after Assembly has produced its outputs,
     especially while a durable Unreal-wait item is queued.  Revalidating those
     upstream files here used to reject otherwise complete import payloads.
     """
@@ -3765,275 +3624,6 @@ def _attachment_vertex_correspondence(
     return source_index, target_index
 
 
-def _attachment_uv_edge_point(obj, component, attachment_uv):
-    """Resolve one UV point on a unique geometric edge of a component."""
-    uv_layer = obj.data.uv_layers.active
-    candidates = []
-    uv_tolerance = 2.0e-6
-    for polygon_index in component["polygons"]:
-        polygon = obj.data.polygons[polygon_index]
-        loops = list(polygon.loop_indices)
-        for offset, first_loop in enumerate(loops):
-            second_loop = loops[(offset + 1) % len(loops)]
-            first_uv = uv_layer.data[first_loop].uv
-            second_uv = uv_layer.data[second_loop].uv
-            delta = (
-                float(second_uv.x) - float(first_uv.x),
-                float(second_uv.y) - float(first_uv.y),
-            )
-            length_squared = delta[0] * delta[0] + delta[1] * delta[1]
-            if length_squared <= 1.0e-20:
-                continue
-            relative = (
-                float(attachment_uv[0]) - float(first_uv.x),
-                float(attachment_uv[1]) - float(first_uv.y),
-            )
-            parameter = (
-                relative[0] * delta[0] + relative[1] * delta[1]
-            ) / length_squared
-            if parameter < -uv_tolerance or parameter > 1.0 + uv_tolerance:
-                continue
-            parameter = max(0.0, min(1.0, parameter))
-            projected = (
-                float(first_uv.x) + delta[0] * parameter,
-                float(first_uv.y) + delta[1] * parameter,
-            )
-            residual = math.dist(projected, attachment_uv)
-            if residual > uv_tolerance:
-                continue
-            first_index = int(obj.data.loops[first_loop].vertex_index)
-            second_index = int(obj.data.loops[second_loop].vertex_index)
-            first_coordinate = obj.data.vertices[first_index].co
-            second_coordinate = obj.data.vertices[second_index].co
-            coordinate = tuple(
-                float(first_coordinate[axis]) * (1.0 - parameter)
-                + float(second_coordinate[axis]) * parameter
-                for axis in range(3)
-            )
-            candidates.append({
-                "coordinate": coordinate,
-                "edge_vertices": [first_index, second_index],
-                "parameter": float(parameter),
-                "uv_residual": float(residual),
-            })
-    if not candidates:
-        return None
-
-    coordinates = [
-        tuple(float(value) for value in obj.data.vertices[index].co)
-        for index in component["vertices"]
-    ]
-    coordinate_tolerance = _fbx_coordinate_tolerance(coordinates)
-    groups = []
-    for candidate in sorted(
-        candidates,
-        key=lambda row: (
-            row["uv_residual"],
-            row["edge_vertices"],
-            row["parameter"],
-        ),
-    ):
-        group = next((
-            row for row in groups
-            if math.dist(row["coordinate"], candidate["coordinate"])
-            <= coordinate_tolerance
-        ), None)
-        if group is None:
-            groups.append({
-                "coordinate": candidate["coordinate"],
-                "candidates": [candidate],
-            })
-        else:
-            group["candidates"].append(candidate)
-    if len(groups) != 1:
-        raise ClusterAssemblyBuildError(
-            "normalized plan attachment UV crosses multiple geometric edges"
-        )
-    best = groups[0]["candidates"][0]
-    return {
-        "coordinate": groups[0]["coordinate"],
-        "edge_vertices": best["edge_vertices"],
-        "parameter": best["parameter"],
-        "uv_residual": best["uv_residual"],
-        "candidate_edge_count": len(candidates),
-    }
-
-
-def _attachment_point_correspondence(
-    source_obj,
-    source_component,
-    target_obj,
-    target_component,
-    attachment_uv,
-):
-    """Resolve an attachment as an exact vertex or a strict UV-edge point.
-
-    Older normalized plans can contain an authored origin vertex that is not
-    referenced by a face.  FBX removes that loose vertex, while preserving the
-    boundary edge on which the authored UV lies.  The compatibility path below
-    is limited to exact source/target topology matches and requires the source
-    edge interpolation to reconstruct local origin.
-    """
-    if (
-        not isinstance(attachment_uv, (list, tuple))
-        or len(attachment_uv) != 2
-    ):
-        raise ClusterAssemblyBuildError(
-            "normalized plan attachment vertex UV is missing or invalid"
-        )
-    try:
-        resolved_uv = tuple(float(value) for value in attachment_uv)
-    except (TypeError, ValueError) as exc:
-        raise ClusterAssemblyBuildError(
-            "normalized plan attachment vertex UV is missing or invalid"
-        ) from exc
-    if any(not math.isfinite(value) for value in resolved_uv):
-        raise ClusterAssemblyBuildError(
-            "normalized plan attachment vertex UV is missing or invalid"
-        )
-    if (
-        source_obj.data.uv_layers.active is None
-        or target_obj.data.uv_layers.active is None
-    ):
-        raise ClusterAssemblyBuildError(
-            "normalized plan attachment correspondence requires UV layers"
-        )
-
-    key = tuple(round(value, 6) for value in resolved_uv)
-    source_index = _coincident_uv_vertex_index(
-        source_obj, source_component, key
-    )
-    target_index = _coincident_uv_vertex_index(
-        target_obj, target_component, key
-    )
-    if source_index is not None and target_index is not None:
-        return {
-            "source_index": source_index,
-            "target_index": target_index,
-            "source_coordinate": tuple(
-                float(value) for value in source_obj.data.vertices[source_index].co
-            ),
-            "target_coordinate": tuple(
-                float(value) for value in target_obj.data.vertices[target_index].co
-            ),
-            "evidence": {
-                "policy": "exact_attachment_uv_vertex_v1",
-                "attachment_uv": list(resolved_uv),
-            },
-        }
-
-    signatures_match = _component_signature(
-        source_obj.data, source_component
-    ) == _component_signature(target_obj.data, target_component)
-    source_edge = None
-    target_edge = None
-    edge_resolution_error = None
-    if signatures_match:
-        try:
-            source_edge = _attachment_uv_edge_point(
-                source_obj, source_component, resolved_uv
-            )
-            target_edge = _attachment_uv_edge_point(
-                target_obj, target_component, resolved_uv
-            )
-        except ClusterAssemblyBuildError as exc:
-            edge_resolution_error = str(exc)
-    def project_full_fbx_origin(fallback_reason):
-        # The final Full FBX is allowed to contain an exact face subset of a
-        # normalized provider plan.  SpeedTree can clip the face carrying the
-        # plan's origin, or a lower-provenance receipt can retain an attachment
-        # UV that no longer describes the provider's normalized local origin.
-        # Do not revive a clipped face or invent an attachment vertex.  Map the
-        # normalized local origin through the surviving Full-FBX overlap;
-        # authored SPM placement still supplies the final absolute translation.
-        try:
-            (
-                source_indices,
-                target_indices,
-                correspondence_evidence,
-            ) = _ordered_cross_object_correspondence(
-                source_obj,
-                source_component,
-                target_obj,
-                target_component,
-                include_evidence=True,
-            )
-            projection = fit_uniform_similarity_transform(
-                [
-                    tuple(float(value) for value in source_obj.data.vertices[index].co)
-                    for index in source_indices
-                ],
-                [
-                    tuple(float(value) for value in target_obj.data.vertices[index].co)
-                    for index in target_indices
-                ],
-            )
-            target_origin = tuple(
-                float(value) for value in projection["translation"]
-            )
-        except ClusterAssemblyBuildError as exc:
-            raise ClusterAssemblyBuildError(
-                "normalized plan attachment pivot UV is absent from the "
-                "source/target render component"
-            ) from exc
-        return {
-            "source_index": None,
-            "target_index": None,
-            "source_coordinate": (0.0, 0.0, 0.0),
-            "target_coordinate": target_origin,
-            "evidence": {
-                "policy": "full_fbx_shared_uv_origin_projection_v1",
-                "fallback_reason": fallback_reason,
-                "attachment_edge_error": edge_resolution_error,
-                "attachment_uv": list(resolved_uv),
-                "correspondence": correspondence_evidence,
-                "similarity_relative_rms": projection[
-                    "similarity_relative_rms"
-                ],
-                "source_fit_rank": projection["source_fit_rank"],
-            },
-        }
-
-    if edge_resolution_error is not None:
-        return project_full_fbx_origin(
-            "attachment_uv_edge_is_geometrically_ambiguous"
-        )
-    if source_edge is None or target_edge is None:
-        return project_full_fbx_origin("attachment_uv_absent_from_render_subset")
-
-    source_coordinates = [
-        tuple(float(value) for value in source_obj.data.vertices[index].co)
-        for index in source_component["vertices"]
-    ]
-    spans = [
-        max(point[axis] for point in source_coordinates)
-        - min(point[axis] for point in source_coordinates)
-        for axis in range(3)
-    ]
-    origin_tolerance = max(max(spans) * 2.0e-6, 1.0e-8)
-    source_origin_error = math.dist(
-        source_edge["coordinate"], (0.0, 0.0, 0.0)
-    )
-    if source_origin_error > origin_tolerance:
-        return project_full_fbx_origin(
-            "attachment_uv_edge_is_not_normalized_source_origin"
-        )
-    return {
-        "source_index": source_index,
-        "target_index": target_index,
-        "source_coordinate": source_edge["coordinate"],
-        "target_coordinate": target_edge["coordinate"],
-        "evidence": {
-            "policy": "normalized_origin_uv_edge_interpolation_v1",
-            "attachment_uv": list(resolved_uv),
-            "source_origin_error": float(source_origin_error),
-            "source_origin_tolerance": float(origin_tolerance),
-            "source_edge": source_edge,
-            "target_edge": target_edge,
-        },
-    }
-
-
 def _normalized_prototype_for_component(prototypes, target_mesh, target_component):
     signature = _component_signature(target_mesh, target_component)
     exact = prototypes.get(signature)
@@ -4522,245 +4112,122 @@ def _world_coordinate(obj, coordinate):
     )
 
 
-def _attachment_vertex_influences(obj, vertex_index, context):
-    """Return positive authored groups on one exact correspondence vertex."""
-
-    try:
-        index = int(vertex_index)
-    except (TypeError, ValueError) as exc:
-        raise ClusterAssemblyBuildError(
-            f"{context} has no valid target attachment vertex"
-        ) from exc
-    if index < 0 or index >= len(obj.data.vertices):
-        raise ClusterAssemblyBuildError(
-            f"{context} has no valid target attachment vertex"
-        )
-    vertex = obj.data.vertices[index]
-    rows = []
-    for item in vertex.groups:
-        weight = float(item.weight)
-        if weight <= 0.0:
-            continue
-        rows.append({
-            "bone": str(obj.vertex_groups[item.group].name),
-            "authored_weight": weight,
-        })
-    rows.sort(key=lambda row: row["bone"])
-    if not rows:
-        raise ClusterAssemblyBuildError(
-            f"{context} target attachment vertex has no final-skeleton weights"
-        )
-    return index, rows
+def _native_position_to_blender_world(coordinate):
+    x, y, z = (float(value) for value in coordinate)
+    return (x * 0.3048, z * 0.3048, -y * 0.3048)
 
 
-def _speedtree_xml_bone_maps(lineage):
-    if not isinstance(lineage, dict):
-        raise ClusterAssemblyBuildError(
-            "exact attachment identity has no SpeedTree XML Bone lineage"
-        )
-    checked = make_speedtree_xml_bone_lineage(
-        lineage.get("bones"),
-        source_spm=lineage.get("source_spm"),
-        source_xml=lineage.get("source_xml"),
-    )
-    if (
-        lineage.get("version") != checked["version"]
-        or lineage.get("status") != "ready"
-        or lineage.get("identity_policy") != checked["identity_policy"]
-        or lineage.get("lineage_sha256") != checked["lineage_sha256"]
-    ):
-        raise ClusterAssemblyBuildError(
-            "exact attachment SpeedTree XML Bone lineage contract is invalid"
-        )
-    return checked, {row["id"]: row for row in checked["bones"]}
-
-
-def _speedtree_xml_bone_id(final_bone_name, context):
-    match = SPEEDTREE_FINAL_BONE_NAME_PATTERN.fullmatch(
-        str(final_bone_name or "")
-    )
-    if match is None:
-        raise ClusterAssemblyBuildError(
-            f"{context} attachment bone has no exact SpeedTree XML ID: "
-            f"{final_bone_name}"
-        )
-    # BWR reserves `Root` outside the SpeedTree Bone table and names Raw XML
-    # Bone ID 0 as Bone_1_Start/Bone_1_End. Every later Bone_N therefore maps
-    # to the exact XML ID N - 1; using N silently validates the next segment.
-    final_bone_ordinal = int(match.group("final_bone_ordinal"))
-    if final_bone_ordinal <= 0:
-        raise ClusterAssemblyBuildError(
-            f"{context} attachment bone has no exact SpeedTree XML ID: "
-            f"{final_bone_name}"
-        )
-    return final_bone_ordinal - 1
-
-
-def _xml_bone_ancestor_ids(bone_id, xml_by_id):
-    chain = []
-    row = xml_by_id.get(int(bone_id))
-    if row is None:
-        raise ClusterAssemblyBuildError(
-            f"attachment Bone ID {bone_id} is missing from target SpeedTree XML"
-        )
-    while row is not None:
-        chain.append(row["id"])
-        parent_id = row["parent_id"]
-        row = xml_by_id.get(parent_id) if parent_id != -1 else None
-    return chain
-
-
-def _xml_bone_lowest_common_ancestor(bone_ids, xml_by_id):
-    ids = list(dict.fromkeys(int(value) for value in bone_ids))
-    if not ids:
-        raise ClusterAssemblyBuildError(
-            "exact attachment vertex contains no SpeedTree XML Bone IDs"
-        )
-    chains = [_xml_bone_ancestor_ids(value, xml_by_id) for value in ids]
-    shared = set(chains[0])
-    for chain in chains[1:]:
-        shared.intersection_update(chain)
-    if not shared:
-        raise ClusterAssemblyBuildError(
-            "attachment SpeedTree XML Bones do not share an authored ancestor: "
-            + ", ".join(str(value) for value in ids)
-        )
-    return next(value for value in chains[0] if value in shared)
-
-
-def _exact_source_bone_influences(source_bone, skeleton_by_name, context):
-    """Resolve one FBX/normalizer bone reference against the final skeleton.
-
-    The source contract is intentionally one-way: every referenced FBX bone
-    must exist in the SPM-derived final skeleton, while extra final-skeleton
-    bones are valid. Geometry position is never an identity fallback.
-    """
-    name = str(source_bone or "").strip()
-    if not name:
-        raise ClusterAssemblyBuildError(
-            f"{context} has no exact source_bone identity"
-        )
-    if name not in skeleton_by_name:
-        raise ClusterAssemblyBuildError(
-            f"{context} source_bone is missing from final skeleton: {name}"
-        )
-    return [
-        {"bone": name, "weight": 1.0},
-    ], {
-        "policy": "exact_normalized_source_bone_v1",
-        "source_bone": name,
-    }
-
-
-def _exact_attachment_anchor_influences(
+def _exact_native_attachment_influences(
     obj,
-    target_attachment_vertex_index,
-    attachment_correspondence,
-    spm_xml_bone_lineage,
+    target_component,
+    target_attachment_vertex,
+    native_receipt,
     skeleton_snapshot,
-    skeleton_by_name,
     context,
 ):
-    """Bind a rendered rigid part from its exact attachment vertex only.
+    """Read authored proxy weights captured inside Modeler's FBX serializer."""
 
-    Weight magnitudes and spatial proximity are diagnostics, never identity
-    selectors. Multiple groups on the one authored attachment vertex are
-    resolved through both the final-skeleton hierarchy and the authoritative
-    target SPM/XML Bone ID/ParentID lineage. The two exact identities must
-    agree, and the resulting anchor must itself be authored on that same
-    vertex. Geometry elsewhere in the rendered component is out of scope.
-    """
-
-    index, authored = _attachment_vertex_influences(
-        obj,
-        target_attachment_vertex_index,
-        context,
-    )
-    names = [row["bone"] for row in authored]
-    missing = [name for name in names if name not in skeleton_by_name]
-    if missing:
-        raise ClusterAssemblyBuildError(
-            f"{context} attachment vertex-group bones missing from final skeleton: "
-            + ", ".join(missing)
-        )
-    anchor = lowest_common_ancestor(
-        names,
-        skeleton_snapshot,
-        skeleton_by_name=skeleton_by_name,
-    )
-    if anchor not in names:
-        raise ClusterAssemblyBuildError(
-            f"{context} exact attachment vertex groups span sibling hierarchies; "
-            f"common ancestor {anchor} is not authored on the attachment vertex"
-        )
-    checked_xml, xml_by_id = _speedtree_xml_bone_maps(spm_xml_bone_lineage)
-    xml_rows = []
-    for row in authored:
-        xml_bone_id = _speedtree_xml_bone_id(row["bone"], context)
-        xml_bone = xml_by_id.get(xml_bone_id)
-        if xml_bone is None:
+    vertices = [int(value) for value in (target_component or {}).get("vertices") or []]
+    if not vertices:
+        raise ClusterAssemblyBuildError(f"{context} has no target component vertices")
+    if target_attachment_vertex is not None:
+        target_attachment_vertex = int(target_attachment_vertex)
+        if target_attachment_vertex not in set(vertices):
             raise ClusterAssemblyBuildError(
-                f"{context} attachment Bone ID {xml_bone_id} is missing from "
-                "target SpeedTree XML"
+                f"{context} attachment vertex is outside its target component"
             )
-        xml_rows.append({
-            **row,
-            "xml_bone_id": xml_bone_id,
-            "xml_parent_id": xml_bone["parent_id"],
-            "xml_generator": xml_bone["generator"],
-            "xml_ancestor_ids": _xml_bone_ancestor_ids(
-                xml_bone_id,
-                xml_by_id,
-            ),
-        })
-    xml_anchor_id = _xml_bone_lowest_common_ancestor(
-        [row["xml_bone_id"] for row in xml_rows],
-        xml_by_id,
+    ordinal_attribute = obj.data.attributes.get(
+        "speedtree_native_geometry_ordinal"
     )
-    skeleton_anchor_xml_id = _speedtree_xml_bone_id(anchor, context)
-    if skeleton_anchor_xml_id != xml_anchor_id:
-        raise ClusterAssemblyBuildError(
-            f"{context} final-skeleton/XML attachment lineage mismatch: "
-            f"{anchor} maps to Bone ID {skeleton_anchor_xml_id}, XML LCA is "
-            f"{xml_anchor_id}"
+    vertex_attribute = obj.data.attributes.get("speedtree_native_vertex_index")
+    if ordinal_attribute is not None and vertex_attribute is not None:
+        ordinals = {
+            int(ordinal_attribute.data[index].value)
+            for index in vertices
+        }
+        if len(ordinals) != 1:
+            raise ClusterAssemblyBuildError(
+                f"{context} spans multiple native serializer geometries"
+            )
+        geometry_ordinal = ordinals.pop()
+        native_vertices = [
+            int(vertex_attribute.data[index].value)
+            for index in (
+                [target_attachment_vertex]
+                if target_attachment_vertex is not None
+                else vertices
+            )
+        ]
+        identity_source = "preserved_native_point_attributes"
+    else:
+        try:
+            geometry_ordinal = exact_geometry_ordinal(
+                native_receipt,
+                len(obj.data.vertices),
+            )
+        except NativeReceiptError as exc:
+            raise ClusterAssemblyBuildError(f"{context}: {exc}") from exc
+        native_vertices = (
+            [target_attachment_vertex]
+            if target_attachment_vertex is not None
+            else vertices
         )
-    if xml_anchor_id not in [row["xml_bone_id"] for row in xml_rows]:
-        raise ClusterAssemblyBuildError(
-            f"{context} XML common ancestor Bone ID {xml_anchor_id} is not "
-            "authored on the exact attachment vertex"
+        identity_source = "exact_unmodified_fbx_geometry_vertex_count"
+    try:
+        instance = exact_generated_instance(
+            native_receipt,
+            geometry_ordinal,
+            native_vertices,
         )
-    xml_anchor = xml_by_id[xml_anchor_id]
-    return [
-        {"bone": anchor, "weight": 1.0},
-    ], {
-        "policy": "exact_render_attachment_vertex_spm_xml_hierarchy_v4",
-        "identity_source": (
-            "exact_target_attachment_vertex_groups_plus_spm_xml_lineage"
-        ),
-        "target_attachment_vertex_index": index,
-        "attachment_correspondence_policy": str(
-            (attachment_correspondence or {}).get("policy") or ""
-        ),
-        "anchor_bone": anchor,
-        "anchor_authored_on_attachment_vertex": True,
-        "authored_attachment_vertex_groups": xml_rows,
-        "spm_xml_lineage": {
-            "identity_policy": checked_xml["identity_policy"],
-            "lineage_sha256": checked_xml["lineage_sha256"],
-            "source_spm": deepcopy(checked_xml.get("source_spm")),
-            "source_xml": deepcopy(checked_xml.get("source_xml")),
-            "anchor_xml_bone_id": xml_anchor_id,
-            "anchor_xml_parent_id": xml_anchor["parent_id"],
-            "anchor_xml_generator": xml_anchor["generator"],
-            "anchor_xml_ancestor_ids": _xml_bone_ancestor_ids(
-                xml_anchor_id,
-                xml_by_id,
+    except NativeReceiptError as exc:
+        raise ClusterAssemblyBuildError(f"{context}: {exc}") from exc
+    authored = list(instance.get("authored_position_influences") or [])
+    root_candidates = [
+        str(row["name"])
+        for row in (skeleton_snapshot or {}).get("bones") or []
+        if int(row.get("index", -1)) > 0
+        and int(row.get("parent_index", -1)) == 0
+    ]
+    if any(row.get("native_root") is True for row in authored):
+        if len(root_candidates) != 1:
+            raise ClusterAssemblyBuildError(
+                f"{context} has no unique native FBX skeleton root"
+            )
+        native_root_name = root_candidates[0]
+    else:
+        native_root_name = ""
+    influences = [
+        {
+            "bone": (
+                native_root_name
+                if row.get("native_root") is True
+                else str(row["exported_cluster_name"])
             ),
-            "final_skeleton_xml_lineage_agreement": True,
-        },
-        "weight_magnitude_used_for_identity": False,
-        "spatial_proximity_used_for_identity": False,
-        "component_hierarchy_used_for_identity": False,
+            "weight": float(row["weight"]),
+        }
+        for row in authored
+    ]
+    return influences, {
+        "policy": "native_modeler_authored_proxy_weights_v1",
+        "identity_source": identity_source,
+        "geometry_ordinal": geometry_ordinal,
+        "native_vertex_indices": instance.get(
+            "matched_native_vertex_indices"
+        ),
+        "queried_native_vertex_count": instance.get(
+            "queried_native_vertex_count"
+        ),
+        "target_attachment_vertex_index": target_attachment_vertex,
+        "unowned_native_vertex_count": instance.get(
+            "unowned_native_vertex_count"
+        ),
+        "owner_selection_policy": instance.get("owner_selection_policy"),
+        "native_instance_id": instance.get("native_instance_id"),
+        "node_guid": instance.get("node_guid"),
+        "parent_guid": instance.get("parent_guid"),
+        "generator_guid": instance.get("generator_guid"),
+        "authored_position_native": instance.get("authored_position_native"),
+        "receipt": native_receipt.get("receipt_path"),
     }
 
 
@@ -5700,10 +5167,10 @@ def _role_material_polygons(
 
 
 def _role_geometry_sources(bpy_module, final_merged_mesh, role_inputs):
-    """Resolve rendered role geometry before BWR's intentional base split.
+    """Resolve rendered role geometry before the intentional base split.
 
     Cluster/leaf placement meshes can remain in ``SpeedTree_Source`` without
-    an armature and therefore do not belong to the repaired Full-SK base. Their
+    an armature and therefore do not belong to the native Full-SK base. Their
     exact material identity is nevertheless the authoritative Assembly
     placement geometry. Prefer those exact source objects before falling back
     to topology search on the final merged base.
@@ -5843,7 +5310,7 @@ def build_blender_assembly_inputs(
     full_fbx_path,
     wind_json_path,
     *,
-    target_xml_path=None,
+    target_native_receipt_path=None,
     pass_through_receipt_path=None,
     pass_through_target_contract=None,
     pass_through_target_spm=None,
@@ -5911,7 +5378,11 @@ def build_blender_assembly_inputs(
                 ),
             }
         manifest_path.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2),
+            json.dumps(
+                manifest,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
             encoding="utf-8",
         )
         manifest["manifest"] = file_fingerprint(manifest_path)
@@ -5938,7 +5409,11 @@ def build_blender_assembly_inputs(
         handoff,
         full_fingerprint_before,
         file_fingerprint(wind_json_path),
-        file_fingerprint(target_xml_path) if target_xml_path else None,
+        (
+            file_fingerprint(target_native_receipt_path)
+            if target_native_receipt_path
+            else None
+        ),
     )
     reusable_manifest = _load_reusable_assembly_manifest(
         manifest_path,
@@ -5980,7 +5455,8 @@ def build_blender_assembly_inputs(
     role_build_plans = {}
     preserved_render_components = []
     authored_spm_fingerprint = None
-    spm_xml_bone_lineage = None
+    native_receipt = None
+    native_receipt_fingerprint = None
     exact_render_attachment_binding_count = 0
     source_correspondence_cache = {}
     base_obj = None
@@ -6066,10 +5542,25 @@ def build_blender_assembly_inputs(
             handoff.get("spm"),
             "target SPM exact attachment identity",
         )
-        spm_xml_bone_lineage = parse_speedtree_xml_bone_lineage(
-            target_xml_path,
-            source_spm=authored_spm_fingerprint,
+        if not target_native_receipt_path:
+            raise ClusterAssemblyBuildError(
+                "Assembly build has no native SpeedTree runtime receipt"
+            )
+        try:
+            native_receipt = load_native_export_receipt(
+                target_native_receipt_path,
+                source_spm=authored_spm_fingerprint["path"],
+            )
+        except NativeReceiptError as exc:
+            raise ClusterAssemblyBuildError(str(exc)) from exc
+        native_receipt_fingerprint = file_fingerprint(
+            native_receipt["receipt_path"]
         )
+        if native_receipt_fingerprint.get("exists") is not True:
+            raise ClusterAssemblyBuildError(
+                "native SpeedTree runtime receipt current file is missing: "
+                + str(native_receipt_fingerprint.get("path"))
+            )
         # No public Assembly artifact may exist until every requested rendered
         # role has proven at least one normalized prototype/component match.
         output.mkdir(parents=True, exist_ok=True)
@@ -6193,28 +5684,87 @@ def build_blender_assembly_inputs(
                     ]
                     bindings = []
                     for instance_index, component in enumerate(instances):
-                        attachment = _attachment_point_correspondence(
-                            source_obj,
-                            source_component,
-                            target_object,
-                            component,
-                            attachment_vertex_uv,
+                        source_attachment_index = attachment_vertex_index
+                        if not (
+                            0 <= source_attachment_index
+                            < len(source_obj.data.vertices)
+                        ):
+                            raise ClusterAssemblyBuildError(
+                                "normalized plan authored attachment vertex is invalid"
+                            )
+                        try:
+                            (
+                                resolved_source_attachment_index,
+                                target_attachment_index,
+                            ) = _attachment_vertex_correspondence(
+                                source_obj,
+                                source_component,
+                                target_object,
+                                component,
+                                attachment_vertex_uv,
+                            )
+                        except ClusterAssemblyBuildError as exc:
+                            if "pivot UV is absent" not in str(exc):
+                                raise
+                            # The FBX clipper may delete the authored origin
+                            # vertex. In that one case, do not synthesize a
+                            # replacement pivot: the native receipt must show
+                            # that every surviving Node-owned local vertex
+                            # intersects one and only one runtime Node range.
+                            resolved_source_attachment_index = None
+                            target_attachment_index = None
+                        source_attachment_coordinate = tuple(
+                            float(value)
+                            for value in source_obj.data.vertices[
+                                source_attachment_index
+                            ].co
                         )
-                        source_attachment_index = attachment["source_index"]
-                        target_attachment_index = attachment["target_index"]
+                        if resolved_source_attachment_index is not None:
+                            resolved_source_attachment_coordinate = tuple(
+                                float(value)
+                                for value in source_obj.data.vertices[
+                                    resolved_source_attachment_index
+                                ].co
+                            )
+                            if math.dist(
+                                source_attachment_coordinate,
+                                resolved_source_attachment_coordinate,
+                            ) > _fbx_coordinate_tolerance(
+                                [
+                                    source_attachment_coordinate,
+                                    resolved_source_attachment_coordinate,
+                                ]
+                            ):
+                                raise ClusterAssemblyBuildError(
+                                    "normalized plan attachment UV does not "
+                                    "identify its authored attachment vertex"
+                                )
+                        influences, influence_source = (
+                            _exact_native_attachment_influences(
+                                target_object,
+                                component,
+                                target_attachment_index,
+                                native_receipt,
+                                snapshot,
+                                (
+                                    "normalized Assembly component "
+                                    f"{part_asset_name}"
+                                ),
+                            )
+                        )
                         source_attachment = _world_coordinate(
                             source_obj,
-                            attachment["source_coordinate"],
+                            source_obj.data.vertices[
+                                source_attachment_index
+                            ].co,
                         )
-                        target_attachment = _world_coordinate(
-                            target_object,
-                            attachment["target_coordinate"],
+                        target_attachment = _native_position_to_blender_world(
+                            influence_source["authored_position_native"]
                         )
-                        attachment_correspondence = attachment["evidence"]
                         fit_source_attachment = source_attachment
                         fit_target_attachment = target_attachment
                         placement_source = (
-                            "exact_render_attachment_correspondence__"
+                            "native_modeler_authored_position__"
                             "surviving_root_tip_rotation_uniform_scale"
                         )
                         exact_render_attachment_binding_count += 1
@@ -6285,12 +5835,10 @@ def build_blender_assembly_inputs(
                                     f"endpoint={exc}; fit={fit_exc}",
                                 )
                         transform["placement_source"] = placement_source
-                        transform["correspondence_evidence"] = (
-                            correspondence_evidence
+                        transform["correspondence_policy"] = (
+                            correspondence_evidence["policy"]
                         )
-                        transform["attachment_correspondence"] = deepcopy(
-                            attachment_correspondence
-                        )
+                        transform.pop("endpoint_evidence", None)
                         transform["attachment_vertex_index"] = (
                             attachment_vertex_index
                         )
@@ -6304,71 +5852,40 @@ def build_blender_assembly_inputs(
                         gate_assembly_transform_residuals(
                             transform,
                             {
-                                "full_asset": stem,
                                 "part_asset": part_asset_name,
-                                "prototype_id": prototype_id,
-                                "role": role,
-                                "card_ordinal": ordinal,
                                 "instance": instance_index,
-                                "target_mesh_id": target_mesh_id,
-                                "placement_source": placement_source,
-                                "component_polygon_indices": (
-                                    component["polygons"]
-                                ),
-                                "correspondence_policy": (
-                                    correspondence_evidence["policy"]
-                                ),
                             },
                             block_geometry=False,
                         )
-                        if composite_parts:
-                            influences = []
-                            influence_source = {
-                                "policy": (
-                                    "deferred_exact_composite_source_bone_v1"
-                                ),
-                            }
-                        elif target_object is final_merged_mesh:
-                            influences, influence_source = (
-                                _exact_attachment_anchor_influences(
-                                    target_object,
-                                    target_attachment_index,
-                                    attachment_correspondence,
-                                    spm_xml_bone_lineage,
-                                    snapshot,
-                                    skeleton_by_name,
-                                    (
-                                        "rendered Assembly component "
-                                        f"{part_asset_name}"
-                                    ),
-                                )
+                        persisted_influence_source = {
+                            key: influence_source.get(key)
+                            for key in (
+                                "policy",
+                                "identity_source",
+                                "geometry_ordinal",
+                                "native_vertex_indices",
+                                "queried_native_vertex_count",
+                                "target_attachment_vertex_index",
+                                "unowned_native_vertex_count",
+                                "owner_selection_policy",
+                                "native_instance_id",
+                                "node_guid",
+                                "receipt",
                             )
-                        else:
-                            influences, influence_source = (
-                                _exact_source_bone_influences(
-                                    variant.get("source_bone"),
-                                    skeleton_by_name,
-                                    (
-                                        "normalized Assembly variant "
-                                        f"{part_asset_name}"
-                                    ),
-                                )
-                            )
+                        }
                         binding = {
                             "instance": instance_index,
                             "card_ordinal": ordinal,
-                            "component_polygon_indices": component["polygons"],
                             "transform": transform,
                             "bone_influences": influences,
-                            "bone_influence_source": influence_source,
+                            "bone_influence_source": persisted_influence_source,
                         }
-                        if not composite_parts:
-                            hierarchy = validate_binding_hierarchy(
-                                binding,
-                                snapshot,
-                                skeleton_by_name=skeleton_by_name,
-                            )
-                            binding["anchor_bone"] = hierarchy["anchor_bone"]
+                        hierarchy = validate_binding_hierarchy(
+                            binding,
+                            snapshot,
+                            skeleton_by_name=skeleton_by_name,
+                        )
+                        binding["anchor_bone"] = hierarchy["anchor_bone"]
                         bindings.append(binding)
                     if composite_parts:
                         if str(variant.get("source_partition_mode") or "") != "COMPOSITE_PER_DEFORM_ROOT":
@@ -6479,17 +5996,6 @@ def build_blender_assembly_inputs(
                                 )
                                 composite_binding["card_ordinal"] = ordinal
                                 composite_binding["composite_subpart_index"] = subpart_index
-                                (
-                                    composite_binding["bone_influences"],
-                                    composite_binding["bone_influence_source"],
-                                ) = _exact_source_bone_influences(
-                                    subpart.get("source_bone"),
-                                    skeleton_by_name,
-                                    (
-                                        "normalized Assembly composite part "
-                                        f"{subpart_asset}"
-                                    ),
-                                )
                                 composite_binding["transform"] = (
                                     compose_similarity_with_relative_matrix(
                                         base_binding["transform"],
@@ -6698,14 +6204,12 @@ def build_blender_assembly_inputs(
             raise ClusterAssemblyBuildError(
                 "target SPM changed while authored placement was built"
             )
-        authored_xml_after = validate_file_fingerprint(
-            spm_xml_bone_lineage.get("source_xml"),
-            "target SpeedTree XML exact attachment lineage",
+        native_receipt_after = file_fingerprint(
+            native_receipt["receipt_path"]
         )
-        if authored_xml_after != spm_xml_bone_lineage.get("source_xml"):
+        if native_receipt_after != native_receipt_fingerprint:
             raise ClusterAssemblyBuildError(
-                "target SpeedTree XML changed while exact attachment identity "
-                "was built"
+                "native SpeedTree runtime receipt changed while Assembly was built"
             )
         persisted_residual_gates = [
             (binding.get("transform") or {}).get("residual_gate") or {}
@@ -6720,13 +6224,12 @@ def build_blender_assembly_inputs(
             "version": PLACEMENT_CONTRACT_VERSION,
             "status": "ready",
             "source_spm": authored_spm_fingerprint,
-            "identity_policy": "exact_render_attachment_correspondence_v1",
-            "translation_source": "exact_target_attachment_vertex",
+            "identity_policy": "native_modeler_authored_position_receipt_v1",
+            "translation_source": "native_modeler_runtime_receipt",
             "rotation_uniform_scale_source": (
                 "surviving_root_tip_frame_then_bounded_similarity_then_"
                 "identity_unit_scale_safe_fallback"
             ),
-            "approximate_node_matching_present": False,
             "exact_render_attachment_binding_count": (
                 exact_render_attachment_binding_count
             ),
@@ -6788,7 +6291,16 @@ def build_blender_assembly_inputs(
             ],
             "preserved_render_components": preserved_render_components,
             "placement_contract": placement_contract,
-            "attachment_bone_contract": spm_xml_bone_lineage,
+            "attachment_bone_contract": {
+                "status": "ready",
+                "policy": "native_modeler_runtime_receipt_v1",
+                "receipt": native_receipt_fingerprint,
+                "source_spm": authored_spm_fingerprint,
+                "bone_count": len(native_receipt.get("bones") or []),
+                "generated_instance_count": len(
+                    native_receipt.get("generated_instances") or []
+                ),
+            },
             "final_skeleton": snapshot,
             "wind_contract": wind_validation,
             "coordinate_contract": {
@@ -6845,7 +6357,11 @@ def build_blender_assembly_inputs(
             manifest,
         )
         manifest_path.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2),
+            json.dumps(
+                manifest,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
             encoding="utf-8",
         )
         manifest["manifest"] = file_fingerprint(manifest_path)
@@ -8686,13 +8202,11 @@ __all__ = [
     "fit_uniform_similarity_transform",
     "gate_assembly_transform_residuals",
     "lowest_common_ancestor",
-    "make_speedtree_xml_bone_lineage",
     "make_skeleton_snapshot",
     "normalize_role_identity",
     "scope_material_pipeline_for_destination",
     "scope_material_pipeline_to_codex_tests",
     "snapshot_blender_armature",
-    "parse_speedtree_xml_bone_lineage",
     "validate_binding_hierarchy",
     "validate_file_fingerprint",
     "validate_manifest_artifacts",
