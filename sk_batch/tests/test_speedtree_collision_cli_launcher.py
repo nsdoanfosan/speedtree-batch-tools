@@ -63,7 +63,7 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         launcher = LAUNCHER_SOURCE.read_text(encoding="utf-8")
         contract = (
             "SPEEDTREE_COLLISION_CLI_CONTRACT="
-            "native-runtime-receipt-v5"
+            "native-runtime-receipt-v6"
         )
 
         self.assertIn(contract, launcher)
@@ -87,6 +87,15 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         self.assertIn("kFindExportBoneMappingRva = 0x6B4DF0", source)
         self.assertIn("if (parentId != 0)", weight_hook)
         self.assertIn("const float rootWeight = 1.0f - childWeight;", weight_hook)
+        self.assertIn('"omitted_no_exact_bone_record"', source)
+        self.assertIn(
+            "gMissingIdZeroBoneRecordLogged.store(false",
+            source,
+        )
+        missing_root_guard = (
+            "if (FindExactExportBoneMapping(exporter, 0) == nullptr)"
+        )
+        self.assertIn(missing_root_guard, weight_hook)
         self.assertIn(
             "gOriginalExportVertexWeights(\n"
             "            exporter,\n"
@@ -94,6 +103,16 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
             "            0,",
             weight_hook,
         )
+        self.assertLess(
+            weight_hook.index(missing_root_guard),
+            weight_hook.index(
+                "gOriginalExportVertexWeights(\n"
+                "            exporter,\n"
+                "            position,\n"
+                "            0,"
+            ),
+        )
+        self.assertIn("SpeedTree_Modeler+0x6B5185", weight_hook)
         self.assertIn("FbxSkeleton::eLimbNode", source)
         self.assertIn("No spatial lookup or normalization", weight_hook)
 
@@ -150,6 +169,8 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         self.assertIn("FileWriteTime(logPath)", source)
         self.assertIn("kProgressStallExitCode", source)
         self.assertIn("no meaningful CPU, I/O, memory, or hook-log", source)
+        self.assertIn("SPEEDTREE_COLLISION_WRAPPER_TIMEOUT_MS", source)
+        self.assertIn("const DWORD processWaitMs = timeoutMs;", source)
 
     def test_modeler_child_uses_the_shortest_rlm_connect_window(self):
         source = LAUNCHER_SOURCE.read_text(encoding="utf-8")

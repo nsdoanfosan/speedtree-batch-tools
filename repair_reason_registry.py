@@ -767,6 +767,9 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "cluster_missing_normalized_export_pivot": ReasonRow(
         UNCLASSIFIED, "cluster_export_handoff_contract.py", "",
     ),
+    "first_exact_assembly_hierarchy_promoted_to_export_pivot": ReasonRow(
+        UNCLASSIFIED, "cluster_export_handoff_contract.py", "",
+    ),
     "cluster_canonical_spm_missing": ReasonRow(
         FATAL, "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
         "cluster_identity",
@@ -2146,6 +2149,7 @@ _classify(
 _classify(
     INFORMATIONAL, "cluster_handoff_diagnostic",
     "cluster_missing_normalized_export_pivot", "missing_export_collection",
+    "first_exact_assembly_hierarchy_promoted_to_export_pivot",
     "multiple_unsuffixed_export_roots", "new_exact_assembly_source_hierarchy",
     "no_unsuffixed_export_root", "persisted_unsuffixed_export_root",
     "assembly_source_fbx_pending_export", "hash_validated_cluster_assembly_source",

@@ -25,7 +25,7 @@
 namespace {
 
 constexpr wchar_t kCapabilityContract[] =
-    L"SPEEDTREE_COLLISION_CLI_CONTRACT=native-runtime-receipt-v5";
+    L"SPEEDTREE_COLLISION_CLI_CONTRACT=native-runtime-receipt-v6";
 
 constexpr wchar_t kDefaultModelerPath[] =
     L"C:\\Program Files\\SpeedTree\\SpeedTree Modeler v10.1.0\\win64\\SpeedTree_Modeler.exe";
@@ -584,6 +584,18 @@ int wmain(int argc, wchar_t** argv) {
             std::optional<std::wstring>(L"0");
         bool persistent = GetEnvironment(L"SPEEDTREE_COLLISION_PERSISTENT") ==
             std::optional<std::wstring>(L"1");
+        if (const auto configuredTimeout =
+                GetEnvironment(L"SPEEDTREE_COLLISION_WRAPPER_TIMEOUT_MS")) {
+            wchar_t* end = nullptr;
+            const unsigned long parsed = wcstoul(
+                configuredTimeout->c_str(),
+                &end,
+                10);
+            if (end != configuredTimeout->c_str() && *end == L'\0' &&
+                parsed >= 1000) {
+                timeoutMs = parsed;
+            }
+        }
         if (const auto configuredAnchor =
                 GetEnvironment(L"SPEEDTREE_COLLISION_SESSION_ANCHOR")) {
             sessionAnchor = *configuredAnchor;
@@ -1137,7 +1149,11 @@ int wmain(int argc, wchar_t** argv) {
             return 0;
         }
 
-        const DWORD processWaitMs = timeoutMs + 5 * 60 * 1000;
+        // ``timeoutMs`` is the wrapper's absolute ownership budget. Process
+        // CPU/memory churn may keep the shorter progress-stall detector alive,
+        // but it must never extend this hard deadline or monopolize the shared
+        // machine-wide SpeedTree export gate.
+        const DWORD processWaitMs = timeoutMs;
         const ULONGLONG waitDeadline = GetTickCount64() + processWaitMs;
         ULONGLONG lastMeaningfulProgress = GetTickCount64();
         ProcessActivitySnapshot activityBaseline{};

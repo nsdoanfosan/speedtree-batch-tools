@@ -280,6 +280,7 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                 xml_ini=str(xml_options),
                 speedtree_exe=str(root / "SpeedTree.exe"),
                 timeout=900,
+                native_process_timeout=180,
             )
             helper = mock.Mock()
             events = []
@@ -293,6 +294,9 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
             def export_bundle(**kwargs):
                 with helper.speedtree_export_gate():
                     events.append("export")
+                    events.append(os.environ.get(
+                        "SPEEDTREE_COLLISION_WRAPPER_TIMEOUT_MS"
+                    ))
                 return {
                     "fbx": {"status": "ok", "kwargs": kwargs},
                     "xml": {"status": "ok", "kwargs": kwargs},
@@ -304,10 +308,23 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
             with mock.patch.object(
                 preflight,
                 "require_texture_skip_writing",
+            ), mock.patch.dict(
+                os.environ,
+                {"SPEEDTREE_COLLISION_WRAPPER_TIMEOUT_MS": "existing"},
             ), redirect_stdout(output):
                 result = preflight.run_export(args, helper)
+                restored_timeout = os.environ.get(
+                    "SPEEDTREE_COLLISION_WRAPPER_TIMEOUT_MS"
+                )
 
-            self.assertEqual(events, ["gate_enter", "export", "gate_exit"])
+            self.assertEqual(
+                events,
+                ["gate_enter", "export", "180000", "gate_exit"],
+            )
+            self.assertEqual(
+                restored_timeout,
+                "existing",
+            )
             self.assertIs(helper.speedtree_export_gate, original_gate)
             self.assertEqual(result["fbx"]["status"], "ok")
             self.assertEqual(result["xml"]["status"], "ok")
@@ -321,11 +338,17 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
             with mock.patch.object(
                 preflight,
                 "require_texture_skip_writing",
+            ), mock.patch.dict(
+                os.environ,
+                {"SPEEDTREE_COLLISION_WRAPPER_TIMEOUT_MS": "existing"},
             ), mock.patch("builtins.print", side_effect=OSError("closed log")):
                 result = preflight.run_export(args, helper)
 
             self.assertEqual(result["fbx"]["status"], "ok")
-            self.assertEqual(events, ["gate_enter", "export", "gate_exit"])
+            self.assertEqual(
+                events,
+                ["gate_enter", "export", "180000", "gate_exit"],
+            )
             self.assertIs(helper.speedtree_export_gate, original_gate)
 
     def test_raw_source_is_structured_provisional_until_pcg_generation(self):
@@ -985,6 +1008,17 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                     "material_names": ["M_leaf_atlas_green"],
                     "reason": "strict ownership was not proven",
                 },
+            },
+        })
+
+        self.assertEqual(issues, [])
+
+    def test_atlas_replacement_is_not_an_unreal_weight_preflight_issue(self):
+        issues = preflight.preflight_contract_issues({
+            "spm": "SK_atlas.spm",
+            "leaf_reference_contract": {
+                "status": "replacement_needed",
+                "replacement_source_slot_count": 1,
             },
         })
 

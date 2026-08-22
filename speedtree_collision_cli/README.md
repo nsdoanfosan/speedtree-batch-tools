@@ -157,8 +157,10 @@ BAT 실행기는 매번 이 빠른 freshness 검사를 거칩니다. 소스 또�
 
 주요 옵션:
 
-- `--timeout-ms 600000`: 전체 계산 최대 시간
+- `--timeout-ms 600000`: CPU/메모리 변화와 무관한 전체 프로세스 절대 최대 시간
 - `--stall-timeout-ms 30000`: CPU/I/O/메모리/로그가 모두 멈춘 시간 제한
+- `SPEEDTREE_COLLISION_WRAPPER_TIMEOUT_MS`: 호출자가 같은 절대 최대 시간을
+  환경변수로 전달할 때 사용하며, 명시한 `--timeout-ms`가 우선합니다.
 - `--log D:\path\collision_hook.log`: 상세 로그
 - `--modeler D:\path\SpeedTree_Modeler.exe`: 설치 경로 재정의
 - `--verification-only`: 임시 감사 출력에서 Collision/Prune bake 생략

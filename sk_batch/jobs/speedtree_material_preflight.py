@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import sys
 import traceback
 from contextlib import contextmanager
@@ -119,6 +120,7 @@ def parse_args():
     parser.add_argument("--speedtree-cli", required=True)
     parser.add_argument("--report", required=True)
     parser.add_argument("--timeout", type=int, default=900)
+    parser.add_argument("--native-process-timeout", type=int, default=180)
     return parser.parse_args()
 
 
@@ -955,6 +957,11 @@ def run_export(args, speedtree_cli):
     # The material-preflight child is single-threaded and runs one bundle, so
     # the temporary module binding cannot overlap another call in this process.
     speedtree_cli.speedtree_export_gate = reported_gate
+    timeout_environment_name = "SPEEDTREE_COLLISION_WRAPPER_TIMEOUT_MS"
+    previous_timeout = os.environ.get(timeout_environment_name)
+    os.environ[timeout_environment_name] = str(
+        max(1, int(getattr(args, "native_process_timeout", 180))) * 1000
+    )
     try:
         return export_bundle(
             exe=Path(args.speedtree_exe),
@@ -967,6 +974,10 @@ def run_export(args, speedtree_cli):
             native_receipt=native_receipt_target,
         )
     finally:
+        if previous_timeout is None:
+            os.environ.pop(timeout_environment_name, None)
+        else:
+            os.environ[timeout_environment_name] = previous_timeout
         speedtree_cli.speedtree_export_gate = original_gate
 
 
@@ -1062,7 +1073,6 @@ def preflight_contract_issues(report):
     leaf_codes = {
         "inspection_error": "SPM_LEAF_INSPECTION_ERROR",
         "invalid_references": "ATLAS_REFERENCE_INVALID",
-        "replacement_needed": "ATLAS_REPLACEMENT_REQUIRED",
     }
     if leaf_status in leaf_codes:
         issues.append(
@@ -1303,13 +1313,17 @@ def main():
         report["instance_profile"] = read_tree_instance_profile(speedtree_spm)
         speedtree_cli = load_speedtree_cli(args.speedtree_cli)
         leaf_contract = inspect_spm_leaf_contract(speedtree_spm)
-        leaf_ok, leaf_message = leaf_contract_user_message(leaf_contract)
+        _leaf_ok, leaf_message = leaf_contract_user_message(leaf_contract)
         report["leaf_reference_contract"] = leaf_contract
         mesh_files = inspect_spm_mesh_file_references(speedtree_spm)
         report["mesh_file_reference_contract"] = mesh_files
         missing_mesh_files = list(mesh_files.get("missing") or [])
         atlas_integrity = mesh_files.get("atlas_consumer_integrity") or {}
-        if not leaf_ok:
+        leaf_reference_blocked = str(leaf_contract.get("status") or "") in {
+            "inspection_error",
+            "invalid_references",
+        }
+        if leaf_reference_blocked:
             report["status"] = "blocked"
             report["error"] = leaf_message
             emit_progress_marker(

@@ -60,6 +60,18 @@ def load_native_export_receipt(path, *, source_spm=None):
         or int(payload.get("schema_version") or 0) != RECEIPT_SCHEMA_VERSION
     ):
         raise NativeReceiptError("native SpeedTree receipt contract is unsupported")
+    id_zero_cluster_write = str(
+        payload.get("id_zero_cluster_write") or "legacy_unreported"
+    )
+    if id_zero_cluster_write not in {
+        "legacy_unreported",
+        "native_exact_bone_record",
+        "omitted_no_exact_bone_record",
+    }:
+        raise NativeReceiptError(
+            "native SpeedTree ID-0 cluster-write contract is unsupported"
+        )
+    payload["id_zero_cluster_write"] = id_zero_cluster_write
 
     source = payload.get("source") or {}
     source_path = Path(str(source.get("path") or "")).resolve()
