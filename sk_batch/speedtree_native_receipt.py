@@ -244,8 +244,8 @@ def exact_generated_instance(receipt, geometry_ordinal, vertex_indices):
     vertices = sorted({int(value) for value in vertex_indices})
     if not vertices:
         raise NativeReceiptError("target component has no vertices")
-    matches = []
-    for row in receipt.get("generated_instances") or []:
+    matches_by_owner = {}
+    for row_index, row in enumerate(receipt.get("generated_instances") or []):
         if int(row["geometry_ordinal"]) != int(geometry_ordinal):
             continue
         ranges = row["vertex_ranges"]
@@ -255,13 +255,52 @@ def exact_generated_instance(receipt, geometry_ordinal, vertex_indices):
             if any(first <= vertex <= last for first, last in ranges)
         ]
         if matched:
-            matches.append((row, matched))
+            node_guid = str(row.get("node_guid") or "")
+            owner_key = (
+                ("node_guid", node_guid)
+                if node_guid
+                else ("serializer_record", row_index)
+            )
+            owner = matches_by_owner.get(owner_key)
+            if owner is None:
+                owner = {
+                    "row": row,
+                    "matched": set(),
+                    "record_indices": [],
+                    "native_instance_ids": set(),
+                }
+                matches_by_owner[owner_key] = owner
+            else:
+                first = owner["row"]
+                identity_fields = (
+                    "geometry_ordinal",
+                    "source_bone_id",
+                    "node_guid",
+                    "parent_guid",
+                    "generator_guid",
+                    "authored_position_native",
+                    "authored_position_influences",
+                )
+                if any(first.get(field) != row.get(field) for field in identity_fields):
+                    raise NativeReceiptError(
+                        "one native runtime Node GUID has inconsistent serializer "
+                        f"records: node_guid={node_guid}"
+                    )
+            owner["matched"].update(matched)
+            owner["record_indices"].append(row_index)
+            if row.get("native_instance_id") is not None:
+                owner["native_instance_ids"].add(
+                    int(row["native_instance_id"])
+                )
+    matches = list(matches_by_owner.values())
     if len(matches) != 1:
         raise NativeReceiptError(
             "target component has no sole intersecting native runtime owner: "
             f"geometry={geometry_ordinal}, matches={len(matches)}"
         )
-    row, matched = matches[0]
+    owner = matches[0]
+    row = owner["row"]
+    matched = sorted(owner["matched"])
     matched_set = set(matched)
     return {
         **row,
@@ -270,5 +309,10 @@ def exact_generated_instance(receipt, geometry_ordinal, vertex_indices):
         "unowned_native_vertex_count": sum(
             vertex not in matched_set for vertex in vertices
         ),
-        "owner_selection_policy": "sole_exact_native_range_intersection_v1",
+        "native_instance_ids": sorted(owner["native_instance_ids"]),
+        "native_serializer_record_indices": list(owner["record_indices"]),
+        "native_serializer_record_count": len(owner["record_indices"]),
+        "owner_selection_policy": (
+            "sole_exact_native_node_guid_range_intersection_v2"
+        ),
     }

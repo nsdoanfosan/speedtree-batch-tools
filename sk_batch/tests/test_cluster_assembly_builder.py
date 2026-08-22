@@ -51,6 +51,7 @@ from cluster_assembly_builder import (  # noqa: E402
     _generated_material_sidecar,
     _normalized_prototype_for_component,
     _ordered_cross_object_correspondence,
+    _partition_components_by_native_runtime_owner,
     _partition_normalized_render_components,
     _role_material_polygons,
     _strip_fbx_scene_textures,
@@ -519,7 +520,7 @@ class ExactNativeAttachmentInfluenceTests(unittest.TestCase):
         self.assertEqual(source["target_attachment_vertex_index"], 1)
         self.assertEqual(
             source["owner_selection_policy"],
-            "sole_exact_native_range_intersection_v1",
+            "sole_exact_native_node_guid_range_intersection_v2",
         )
 
     def test_clipped_attachment_uses_sole_exact_component_intersection(self):
@@ -778,6 +779,109 @@ class ComponentTopologyTests(unittest.TestCase):
             sum(len(row["instances"]) for row in matched.values()),
             2,
         )
+
+    def test_native_node_guid_splits_coincident_welded_card_instances(self):
+        target = seam_split_test_mesh(False)
+        vertex_offset = len(target.vertices)
+        loop_offset = len(target.loops)
+        target.vertices.extend([
+            SimpleNamespace(co=tuple(vertex.co))
+            for vertex in target.vertices[:vertex_offset]
+        ])
+        target.loops.extend([
+            SimpleNamespace(vertex_index=loop.vertex_index + vertex_offset)
+            for loop in target.loops[:loop_offset]
+        ])
+        target.uv_layers.active.data.extend([
+            SimpleNamespace(uv=SimpleNamespace(x=row.uv.x, y=row.uv.y))
+            for row in target.uv_layers.active.data[:loop_offset]
+        ])
+        target.polygons.extend([
+            SimpleNamespace(
+                index=polygon.index + 2,
+                vertices=tuple(
+                    value + vertex_offset for value in polygon.vertices
+                ),
+                loop_indices=tuple(
+                    value + loop_offset for value in polygon.loop_indices
+                ),
+            )
+            for polygon in target.polygons[:2]
+        ])
+        target.attributes = {
+            "speedtree_native_geometry_ordinal": SimpleNamespace(data=[
+                SimpleNamespace(value=3) for _vertex in target.vertices
+            ]),
+            "speedtree_native_vertex_index": SimpleNamespace(data=[
+                SimpleNamespace(value=index)
+                for index, _vertex in enumerate(target.vertices)
+            ]),
+        }
+        welded = _component_groups(target, [0, 1, 2, 3])
+        self.assertEqual(len(welded), 1)
+        receipt = {"generated_instances": [
+            {
+                "geometry_ordinal": 3,
+                "node_guid": "node-a",
+                "vertex_ranges": [(0, vertex_offset - 1)],
+            },
+            {
+                "geometry_ordinal": 3,
+                "node_guid": "node-b",
+                "vertex_ranges": [
+                    (vertex_offset, len(target.vertices) - 1)
+                ],
+            },
+        ]}
+
+        partitioned = _partition_components_by_native_runtime_owner(
+            SimpleNamespace(name="target", data=target),
+            welded,
+            receipt,
+        )
+
+        self.assertEqual(len(partitioned), 2)
+        self.assertEqual(
+            [row["native_runtime_owner"] for row in partitioned],
+            [["node_guid", "node-a"], ["node_guid", "node-b"]],
+        )
+        self.assertEqual(
+            [len(row["polygons"]) for row in partitioned],
+            [2, 2],
+        )
+
+    def test_same_native_node_guid_does_not_split_serializer_segments(self):
+        target = seam_split_test_mesh(False)
+        target.attributes = {
+            "speedtree_native_geometry_ordinal": SimpleNamespace(data=[
+                SimpleNamespace(value=3) for _vertex in target.vertices
+            ]),
+            "speedtree_native_vertex_index": SimpleNamespace(data=[
+                SimpleNamespace(value=index)
+                for index, _vertex in enumerate(target.vertices)
+            ]),
+        }
+        components = _component_groups(target, [0, 1])
+        receipt = {"generated_instances": [
+            {
+                "geometry_ordinal": 3,
+                "node_guid": "same-node",
+                "vertex_ranges": [(0, 1)],
+            },
+            {
+                "geometry_ordinal": 3,
+                "node_guid": "same-node",
+                "vertex_ranges": [(2, 3)],
+            },
+        ]}
+
+        partitioned = _partition_components_by_native_runtime_owner(
+            SimpleNamespace(name="target", data=target),
+            components,
+            receipt,
+        )
+
+        self.assertEqual(partitioned, components)
 
     def test_unique_uv_face_subset_uses_the_normalized_prototype(self):
         source = seam_split_test_mesh(False)

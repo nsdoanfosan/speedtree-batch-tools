@@ -64,7 +64,7 @@ MAX_SPEEDTREE_RENDER_FACE_MULTIPLICITY = 2
 # and ambiguous in the next.
 MIN_FBX_COORDINATE_TOLERANCE_METERS = 1.0e-6
 PASS_THROUGH_PROVENANCE_SCHEMA_VERSION = 1
-ASSEMBLY_BUILD_CACHE_VERSION = 7
+ASSEMBLY_BUILD_CACHE_VERSION = 8
 PASS_THROUGH_PROVENANCE_REASON = (
     "selected_target_contract_handoff_pass_through"
 )
@@ -1499,7 +1499,10 @@ def validate_normalized_prototype_unit_contract(manifest):
                     )
                 if (
                     influence_source.get("owner_selection_policy")
-                    != "sole_exact_native_range_intersection_v1"
+                    not in {
+                        "sole_exact_native_range_intersection_v1",
+                        "sole_exact_native_node_guid_range_intersection_v2",
+                    }
                     or not influence_source.get("native_vertex_indices")
                     or not influence_source.get("node_guid")
                     or not influence_source.get("receipt")
@@ -3260,6 +3263,91 @@ def _exact_index_component_groups(mesh, polygon_indices):
     )
 
 
+def _partition_components_by_native_runtime_owner(obj, components, receipt):
+    """Split accidentally welded render components by exact runtime Node GUID.
+
+    SpeedTree can place two independent cards on the same authored edge.  The
+    FBX/BWR coordinate weld then correctly reconnects seam-split faces, but it
+    cannot distinguish those coincident card instances by geometry alone.  The
+    native serializer receipt can: every surviving vertex retains its exact
+    geometry ordinal/local index, and each Node record carries its runtime
+    GUID.  Use that identity only when a welded component actually intersects
+    multiple Nodes; ordinary one-owner components remain untouched.
+    """
+
+    ordinal_attribute = obj.data.attributes.get(
+        "speedtree_native_geometry_ordinal"
+    )
+    vertex_attribute = obj.data.attributes.get("speedtree_native_vertex_index")
+    if ordinal_attribute is None or vertex_attribute is None:
+        return list(components)
+
+    owner_by_native_vertex = defaultdict(set)
+    for row_index, row in enumerate(receipt.get("generated_instances") or []):
+        node_guid = str(row.get("node_guid") or "")
+        owner = (
+            ("node_guid", node_guid)
+            if node_guid
+            else ("serializer_record", int(row_index))
+        )
+        geometry_ordinal = int(row["geometry_ordinal"])
+        for first, last in row.get("vertex_ranges") or []:
+            for native_vertex_index in range(int(first), int(last) + 1):
+                owner_by_native_vertex[
+                    (geometry_ordinal, native_vertex_index)
+                ].add(owner)
+
+    def vertex_owners(vertex_index):
+        key = (
+            int(ordinal_attribute.data[int(vertex_index)].value),
+            int(vertex_attribute.data[int(vertex_index)].value),
+        )
+        return owner_by_native_vertex.get(key, set())
+
+    partitioned = []
+    for component in components:
+        component_owners = set()
+        polygon_owners = {}
+        for polygon_index in component["polygons"]:
+            owners = set()
+            for vertex_index in obj.data.polygons[polygon_index].vertices:
+                owners.update(vertex_owners(vertex_index))
+            if len(owners) > 1:
+                raise ClusterAssemblyBuildError(
+                    "one rendered polygon crosses multiple native runtime "
+                    f"Node owners: object={obj.name!r} polygon={polygon_index} "
+                    f"owners={sorted(owners)}"
+                )
+            owner = next(iter(owners)) if owners else None
+            polygon_owners[int(polygon_index)] = owner
+            if owner is not None:
+                component_owners.add(owner)
+        if len(component_owners) <= 1:
+            partitioned.append(component)
+            continue
+        if any(owner is None for owner in polygon_owners.values()):
+            raise ClusterAssemblyBuildError(
+                "a multi-Node rendered component contains polygons without "
+                f"native runtime ownership: object={obj.name!r}"
+            )
+        by_owner = defaultdict(list)
+        for polygon_index, owner in polygon_owners.items():
+            by_owner[owner].append(polygon_index)
+        for owner in sorted(by_owner):
+            polygons = sorted(by_owner[owner])
+            vertices = sorted({
+                int(vertex)
+                for polygon_index in polygons
+                for vertex in obj.data.polygons[polygon_index].vertices
+            })
+            partitioned.append({
+                "vertices": vertices,
+                "polygons": polygons,
+                "native_runtime_owner": list(owner),
+            })
+    return sorted(partitioned, key=lambda row: row["polygons"][0])
+
+
 def _component_signature(mesh, component):
     uv_layer = mesh.uv_layers.active
     uv_faces = []
@@ -3473,7 +3561,12 @@ def _match_uv_candidate_groups(
         raise ClusterAssemblyBuildError(
             "normalized plan duplicate UV has fewer source positions than "
             f"the target: uv={key} source={len(source_groups)} "
-            f"target={len(target_groups)}"
+            f"target={len(target_groups)} source_object={source_obj.name!r} "
+            f"target_object={target_obj.name!r} "
+            "source_coordinates="
+            f"{[row['coordinate'] for row in source_groups]} "
+            "target_coordinates="
+            f"{[row['coordinate'] for row in target_groups]}"
         )
     if len(source_groups) > 8:
         raise ClusterAssemblyBuildError(
@@ -5475,6 +5568,29 @@ def build_blender_assembly_inputs(
             f"contract, got system={source_unit_system} scale={source_scale_length}"
         )
     try:
+        authored_spm_fingerprint = validate_file_fingerprint(
+            handoff.get("spm"),
+            "target SPM exact attachment identity",
+        )
+        if not target_native_receipt_path:
+            raise ClusterAssemblyBuildError(
+                "Assembly build has no native SpeedTree runtime receipt"
+            )
+        try:
+            native_receipt = load_native_export_receipt(
+                target_native_receipt_path,
+                source_spm=authored_spm_fingerprint["path"],
+            )
+        except NativeReceiptError as exc:
+            raise ClusterAssemblyBuildError(str(exc)) from exc
+        native_receipt_fingerprint = file_fingerprint(
+            native_receipt["receipt_path"]
+        )
+        if native_receipt_fingerprint.get("exists") is not True:
+            raise ClusterAssemblyBuildError(
+                "native SpeedTree runtime receipt current file is missing: "
+                + str(native_receipt_fingerprint.get("path"))
+            )
         provider_order = sorted(
             roles,
             key=lambda provider_key: (
@@ -5511,6 +5627,11 @@ def build_blender_assembly_inputs(
                 target_object.data,
                 role_row["polygon_indices"],
             )
+            components = _partition_components_by_native_runtime_owner(
+                target_object,
+                components,
+                native_receipt,
+            )
             matched, preserved = _partition_normalized_render_components(
                 prototypes,
                 target_object.data,
@@ -5540,29 +5661,6 @@ def build_blender_assembly_inputs(
                     **row,
                 })
         _validate_role_component_claims(role_build_plans)
-        authored_spm_fingerprint = validate_file_fingerprint(
-            handoff.get("spm"),
-            "target SPM exact attachment identity",
-        )
-        if not target_native_receipt_path:
-            raise ClusterAssemblyBuildError(
-                "Assembly build has no native SpeedTree runtime receipt"
-            )
-        try:
-            native_receipt = load_native_export_receipt(
-                target_native_receipt_path,
-                source_spm=authored_spm_fingerprint["path"],
-            )
-        except NativeReceiptError as exc:
-            raise ClusterAssemblyBuildError(str(exc)) from exc
-        native_receipt_fingerprint = file_fingerprint(
-            native_receipt["receipt_path"]
-        )
-        if native_receipt_fingerprint.get("exists") is not True:
-            raise ClusterAssemblyBuildError(
-                "native SpeedTree runtime receipt current file is missing: "
-                + str(native_receipt_fingerprint.get("path"))
-            )
         # No public Assembly artifact may exist until every requested rendered
         # role has proven at least one normalized prototype/component match.
         output.mkdir(parents=True, exist_ok=True)
