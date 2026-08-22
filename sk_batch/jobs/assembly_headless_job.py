@@ -1124,15 +1124,11 @@ def main():
         if reusable_contracts is None:
             leaf_reference_contract = {
                 "status": "not_applicable",
-                "reason": "post_export_spm_reparse_removed",
             }
             material_export_contract = {
                 "status": "not_applicable",
-                "reason": "native_export_artifacts_are_authoritative",
             }
-            report["spm_contract_inspection_source"] = (
-                "native_export_receipt_without_spm_reparse"
-            )
+            report["spm_contract_inspection_source"] = "native_export_receipt"
         else:
             leaf_reference_contract, material_export_contract = (
                 reusable_contracts
