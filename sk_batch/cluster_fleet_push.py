@@ -209,10 +209,9 @@ def validate_assembly_result(report_path, target):
     if (
         placement.get("version") != 2
         or placement.get("identity_policy")
-        != "exact_render_attachment_correspondence_v1"
+        != "native_modeler_authored_position_receipt_v1"
         or placement.get("translation_source")
-        != "exact_target_attachment_vertex"
-        or placement.get("approximate_node_matching_present") is not False
+        != "native_modeler_runtime_receipt"
     ):
         problems.append("assembly_binding_policy_not_current")
     if any(
@@ -224,31 +223,33 @@ def validate_assembly_result(report_path, target):
             "degraded_authored_card_binding_count",
         )
     ):
-        problems.append("approximate_node_matching_contract_present")
+        problems.append("legacy_attachment_identity_contract_present")
     placement_spm = placement.get("source_spm") or {}
     attachment_spm = attachment_bones.get("source_spm") or {}
-    attachment_rows = list(attachment_bones.get("bones") or [])
     try:
         declared_attachment_bone_count = int(
             attachment_bones.get("bone_count") or 0
         )
+        generated_instance_count = int(
+            attachment_bones.get("generated_instance_count") or 0
+        )
     except (TypeError, ValueError):
         declared_attachment_bone_count = -1
+        generated_instance_count = -1
+    native_receipt = attachment_bones.get("receipt") or {}
     if (
-        attachment_bones.get("version") != 1
-        or attachment_bones.get("status") != "ready"
-        or attachment_bones.get("identity_policy")
-        != "exact_speedtree_xml_bone_id_parent_id_v1"
-        or declared_attachment_bone_count != len(attachment_rows)
-        or not attachment_rows
-        or len(str(attachment_bones.get("lineage_sha256") or "")) != 64
-        or not (attachment_bones.get("source_xml") or {}).get("sha256")
+        attachment_bones.get("status") != "ready"
+        or attachment_bones.get("policy")
+        != "native_modeler_runtime_receipt_v1"
+        or declared_attachment_bone_count <= 0
+        or generated_instance_count <= 0
+        or not native_receipt.get("sha256")
         or str(placement_spm.get("path") or "")
         != str(attachment_spm.get("path") or "")
         or str(placement_spm.get("sha256") or "").casefold()
         != str(attachment_spm.get("sha256") or "").casefold()
     ):
-        problems.append("exact_attachment_bone_lineage_contract_missing")
+        problems.append("native_attachment_receipt_contract_missing")
     preserved_polygons = sum(
         int(row.get("polygon_count") or 0) for row in preserved
     )

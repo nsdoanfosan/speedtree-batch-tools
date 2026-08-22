@@ -6,7 +6,7 @@ SpeedTree 식생 변환 작업을 위한 독립형 Windows 배치 도구 모음�
 
 - `SpeedTree_Batch_Tools.bat`: 아래 세 도구를 한 창의 탭으로 전환하는 통합 실행 파일 (`Ctrl+1/2/3` 지원, 현재 탭은 별도 창으로 분리 가능)
 - `pcg_st9_texture_batch/PCG_ST9_Texture_Batch.bat`: PCG에서 사용하는 ST9 나무를 SK·나나이트·버추얼 텍스처 작업으로 연결하는 준비 보드
-- `sk_batch/SK_Batch.bat`: SPM 수정, Blender 리페어, Unreal 전송을 단계별로 실행하는 SK 식생 배치 도구
+- `sk_batch/SK_Batch.bat`: SPM 준비, Blender Assembly, Unreal 전송을 단계별로 실행하는 SK 식생 배치 도구
 - `spm_generator_sync/SPM_Generator_Sync.bat`: 같은 수종의 SPM을 마스터·자식·독립 계보로 관리하고 Base 제작 구조와 아이콘 색을 동기화하는 도구. 이후 SK Batch의 `0. Generator Sync`가 같은 엔진을 호출할 수 있는 패키지 진입점을 포함합니다.
 
 각 도구의 상세 사용법은 해당 폴더의 `README.md`를 참고합니다.
@@ -98,7 +98,7 @@ GitHub/
 ## 생성 산출물 보존 및 용량 상한
 
 모든 BAT GUI는 실제 작업을 시작하기 전에 `artifact_retention.py`의 전역 정리를
-자동 적용합니다. `sk_batch/logs`(pre-repair Blend, log, manifest/queue JSON 포함),
+자동 적용합니다. `sk_batch/logs`(중간 Blend, log, manifest/queue JSON 포함),
 PCG/SPM report 폴더, `sk_batch/cache`,
 `%LOCALAPPDATA%\SpeedTreeBatchTools`의 cache/retry/process receipt와 공유 queue,
 회전 오류 로그, `D:\OneDrive\Forestportfolio` 아래 도구 소유 백업이 하나의
@@ -110,7 +110,7 @@ PCG/SPM report 폴더, `sk_batch/cache`,
   오래된 생성물부터 지웁니다. 절대 상한은 `total_bytes < 10 * 1024^3`이며 정확히
   10 GiB도 허용하지 않습니다. 256 MiB 기본 여유는 작은 log/JSON과 예상치 오차가
   순간 상한을 침범하지 않도록 둡니다.
-- 대형 pre-repair 복사는 쓰기 전에 예상 크기를 예약하고 완료 또는 실패 직후 다시
+- 대형 중간 Blend 복사는 쓰기 전에 예상 크기를 예약하고 완료 또는 실패 직후 다시
   정리합니다. 예약 JSON과 plan/apply는 abandoned-safe process mutex로 직렬화됩니다.
 - Send2UE Headless/RPC/Exact Push의 대형 FBX export payload만 OneDrive 밖의
   `D:\SpeedTreeBatchTools\send2ue_fbx`에 씁니다. 이 payload는 백업을 만들지 않으며,

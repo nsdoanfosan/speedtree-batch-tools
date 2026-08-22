@@ -46,6 +46,9 @@ from speedtree_texture_contract import (  # noqa: E402
 from speedtree_export_options_contract import (  # noqa: E402
     require_texture_skip_writing,
 )
+from speedtree_native_receipt import (  # noqa: E402
+    load_native_export_receipt,
+)
 from pcg_st9_texture_batch.pcg_texture_audit import (  # noqa: E402
     _unsafe_provisional_source,
     atlas_provisional_source_declarations,
@@ -543,7 +546,7 @@ def augment_texture_readiness_contract(
     ):
         # Atlas provenance, SPM texture slots and live Generator delivery are
         # used only to classify unmanaged declared sources. Managed bindings
-        # already carry the exact texture-set contract consumed by Repair and
+        # already carry the exact texture-set contract consumed by Assembly and
         # Push, so a fleet-wide Atlas audit here cannot change the result.
         return readiness
     parsed = read_stmat_material_sources(stmat_path)
@@ -830,7 +833,7 @@ def augment_texture_readiness_contract(
                     "evidence proves this material is inactive"
                 )
                 binding.update({
-                    # Preserve ``not_managed`` so downstream repair keeps the
+                    # Preserve ``not_managed`` so downstream Assembly keeps the
                     # declared sources instead of treating the non-exporting
                     # diagnostic row as an unresolved managed set.
                     "texture_contract_status":
@@ -910,6 +913,9 @@ def run_export(args, speedtree_cli):
     spm = Path(args.spm)
     fbx_target = spm.parent / "fbx" / f"{spm.stem}.fbx"
     xml_target = spm.parent / "xml" / f"{spm.stem}.xml"
+    native_receipt_target = (
+        fbx_target.parent / f"{spm.stem}.speedtree_native_receipt.json"
+    )
     require_texture_skip_writing(
         args.fbx_ini,
         purpose=f"{spm.name} material-preflight FBX export",
@@ -958,6 +964,7 @@ def run_export(args, speedtree_cli):
                 ("xml", xml_target, Path(args.xml_ini)),
             ),
             timeout_seconds=max(1, int(args.timeout)),
+            native_receipt=native_receipt_target,
         )
     finally:
         speedtree_cli.speedtree_export_gate = original_gate
@@ -1384,6 +1391,20 @@ def main():
             ):
                 report["speedtree_export"] = export_bundle["fbx"]
                 report["speedtree_xml_export"] = export_bundle["xml"]
+                native_receipt = load_native_export_receipt(
+                    export_bundle["fbx"].get("native_receipt"),
+                    source_spm=speedtree_spm,
+                )
+                report["speedtree_native_receipt"] = {
+                    "status": "ready",
+                    "path": native_receipt["receipt_path"],
+                    "identity_policy": native_receipt.get("identity_policy"),
+                    "geometry_count": native_receipt.get("geometry_count"),
+                    "bone_count": len(native_receipt.get("bones") or []),
+                    "generated_instance_count": len(
+                        native_receipt.get("generated_instances") or []
+                    ),
+                }
                 report["speedtree_export_bundle"] = {
                     "policy": (
                         "native_collision_prune_fbx_xml_one_process"

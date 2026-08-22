@@ -30,13 +30,10 @@ from cluster_assembly_builder import (  # noqa: E402
     gate_assembly_transform_residuals,
     lowest_common_ancestor,
     make_skeleton_snapshot,
-    make_speedtree_xml_bone_lineage,
-    parse_speedtree_xml_bone_lineage,
     scope_material_pipeline_for_destination,
     scope_material_pipeline_to_codex_tests,
     _attachment_vertex_correspondence,
     _validate_base_export_parent_chain,
-    _attachment_point_correspondence,
     _assembly_fit_summary,
     _assembly_build_input_signature,
     _load_reusable_assembly_manifest,
@@ -48,8 +45,7 @@ from cluster_assembly_builder import (  # noqa: E402
     _component_signature,
     _current_unreal_skeleton_diagnostic,
     _expected_normalized_bounds_for_variant,
-    _exact_attachment_anchor_influences,
-    _exact_source_bone_influences,
+    _exact_native_attachment_influences,
     _export_selected_fbx,
     _generated_material_sidecar,
     _normalized_prototype_for_component,
@@ -69,18 +65,8 @@ from cluster_assembly_builder import (  # noqa: E402
     validate_unreal_normalized_prototype_bounds,
     validate_wind_json_against_skeleton,
     validate_persisted_residual_gate,
+    validate_file_fingerprint,
 )
-
-
-def exact_xml_lineage(*rows):
-    return make_speedtree_xml_bone_lineage(
-        [
-            {"id": bone_id, "parent_id": parent_id, "generator": generator}
-            for bone_id, parent_id, generator in rows
-        ],
-        source_spm={"path": "C:/target.spm", "sha256": "a" * 64},
-        source_xml={"path": "C:/target.xml", "sha256": "b" * 64},
-    )
 
 
 def exact_bone_skeleton(*rows):
@@ -112,6 +98,17 @@ def exact_bone_skeleton(*rows):
 
 
 class AssemblyBuildCacheTests(unittest.TestCase):
+    def test_current_file_path_is_accepted_as_exact_evidence(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "native_receipt.json"
+            target.write_text("{}", encoding="utf-8")
+
+            first = validate_file_fingerprint(target, "native receipt")
+            second = validate_file_fingerprint(target, "native receipt")
+
+            self.assertTrue(first["exists"])
+            self.assertEqual(first, second)
+
     def test_signature_ignores_lineage_only_source_blend(self):
         handoff = {
             "spm": {"path": "C:/tree.spm", "sha256": "a" * 64},
@@ -410,315 +407,119 @@ class GeneratedAssemblyReferencePoseSyncTests(unittest.TestCase):
             })
 
 
-class ExactSourceBoneInfluenceTests(unittest.TestCase):
-    def test_allows_unused_spm_bones_while_resolving_referenced_fbx_bone(self):
-        influences, source = _exact_source_bone_influences(
-            "Bone_2_Start",
-            {
-                "Bone_1_Start": object(),
-                "Bone_2_Start": object(),
-                "Bone_3_Start": object(),
-            },
-            "test variant",
-        )
-
-        self.assertEqual(
-            influences,
-            [{"bone": "Bone_2_Start", "weight": 1.0}],
-        )
-        self.assertEqual(source["policy"], "exact_normalized_source_bone_v1")
-
-    def test_rejects_missing_fbx_bone_without_spatial_fallback(self):
-        with self.assertRaisesRegex(
-            ClusterAssemblyBuildError,
-            "source_bone is missing from final skeleton: Bone_9_Start",
-        ):
-            _exact_source_bone_influences(
-                "Bone_9_Start",
-                {
-                    "Bone_1_Start": object(),
-                    "Bone_2_Start": object(),
-                },
-                "test variant",
-            )
-
-    def test_rejects_missing_source_bone_identity(self):
-        with self.assertRaisesRegex(
-            ClusterAssemblyBuildError,
-            "has no exact source_bone identity",
-        ):
-            _exact_source_bone_influences(
-                "",
-                {"Bone_1_Start": object()},
-                "test variant",
-            )
-
-
-class SpeedTreeXmlBoneLineageTests(unittest.TestCase):
-    def test_parser_preserves_exact_id_parent_and_generator(self):
-        xml = """<Root><Bones>
-        <Bone ID="17" ParentID="-1" Generator="Trunk" />
-        <Bone ID="407" ParentID="17" Generator="Branch" />
-        </Bones></Root>"""
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "target.xml"
-            path.write_text(xml, encoding="utf-8")
-            lineage = parse_speedtree_xml_bone_lineage(
-                path,
-                source_spm={"path": "target.spm", "sha256": "a" * 64},
-            )
-
-        self.assertEqual(lineage["root_bone_ids"], [17])
-        self.assertEqual(
-            lineage["bones"],
-            [
-                {"id": 17, "parent_id": -1, "generator": "Trunk"},
-                {"id": 407, "parent_id": 17, "generator": "Branch"},
-            ],
-        )
-        self.assertEqual(
-            lineage["identity_policy"],
-            "exact_speedtree_xml_bone_id_parent_id_v1",
-        )
-
-    def test_rejects_duplicate_missing_parent_and_cycle(self):
-        invalid_rows = (
-            [
-                {"id": 1, "parent_id": -1},
-                {"id": 1, "parent_id": -1},
-            ],
-            [{"id": 1, "parent_id": 99}],
-            [
-                {"id": 1, "parent_id": 2},
-                {"id": 2, "parent_id": 1},
-            ],
-        )
-        for rows in invalid_rows:
-            with self.subTest(rows=rows), self.assertRaises(
-                ClusterAssemblyBuildError
-            ):
-                make_speedtree_xml_bone_lineage(rows)
-
-
-class ExactAttachmentAnchorInfluenceTests(unittest.TestCase):
+class ExactNativeAttachmentInfluenceTests(unittest.TestCase):
     @staticmethod
-    def _object(group_names, vertex_weights):
-        return SimpleNamespace(
-            vertex_groups=[SimpleNamespace(name=name) for name in group_names],
-            data=SimpleNamespace(
-                vertices=[
-                    SimpleNamespace(
-                        groups=[
-                            SimpleNamespace(group=group, weight=weight)
-                            for group, weight in weights
-                        ]
-                    )
-                    for weights in vertex_weights
-                ]
+    def _skeleton():
+        return make_skeleton_snapshot([
+            {"index": 0, "name": "Armature", "parent_index": -1},
+            {"index": 1, "name": "NativeRoot", "parent_index": 0, "parent_name": "Armature"},
+            {"index": 2, "name": "CapturedChild", "parent_index": 1, "parent_name": "NativeRoot"},
+        ])
+
+    @staticmethod
+    def _receipt():
+        return {
+            "receipt_path": "C:/native.json",
+            "geometries": [{"ordinal": 4, "vertex_count": 12}],
+            "generated_instances": [{
+                "geometry_ordinal": 4,
+                "native_instance_id": 2305,
+                "node_guid": "node-guid",
+                "parent_guid": "parent-guid",
+                "generator_guid": "generator-guid",
+                "authored_position_native": [1.0, 2.0, 3.0],
+                "vertex_ranges": [(2, 7)],
+                "authored_position_influences": [
+                    {
+                        "bone_id": 0,
+                        "native_root": True,
+                        "exported_cluster_name": "",
+                        "weight": 0.25,
+                    },
+                    {
+                        "bone_id": 7,
+                        "native_root": False,
+                        "exported_cluster_name": "CapturedChild",
+                        "weight": 0.75,
+                    },
+                ],
+            }],
+        }
+
+    @staticmethod
+    def _object(ordinals, native_indices):
+        attributes = {
+            "speedtree_native_geometry_ordinal": SimpleNamespace(
+                data=[SimpleNamespace(value=value) for value in ordinals]
             ),
+            "speedtree_native_vertex_index": SimpleNamespace(
+                data=[SimpleNamespace(value=value) for value in native_indices]
+            ),
+        }
+        return SimpleNamespace(
+            data=SimpleNamespace(
+                vertices=[SimpleNamespace() for _value in ordinals],
+                attributes=attributes,
+            )
         )
 
-    def _resolve(self, obj, vertex_index, snapshot, lineage, context):
-        return _exact_attachment_anchor_influences(
+    def test_uses_native_runtime_owner_and_authored_weights(self):
+        obj = self._object([4, 4, 4], [2, 3, 4])
+        influences, source = _exact_native_attachment_influences(
             obj,
-            vertex_index,
-            {"policy": "exact_attachment_uv_vertex_v1"},
-            lineage,
-            snapshot,
-            {row["name"]: row for row in snapshot["bones"]},
-            context,
+            {"vertices": [0, 1, 2]},
+            1,
+            self._receipt(),
+            self._skeleton(),
+            "test native component",
         )
 
-    def test_uses_exact_skeleton_and_xml_hierarchy_not_weight_magnitude(self):
-        snapshot = exact_bone_skeleton(
-            ("Bone_1_Start", "Root"),
-            ("Bone_2_Start", "Bone_1_Start"),
-        )
-        lineage = exact_xml_lineage(
-            (0, -1, "Branch"),
-            (1, 0, "Leaf"),
-        )
-        obj = self._object(
-            ["Bone_1_Start", "Bone_2_Start"],
-            [[(0, 0.01), (1, 0.99)]],
-        )
-
-        influences, source = self._resolve(
-            obj, 0, snapshot, lineage, "test rendered attachment"
-        )
-
-        self.assertEqual(
-            influences,
-            [{"bone": "Bone_1_Start", "weight": 1.0}],
-        )
+        self.assertEqual(influences, [
+            {"bone": "NativeRoot", "weight": 0.25},
+            {"bone": "CapturedChild", "weight": 0.75},
+        ])
         self.assertEqual(
             source["policy"],
-            "exact_render_attachment_vertex_spm_xml_hierarchy_v4",
+            "native_modeler_authored_proxy_weights_v1",
         )
-        self.assertEqual(
-            source["spm_xml_lineage"]["anchor_xml_bone_id"],
-            0,
-        )
-        self.assertTrue(
-            source["spm_xml_lineage"][
-                "final_skeleton_xml_lineage_agreement"
-            ]
-        )
-        self.assertFalse(source["weight_magnitude_used_for_identity"])
-        self.assertFalse(source["spatial_proximity_used_for_identity"])
-        self.assertFalse(source["component_hierarchy_used_for_identity"])
-
-    def test_uses_exact_target_vertex_not_unrelated_component_lca(self):
-        snapshot = exact_bone_skeleton(
-            ("Bone_1_Start", "Root"),
-            ("Bone_2_Start", "Root"),
-        )
-        lineage = exact_xml_lineage(
-            (0, -1, "Branch"),
-            (1, -1, "Branch"),
-        )
-        obj = self._object(
-            ["Bone_1_Start", "Bone_2_Start"],
-            [[(0, 1.0)], [(1, 1.0)]],
-        )
-
-        influences, source = self._resolve(
-            obj, 1, snapshot, lineage, "test rendered leaf_side attachment"
-        )
-
-        self.assertEqual(
-            influences,
-            [{"bone": "Bone_2_Start", "weight": 1.0}],
-        )
-        self.assertEqual(source["anchor_bone"], "Bone_2_Start")
+        self.assertEqual(source["geometry_ordinal"], 4)
+        self.assertEqual(source["native_vertex_indices"], [3])
         self.assertEqual(source["target_attachment_vertex_index"], 1)
         self.assertEqual(
-            source["identity_source"],
-            "exact_target_attachment_vertex_groups_plus_spm_xml_lineage",
+            source["owner_selection_policy"],
+            "sole_exact_native_range_intersection_v1",
         )
 
-    def test_applies_single_exact_attachment_bone_to_every_rendered_role(self):
-        snapshot = exact_bone_skeleton(("Bone_7_Start", "Root"))
-        lineage = exact_xml_lineage((6, -1, "Branch"))
-        obj = self._object(["Bone_7_Start"], [[(0, 1.0)]])
+    def test_clipped_attachment_uses_sole_exact_component_intersection(self):
+        obj = self._object([4, 4, 4], [0, 3, 11])
+        influences, source = _exact_native_attachment_influences(
+            obj,
+            {"vertices": [0, 1, 2]},
+            None,
+            self._receipt(),
+            self._skeleton(),
+            "test clipped native component",
+        )
 
-        for role in ROLE_ORDER:
-            with self.subTest(role=role):
-                influences, source = self._resolve(
-                    obj,
-                    0,
-                    snapshot,
-                    lineage,
-                    f"test rendered {role} attachment",
-                )
-                self.assertEqual(
-                    influences,
-                    [{"bone": "Bone_7_Start", "weight": 1.0}],
-                )
-                self.assertEqual(source["anchor_bone"], "Bone_7_Start")
+        self.assertEqual(influences[1]["bone"], "CapturedChild")
+        self.assertEqual(source["native_vertex_indices"], [3])
+        self.assertEqual(source["queried_native_vertex_count"], 3)
+        self.assertEqual(source["unowned_native_vertex_count"], 2)
+        self.assertIsNone(source["target_attachment_vertex_index"])
 
-    def test_rejects_attachment_bone_missing_from_final_skeleton(self):
-        snapshot = exact_bone_skeleton(("Bone_1_Start", "Root"))
-        lineage = exact_xml_lineage((8, -1, "Branch"))
-        obj = self._object(["Bone_9_Start"], [[(0, 1.0)]])
-
+    def test_rejects_component_spanning_native_geometries(self):
+        obj = self._object([4, 5], [2, 3])
         with self.assertRaisesRegex(
             ClusterAssemblyBuildError,
-            "attachment vertex-group bones missing from final skeleton: "
-            "Bone_9_Start",
+            "spans multiple native serializer geometries",
         ):
-            self._resolve(
-                obj, 0, snapshot, lineage, "test rendered attachment"
-            )
-
-    def test_does_not_invent_unweighted_lca_on_attachment_vertex(self):
-        snapshot = exact_bone_skeleton(
-            ("Bone_1_Start", "Root"),
-            ("Bone_2_Start", "Bone_1_Start"),
-            ("Bone_3_Start", "Bone_1_Start"),
-        )
-        lineage = exact_xml_lineage(
-            (0, -1, "Branch"),
-            (1, 0, "Branch"),
-            (2, 0, "Branch"),
-        )
-        obj = self._object(
-            ["Bone_2_Start", "Bone_3_Start"],
-            [[(0, 0.5), (1, 0.5)]],
-        )
-
-        with self.assertRaisesRegex(
-            ClusterAssemblyBuildError,
-            "common ancestor Bone_1_Start is not authored on the attachment vertex",
-        ):
-            self._resolve(
-                obj, 0, snapshot, lineage, "test rendered attachment"
-            )
-
-    def test_rejects_final_skeleton_xml_lineage_disagreement(self):
-        snapshot = exact_bone_skeleton(
-            ("Bone_1_Start", "Root"),
-            ("Bone_2_Start", "Bone_1_Start"),
-        )
-        lineage = exact_xml_lineage(
-            (0, -1, "Branch"),
-            (1, -1, "Branch"),
-        )
-        obj = self._object(
-            ["Bone_1_Start", "Bone_2_Start"],
-            [[(0, 0.5), (1, 0.5)]],
-        )
-
-        with self.assertRaisesRegex(
-            ClusterAssemblyBuildError,
-            "do not share an authored ancestor",
-        ):
-            self._resolve(
-                obj, 0, snapshot, lineage, "test rendered attachment"
-            )
-
-    def test_black_locust_shape_selects_attachment_bone_not_component_lca(self):
-        snapshot = exact_bone_skeleton(
-            ("Bone_17_End", "Root"),
-            ("Bone_407_End", "Bone_17_End"),
-            ("Bone_512_End", "Bone_17_End"),
-        )
-        lineage = exact_xml_lineage(
-            (16, -1, "Trunk"),
-            (406, 16, "Branch"),
-            (511, 16, "Branch"),
-        )
-        obj = self._object(
-            ["Bone_407_End", "Bone_512_End"],
-            [[(0, 1.0)], [(1, 1.0)]],
-        )
-
-        influences, source = self._resolve(
-            obj, 0, snapshot, lineage, "test rendered cluster attachment"
-        )
-
-        self.assertEqual(
-            influences,
-            [{"bone": "Bone_407_End", "weight": 1.0}],
-        )
-        self.assertEqual(source["anchor_bone"], "Bone_407_End")
-        self.assertNotEqual(source["anchor_bone"], "Bone_17_End")
-        self.assertEqual(
-            source["spm_xml_lineage"]["anchor_xml_bone_id"],
-            406,
-        )
-
-    def test_rejects_negative_target_attachment_vertex_index(self):
-        snapshot = exact_bone_skeleton(("Bone_1_Start", "Root"))
-        lineage = exact_xml_lineage((0, -1, "Branch"))
-        obj = self._object(["Bone_1_Start"], [[(0, 1.0)]])
-
-        with self.assertRaisesRegex(
-            ClusterAssemblyBuildError,
-            "has no valid target attachment vertex",
-        ):
-            self._resolve(
-                obj, -1, snapshot, lineage, "test rendered attachment"
+            _exact_native_attachment_influences(
+                obj,
+                {"vertices": [0, 1]},
+                0,
+                self._receipt(),
+                self._skeleton(),
+                "test native component",
             )
 
 
@@ -833,66 +634,6 @@ def stacked_uv_test_mesh(*, identical_faces=False, reverse_polygons=False):
         ))
     return SimpleNamespace(
         vertices=vertices,
-        polygons=polygons,
-        loops=loops,
-        uv_layers=SimpleNamespace(active=SimpleNamespace(data=uv_data)),
-    )
-
-
-def edge_attachment_test_mesh(*, y_offset=0.0):
-    coordinates = [
-        (-1.0, y_offset, 0.0),
-        (1.0, y_offset, 0.0),
-        (0.0, y_offset + 1.0, 0.0),
-    ]
-    uvs = [(0.0, 0.0), (1.0, 0.0), (0.5, 1.0)]
-    return SimpleNamespace(
-        vertices=[SimpleNamespace(co=value) for value in coordinates],
-        polygons=[SimpleNamespace(
-            index=0,
-            vertices=(0, 1, 2),
-            loop_indices=(0, 1, 2),
-        )],
-        loops=[SimpleNamespace(vertex_index=index) for index in range(3)],
-        uv_layers=SimpleNamespace(active=SimpleNamespace(data=[
-            SimpleNamespace(uv=SimpleNamespace(x=uv[0], y=uv[1]))
-            for uv in uvs
-        ])),
-    )
-
-
-def clipped_origin_subset_test_mesh(*, scale=1.0, translation=(0.0, 0.0, 0.0)):
-    source_coordinates = [
-        (0.0, 0.0, 0.0),
-        (1.0, 0.0, 0.0),
-        (0.0, 1.0, 0.0),
-        (1.0, 1.0, 0.0),
-    ]
-    coordinates = [
-        tuple(scale * value + translation[axis] for axis, value in enumerate(row))
-        for row in source_coordinates
-    ]
-    faces = [(0, 1, 2), (1, 3, 2)]
-    uvs = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)]
-    loops = []
-    uv_data = []
-    polygons = []
-    for polygon_index, face in enumerate(faces):
-        loop_indices = []
-        for vertex_index in face:
-            loop_indices.append(len(loops))
-            loops.append(SimpleNamespace(vertex_index=vertex_index))
-            uv = uvs[vertex_index]
-            uv_data.append(SimpleNamespace(
-                uv=SimpleNamespace(x=uv[0], y=uv[1])
-            ))
-        polygons.append(SimpleNamespace(
-            index=polygon_index,
-            vertices=face,
-            loop_indices=loop_indices,
-        ))
-    return SimpleNamespace(
-        vertices=[SimpleNamespace(co=value) for value in coordinates],
         polygons=polygons,
         loops=loops,
         uv_layers=SimpleNamespace(active=SimpleNamespace(data=uv_data)),
@@ -1295,7 +1036,7 @@ class ComponentTopologyTests(unittest.TestCase):
             "polygons": [0, 1],
         }
 
-        attachment = _attachment_point_correspondence(
+        source_attachment, target_attachment = _attachment_vertex_correspondence(
             SimpleNamespace(data=source),
             source_component,
             SimpleNamespace(data=target),
@@ -1309,135 +1050,10 @@ class ComponentTopologyTests(unittest.TestCase):
             target_component,
         )
 
-        self.assertEqual(attachment["source_index"], 0)
-        self.assertEqual(attachment["target_index"], 0)
+        self.assertEqual(source_attachment, 0)
+        self.assertEqual(target_attachment, 0)
         self.assertEqual(len(source_indices), len(target_indices))
         self.assertGreaterEqual(len(source_indices), 3)
-
-    def test_loose_attachment_vertex_recovers_from_matching_uv_edges(self):
-        source = edge_attachment_test_mesh()
-        target = edge_attachment_test_mesh(y_offset=5.0)
-        source_component = _component_groups(source, [0])[0]
-        target_component = _component_groups(target, [0])[0]
-
-        result = _attachment_point_correspondence(
-            SimpleNamespace(data=source),
-            source_component,
-            SimpleNamespace(data=target),
-            target_component,
-            [0.5, 0.0],
-        )
-
-        self.assertIsNone(result["source_index"])
-        self.assertIsNone(result["target_index"])
-        self.assertEqual(result["source_coordinate"], (0.0, 0.0, 0.0))
-        self.assertEqual(result["target_coordinate"], (0.0, 5.0, 0.0))
-        self.assertEqual(
-            result["evidence"]["policy"],
-            "normalized_origin_uv_edge_interpolation_v1",
-        )
-
-    def test_full_fbx_correspondence_overrides_stale_nonorigin_attachment_edge(self):
-        source = edge_attachment_test_mesh(y_offset=1.0)
-        target = edge_attachment_test_mesh(y_offset=5.0)
-        source_component = _component_groups(source, [0])[0]
-        target_component = _component_groups(target, [0])[0]
-
-        result = _attachment_point_correspondence(
-            SimpleNamespace(data=source),
-            source_component,
-            SimpleNamespace(data=target),
-            target_component,
-            [0.5, 0.0],
-        )
-
-        self.assertIsNone(result["source_index"])
-        self.assertIsNone(result["target_index"])
-        self.assertEqual(result["source_coordinate"], (0.0, 0.0, 0.0))
-        self.assertEqual(result["target_coordinate"], (0.0, 4.0, 0.0))
-        self.assertEqual(
-            result["evidence"]["policy"],
-            "full_fbx_shared_uv_origin_projection_v1",
-        )
-        self.assertEqual(
-            result["evidence"]["fallback_reason"],
-            "attachment_uv_edge_is_not_normalized_source_origin",
-        )
-
-    def test_full_fbx_correspondence_overrides_ambiguous_attachment_edge(self):
-        source = edge_attachment_test_mesh()
-        target = edge_attachment_test_mesh(y_offset=5.0)
-        source_component = _component_groups(source, [0])[0]
-        target_component = _component_groups(target, [0])[0]
-        source_edge = {
-            "coordinate": (0.0, 0.0, 0.0),
-            "edge_vertices": [0, 1],
-            "parameter": 0.5,
-            "uv_residual": 0.0,
-            "candidate_edge_count": 1,
-        }
-
-        with mock.patch(
-            "cluster_assembly_builder._attachment_uv_edge_point",
-            side_effect=[
-                source_edge,
-                ClusterAssemblyBuildError(
-                    "normalized plan attachment UV crosses multiple geometric edges"
-                ),
-            ],
-        ):
-            result = _attachment_point_correspondence(
-                SimpleNamespace(data=source),
-                source_component,
-                SimpleNamespace(data=target),
-                target_component,
-                [0.5, 0.0],
-            )
-
-        self.assertEqual(result["source_coordinate"], (0.0, 0.0, 0.0))
-        self.assertEqual(result["target_coordinate"], (0.0, 5.0, 0.0))
-        self.assertEqual(
-            result["evidence"]["fallback_reason"],
-            "attachment_uv_edge_is_geometrically_ambiguous",
-        )
-        self.assertIn(
-            "crosses multiple geometric edges",
-            result["evidence"]["attachment_edge_error"],
-        )
-
-    def test_full_fbx_subset_projects_clipped_plan_origin_from_shared_uvs(self):
-        source = clipped_origin_subset_test_mesh()
-        target = clipped_origin_subset_test_mesh(
-            scale=2.0,
-            translation=(5.0, 7.0, 0.0),
-        )
-        source_component = _component_groups(source, [0, 1])[0]
-        target_component = _component_groups(target, [1])[0]
-
-        result = _attachment_point_correspondence(
-            SimpleNamespace(data=source),
-            source_component,
-            SimpleNamespace(data=target),
-            target_component,
-            [0.0, 0.0],
-        )
-
-        self.assertIsNone(result["source_index"])
-        self.assertIsNone(result["target_index"])
-        self.assertEqual(result["source_coordinate"], (0.0, 0.0, 0.0))
-        for actual, expected in zip(
-            result["target_coordinate"], (5.0, 7.0, 0.0)
-        ):
-            self.assertAlmostEqual(actual, expected)
-        self.assertEqual(
-            result["evidence"]["policy"],
-            "full_fbx_shared_uv_origin_projection_v1",
-        )
-        self.assertEqual(
-            result["evidence"]["correspondence"]["source_only_uv_key_count"],
-            1,
-        )
-
 
 def skeleton_snapshot():
     identity = [

@@ -18,8 +18,9 @@ SpeedTree SPM을 Blender Assembly와 Unreal 전달 산출물로 처리하는 배
 
 - SpeedTree의 개조 native exporter가 SPM에 저장된 정확한 본 연결과 skin weight를
   FBX/XML에 직접 직렬화한다.
-- nearest bone, 거리 기반 근사, 0-weight 자동 할당, weight 보정, BaseRef 본 복원은
-  수행하지 않는다.
+- Blender에서는 nearest bone, 거리 기반 추정, 0-weight 자동 할당, weight 보정,
+  BaseRef 재처리를 수행하지 않는다. BaseRef/weight 직렬화 버그는 Modeler native
+  exporter 호출 안에서 이미 파싱된 원본 값으로 해결한다.
 - Blender 단계는 이미 직렬화된 rig를 변경하지 않고 Assembly, 재질, wind와
   Cluster 관계 산출물을 만든다.
 - 현재 영수증이 유효한 Blend는 Blender를 시작하기 전에 건너뛴다.
@@ -46,6 +47,9 @@ SpeedTree SPM을 Blender Assembly와 Unreal 전달 산출물로 처리하는 배
 - 영수증 JSON 자체는 작다. 이전 구현은 영수증이 참조한 대용량 FBX/XML/Atlas를
   매번 다시 해시해 영수증이 큰 것처럼 보였으나, 현재는 동일 NTFS identity를 먼저
   확인하고 바뀐 파일만 읽는다.
+- Assembly용 native receipt는 FBX serializer가 기록한 geometry/local vertex와
+  runtime Node/Generator/bone identity를 담는다. Assembly는 이를 직접 소비하며
+  SPM/XML에서 해당 관계를 다시 파싱하지 않는다.
 - 시작할 때 수천 개의 종료 영수증을 전부 파싱하지 않는다. 활성 인덱스를 사용하고
   종료 이력은 한 번에 512개로 정리한다.
 - 캐시는 힌트일 뿐이다. 같은 크기와 수정 시각을 유지한 채 내용이 바뀌어도 NTFS

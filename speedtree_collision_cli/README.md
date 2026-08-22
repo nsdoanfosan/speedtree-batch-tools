@@ -18,6 +18,8 @@ SpeedTree Modeler 10.1.0의 공식 `-export` 경로가 Collision과 Shade Prunin
    FBX/XML serializer가 같은 정확한 계층을 사용하게 합니다.
 7. FBX serializer가 이미 계산한 ID 0/root influence와 단일 root의 Start
    cluster를 deform bone으로 보존합니다.
+8. 같은 serializer 호출에서 geometry/local vertex, runtime Node/Generator GUID,
+   authored position과 그 위치의 원본 bone influence를 native receipt로 기록합니다.
 
 Modeler 창, 파일 선택창, recovery Question, blank 문서, 마우스 포커스,
 Windows desktop 격리는 생산 경로에서 사용하지 않습니다.
@@ -78,6 +80,34 @@ child weight와 동일한 단정도 연산의 보수값을 Modeler 원본 ID 0 c
 - bone이 아닌 vertex group으로 향한 양수 weight 0개
 - BaseRef 305개 XML parent 불일치 0개, FBX orphan 0개
 
+## Native runtime receipt
+
+`--native-receipt`는 Modeler가 SPM을 이미 파싱한 뒤 FBX를 직렬화하는 바로 그
+호출에서 후속 Assembly 식별값을 기록합니다. Python이나 Blender가 SPM/XML을
+다시 열어 본·Node·Generator·배치 프록시를 복원하지 않습니다.
+
+```powershell
+.\speedtree_collision_cli\bin\speedtree_collision_cli.exe `
+  --native-receipt "D:\out\tree.speedtree_native_receipt.json" `
+  "D:\path\tree.spm" `
+  -export_options "D:\path\Options_MA_Fbx.ini" `
+  -export "D:\out\tree.fbx"
+```
+
+영수증에는 다음 exact identity만 들어갑니다.
+
+- serializer geometry ordinal과 정확한 local vertex 범위
+- 실제 runtime Node/parent/Generator GUID와 authored position
+- Modeler 원본 weight solver가 authored position에 반환한 양수 influence
+- 실제 생성된 FBX cluster node 이름과 native bone ID/parent ID
+
+Assembly는 보존된 geometry/local vertex ID와 이 범위가 교차하는 runtime Node가
+정확히 하나일 때만 바인딩합니다. 여러 Node가 교차하면 순위를 매기지 않고
+거부합니다. 잘린 FBX 부분집합에서 authored origin vertex가 사라져도 surviving
+local vertex가 단 하나의 runtime Node 범위를 증명하면 그 원본 authored position과
+weight를 그대로 사용합니다. 최근접 검색, 비율 투표, 이름 매칭, weight 재계산은
+없습니다.
+
 ## 사용법
 
 기존 SpeedTree CLI 인자를 그대로 넘깁니다. `--native-cli`는 기본값이므로
@@ -132,6 +162,8 @@ BAT 실행기는 매번 이 빠른 freshness 검사를 거칩니다. 소스 또�
 - `--log D:\path\collision_hook.log`: 상세 로그
 - `--modeler D:\path\SpeedTree_Modeler.exe`: 설치 경로 재정의
 - `--verification-only`: 임시 감사 출력에서 Collision/Prune bake 생략
+- `--native-receipt D:\path\tree.speedtree_native_receipt.json`: Modeler 런타임/
+  FBX serializer identity 기록
 - `--gui-bake`: 이전 GUI 기반 구현을 명시적으로 사용하는 진단 전용 옵션
 
 `--persistent`, `--session-anchor`, `--isolated-window`는 이전 GUI 호환 경로에만

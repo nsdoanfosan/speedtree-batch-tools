@@ -8,10 +8,16 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <new>
+#include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "session_protocol.h"
@@ -32,9 +38,6 @@ constexpr std::uintptr_t kNativeExportBuildRva = 0xAA530;
 constexpr std::uintptr_t kNativeModelUpdateRva = 0x3D1170;
 constexpr std::uintptr_t kNativeExportFinalizeGeometryRva = 0xA7580;
 constexpr std::uintptr_t kNativeExportFinalizeDocumentRva = 0xB1510;
-#ifdef SPEEDTREE_BONE_FORENSICS
-constexpr std::uintptr_t kVfxExportBoneRva = 0x6BAC60;
-#endif
 constexpr std::uintptr_t kResolveBranchBoneIdRva = 0x4B5C00;
 constexpr std::uintptr_t kInsertExportBoneRva = 0x37D4A0;
 constexpr std::uintptr_t kExportVertexWeightsRva = 0x6B4FE0;
@@ -42,6 +45,7 @@ constexpr std::uintptr_t kFindExportBoneMappingRva = 0x6B4DF0;
 constexpr std::uintptr_t kFbxClusterAddControlPointRva = 0x1259E50;
 constexpr std::uintptr_t kFbxClusterAppendIndexRva = 0x1248300;
 constexpr std::uintptr_t kFbxClusterAppendWeightRva = 0x125AB20;
+constexpr std::uintptr_t kFbxNodeCreateRva = 0x122FC30;
 constexpr std::uintptr_t kFbxSingleRootWrapperBranchRva = 0x6B6C40;
 constexpr std::uintptr_t kFbxRootWrapperSkeletonTypeRva = 0x6B6C55;
 constexpr std::uintptr_t kTreeDocumentPrepareRva = 0x728F00;
@@ -130,12 +134,6 @@ constexpr unsigned char kQDialogExecPrologue[12] = {
     0x48, 0x8b, 0x79, 0x08,
 };
 
-#ifdef SPEEDTREE_BONE_FORENSICS
-constexpr unsigned char kVfxExportBonePrologue[12] = {
-    0x48, 0x89, 0x5c, 0x24, 0x18,
-    0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55,
-};
-#endif
 
 constexpr unsigned char kInsertExportBonePrologue[15] = {
     0x48, 0x8b, 0xc4,
@@ -151,11 +149,19 @@ constexpr unsigned char kExportVertexWeightsPrologue[15] = {
     0x48, 0x89, 0x78, 0x20,
 };
 
+
 constexpr unsigned char kFbxClusterAddControlPointPrologue[14] = {
     0x85, 0xD2,
     0x78, 0x39,
     0xF2, 0x0F, 0x11, 0x54, 0x24, 0x18,
     0x89, 0x54, 0x24, 0x10,
+};
+
+constexpr unsigned char kFbxNodeCreatePrologue[13] = {
+    0x48, 0x89, 0x5C, 0x24, 0x08,
+    0x57,
+    0x48, 0x83, 0xEC, 0x30,
+    0x48, 0x8B, 0xFA,
 };
 
 constexpr int kQMessageBoxQuestionIcon = 4;
@@ -195,14 +201,6 @@ using NativeExportBuildFn = void(__fastcall*)(void* exportBuilder);
 using NativeModelUpdateFn = bool(__fastcall*)(void* model, int variation);
 using NativeExportFinalizeGeometryFn = void(__fastcall*)(void* exportBuilder, bool separate);
 using NativeExportFinalizeDocumentFn = void(__fastcall*)(void* exportBuilder);
-#ifdef SPEEDTREE_BONE_FORENSICS
-using VfxExportBoneFn = void(__fastcall*)(
-    void* exporter,
-    void* bone,
-    void* parentBone,
-    void* parentStartNode,
-    void* parentEndNode);
-#endif
 using ResolveBranchBoneIdFn = int(__fastcall*)(void* branch, float position, int section);
 using InsertExportBoneFn = void(__fastcall*)(
     void* exportData,
@@ -221,6 +219,7 @@ using FbxClusterAddControlPointFn = void(__fastcall*)(
     double weight);
 using FbxClusterAppendIndexFn = void*(__fastcall*)(void* array, const int* value);
 using FbxClusterAppendWeightFn = void*(__fastcall*)(void* array, const double* value);
+using FbxNodeCreateFn = void*(__fastcall*)(void* manager, const char* name);
 using TreeDocumentPrepareFn = void(__fastcall*)(void* treeDocument);
 using TreeDocumentModelStageFn = void(__fastcall*)(void* modelInterface);
 using ScheduleCollisionFn = void(__fastcall*)(void* model, bool force);
@@ -320,9 +319,6 @@ NativeExportBuildFn gOriginalNativeExportBuild = nullptr;
 NativeModelUpdateFn gOriginalNativeModelUpdate = nullptr;
 NativeExportFinalizeGeometryFn gOriginalNativeExportFinalizeGeometry = nullptr;
 NativeExportFinalizeDocumentFn gOriginalNativeExportFinalizeDocument = nullptr;
-#ifdef SPEEDTREE_BONE_FORENSICS
-VfxExportBoneFn gOriginalVfxExportBone = nullptr;
-#endif
 ResolveBranchBoneIdFn gResolveBranchBoneId = nullptr;
 InsertExportBoneFn gOriginalInsertExportBone = nullptr;
 ExportVertexWeightsFn gOriginalExportVertexWeights = nullptr;
@@ -330,6 +326,10 @@ FindExportBoneMappingFn gFindExportBoneMapping = nullptr;
 FbxClusterAddControlPointFn gUnusedOriginalFbxClusterAddControlPoint = nullptr;
 FbxClusterAppendIndexFn gFbxClusterAppendIndex = nullptr;
 FbxClusterAppendWeightFn gFbxClusterAppendWeight = nullptr;
+FbxNodeCreateFn gOriginalFbxNodeCreate = nullptr;
+void* gCurrentExportSourceVertexRecord = nullptr;
+void* gCurrentExportGeometry = nullptr;
+void* gExportVertexWeightsEntryStub = nullptr;
 SpeedTreeExportFn gNativeSpeedTreeExport = nullptr;
 MainWindowIdleFn gOriginalMainWindowOnIdle = nullptr;
 MainWindowIdleFn gOriginalMainWindowOnIdleDraw = nullptr;
@@ -378,12 +378,10 @@ HookRecord gNativeExportBuildHook;
 HookRecord gNativeModelUpdateHook;
 HookRecord gNativeExportFinalizeGeometryHook;
 HookRecord gNativeExportFinalizeDocumentHook;
-#ifdef SPEEDTREE_BONE_FORENSICS
-HookRecord gVfxExportBoneHook;
-#endif
 HookRecord gInsertExportBoneHook;
 HookRecord gExportVertexWeightsHook;
 HookRecord gFbxClusterAddControlPointHook;
+HookRecord gFbxNodeCreateHook;
 HookRecord gMainWindowOnIdleHook;
 HookRecord gMainWindowOnIdleDrawHook;
 HookRecord gNotifyInternalHook;
@@ -402,19 +400,91 @@ struct FbxWeightExportContext {
     FbxWeightAddCapture additions[4]{};
     int additionCount = 0;
     bool overrideWeight = false;
+    bool suppressWrite = false;
     double replacementWeight = 0.0;
 };
 
 thread_local FbxWeightExportContext* gFbxWeightExportContext = nullptr;
-#ifdef SPEEDTREE_BONE_FORENSICS
-struct BoneProbeObservation {
-    void* bone = nullptr;
-    void* sourceBranch = nullptr;
-    int id = -1;
+
+struct NativeReceiptInfluence {
+    int boneId = 0;
+    std::string mappingNode;
+    std::string exportedClusterName;
+    double weight = 0.0;
 };
-std::vector<BoneProbeObservation> gBoneProbeObservations;
-void* gBoneProbeExporter = nullptr;
-#endif
+
+struct NativeReceiptBone {
+    int boneId = 0;
+    int parentId = 0;
+    float start[3]{};
+    float end[3]{};
+    std::string sourceType;
+};
+
+struct NativeReceiptRange {
+    int firstVertex = -1;
+    int lastVertex = -1;
+};
+
+struct NativeReceiptGeometry {
+    void* geometry = nullptr;
+    int maximumVertexIndex = -1;
+};
+
+struct NativeReceiptProxyKey {
+    int geometryOrdinal = -1;
+    int sourceBoneId = 0;
+    int recordType = 0;
+    int instanceId = 0;
+    std::uintptr_t sourceObject = 0;
+
+    bool operator==(const NativeReceiptProxyKey& other) const noexcept {
+        return geometryOrdinal == other.geometryOrdinal &&
+            sourceBoneId == other.sourceBoneId &&
+            recordType == other.recordType &&
+            instanceId == other.instanceId &&
+            sourceObject == other.sourceObject;
+    }
+};
+
+struct NativeReceiptProxyKeyHash {
+    std::size_t operator()(const NativeReceiptProxyKey& key) const noexcept {
+        std::size_t result = 1469598103934665603ull;
+        const auto mix = [&result](std::uint32_t value) {
+            result ^= static_cast<std::size_t>(value);
+            result *= 1099511628211ull;
+        };
+        mix(static_cast<std::uint32_t>(key.geometryOrdinal));
+        mix(static_cast<std::uint32_t>(key.sourceBoneId));
+        mix(static_cast<std::uint32_t>(key.recordType));
+        mix(static_cast<std::uint32_t>(key.instanceId));
+        mix(static_cast<std::uint32_t>(key.sourceObject));
+        mix(static_cast<std::uint32_t>(key.sourceObject >> 32));
+        return result;
+    }
+};
+
+struct NativeReceiptProxy {
+    NativeReceiptProxyKey key{};
+    std::string sourceType;
+    std::string nodeGuid;
+    std::string parentGuid;
+    std::string generatorGuid;
+    bool hasAuthoredPosition = false;
+    float authoredPositionNative[3]{};
+    std::vector<NativeReceiptInfluence> influences;
+    std::vector<NativeReceiptRange> vertexRanges;
+};
+
+std::mutex gNativeReceiptMutex;
+std::vector<NativeReceiptGeometry> gNativeReceiptGeometries;
+std::unordered_map<void*, std::string> gNativeReceiptFbxNodeNames;
+std::vector<NativeReceiptBone> gNativeReceiptBones;
+std::vector<NativeReceiptProxy> gNativeReceiptProxies;
+std::unordered_map<
+    NativeReceiptProxyKey,
+    std::size_t,
+    NativeReceiptProxyKeyHash> gNativeReceiptProxyIndexes;
 NativeStateProbe gNativeStateProbes[] = {
     {0x135A59, "native export probe 135A59"},
     {0x135A9D, "native export probe 135A9D"},
@@ -456,6 +526,8 @@ wchar_t gGuiExportPath[32768]{};
 wchar_t gGuiExportOptionsPath[32768]{};
 wchar_t gSecondaryExportPath[32768]{};
 wchar_t gSecondaryExportOptionsPath[32768]{};
+wchar_t gNativeInputPath[32768]{};
+wchar_t gNativeReceiptPath[32768]{};
 wchar_t gPersistentInputPath[32768]{};
 DWORD gTimeoutMs = kDefaultTimeoutMs;
 ULONGLONG gHookStartTick = 0;
@@ -589,6 +661,7 @@ bool IsCollisionThread(const void* object) {
 }
 
 [[noreturn]] void AbortExport(DWORD exitCode, const char* reason);
+void WriteAbsoluteJump(unsigned char* destination, const void* target);
 
 const char* ReadSpeedTreeRttiName(const void* object) {
     if (object == nullptr || gSpeedTreeBase == 0 || gSpeedTreeImageSize == 0) {
@@ -633,14 +706,19 @@ void __fastcall HookedFbxClusterAddControlPoint(
         context != nullptr && context->overrideWeight
         ? context->replacementWeight
         : weight;
-    int storedIndex = vertexIndex;
-    double storedWeight = effectiveWeight;
-    gFbxClusterAppendIndex(
-        static_cast<unsigned char*>(cluster) + 0xA8,
-        &storedIndex);
-    gFbxClusterAppendWeight(
-        static_cast<unsigned char*>(cluster) + 0xB0,
-        &storedWeight);
+    if (!(effectiveWeight > 0.0) || !std::isfinite(effectiveWeight)) {
+        return;
+    }
+    if (context == nullptr || !context->suppressWrite) {
+        int storedIndex = vertexIndex;
+        double storedWeight = effectiveWeight;
+        gFbxClusterAppendIndex(
+            static_cast<unsigned char*>(cluster) + 0xA8,
+            &storedIndex);
+        gFbxClusterAppendWeight(
+            static_cast<unsigned char*>(cluster) + 0xB0,
+            &storedWeight);
+    }
     if (context != nullptr) {
         if (context->additionCount < static_cast<int>(std::size(context->additions))) {
             context->additions[context->additionCount] = {
@@ -650,6 +728,244 @@ void __fastcall HookedFbxClusterAddControlPoint(
             };
         }
         ++context->additionCount;
+    }
+}
+
+void* __fastcall HookedFbxNodeCreate(void* manager, const char* name) {
+    void* node = gOriginalFbxNodeCreate(manager, name);
+    if (node != nullptr && name != nullptr && name[0] != '\0' &&
+        gNativeReceiptPath[0] != L'\0' &&
+        !gSecondaryNativeSerializationActive.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(gNativeReceiptMutex);
+        gNativeReceiptFbxNodeNames[node] = name;
+    }
+    return node;
+}
+
+void ResetNativeReceiptCapture() {
+    std::lock_guard<std::mutex> lock(gNativeReceiptMutex);
+    gNativeReceiptGeometries.clear();
+    gNativeReceiptBones.clear();
+    gNativeReceiptProxies.clear();
+    gNativeReceiptProxyIndexes.clear();
+}
+
+int NativeReceiptGeometryOrdinal(void* geometry, int vertexIndex) {
+    const auto found = std::find_if(
+        gNativeReceiptGeometries.begin(),
+        gNativeReceiptGeometries.end(),
+        [geometry](const NativeReceiptGeometry& row) {
+            return row.geometry == geometry;
+        });
+    if (found != gNativeReceiptGeometries.end()) {
+        found->maximumVertexIndex = (std::max)(
+            found->maximumVertexIndex,
+            vertexIndex);
+        return static_cast<int>(found - gNativeReceiptGeometries.begin());
+    }
+    gNativeReceiptGeometries.push_back({geometry, vertexIndex});
+    return static_cast<int>(gNativeReceiptGeometries.size() - 1);
+}
+
+std::string Base64Guid(const unsigned char* bytes) {
+    static constexpr char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string encoded;
+    encoded.reserve(24);
+    for (std::size_t offset = 0; offset < 15; offset += 3) {
+        const std::uint32_t value =
+            (static_cast<std::uint32_t>(bytes[offset]) << 16) |
+            (static_cast<std::uint32_t>(bytes[offset + 1]) << 8) |
+            static_cast<std::uint32_t>(bytes[offset + 2]);
+        encoded.push_back(alphabet[(value >> 18) & 0x3F]);
+        encoded.push_back(alphabet[(value >> 12) & 0x3F]);
+        encoded.push_back(alphabet[(value >> 6) & 0x3F]);
+        encoded.push_back(alphabet[value & 0x3F]);
+    }
+    const std::uint32_t tail = static_cast<std::uint32_t>(bytes[15]) << 16;
+    encoded.push_back(alphabet[(tail >> 18) & 0x3F]);
+    encoded.push_back(alphabet[(tail >> 12) & 0x3F]);
+    encoded += "==";
+    return encoded;
+}
+
+void CaptureNativeReceiptProxy(
+    void* exporter,
+    const float* /*serializedPosition*/,
+    int sourceBoneId,
+    int vertexIndex,
+    void* clusterMap) {
+    if (gNativeReceiptPath[0] == L'\0' ||
+        gSecondaryNativeSerializationActive.load(std::memory_order_acquire) ||
+        gCurrentExportSourceVertexRecord == nullptr ||
+        gCurrentExportGeometry == nullptr) {
+        return;
+    }
+
+    const auto* record = static_cast<const unsigned char*>(
+        gCurrentExportSourceVertexRecord);
+    void* sourceObject = *reinterpret_cast<void* const*>(record + 0x110);
+
+    NativeReceiptProxyKey key{};
+    key.sourceBoneId = sourceBoneId;
+    key.recordType = *reinterpret_cast<const int*>(record + 0x118);
+    key.instanceId = *reinterpret_cast<const int*>(record + 0x120);
+    key.sourceObject = reinterpret_cast<std::uintptr_t>(sourceObject);
+
+    std::lock_guard<std::mutex> lock(gNativeReceiptMutex);
+    key.geometryOrdinal = NativeReceiptGeometryOrdinal(
+        gCurrentExportGeometry,
+        vertexIndex);
+    const auto existing = gNativeReceiptProxyIndexes.find(key);
+    std::size_t proxyIndex = 0;
+    if (existing == gNativeReceiptProxyIndexes.end()) {
+        NativeReceiptProxy proxy{};
+        proxy.key = key;
+        const char* sourceType = ReadSpeedTreeRttiName(sourceObject);
+        if (sourceType != nullptr) {
+            proxy.sourceType = sourceType;
+        }
+        if (sourceObject != nullptr && sourceType != nullptr &&
+            std::strstr(sourceType, "Node@@") != nullptr &&
+            exporter != nullptr && clusterMap != nullptr) {
+            const auto* sourceBytes = static_cast<const unsigned char*>(
+                sourceObject);
+            proxy.nodeGuid = Base64Guid(sourceBytes + 0x10);
+            void* parentObject = *reinterpret_cast<void* const*>(
+                sourceBytes + 0x98);
+            if (ReadSpeedTreeRttiName(parentObject) != nullptr) {
+                proxy.parentGuid = Base64Guid(
+                    static_cast<const unsigned char*>(parentObject) + 0x10);
+            }
+            void* generatorObject = *reinterpret_cast<void* const*>(
+                sourceBytes + 0x128);
+            if (ReadSpeedTreeRttiName(generatorObject) != nullptr) {
+                proxy.generatorGuid = Base64Guid(
+                    static_cast<const unsigned char*>(generatorObject) + 0x10);
+            }
+            std::memcpy(
+                proxy.authoredPositionNative,
+                sourceBytes + 0x110,
+                sizeof(proxy.authoredPositionNative));
+            proxy.hasAuthoredPosition = true;
+
+            const auto* geometryBytes = static_cast<const unsigned char*>(
+                gCurrentExportGeometry);
+            const float authoredSolver[3] = {
+                (proxy.authoredPositionNative[0] -
+                    *reinterpret_cast<const float*>(geometryBytes + 0x2C)) * 30.48f,
+                (proxy.authoredPositionNative[1] -
+                    *reinterpret_cast<const float*>(geometryBytes + 0x30)) * 30.48f,
+                (proxy.authoredPositionNative[2] -
+                    *reinterpret_cast<const float*>(geometryBytes + 0x34)) * 30.48f,
+            };
+            int parentId = 0;
+            int lookupId = sourceBoneId;
+            auto* mapping = static_cast<ExportBoneMapping*>(
+                gFindExportBoneMapping(
+                    static_cast<unsigned char*>(exporter) + 0x60,
+                    &lookupId));
+            if (mapping != nullptr && mapping->boneRecord != nullptr) {
+                parentId = *reinterpret_cast<const int*>(
+                    static_cast<const unsigned char*>(mapping->boneRecord) + 0x04);
+            }
+            const auto exportedNodeName = [exporter](int boneId) {
+                int requestedId = boneId;
+                auto* requested = static_cast<ExportBoneMapping*>(
+                    gFindExportBoneMapping(
+                        static_cast<unsigned char*>(exporter) + 0x60,
+                        &requestedId));
+                if (requested == nullptr || requested->startNode == nullptr) {
+                    return std::string{};
+                }
+                const auto found = gNativeReceiptFbxNodeNames.find(
+                    requested->startNode);
+                return found == gNativeReceiptFbxNodeNames.end()
+                    ? std::string{}
+                    : found->second;
+            };
+
+            FbxWeightExportContext probe{};
+            probe.suppressWrite = true;
+            FbxWeightExportContext* previousContext = gFbxWeightExportContext;
+            gFbxWeightExportContext = &probe;
+            gOriginalExportVertexWeights(
+                exporter,
+                authoredSolver,
+                sourceBoneId,
+                vertexIndex,
+                clusterMap);
+            gFbxWeightExportContext = previousContext;
+            if (probe.additionCount > 0) {
+                proxy.influences.push_back({
+                    sourceBoneId,
+                    "start",
+                    exportedNodeName(sourceBoneId),
+                    probe.additions[0].weight,
+                });
+            }
+            if (probe.additionCount > 1) {
+                proxy.influences.push_back({
+                    parentId,
+                    "start",
+                    exportedNodeName(parentId),
+                    probe.additions[1].weight,
+                });
+            } else if (sourceBoneId > 0 && parentId == 0 &&
+                       probe.additionCount == 1) {
+                const float childWeight = static_cast<float>(
+                    probe.additions[0].weight);
+                const float rootWeight = 1.0f - childWeight;
+                if (rootWeight > 0.0f) {
+                    proxy.influences.push_back({
+                        0,
+                        "start",
+                        exportedNodeName(0),
+                        static_cast<double>(rootWeight),
+                    });
+                }
+            }
+        }
+        proxyIndex = gNativeReceiptProxies.size();
+        gNativeReceiptProxies.push_back(std::move(proxy));
+        gNativeReceiptProxyIndexes.emplace(key, proxyIndex);
+    } else {
+        proxyIndex = existing->second;
+    }
+
+    auto& ranges = gNativeReceiptProxies[proxyIndex].vertexRanges;
+    if (!ranges.empty() && ranges.back().lastVertex + 1 == vertexIndex) {
+        ranges.back().lastVertex = vertexIndex;
+    } else {
+        ranges.push_back({vertexIndex, vertexIndex});
+    }
+}
+
+void CaptureNativeReceiptBone(const void* sourceBoneRecord, const void* sourceBranch) {
+    if (gNativeReceiptPath[0] == L'\0' ||
+        gSecondaryNativeSerializationActive.load(std::memory_order_acquire) ||
+        sourceBoneRecord == nullptr) {
+        return;
+    }
+    const auto* bytes = static_cast<const unsigned char*>(sourceBoneRecord);
+    NativeReceiptBone row{};
+    row.boneId = *reinterpret_cast<const int*>(bytes);
+    row.parentId = *reinterpret_cast<const int*>(bytes + 0x04);
+    std::memcpy(row.start, bytes + 0x08, sizeof(row.start));
+    std::memcpy(row.end, bytes + 0x14, sizeof(row.end));
+    const char* sourceType = ReadSpeedTreeRttiName(sourceBranch);
+    if (sourceType != nullptr) {
+        row.sourceType = sourceType;
+    }
+    std::lock_guard<std::mutex> lock(gNativeReceiptMutex);
+    const auto duplicate = std::find_if(
+        gNativeReceiptBones.begin(),
+        gNativeReceiptBones.end(),
+        [&row](const NativeReceiptBone& existing) {
+            return existing.boneId == row.boneId;
+        });
+    if (duplicate == gNativeReceiptBones.end()) {
+        gNativeReceiptBones.push_back(std::move(row));
     }
 }
 
@@ -670,6 +986,12 @@ void __fastcall HookedExportVertexWeights(
         clusterMap);
     gFbxWeightExportContext = previousContext;
 
+    CaptureNativeReceiptProxy(
+        exporter,
+        position,
+        sourceBoneId,
+        vertexIndex,
+        clusterMap);
     if (sourceBoneId <= 0 || exporter == nullptr || position == nullptr ||
         clusterMap == nullptr) {
         return;
@@ -743,6 +1065,52 @@ void __fastcall HookedExportVertexWeights(
             kHookRuntimeFailureExitCode,
             "FBX ID-0 influence restoration raised an exception while reading exporter data");
     }
+}
+
+bool BuildExportVertexWeightsEntryStub() {
+    if (gExportVertexWeightsEntryStub != nullptr) {
+        return true;
+    }
+    auto* stub = static_cast<unsigned char*>(VirtualAlloc(
+        nullptr,
+        64,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_EXECUTE_READWRITE));
+    if (stub == nullptr) {
+        Log("FBX vertex-record entry stub allocation failed");
+        return false;
+    }
+    // Preserve the caller's RBX vertex-record pointer before entering compiled
+    // C++. ExportVertexWeights has no formal source-record parameter, even
+    // though its only FBX caller keeps that exact record in nonvolatile RBX.
+    stub[0] = 0x48;
+    stub[1] = 0xB8;
+    *reinterpret_cast<std::uintptr_t*>(stub + 2) =
+        reinterpret_cast<std::uintptr_t>(&gCurrentExportSourceVertexRecord);
+    stub[10] = 0x48;
+    stub[11] = 0x89;
+    stub[12] = 0x18;
+    stub[13] = 0x48;
+    stub[14] = 0xB8;
+    *reinterpret_cast<std::uintptr_t*>(stub + 15) =
+        reinterpret_cast<std::uintptr_t>(&gCurrentExportGeometry);
+    stub[23] = 0x48;
+    stub[24] = 0x89;
+    stub[25] = 0x38;
+    WriteAbsoluteJump(stub + 26, reinterpret_cast<const void*>(
+        HookedExportVertexWeights));
+    FlushInstructionCache(GetCurrentProcess(), stub, 38);
+    gExportVertexWeightsEntryStub = stub;
+    return true;
+}
+
+void FreeExportVertexWeightsEntryStub() {
+    if (gExportVertexWeightsEntryStub != nullptr) {
+        VirtualFree(gExportVertexWeightsEntryStub, 0, MEM_RELEASE);
+        gExportVertexWeightsEntryStub = nullptr;
+    }
+    gCurrentExportSourceVertexRecord = nullptr;
+    gCurrentExportGeometry = nullptr;
 }
 
 void __fastcall HookedInsertExportBone(
@@ -845,315 +1213,11 @@ void __fastcall HookedInsertExportBone(
                 kHookRuntimeFailureExitCode,
                 "BaseRef bone serialization raised an exception while reading parsed data");
         }
+        CaptureNativeReceiptBone(sourceBoneRecord, sourceBranch);
     }
     gOriginalInsertExportBone(exportData, sourceBoneRecord, sourceBranch);
 }
 
-#ifdef SPEEDTREE_BONE_FORENSICS
-// Optional disassembly-validation probe retained for future version ports.
-// Production builds leave it disabled and only install the shared graph hook.
-void __fastcall HookedVfxExportBone(
-    void* exporter,
-    void* bone,
-    void* parentBone,
-    void* parentStartNode,
-    void* parentEndNode) {
-    if (bone != nullptr) {
-        __try {
-            if (gBoneProbeExporter != exporter) {
-                gBoneProbeExporter = exporter;
-                gBoneProbeObservations.clear();
-            }
-            const auto* bytes = static_cast<const unsigned char*>(bone);
-            gBoneProbeObservations.push_back({
-                bone,
-                *reinterpret_cast<void* const*>(bytes + 0x08),
-                *reinterpret_cast<const int*>(bytes),
-            });
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            Log("bone observation capture raised an exception");
-        }
-    }
-    if (bone != nullptr && parentBone == nullptr) {
-        __try {
-            const auto* bytes = static_cast<const unsigned char*>(bone);
-            const int id = *reinterpret_cast<const int*>(bytes);
-            void* source = *reinterpret_cast<void* const*>(bytes + 0x08);
-            const char* sourceType = ReadSpeedTreeRttiName(source);
-            const auto* childBegin = *reinterpret_cast<const int* const*>(bytes + 0x30);
-            const auto* childEnd = *reinterpret_cast<const int* const*>(bytes + 0x38);
-            const std::ptrdiff_t childCount =
-                childBegin != nullptr && childEnd >= childBegin ? childEnd - childBegin : -1;
-            char message[512]{};
-            _snprintf_s(
-                message,
-                sizeof(message),
-                _TRUNCATE,
-                "bone probe top-level id=%d record=%p source=%p source_rtti=%s "
-                "start=(%.9g,%.9g,%.9g) end=(%.9g,%.9g,%.9g) children=%lld",
-                id,
-                bone,
-                source,
-                sourceType == nullptr ? "<none>" : sourceType,
-                static_cast<double>(*reinterpret_cast<const float*>(bytes + 0x10)),
-                static_cast<double>(*reinterpret_cast<const float*>(bytes + 0x14)),
-                static_cast<double>(*reinterpret_cast<const float*>(bytes + 0x18)),
-                static_cast<double>(*reinterpret_cast<const float*>(bytes + 0x1C)),
-                static_cast<double>(*reinterpret_cast<const float*>(bytes + 0x20)),
-                static_cast<double>(*reinterpret_cast<const float*>(bytes + 0x24)),
-                static_cast<long long>(childCount));
-            Log(message);
-            if (id != 1 && source != nullptr) {
-                void* baseNode = *reinterpret_cast<void* const*>(
-                    static_cast<const unsigned char*>(source) + 0x98);
-                void* baseRef = baseNode == nullptr
-                    ? nullptr
-                    : *reinterpret_cast<void* const*>(
-                          static_cast<const unsigned char*>(baseNode) + 0x2D0);
-                void* targetBranch = baseRef == nullptr
-                    ? nullptr
-                    : *reinterpret_cast<void* const*>(
-                          static_cast<const unsigned char*>(baseRef) + 0x98);
-                const auto* sourceBytes = static_cast<const unsigned char*>(source);
-                const std::int16_t anchorIndex =
-                    *reinterpret_cast<const std::int16_t*>(sourceBytes + 0x1B8);
-                float anchorPosition = 0.0f;
-                if (anchorIndex != -1) {
-                    const auto* anchorRecords = *reinterpret_cast<const unsigned char* const*>(
-                        sourceBytes + 0x1D8);
-                    if (anchorRecords == nullptr) {
-                        Log("bone probe exact resolver found a non-null anchor index without records");
-                    } else {
-                        anchorPosition = *reinterpret_cast<const float*>(
-                            anchorRecords + static_cast<std::size_t>(anchorIndex) * 24);
-                    }
-                }
-                const float branchOffset =
-                    *reinterpret_cast<const float*>(sourceBytes + 0x144);
-                const int section = *reinterpret_cast<const int*>(sourceBytes + 0x140);
-                const int resolvedParentId =
-                    targetBranch != nullptr && gResolveBranchBoneId != nullptr
-                    ? gResolveBranchBoneId(
-                          targetBranch,
-                          anchorPosition + branchOffset,
-                          section)
-                    : 0;
-                int targetFirst = -1;
-                int targetLast = -1;
-                int targetCount = 0;
-                bool targetContainsResolvedParent = false;
-                for (const auto& observation : gBoneProbeObservations) {
-                    if (observation.sourceBranch != targetBranch) {
-                        continue;
-                    }
-                    if (targetFirst < 0) {
-                        targetFirst = observation.id;
-                    }
-                    targetLast = observation.id;
-                    ++targetCount;
-                    targetContainsResolvedParent =
-                        targetContainsResolvedParent || observation.id == resolvedParentId;
-                }
-                char edgeMessage[768]{};
-                _snprintf_s(
-                    edgeMessage,
-                    sizeof(edgeMessage),
-                    _TRUNCATE,
-                    "bone probe parsed edge child=%d base=%p base_ref=%p "
-                    "target_branch=%p target_count=%d target_first=%d target_last=%d "
-                    "anchor_index=%d anchor_position=%.9g branch_offset=%.9g "
-                    "position=%.9g section=%d resolved_parent=%d target_contains=%d",
-                    id,
-                    baseNode,
-                    baseRef,
-                    targetBranch,
-                    targetCount,
-                    targetFirst,
-                    targetLast,
-                    static_cast<int>(anchorIndex),
-                    static_cast<double>(anchorPosition),
-                    static_cast<double>(branchOffset),
-                    static_cast<double>(anchorPosition + branchOffset),
-                    section,
-                    resolvedParentId,
-                    targetContainsResolvedParent ? 1 : 0);
-                Log(edgeMessage);
-            }
-            if (id == 508 && source != nullptr) {
-                const auto logPointers = [](const char* label, void* object, std::size_t bytes) {
-                    const auto* objectBytes = static_cast<const unsigned char*>(object);
-                    for (std::size_t offset = 0; offset < bytes; offset += sizeof(void*)) {
-                        void* candidate = *reinterpret_cast<void* const*>(objectBytes + offset);
-                        const char* candidateType = ReadSpeedTreeRttiName(candidate);
-                        if (candidateType == nullptr ||
-                            (std::strstr(candidateType, "Node@@") == nullptr &&
-                             std::strstr(candidateType, "Generator@@") == nullptr &&
-                             std::strstr(candidateType, "Link@@") == nullptr)) {
-                            continue;
-                        }
-                        char pointerMessage[256]{};
-                        _snprintf_s(
-                            pointerMessage,
-                            sizeof(pointerMessage),
-                            _TRUNCATE,
-                            "bone probe %s+0x%zX=%p rtti=%s",
-                            label,
-                            offset,
-                            candidate,
-                            candidateType);
-                        Log(pointerMessage);
-                    }
-                };
-                logPointers("source", source, 0x800);
-                void* parentNode = *reinterpret_cast<void* const*>(
-                    static_cast<const unsigned char*>(source) + 0x98);
-                if (parentNode != nullptr) {
-                    logPointers("base_parent", parentNode, 0x400);
-                    void* baseRef = *reinterpret_cast<void* const*>(
-                        static_cast<const unsigned char*>(parentNode) + 0x2D0);
-                    const char* baseRefType = ReadSpeedTreeRttiName(baseRef);
-                    if (baseRefType != nullptr &&
-                        std::strstr(baseRefType, "CBaseRefNode") != nullptr) {
-                        void* targetBranch = *reinterpret_cast<void* const*>(
-                            static_cast<const unsigned char*>(baseRef) + 0x98);
-                        void* evaluatedBranch = *reinterpret_cast<void* const*>(
-                            static_cast<const unsigned char*>(parentNode) + 0x2C8);
-                        char referenceMessage[512]{};
-                        const auto* refBytes = static_cast<const unsigned char*>(baseRef);
-                        _snprintf_s(
-                            referenceMessage,
-                            sizeof(referenceMessage),
-                            _TRUNCATE,
-                            "bone probe exact base=%p base_ref=%p target_branch=%p "
-                            "ref_u32[248..25c]=%u,%u,%u,%u,%u,%u",
-                            parentNode,
-                            baseRef,
-                            targetBranch,
-                            *reinterpret_cast<const unsigned int*>(refBytes + 0x248),
-                            *reinterpret_cast<const unsigned int*>(refBytes + 0x24C),
-                            *reinterpret_cast<const unsigned int*>(refBytes + 0x250),
-                            *reinterpret_cast<const unsigned int*>(refBytes + 0x254),
-                            *reinterpret_cast<const unsigned int*>(refBytes + 0x258),
-                            *reinterpret_cast<const unsigned int*>(refBytes + 0x25C));
-                        Log(referenceMessage);
-                        const auto logNodeState = [](const char* label, void* object) {
-                            if (object == nullptr) {
-                                return;
-                            }
-                            const auto* nodeBytes = static_cast<const unsigned char*>(object);
-                            const auto* listBegin = *reinterpret_cast<void* const* const*>(
-                                nodeBytes + 0x1D8);
-                            const auto* listEnd = *reinterpret_cast<void* const* const*>(
-                                nodeBytes + 0x1E0);
-                            char nodeMessage[512]{};
-                            _snprintf_s(
-                                nodeMessage,
-                                sizeof(nodeMessage),
-                                _TRUNCATE,
-                                "bone probe node %s=%p rtti=%s parent=%p generator=%p "
-                                "pos=(%.9g,%.9g,%.9g) anchor=%d aux=%d list=%p..%p",
-                                label,
-                                object,
-                                ReadSpeedTreeRttiName(object),
-                                *reinterpret_cast<void* const*>(nodeBytes + 0x98),
-                                *reinterpret_cast<void* const*>(nodeBytes + 0x128),
-                                static_cast<double>(*reinterpret_cast<const float*>(nodeBytes + 0x110)),
-                                static_cast<double>(*reinterpret_cast<const float*>(nodeBytes + 0x114)),
-                                static_cast<double>(*reinterpret_cast<const float*>(nodeBytes + 0x118)),
-                                *reinterpret_cast<const int*>(nodeBytes + 0x1F8),
-                                *reinterpret_cast<const int*>(nodeBytes + 0x1F4),
-                                listBegin,
-                                listEnd);
-                            Log(nodeMessage);
-                        };
-                        logNodeState("child_branch", source);
-                        logNodeState("base", parentNode);
-                        logNodeState("evaluated_branch", evaluatedBranch);
-                        logNodeState("base_ref", baseRef);
-                        logNodeState("target_branch", targetBranch);
-
-                        struct NamedPointer {
-                            const char* name;
-                            void* value;
-                        };
-                        const NamedPointer knownPointers[] = {
-                            {"child_branch", source},
-                            {"base", parentNode},
-                            {"evaluated_branch", evaluatedBranch},
-                            {"base_ref", baseRef},
-                            {"target_branch", targetBranch},
-                        };
-                        const auto logExactPointerMatches = [&knownPointers](
-                            const char* ownerName,
-                            void* owner,
-                            std::size_t byteCount) {
-                            if (owner == nullptr) {
-                                return;
-                            }
-                            const auto* ownerBytes = static_cast<const unsigned char*>(owner);
-                            for (std::size_t offset = 0; offset + sizeof(void*) <= byteCount;
-                                 offset += sizeof(void*)) {
-                                void* value = *reinterpret_cast<void* const*>(ownerBytes + offset);
-                                if (value == nullptr) {
-                                    continue;
-                                }
-                                for (const auto& known : knownPointers) {
-                                    if (value != known.value) {
-                                        continue;
-                                    }
-                                    char matchMessage[256]{};
-                                    _snprintf_s(
-                                        matchMessage,
-                                        sizeof(matchMessage),
-                                        _TRUNCATE,
-                                        "bone probe pointer match %s+0x%zX -> %s=%p",
-                                        ownerName,
-                                        offset,
-                                        known.name,
-                                        known.value);
-                                    Log(matchMessage);
-                                }
-                            }
-                        };
-                        logExactPointerMatches("child_branch", source, 0x1000);
-                        logExactPointerMatches("base", parentNode, 0x400);
-                        logExactPointerMatches("evaluated_branch", evaluatedBranch, 0x1000);
-                        logExactPointerMatches("base_ref", baseRef, 0x300);
-                        logExactPointerMatches("target_branch", targetBranch, 0x1000);
-                        for (const auto& observation : gBoneProbeObservations) {
-                            if (observation.sourceBranch != targetBranch) {
-                                continue;
-                            }
-                            char targetMessage[192]{};
-                            _snprintf_s(
-                                targetMessage,
-                                sizeof(targetMessage),
-                                _TRUNCATE,
-                                "bone probe exact target record id=%d bone=%p",
-                                observation.id,
-                                observation.bone);
-                            Log(targetMessage);
-                        }
-                    }
-                }
-                void* ownerGenerator = *reinterpret_cast<void* const*>(
-                    static_cast<const unsigned char*>(source) + 0x128);
-                if (ownerGenerator != nullptr) {
-                    logPointers("source_generator", ownerGenerator, 0x1000);
-                }
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            Log("bone probe raised an exception");
-        }
-    }
-    gOriginalVfxExportBone(
-        exporter,
-        bone,
-        parentBone,
-        parentStartNode,
-        parentEndNode);
-}
-#endif
 
 void LogCollisionInputTypes(const char* phase, void* model) {
     if (model == nullptr) {
@@ -1554,10 +1618,9 @@ bool SetRlmConnectFailFastPatch(bool enabled) {
 void RemoveCommonHooks() {
     RemoveHook(gInsertExportBoneHook);
     RemoveHook(gExportVertexWeightsHook);
+    FreeExportVertexWeightsEntryStub();
+    RemoveHook(gFbxNodeCreateHook);
     RemoveHook(gFbxClusterAddControlPointHook);
-#ifdef SPEEDTREE_BONE_FORENSICS
-    RemoveHook(gVfxExportBoneHook);
-#endif
     RemoveHook(gQThreadStartHook);
     if (gFbxDeformRootPatchInstalled) {
         SetFbxDeformRootPatch(false);
@@ -4432,6 +4495,210 @@ std::string WidePathToUtf8(const wchar_t* value) {
     return result;
 }
 
+std::string JsonEscape(const std::string& value) {
+    std::string escaped;
+    escaped.reserve(value.size() + 16);
+    for (const unsigned char character : value) {
+        switch (character) {
+        case '"': escaped += "\\\""; break;
+        case '\\': escaped += "\\\\"; break;
+        case '\b': escaped += "\\b"; break;
+        case '\f': escaped += "\\f"; break;
+        case '\n': escaped += "\\n"; break;
+        case '\r': escaped += "\\r"; break;
+        case '\t': escaped += "\\t"; break;
+        default:
+            if (character < 0x20) {
+                char encoded[7]{};
+                _snprintf_s(
+                    encoded,
+                    sizeof(encoded),
+                    _TRUNCATE,
+                    "\\u%04x",
+                    static_cast<unsigned int>(character));
+                escaped += encoded;
+            } else {
+                escaped.push_back(static_cast<char>(character));
+            }
+            break;
+        }
+    }
+    return escaped;
+}
+
+bool WriteNativeReceipt() {
+    if (gNativeReceiptPath[0] == L'\0') {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> lock(gNativeReceiptMutex);
+    std::sort(
+        gNativeReceiptBones.begin(),
+        gNativeReceiptBones.end(),
+        [](const NativeReceiptBone& left, const NativeReceiptBone& right) {
+            return left.boneId < right.boneId;
+        });
+
+    const std::filesystem::path destination(gNativeReceiptPath);
+    std::error_code directoryError;
+    if (!destination.parent_path().empty()) {
+        std::filesystem::create_directories(
+            destination.parent_path(),
+            directoryError);
+    }
+    if (directoryError) {
+        Log("native receipt parent directory could not be created");
+        return false;
+    }
+    std::filesystem::path temporary = destination;
+    temporary += L".tmp." + std::to_wstring(GetCurrentProcessId());
+
+    WIN32_FILE_ATTRIBUTE_DATA sourceAttributes{};
+    const bool hasSourceIdentity = GetFileAttributesExW(
+        gNativeInputPath,
+        GetFileExInfoStandard,
+        &sourceAttributes) != FALSE;
+    const std::uint64_t sourceSize = hasSourceIdentity
+        ? (static_cast<std::uint64_t>(sourceAttributes.nFileSizeHigh) << 32) |
+            sourceAttributes.nFileSizeLow
+        : 0;
+    const std::uint64_t sourceWriteTime = hasSourceIdentity
+        ? (static_cast<std::uint64_t>(
+               sourceAttributes.ftLastWriteTime.dwHighDateTime) << 32) |
+            sourceAttributes.ftLastWriteTime.dwLowDateTime
+        : 0;
+
+    std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
+    if (!stream) {
+        Log("native receipt temporary file could not be opened");
+        return false;
+    }
+    stream << std::setprecision(17);
+    stream << "{\n"
+           << "  \"schema_version\": 2,\n"
+           << "  \"kind\": \"speedtree_native_export_receipt\",\n"
+           << "  \"status\": \"ready\",\n"
+           << "  \"identity_policy\": "
+              "\"modeler_parsed_runtime_and_fbx_serializer_records_v1\",\n"
+           << "  \"source\": {\"path\": \""
+           << JsonEscape(WidePathToUtf8(gNativeInputPath))
+           << "\", \"size\": " << sourceSize
+           << ", \"last_write_time_100ns\": " << sourceWriteTime << "},\n"
+           << "  \"output\": {\"path\": \""
+           << JsonEscape(WidePathToUtf8(gGuiExportPath)) << "\"},\n"
+           << "  \"coordinate_contract\": {"
+              "\"native_unit_to_meter\": 0.3048, "
+              "\"native_unit_to_solver\": 30.48, "
+              "\"blender_xyz_from_native_xyz\": ["
+              "\"x*0.3048\", \"z*0.3048\", \"-y*0.3048\"]},\n"
+           << "  \"geometry_count\": "
+           << gNativeReceiptGeometries.size() << ",\n"
+           << "  \"geometries\": [\n";
+    for (std::size_t index = 0; index < gNativeReceiptGeometries.size(); ++index) {
+        const auto& geometry = gNativeReceiptGeometries[index];
+        stream << "    {\"ordinal\": " << index
+               << ", \"vertex_count\": "
+               << geometry.maximumVertexIndex + 1 << "}"
+               << (index + 1 == gNativeReceiptGeometries.size() ? "\n" : ",\n");
+    }
+    stream << "  ],\n"
+           << "  \"bones\": [\n";
+    for (std::size_t index = 0; index < gNativeReceiptBones.size(); ++index) {
+        const auto& bone = gNativeReceiptBones[index];
+        stream << "    {\"id\": " << bone.boneId
+               << ", \"parent_id\": " << bone.parentId
+               << ", \"start_native\": ["
+               << bone.start[0] << ", " << bone.start[1] << ", "
+               << bone.start[2] << "], \"end_native\": ["
+               << bone.end[0] << ", " << bone.end[1] << ", "
+               << bone.end[2] << "], \"source_rtti\": \""
+               << JsonEscape(bone.sourceType) << "\"}"
+               << (index + 1 == gNativeReceiptBones.size() ? "\n" : ",\n");
+    }
+    stream << "  ],\n  \"generated_instances\": [\n";
+    for (std::size_t index = 0; index < gNativeReceiptProxies.size(); ++index) {
+        const auto& proxy = gNativeReceiptProxies[index];
+        stream << "    {\"geometry_ordinal\": " << proxy.key.geometryOrdinal
+               << ", \"native_instance_id\": " << proxy.key.instanceId
+               << ", \"record_type\": " << proxy.key.recordType
+               << ", \"source_bone_id\": " << proxy.key.sourceBoneId
+               << ", \"source_rtti\": \""
+               << JsonEscape(proxy.sourceType) << "\"";
+        if (proxy.hasAuthoredPosition) {
+            stream << ", \"node_guid\": \""
+                   << proxy.nodeGuid
+                   << "\"";
+            if (!proxy.parentGuid.empty()) {
+                stream << ", \"parent_guid\": \""
+                       << proxy.parentGuid << "\"";
+            }
+            if (!proxy.generatorGuid.empty()) {
+                stream << ", \"generator_guid\": \""
+                       << proxy.generatorGuid << "\"";
+            }
+            stream << ", \"authored_position_native\": ["
+                   << proxy.authoredPositionNative[0] << ", "
+                   << proxy.authoredPositionNative[1] << ", "
+                   << proxy.authoredPositionNative[2]
+                   << "], \"authored_position_influences\": [";
+            for (std::size_t influenceIndex = 0;
+                 influenceIndex < proxy.influences.size();
+                 ++influenceIndex) {
+                const auto& influence = proxy.influences[influenceIndex];
+                stream << "{\"bone_id\": " << influence.boneId
+                       << ", \"mapping_node\": \""
+                       << JsonEscape(influence.mappingNode)
+                       << "\", \"exported_cluster_name\": \""
+                       << JsonEscape(influence.exportedClusterName)
+                       << "\", \"native_root\": "
+                       << (influence.boneId == 0 ? "true" : "false")
+                       << ", \"weight\": " << influence.weight << "}";
+                if (influenceIndex + 1 != proxy.influences.size()) {
+                    stream << ", ";
+                }
+            }
+            stream << "]";
+        }
+        stream << ", \"vertex_ranges\": [";
+        for (std::size_t rangeIndex = 0;
+             rangeIndex < proxy.vertexRanges.size();
+             ++rangeIndex) {
+            const auto& range = proxy.vertexRanges[rangeIndex];
+            stream << "[" << range.firstVertex << ", " << range.lastVertex << "]";
+            if (rangeIndex + 1 != proxy.vertexRanges.size()) {
+                stream << ", ";
+            }
+        }
+        stream << "]}"
+               << (index + 1 == gNativeReceiptProxies.size() ? "\n" : ",\n");
+    }
+    stream << "  ]\n}\n";
+    stream.close();
+    if (!stream) {
+        DeleteFileW(temporary.c_str());
+        Log("native receipt write did not complete");
+        return false;
+    }
+    if (!MoveFileExW(
+            temporary.c_str(),
+            destination.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(temporary.c_str());
+        Log("native receipt atomic promotion failed");
+        return false;
+    }
+    char message[256]{};
+    _snprintf_s(
+        message,
+        sizeof(message),
+        _TRUNCATE,
+        "native export receipt completed bones=%llu instances=%llu",
+        static_cast<unsigned long long>(gNativeReceiptBones.size()),
+        static_cast<unsigned long long>(gNativeReceiptProxies.size()));
+    Log(message);
+    return true;
+}
+
 void RunSecondaryNativeExport(void* mainWindow, bool gameExport) {
     if (gSecondaryExportPath[0] == L'\0') {
         return;
@@ -4462,6 +4729,7 @@ void RunSecondaryNativeExport(void* mainWindow, bool gameExport) {
 
 void __fastcall HookedSpeedTreeExport(void* arg1, void* arg2, void* arg3, bool gameExport) {
     Log("SpeedTree native CLI export intercepted");
+    ResetNativeReceiptCapture();
     __try {
         const auto* firstText = static_cast<const std::string*>(arg2);
         const auto* secondText = static_cast<const std::string*>(arg3);
@@ -4482,6 +4750,7 @@ void __fastcall HookedSpeedTreeExport(void* arg1, void* arg2, void* arg3, bool g
     if (gVerificationOnly) {
         Log("native CLI verification-only export skips Collision/Prune bake");
         gOriginalSpeedTreeExport(arg1, arg2, arg3, gameExport);
+        WriteNativeReceipt();
         RunSecondaryNativeExport(arg1, gameExport);
         Log("native CLI bundled verification export completed");
         return;
@@ -4567,6 +4836,7 @@ void __fastcall HookedSpeedTreeExport(void* arg1, void* arg2, void* arg3, bool g
             "native CLI model finalization raised an internal exception");
     }
     gOriginalSpeedTreeExport(arg1, arg2, arg3, gameExport);
+    WriteNativeReceipt();
     RunSecondaryNativeExport(arg1, gameExport);
     if (!SetNativeDeferredUiUpdateNoop(false)) {
         AbortExport(
@@ -4606,7 +4876,14 @@ bool ReadConfiguration() {
         L"SPEEDTREE_COLLISION_CLI_SECONDARY_OPTIONS",
         gSecondaryExportOptionsPath,
         static_cast<DWORD>(std::size(gSecondaryExportOptionsPath)));
-
+    GetEnvironmentVariableW(
+        L"SPEEDTREE_COLLISION_CLI_INPUT",
+        gNativeInputPath,
+        static_cast<DWORD>(std::size(gNativeInputPath)));
+    GetEnvironmentVariableW(
+        L"SPEEDTREE_COLLISION_CLI_NATIVE_RECEIPT",
+        gNativeReceiptPath,
+        static_cast<DWORD>(std::size(gNativeReceiptPath)));
     wchar_t timeoutText[64]{};
     if (GetEnvironmentVariableW(
             L"SPEEDTREE_COLLISION_CLI_TIMEOUT_MS",
@@ -4817,26 +5094,26 @@ bool InstallHooks() {
         RemoveCommonHooks();
         return false;
     }
-    if (!InstallRegisterPreservingHook(
+    if (!BuildExportVertexWeightsEntryStub() ||
+        !InstallRegisterPreservingHook(
             gExportVertexWeightsHook,
             reinterpret_cast<void*>(gSpeedTreeBase + kExportVertexWeightsRva),
-            HookedExportVertexWeights,
+            gExportVertexWeightsEntryStub,
             kExportVertexWeightsPrologue,
             reinterpret_cast<void**>(&gOriginalExportVertexWeights))) {
+        FreeExportVertexWeightsEntryStub();
         RemoveCommonHooks();
         return false;
     }
-#ifdef SPEEDTREE_BONE_FORENSICS
     if (!InstallHook(
-            gVfxExportBoneHook,
-            reinterpret_cast<void*>(gSpeedTreeBase + kVfxExportBoneRva),
-            HookedVfxExportBone,
-            kVfxExportBonePrologue,
-            reinterpret_cast<void**>(&gOriginalVfxExportBone))) {
+            gFbxNodeCreateHook,
+            reinterpret_cast<void*>(gSpeedTreeBase + kFbxNodeCreateRva),
+            HookedFbxNodeCreate,
+            kFbxNodeCreatePrologue,
+            reinterpret_cast<void**>(&gOriginalFbxNodeCreate))) {
         RemoveCommonHooks();
         return false;
     }
-#endif
     if (!InstallRegisterPreservingHook(
             gInsertExportBoneHook,
             reinterpret_cast<void*>(gSpeedTreeBase + kInsertExportBoneRva),

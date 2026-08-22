@@ -25,7 +25,7 @@
 namespace {
 
 constexpr wchar_t kCapabilityContract[] =
-    L"SPEEDTREE_COLLISION_CLI_CONTRACT=native-bundle-single-bake-v4";
+    L"SPEEDTREE_COLLISION_CLI_CONTRACT=native-runtime-receipt-v5";
 
 constexpr wchar_t kDefaultModelerPath[] =
     L"C:\\Program Files\\SpeedTree\\SpeedTree Modeler v10.1.0\\win64\\SpeedTree_Modeler.exe";
@@ -527,6 +527,7 @@ void PrintUsage() {
         << L"  --gui-bake            Use the legacy Modeler bake path for diagnosis\n"
         << L"  --secondary-export-options <ini>  Native CLI second export preset\n"
         << L"  --secondary-export <path>  Native CLI second output in the same process\n"
+        << L"  --native-receipt <path>  Exact parsed-runtime/export-serializer receipt\n"
         << L"  --isolated-window     Legacy GUI bake: use a private Windows desktop\n"
         << L"  --interactive-window  Show Modeler normally for diagnosis\n"
         << L"  --diagnose            Verify installed binary hashes and exit\n\n"
@@ -569,6 +570,7 @@ int wmain(int argc, wchar_t** argv) {
         std::filesystem::path sessionAnchor;
         std::filesystem::path secondaryExportOptions;
         std::filesystem::path secondaryExportOutput;
+        std::filesystem::path nativeReceipt;
         bool diagnose = false;
         bool serveSession = false;
         bool pingSession = false;
@@ -634,6 +636,8 @@ int wmain(int argc, wchar_t** argv) {
                 secondaryExportOptions = argv[++index];
             } else if (value == L"--secondary-export" && index + 1 < argc) {
                 secondaryExportOutput = argv[++index];
+            } else if (value == L"--native-receipt" && index + 1 < argc) {
+                nativeReceipt = argv[++index];
             } else if (value == L"--session-anchor" && index + 1 < argc) {
                 sessionAnchor = argv[++index];
             } else if (value == L"--isolated-window") {
@@ -684,6 +688,10 @@ int wmain(int argc, wchar_t** argv) {
         }
         if (verificationOnly && !nativeCli) {
             std::wcerr << L"Verification-only export is supported only by native CLI mode.\n";
+            return 2;
+        }
+        if (!nativeReceipt.empty() && !nativeCli) {
+            std::wcerr << L"Native receipts are supported only by native CLI mode.\n";
             return 2;
         }
 
@@ -794,6 +802,7 @@ int wmain(int argc, wchar_t** argv) {
         }
         std::optional<std::filesystem::file_time_type> outputWriteTimeBefore;
         std::optional<std::filesystem::file_time_type> secondaryWriteTimeBefore;
+        std::optional<std::filesystem::file_time_type> receiptWriteTimeBefore;
         if (!serveSession && std::filesystem::is_regular_file(outputFbx)) {
             outputWriteTimeBefore = std::filesystem::last_write_time(outputFbx);
         }
@@ -801,6 +810,10 @@ int wmain(int argc, wchar_t** argv) {
             std::filesystem::is_regular_file(secondaryExportOutput)) {
             secondaryWriteTimeBefore =
                 std::filesystem::last_write_time(secondaryExportOutput);
+        }
+        if (!nativeReceipt.empty() &&
+            std::filesystem::is_regular_file(nativeReceipt)) {
+            receiptWriteTimeBefore = std::filesystem::last_write_time(nativeReceipt);
         }
 
         if (logPath.empty()) {
@@ -932,6 +945,14 @@ int wmain(int argc, wchar_t** argv) {
             secondaryExportOptions.empty()
                 ? L""
                 : std::filesystem::absolute(secondaryExportOptions).wstring());
+        const auto restoreNativeInput = SetTemporaryEnvironment(
+            L"SPEEDTREE_COLLISION_CLI_INPUT",
+            serveSession ? L"" : std::filesystem::absolute(inputModel).wstring());
+        const auto restoreNativeReceipt = SetTemporaryEnvironment(
+            L"SPEEDTREE_COLLISION_CLI_NATIVE_RECEIPT",
+            nativeReceipt.empty()
+                ? L""
+                : std::filesystem::absolute(nativeReceipt).wstring());
         const auto restoreGameExport = SetTemporaryEnvironment(
             L"SPEEDTREE_COLLISION_CLI_GAME_EXPORT",
             gameExport ? L"1" : L"0");
@@ -998,6 +1019,8 @@ int wmain(int argc, wchar_t** argv) {
 
         RestoreEnvironment(restoreSessionServer);
         RestoreEnvironment(restoreGameExport);
+        RestoreEnvironment(restoreNativeReceipt);
+        RestoreEnvironment(restoreNativeInput);
         RestoreEnvironment(restoreSecondaryOptions);
         RestoreEnvironment(restoreSecondaryOutput);
         RestoreEnvironment(restoreExportOptions);
@@ -1194,6 +1217,18 @@ int wmain(int argc, wchar_t** argv) {
                 std::filesystem::last_write_time(secondaryExportOutput) ==
                     *secondaryWriteTimeBefore) {
                 std::wcerr << L"The secondary output was not updated; stale output was rejected.\n";
+                return 9;
+            }
+        }
+        if (!nativeReceipt.empty()) {
+            if (!std::filesystem::is_regular_file(nativeReceipt)) {
+                std::wcerr << L"SpeedTree exited successfully but the native receipt was not created.\n";
+                return 9;
+            }
+            if (receiptWriteTimeBefore.has_value() &&
+                std::filesystem::last_write_time(nativeReceipt) ==
+                    *receiptWriteTimeBefore) {
+                std::wcerr << L"The native receipt was not updated; stale evidence was rejected.\n";
                 return 9;
             }
         }

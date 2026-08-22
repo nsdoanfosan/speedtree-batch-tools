@@ -63,7 +63,7 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         launcher = LAUNCHER_SOURCE.read_text(encoding="utf-8")
         contract = (
             "SPEEDTREE_COLLISION_CLI_CONTRACT="
-            "native-bundle-single-bake-v4"
+            "native-runtime-receipt-v5"
         )
 
         self.assertIn(contract, launcher)

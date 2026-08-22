@@ -37,26 +37,21 @@ def exact_identity_contract(binding_count):
     return {
         "placement_contract": {
             "version": 2,
-            "identity_policy": "exact_render_attachment_correspondence_v1",
-            "translation_source": "exact_target_attachment_vertex",
-            "approximate_node_matching_present": False,
+            "identity_policy": "native_modeler_authored_position_receipt_v1",
+            "translation_source": "native_modeler_runtime_receipt",
             "exact_render_attachment_binding_count": binding_count,
             "source_spm": source_spm,
         },
         "attachment_bone_contract": {
-            "version": 1,
             "status": "ready",
-            "identity_policy": "exact_speedtree_xml_bone_id_parent_id_v1",
+            "policy": "native_modeler_runtime_receipt_v1",
             "source_spm": source_spm,
-            "source_xml": {
-                "path": "C:/target.xml",
+            "receipt": {
+                "path": "C:/target.speedtree_native_receipt.json",
                 "sha256": "b" * 64,
             },
             "bone_count": 1,
-            "bones": [
-                {"id": 7, "parent_id": -1, "generator": "Branch"}
-            ],
-            "lineage_sha256": "c" * 64,
+            "generated_instance_count": 1,
         },
     }
 
@@ -340,7 +335,7 @@ class ClusterFleetPushTests(unittest.TestCase):
             self.assertEqual(result["bindings"], 2)
             self.assertEqual(result["preserved_role_polygons_kept"], 3)
 
-    def test_assembly_result_rejects_spatial_node_recovery_contract(self):
+    def test_assembly_result_rejects_legacy_node_assignment_contract(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             report = root / "assembly_report.json"
@@ -350,12 +345,7 @@ class ClusterFleetPushTests(unittest.TestCase):
                 "placement_contract": {
                     "version": 1,
                     "authored_node_assignment": {
-                        "policy": (
-                            "deterministic_state_mesh_then_global_position_"
-                            "recovery_shared_components_v4"
-                        ),
                         "assigned_count": 1,
-                        "unmatched_count": 0,
                     },
                     "degraded_authored_card_binding_count": 0,
                 },
@@ -367,7 +357,7 @@ class ClusterFleetPushTests(unittest.TestCase):
 
             self.assertFalse(result["ok"])
             self.assertIn(
-                "approximate_node_matching_contract_present",
+                "legacy_attachment_identity_contract_present",
                 result["problems"],
             )
 

@@ -177,8 +177,26 @@ class ClusterSavePolicyTests(unittest.TestCase):
             "# The Assembly result is the save authority.",
             source,
         )
-        self.assertIn("if merged_object is not None:", source)
+        self.assertIn(
+            "if merged_object is not None or empty_after_dummy_cleanup:",
+            source,
+        )
         self.assertNotIn("blocking_export_collection_issues", source)
+
+    def test_authorized_dummy_only_asset_is_not_a_native_skin_failure(self):
+        source = JOB_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            'result.get("status") == "empty_after_dummy_cleanup"',
+            source,
+        )
+        self.assertIn(
+            'handoff_status = "empty_after_dummy_cleanup"',
+            source,
+        )
+        self.assertIn(
+            'result["native_skin_passthrough"] = False',
+            source,
+        )
 
 
 if __name__ == "__main__":
