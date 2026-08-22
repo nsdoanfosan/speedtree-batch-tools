@@ -84,7 +84,7 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         ]
         entry_stub = source[
             source.index("bool BuildExportVertexWeightsEntryStub"):
-            source.index("bool BuildExportVertexWeightsOriginalCallStub")
+            source.index("void FreeExportVertexWeightsEntryStub")
         ]
 
         self.assertIn("kExportVertexWeightsRva = 0x6B4FE0", source)
@@ -102,7 +102,7 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         )
         self.assertIn(missing_root_guard, weight_hook)
         primary_call = (
-            "gOriginalExportVertexWeightsCall(\n"
+            "gOriginalExportVertexWeights(\n"
             "        exporter,\n"
             "        position,\n"
             "        sourceBoneId,"
@@ -118,7 +118,7 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
             weight_hook,
         )
         self.assertIn(
-            "gOriginalExportVertexWeightsCall(\n"
+            "gOriginalExportVertexWeights(\n"
             "            exporter,\n"
             "            position,\n"
             "            0,",
@@ -127,7 +127,7 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         self.assertLess(
             weight_hook.index(missing_root_guard),
             weight_hook.index(
-                "gOriginalExportVertexWeightsCall(\n"
+                "gOriginalExportVertexWeights(\n"
                 "            exporter,\n"
                 "            position,\n"
                 "            0,"
