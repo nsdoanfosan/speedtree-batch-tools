@@ -322,6 +322,7 @@ NativeExportFinalizeDocumentFn gOriginalNativeExportFinalizeDocument = nullptr;
 ResolveBranchBoneIdFn gResolveBranchBoneId = nullptr;
 InsertExportBoneFn gOriginalInsertExportBone = nullptr;
 ExportVertexWeightsFn gOriginalExportVertexWeights = nullptr;
+ExportVertexWeightsFn gOriginalExportVertexWeightsCall = nullptr;
 FindExportBoneMappingFn gFindExportBoneMapping = nullptr;
 FbxClusterAddControlPointFn gUnusedOriginalFbxClusterAddControlPoint = nullptr;
 FbxClusterAppendIndexFn gFbxClusterAppendIndex = nullptr;
@@ -330,6 +331,7 @@ FbxNodeCreateFn gOriginalFbxNodeCreate = nullptr;
 void* gCurrentExportSourceVertexRecord = nullptr;
 void* gCurrentExportGeometry = nullptr;
 void* gExportVertexWeightsEntryStub = nullptr;
+void* gExportVertexWeightsOriginalCallStub = nullptr;
 SpeedTreeExportFn gNativeSpeedTreeExport = nullptr;
 MainWindowIdleFn gOriginalMainWindowOnIdle = nullptr;
 MainWindowIdleFn gOriginalMainWindowOnIdleDraw = nullptr;
@@ -716,8 +718,8 @@ void LogMissingIdZeroBoneRecordOnce() {
             true,
             std::memory_order_acq_rel)) {
         Log(
-            "FBX ID-0 cluster write skipped because this export has no exact "
-            "ID-0 bone record");
+            "Synthetic complementary FBX ID-0 cluster write skipped because "
+            "this export has no exact ID-0 bone record");
     }
 }
 
@@ -909,57 +911,44 @@ void CaptureNativeReceiptProxy(
                     : found->second;
             };
 
-            if (sourceBoneId == 0 && mapping == nullptr) {
-                // This node is wholly attached to the authored Root wrapper.
-                // The stock serializer cannot write that absent ID-0 mapping,
-                // but the receipt must retain its exact runtime ownership so
-                // Blender can restore the omitted deform weight after import.
+            FbxWeightExportContext probe{};
+            probe.suppressWrite = true;
+            FbxWeightExportContext* previousContext = gFbxWeightExportContext;
+            gFbxWeightExportContext = &probe;
+            gOriginalExportVertexWeightsCall(
+                exporter,
+                authoredSolver,
+                sourceBoneId,
+                vertexIndex,
+                clusterMap);
+            gFbxWeightExportContext = previousContext;
+            if (probe.additionCount > 0) {
                 proxy.influences.push_back({
-                    0,
-                    "start",
-                    "",
-                    1.0,
-                });
-            } else {
-                FbxWeightExportContext probe{};
-                probe.suppressWrite = true;
-                FbxWeightExportContext* previousContext = gFbxWeightExportContext;
-                gFbxWeightExportContext = &probe;
-                gOriginalExportVertexWeights(
-                    exporter,
-                    authoredSolver,
                     sourceBoneId,
-                    vertexIndex,
-                    clusterMap);
-                gFbxWeightExportContext = previousContext;
-                if (probe.additionCount > 0) {
+                    "start",
+                    exportedNodeName(sourceBoneId),
+                    probe.additions[0].weight,
+                });
+            }
+            if (probe.additionCount > 1) {
+                proxy.influences.push_back({
+                    parentId,
+                    "start",
+                    exportedNodeName(parentId),
+                    probe.additions[1].weight,
+                });
+            } else if (sourceBoneId > 0 && parentId == 0 &&
+                       probe.additionCount == 1) {
+                const float childWeight = static_cast<float>(
+                    probe.additions[0].weight);
+                const float rootWeight = 1.0f - childWeight;
+                if (rootWeight > 0.0f) {
                     proxy.influences.push_back({
-                        sourceBoneId,
+                        0,
                         "start",
-                        exportedNodeName(sourceBoneId),
-                        probe.additions[0].weight,
+                        exportedNodeName(0),
+                        static_cast<double>(rootWeight),
                     });
-                }
-                if (probe.additionCount > 1) {
-                    proxy.influences.push_back({
-                        parentId,
-                        "start",
-                        exportedNodeName(parentId),
-                        probe.additions[1].weight,
-                    });
-                } else if (sourceBoneId > 0 && parentId == 0 &&
-                           probe.additionCount == 1) {
-                    const float childWeight = static_cast<float>(
-                        probe.additions[0].weight);
-                    const float rootWeight = 1.0f - childWeight;
-                    if (rootWeight > 0.0f) {
-                        proxy.influences.push_back({
-                            0,
-                            "start",
-                            exportedNodeName(0),
-                            static_cast<double>(rootWeight),
-                        });
-                    }
                 }
             }
         }
@@ -1012,28 +1001,14 @@ void __fastcall HookedExportVertexWeights(
     int sourceBoneId,
     int vertexIndex,
     void* clusterMap) {
-    // The stock serializer assumes that an ID-0 request always has a matching
-    // export-bone record and dereferences that record without a null check.
-    // Some valid models begin at Bone 1 and deliberately have no deformable
-    // ID-0 record.  The hook used to manufacture an ID-0 request for those
-    // models while restoring complementary root weights, which crashed the
-    // Modeler at SpeedTree_Modeler+0x6B5185.  Preserve native behavior for
-    // that graph: there is no destination Root cluster to write.
-    if (sourceBoneId == 0 &&
-        FindExactExportBoneMapping(exporter, 0) == nullptr) {
-        CaptureNativeReceiptProxy(
-            exporter,
-            position,
-            sourceBoneId,
-            vertexIndex,
-            clusterMap);
-        LogMissingIdZeroBoneRecordOnce();
-        return;
-    }
+    // Always preserve the stock call, including native sourceBoneId==0 calls.
+    // A valid no-generator model can use that implicit native path even though
+    // the export-bone map has no exact ID-0 record.  Only the later *synthetic*
+    // complementary Root call needs the exact-record guard.
     FbxWeightExportContext primary{};
     FbxWeightExportContext* previousContext = gFbxWeightExportContext;
     gFbxWeightExportContext = &primary;
-    gOriginalExportVertexWeights(
+    gOriginalExportVertexWeightsCall(
         exporter,
         position,
         sourceBoneId,
@@ -1096,6 +1071,9 @@ void __fastcall HookedExportVertexWeights(
         if (rootWeight <= 0.0f) {
             return;
         }
+        // This call is manufactured by the hook, unlike the native call above.
+        // Without an exact ID-0 destination record it was observed to crash at
+        // SpeedTree_Modeler+0x6B5185, so guard only this complementary write.
         if (FindExactExportBoneMapping(exporter, 0) == nullptr) {
             LogMissingIdZeroBoneRecordOnce();
             return;
@@ -1105,7 +1083,7 @@ void __fastcall HookedExportVertexWeights(
         root.overrideWeight = true;
         root.replacementWeight = static_cast<double>(rootWeight);
         gFbxWeightExportContext = &root;
-        gOriginalExportVertexWeights(
+        gOriginalExportVertexWeightsCall(
             exporter,
             position,
             0,
@@ -1132,7 +1110,7 @@ bool BuildExportVertexWeightsEntryStub() {
     }
     auto* stub = static_cast<unsigned char*>(VirtualAlloc(
         nullptr,
-        64,
+        96,
         MEM_RESERVE | MEM_COMMIT,
         PAGE_EXECUTE_READWRITE));
     if (stub == nullptr) {
@@ -1156,14 +1134,97 @@ bool BuildExportVertexWeightsEntryStub() {
     stub[23] = 0x48;
     stub[24] = 0x89;
     stub[25] = 0x38;
-    WriteAbsoluteJump(stub + 26, reinterpret_cast<const void*>(
-        HookedExportVertexWeights));
-    FlushInstructionCache(GetCurrentProcess(), stub, 38);
+    // Native ID-0 is an implicit serializer path. Tail-jump straight to the
+    // SpeedTree trampoline so its undocumented caller register/stack state is
+    // untouched. Only positive IDs enter compiled hook code.
+    stub[26] = 0x45;
+    stub[27] = 0x85;
+    stub[28] = 0xC0;             // test r8d, r8d
+    stub[29] = 0x75;
+    stub[30] = 0x0C;             // jne HookedExportVertexWeights
+    stub[31] = 0x48;
+    stub[32] = 0xB8;
+    *reinterpret_cast<std::uintptr_t*>(stub + 33) =
+        reinterpret_cast<std::uintptr_t>(&gOriginalExportVertexWeights);
+    stub[41] = 0xFF;
+    stub[42] = 0x20;             // jmp qword ptr [rax]
+    WriteAbsoluteJump(
+        stub + 43,
+        reinterpret_cast<const void*>(HookedExportVertexWeights));
+    FlushInstructionCache(GetCurrentProcess(), stub, 55);
     gExportVertexWeightsEntryStub = stub;
     return true;
 }
 
+bool BuildExportVertexWeightsOriginalCallStub() {
+    if (gExportVertexWeightsOriginalCallStub != nullptr) {
+        return true;
+    }
+    if (gOriginalExportVertexWeights == nullptr) {
+        Log("FBX original vertex-weight call stub has no trampoline target");
+        return false;
+    }
+    auto* stub = static_cast<unsigned char*>(VirtualAlloc(
+        nullptr,
+        64,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_EXECUTE_READWRITE));
+    if (stub == nullptr) {
+        Log("FBX original vertex-weight call stub allocation failed");
+        return false;
+    }
+
+    // The stock routine has an undocumented dependency on the FBX caller's
+    // nonvolatile RBX vertex-record pointer. Compiled C++ may repurpose RBX
+    // inside HookedExportVertexWeights, so restore that exact captured value
+    // around every trampoline call. Also forward the fifth stack argument.
+    stub[0] = 0x53;              // push rbx
+    stub[1] = 0x48;
+    stub[2] = 0x83;
+    stub[3] = 0xEC;
+    stub[4] = 0x20;              // sub rsp, 0x20
+    stub[5] = 0x48;
+    stub[6] = 0x8B;
+    stub[7] = 0x44;
+    stub[8] = 0x24;
+    stub[9] = 0x50;              // mov rax, [rsp+0x50]
+    stub[10] = 0x48;
+    stub[11] = 0x89;
+    stub[12] = 0x44;
+    stub[13] = 0x24;
+    stub[14] = 0x20;             // mov [rsp+0x20], rax
+    stub[15] = 0x48;
+    stub[16] = 0xB8;
+    *reinterpret_cast<std::uintptr_t*>(stub + 17) =
+        reinterpret_cast<std::uintptr_t>(&gCurrentExportSourceVertexRecord);
+    stub[25] = 0x48;
+    stub[26] = 0x8B;
+    stub[27] = 0x18;             // mov rbx, [rax]
+    stub[28] = 0x48;
+    stub[29] = 0xB8;
+    *reinterpret_cast<std::uintptr_t*>(stub + 30) =
+        reinterpret_cast<std::uintptr_t>(gOriginalExportVertexWeights);
+    stub[38] = 0xFF;
+    stub[39] = 0xD0;             // call rax
+    stub[40] = 0x48;
+    stub[41] = 0x83;
+    stub[42] = 0xC4;
+    stub[43] = 0x20;             // add rsp, 0x20
+    stub[44] = 0x5B;             // pop rbx
+    stub[45] = 0xC3;             // ret
+    FlushInstructionCache(GetCurrentProcess(), stub, 46);
+    gExportVertexWeightsOriginalCallStub = stub;
+    gOriginalExportVertexWeightsCall =
+        reinterpret_cast<ExportVertexWeightsFn>(stub);
+    return true;
+}
+
 void FreeExportVertexWeightsEntryStub() {
+    if (gExportVertexWeightsOriginalCallStub != nullptr) {
+        VirtualFree(gExportVertexWeightsOriginalCallStub, 0, MEM_RELEASE);
+        gExportVertexWeightsOriginalCallStub = nullptr;
+    }
+    gOriginalExportVertexWeightsCall = nullptr;
     if (gExportVertexWeightsEntryStub != nullptr) {
         VirtualFree(gExportVertexWeightsEntryStub, 0, MEM_RELEASE);
         gExportVertexWeightsEntryStub = nullptr;
@@ -4632,6 +4693,12 @@ bool WriteNativeReceipt() {
         Log("native receipt temporary file could not be opened");
         return false;
     }
+    const char* idZeroClusterWrite =
+        gNativeReceiptBones.empty() && gNativeReceiptProxies.empty()
+        ? "not_applicable_boneless_export"
+        : (gMissingIdZeroBoneRecordLogged.load(std::memory_order_acquire)
+               ? "omitted_no_exact_bone_record"
+               : "native_exact_bone_record");
     stream << std::setprecision(17);
     stream << "{\n"
            << "  \"schema_version\": 2,\n"
@@ -4646,9 +4713,7 @@ bool WriteNativeReceipt() {
            << "  \"output\": {\"path\": \""
            << JsonEscape(WidePathToUtf8(gGuiExportPath)) << "\"},\n"
            << "  \"id_zero_cluster_write\": \""
-           << (gMissingIdZeroBoneRecordLogged.load(std::memory_order_acquire)
-                   ? "omitted_no_exact_bone_record"
-                   : "native_exact_bone_record")
+           << idZeroClusterWrite
            << "\",\n"
            << "  \"coordinate_contract\": {"
               "\"native_unit_to_meter\": 0.3048, "
@@ -5164,7 +5229,8 @@ bool InstallHooks() {
             reinterpret_cast<void*>(gSpeedTreeBase + kExportVertexWeightsRva),
             gExportVertexWeightsEntryStub,
             kExportVertexWeightsPrologue,
-            reinterpret_cast<void**>(&gOriginalExportVertexWeights))) {
+            reinterpret_cast<void**>(&gOriginalExportVertexWeights)) ||
+        !BuildExportVertexWeightsOriginalCallStub()) {
         FreeExportVertexWeightsEntryStub();
         RemoveCommonHooks();
         return false;
