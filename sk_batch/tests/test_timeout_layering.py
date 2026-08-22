@@ -12,10 +12,10 @@ SPEC.loader.exec_module(CONTRACT)
 
 
 class TimeoutLayeringTests(unittest.TestCase):
-    def test_material_speedtree_phase_has_one_timeout_owner(self):
-        rules = CONTRACT.material_preflight_inactivity_rules(180, 3600)
+    def test_material_speedtree_phase_has_independent_queue_and_execution_bounds(self):
+        rules = CONTRACT.material_preflight_inactivity_rules(180, 3600, 930)
         self.assertEqual(rules[CONTRACT.SPEEDTREE_SLOT_WAIT_MARKER], 3600)
-        self.assertIsNone(rules[CONTRACT.SPEEDTREE_SLOT_ACQUIRED_MARKER])
+        self.assertEqual(rules[CONTRACT.SPEEDTREE_SLOT_ACQUIRED_MARKER], 930)
         self.assertEqual(rules[CONTRACT.MATERIAL_PREFLIGHT_EXPORT_DONE_MARKER], 180)
 
     def test_send2ue_rpc_phase_has_one_timeout_owner(self):
@@ -25,10 +25,11 @@ class TimeoutLayeringTests(unittest.TestCase):
         self.assertIsNone(rules[CONTRACT.SEND2UE_RPC_OWNED_START_MARKER])
         self.assertEqual(rules[CONTRACT.SEND2UE_RPC_OWNED_DONE_MARKER], 180)
 
-    def test_gui_uses_existing_marker_watchdog_without_wall_clock_wrapper(self):
+    def test_gui_uses_marker_watchdog_with_native_cleanup_grace(self):
         source = (REPO / "sk_batch" / "sk_batch_gui.pyw").read_text(encoding="utf-8")
         self.assertIn("material_preflight_inactivity_rules(", source)
-        self.assertNotIn("export_timeout + timeout_grace", source)
+        self.assertIn("execution_timeout = export_timeout +", source)
+        self.assertIn("speedtree_material_preflight_cleanup_grace", source)
         self.assertGreaterEqual(source.count("send2ue_inactivity_rules("), 2)
         self.assertGreaterEqual(
             len(re.findall(r"_run_limited\([\s\S]{0,900}?\n\s*None,", source)),

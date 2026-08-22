@@ -127,9 +127,13 @@ DEFAULT_CONFIG = {
     "cpu_cores": max(1, (os.cpu_count() or 8) // 2),
     "blender_job_timeout": 3600,
     "speedtree_material_preflight_timeout": 900,
+    # One native Modeler attempt must not own the machine-wide gate for the
+    # entire bundle/fallback budget when its synchronous update spins forever.
+    "speedtree_native_process_timeout": 180,
     # These are inactivity budgets, not one queue+runtime wall-clock budget.
     # A child progress marker resets the applicable phase budget.
     "speedtree_material_preflight_queue_timeout": 3600,
+    "speedtree_material_preflight_cleanup_grace": 30,
     "child_stage_inactivity_timeout": 180,
     "child_timeout_grace": 60,
     "cluster_receipt_refresh_timeout": 600,

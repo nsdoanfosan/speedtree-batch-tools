@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import sys
 import traceback
 from contextlib import contextmanager
@@ -119,6 +120,7 @@ def parse_args():
     parser.add_argument("--speedtree-cli", required=True)
     parser.add_argument("--report", required=True)
     parser.add_argument("--timeout", type=int, default=900)
+    parser.add_argument("--native-process-timeout", type=int, default=180)
     return parser.parse_args()
 
 
@@ -955,6 +957,11 @@ def run_export(args, speedtree_cli):
     # The material-preflight child is single-threaded and runs one bundle, so
     # the temporary module binding cannot overlap another call in this process.
     speedtree_cli.speedtree_export_gate = reported_gate
+    timeout_environment_name = "SPEEDTREE_COLLISION_WRAPPER_TIMEOUT_MS"
+    previous_timeout = os.environ.get(timeout_environment_name)
+    os.environ[timeout_environment_name] = str(
+        max(1, int(getattr(args, "native_process_timeout", 180))) * 1000
+    )
     try:
         return export_bundle(
             exe=Path(args.speedtree_exe),
@@ -967,6 +974,10 @@ def run_export(args, speedtree_cli):
             native_receipt=native_receipt_target,
         )
     finally:
+        if previous_timeout is None:
+            os.environ.pop(timeout_environment_name, None)
+        else:
+            os.environ[timeout_environment_name] = previous_timeout
         speedtree_cli.speedtree_export_gate = original_gate
 
 
