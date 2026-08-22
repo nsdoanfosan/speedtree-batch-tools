@@ -30,6 +30,7 @@ from cluster_assembly_builder import (  # noqa: E402
     gate_assembly_transform_residuals,
     lowest_common_ancestor,
     make_skeleton_snapshot,
+    snapshot_blender_armature,
     scope_material_pipeline_for_destination,
     scope_material_pipeline_to_codex_tests,
     _attachment_vertex_correspondence,
@@ -95,6 +96,37 @@ def exact_bone_skeleton(*rows):
         })
         index_by_name[name] = index
     return make_skeleton_snapshot(bones)
+
+
+class BlenderSkeletonSnapshotTests(unittest.TestCase):
+    def test_authored_root_is_index_zero_without_armature_object_node(self):
+        identity = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+        root = SimpleNamespace(name="Root", parent=None, matrix_local=identity)
+        child = SimpleNamespace(
+            name="Bone_1_Start", parent=root, matrix_local=identity
+        )
+        armature = SimpleNamespace(
+            type="ARMATURE",
+            name="Armature",
+            data=SimpleNamespace(bones=[root, child]),
+            matrix_world=identity,
+        )
+
+        snapshot = snapshot_blender_armature(armature)
+
+        self.assertEqual(
+            [
+                (row["index"], row["name"], row["parent_index"])
+                for row in snapshot["bones"]
+            ],
+            [(0, "Root", -1), (1, "Bone_1_Start", 0)],
+        )
+        self.assertNotIn("Armature", [row["name"] for row in snapshot["bones"]])
 
 
 class AssemblyBuildCacheTests(unittest.TestCase):

@@ -738,35 +738,6 @@ def leaf_contract_user_message(contract):
             "현재 내보내는 잎 노드의 재질 연결이 끊어짐 — "
             + detail + " → SPM 연결 복구 필요"
         )
-    if status == "replacement_needed":
-        existing = int(
-            contract.get("replacement_source_slot_count")
-            if contract.get("replacement_source_slot_count") is not None
-            else contract.get("visible_source_slot_count")
-            or contract.get("source_slot_count")
-            or 0
-        )
-        connected = int(
-            contract.get("replacement_connected_slot_count")
-            if contract.get("replacement_connected_slot_count") is not None
-            else contract.get("visible_managed_slot_count")
-            or contract.get("managed_slot_count")
-            or 0
-        )
-        if existing and connected:
-            detail = (
-                f"현재 내보내는 잎 카드 중 새 Atlas 연결 {connected}개, "
-                f"기존 재질 사용 {existing}개"
-            )
-        elif existing:
-            detail = (
-                f"현재 내보내는 잎 카드 {existing}개가 아직 기존 재질을 사용 중"
-            )
-        else:
-            detail = (
-                "새 Atlas 재질은 만들어졌지만 현재 내보내는 잎 노드에 연결되지 않음"
-            )
-        return False, f"Atlas 연결 확인 필요 — {detail} → 연결 후 ② Blender Repair"
     if status == "no_leaf_slots":
         return True, "Atlas 연결 검사 비적용 — 현재 내보내는 Atlas 대상 잎 슬롯 없음"
     return True, "현재 내보내는 잎 재질 연결 정상"

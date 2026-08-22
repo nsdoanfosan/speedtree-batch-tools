@@ -2086,7 +2086,7 @@ class BlendLiveStatusTests(unittest.TestCase):
         self.assertEqual(reason, "")
         validate_artifacts.assert_called_once()
 
-    def test_live_status_explains_unconnected_managed_atlas(self):
+    def test_live_status_does_not_block_on_unconnected_managed_atlas(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         contract = {
@@ -2100,9 +2100,8 @@ class BlendLiveStatusTests(unittest.TestCase):
         ):
             status = app._blend_status_text(Path("SK_tree_lauraceae_10.spm"))
 
-        self.assertIn("Atlas 연결 확인 필요", status)
-        self.assertIn("기존 재질을 사용 중", status)
-        self.assertIn("연결 후", status)
+        self.assertNotIn("Atlas 연결 확인 필요", status)
+        self.assertNotIn("기존 재질을 사용 중", status)
 
     def test_live_status_reports_missing_speedtree_export_materials(self):
         gui = load_gui_module()

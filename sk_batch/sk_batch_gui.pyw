@@ -11218,7 +11218,7 @@ class App:
             reasons.append("버텍스 컬러 검사 실패")
         if payload_contract.get("status") == "blocked":
             reasons.append("AO/Nanite UV payload 검사 실패")
-        if leaf_contract.get("status") in {"blocked", "replacement_needed"}:
+        if leaf_contract.get("status") in {"blocked", "inspection_error", "invalid_references"}:
             reasons.append("SPM leaf 참조 실패")
         if reasons:
             return False, "① 사전검사 차단: " + " | ".join(reasons)

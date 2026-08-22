@@ -64,7 +64,7 @@ MAX_SPEEDTREE_RENDER_FACE_MULTIPLICITY = 2
 # and ambiguous in the next.
 MIN_FBX_COORDINATE_TOLERANCE_METERS = 1.0e-6
 PASS_THROUGH_PROVENANCE_SCHEMA_VERSION = 1
-ASSEMBLY_BUILD_CACHE_VERSION = 6
+ASSEMBLY_BUILD_CACHE_VERSION = 7
 PASS_THROUGH_PROVENANCE_REASON = (
     "selected_target_contract_handoff_pass_through"
 )
@@ -1994,37 +1994,30 @@ def _matrix_rows(matrix):
 
 
 def snapshot_blender_armature(armature):
-    """Capture the final FBX-import Skeleton, including its object root.
+    """Capture the final FBX-import Skeleton from authored armature bones.
 
-    The existing BWR/Send2UE FBX contract imports the Blender armature object as
-    reference-skeleton index 0, then the authored Blender bones starting at
-    index 1.  DynamicWind generation uses that exact exported identity.
+    Send2UE suppresses Blender's armature-object FBX node for this pipeline, so
+    Unreal imports the authored top-level bone at reference-skeleton index 0.
+    Treating the object as an additional root collides with SpeedTree's real
+    ``Root`` bone and makes Unreal rename that authored bone to ``Root1``.
     """
     if getattr(armature, "type", "") != "ARMATURE":
         raise ClusterAssemblyBuildError("final armature object is invalid")
     bones = list(getattr(getattr(armature, "data", None), "bones", ()) or ())
     if not bones:
         raise ClusterAssemblyBuildError("final armature has no bones")
-    indices = {bone.name: index + 1 for index, bone in enumerate(bones)}
-    rows = [
-        {
-            "index": 0,
-            "name": str(armature.name),
-            "parent_index": -1,
-            "parent_name": None,
-            "bind_matrix": _matrix_rows(armature.matrix_world),
-        }
-    ]
+    indices = {bone.name: index for index, bone in enumerate(bones)}
+    rows = []
     for source_index, bone in enumerate(bones):
-        index = source_index + 1
+        index = source_index
         parent = getattr(bone, "parent", None)
         parent_name = str(parent.name) if parent else None
         rows.append(
             {
                 "index": index,
                 "name": str(bone.name),
-                "parent_index": indices[parent_name] if parent_name else 0,
-                "parent_name": parent_name or str(armature.name),
+                "parent_index": indices[parent_name] if parent_name else -1,
+                "parent_name": parent_name,
                 "bind_matrix": _matrix_rows(bone.matrix_local),
             }
         )
@@ -2162,6 +2155,7 @@ def validate_binding_hierarchy(
     skeleton_snapshot,
     wind_bones=None,
     skeleton_by_name=None,
+    bone_authority_label="final Unreal Skeleton",
 ):
     if skeleton_by_name is None:
         checked, skeleton_by_name = _skeleton_maps(skeleton_snapshot)
@@ -2180,8 +2174,11 @@ def validate_binding_hierarchy(
             )
         ancestor_chain(name, skeleton_snapshot, skeleton_by_name)
         if wind_bones is not None and name not in wind_bones:
+            available = sorted(str(value) for value in wind_bones)
             raise ClusterAssemblyBuildError(
-                f"Assembly binding bone is absent from final wind JSON: {name}"
+                f"Assembly binding bone is absent from {bone_authority_label}: "
+                f"{name}; available_count={len(available)}, "
+                f"available_sample={available[:12]}"
             )
         names.append(name)
         total += weight
@@ -2358,6 +2355,7 @@ def validate_wind_json_against_skeleton(
             checked,
             wind_bones=seen,
             skeleton_by_name=by_name,
+            bone_authority_label="final wind JSON",
         )
         for binding in bindings
     ]
@@ -4864,7 +4862,11 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
                 "send2ue", "fbx_export"
             )
 
-            bpy.context.scene.send2ue.export_object_name_as_root = True
+            # The authored SpeedTree armature already has its one real Root
+            # bone.  Exporting Blender's armature object as another `root`
+            # collides case-insensitively in Unreal and renames the authored
+            # bone to Root1, breaking exact Assembly bindings.
+            bpy.context.scene.send2ue.export_object_name_as_root = False
             bpy.context.scene.send2ue.export_custom_root_name = ""
             bpy.context.scene.send2ue.use_object_origin = False
             textureless_flag = (

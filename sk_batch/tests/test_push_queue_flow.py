@@ -3199,6 +3199,14 @@ class PushQueueFlowTests(unittest.TestCase):
             "disable_optional_send2ue_validations(scene_props)",
             push_source,
         )
+        self.assertIn(
+            "configure_authored_skeleton_root_export(scene_props)",
+            push_source,
+        )
+        self.assertIn(
+            "scene_props.export_object_name_as_root = False",
+            push_source,
+        )
         self.assertNotIn("if blocked_vertex_payloads:", push_source)
         self.assertNotIn("if empty_material_slots:", push_source)
         self.assertIn(

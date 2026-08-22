@@ -1269,7 +1269,7 @@ def main():
         report["leaf_reference_contract"] = leaf_reference_contract
         report["material_export_contract"] = material_export_contract
         leaf_reference_blocked = leaf_reference_contract.get("status") in {
-            "inspection_error", "invalid_references", "replacement_needed",
+            "inspection_error", "invalid_references",
         }
         material_export_blocked = material_export_contract.get("status") not in {
             "ok", "not_applicable",
