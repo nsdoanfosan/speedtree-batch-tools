@@ -6014,7 +6014,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             app._execute_material_preflight.assert_not_called()
             app._run_limited.assert_not_called()
 
-    def test_relation_receipt_drift_refreshes_before_current_owner_skip(self):
+    def test_relation_receipt_drift_does_not_run_pcg_publication(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as temporary:
@@ -6075,7 +6075,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 app._job_blender(str(spm), spm, item)
 
             self.assertEqual(events, ["relation_refresh", "output_state"])
-            app._refresh_canonical_atlas_manifests.assert_called_once_with(spm)
+            app._refresh_canonical_atlas_manifests.assert_not_called()
             app._publish_current_assembly_skip.assert_called_once()
             app._execute_material_preflight.assert_not_called()
 
