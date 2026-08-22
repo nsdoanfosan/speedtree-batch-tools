@@ -1013,6 +1013,17 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
 
         self.assertEqual(issues, [])
 
+    def test_atlas_replacement_is_not_an_unreal_weight_preflight_issue(self):
+        issues = preflight.preflight_contract_issues({
+            "spm": "SK_atlas.spm",
+            "leaf_reference_contract": {
+                "status": "replacement_needed",
+                "replacement_source_slot_count": 1,
+            },
+        })
+
+        self.assertEqual(issues, [])
+
     def test_provider_claim_disagreement_does_not_abort_texture_preflight(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

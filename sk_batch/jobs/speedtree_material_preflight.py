@@ -1073,7 +1073,6 @@ def preflight_contract_issues(report):
     leaf_codes = {
         "inspection_error": "SPM_LEAF_INSPECTION_ERROR",
         "invalid_references": "ATLAS_REFERENCE_INVALID",
-        "replacement_needed": "ATLAS_REPLACEMENT_REQUIRED",
     }
     if leaf_status in leaf_codes:
         issues.append(
@@ -1314,13 +1313,17 @@ def main():
         report["instance_profile"] = read_tree_instance_profile(speedtree_spm)
         speedtree_cli = load_speedtree_cli(args.speedtree_cli)
         leaf_contract = inspect_spm_leaf_contract(speedtree_spm)
-        leaf_ok, leaf_message = leaf_contract_user_message(leaf_contract)
+        _leaf_ok, leaf_message = leaf_contract_user_message(leaf_contract)
         report["leaf_reference_contract"] = leaf_contract
         mesh_files = inspect_spm_mesh_file_references(speedtree_spm)
         report["mesh_file_reference_contract"] = mesh_files
         missing_mesh_files = list(mesh_files.get("missing") or [])
         atlas_integrity = mesh_files.get("atlas_consumer_integrity") or {}
-        if not leaf_ok:
+        leaf_reference_blocked = str(leaf_contract.get("status") or "") in {
+            "inspection_error",
+            "invalid_references",
+        }
+        if leaf_reference_blocked:
             report["status"] = "blocked"
             report["error"] = leaf_message
             emit_progress_marker(

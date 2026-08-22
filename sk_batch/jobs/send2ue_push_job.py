@@ -270,6 +270,32 @@ def disable_optional_send2ue_validations(scene_props):
     return disabled
 
 
+def configure_authored_skeleton_root_export(scene_props):
+    """Make the authored top-level bone the one Unreal reference root.
+
+    SpeedTree armatures already contain a real ``Root`` bone.  Send2UE's
+    object-root mode renames Blender's ``Armature`` object to ``root``; Unreal
+    then sees a case-insensitive duplicate and renames the authored bone to
+    ``Root1``.  Suppressing the object node preserves the authored hierarchy.
+    """
+    before = {
+        "export_object_name_as_root": bool(
+            scene_props.export_object_name_as_root
+        ),
+        "export_custom_root_name": str(scene_props.export_custom_root_name),
+    }
+    scene_props.export_object_name_as_root = False
+    scene_props.export_custom_root_name = ""
+    return {
+        "contract": "send2ue_fbx_authored_bone_root",
+        "before": before,
+        "after": {
+            "export_object_name_as_root": False,
+            "export_custom_root_name": "",
+        },
+    }
+
+
 def write_report(path, data):
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -773,6 +799,9 @@ def main():
         scene_props = bpy.context.scene.send2ue
         report["send2ue_optional_validations_disabled"] = (
             disable_optional_send2ue_validations(scene_props)
+        )
+        report["send2ue_skeleton_root_export"] = (
+            configure_authored_skeleton_root_export(scene_props)
         )
         folder_before_sync = scene_props.unreal_mesh_folder_path
         # A saved template or an earlier output layout can leave this value on

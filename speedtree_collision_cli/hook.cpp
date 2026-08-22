@@ -694,6 +694,33 @@ struct ExportBoneMapping {
     void* endNode;
 };
 
+std::atomic_bool gMissingIdZeroBoneRecordLogged{false};
+
+ExportBoneMapping* FindExactExportBoneMapping(void* exporter, int boneId) {
+    if (exporter == nullptr) {
+        return nullptr;
+    }
+    int lookupId = boneId;
+    auto* mapping = static_cast<ExportBoneMapping*>(gFindExportBoneMapping(
+        static_cast<unsigned char*>(exporter) + 0x60,
+        &lookupId));
+    return mapping != nullptr && mapping->boneRecord != nullptr
+        ? mapping
+        : nullptr;
+}
+
+void LogMissingIdZeroBoneRecordOnce() {
+    bool expected = false;
+    if (gMissingIdZeroBoneRecordLogged.compare_exchange_strong(
+            expected,
+            true,
+            std::memory_order_acq_rel)) {
+        Log(
+            "FBX ID-0 cluster write skipped because this export has no exact "
+            "ID-0 bone record");
+    }
+}
+
 void __fastcall HookedFbxClusterAddControlPoint(
     void* cluster,
     int vertexIndex,
@@ -744,6 +771,7 @@ void* __fastcall HookedFbxNodeCreate(void* manager, const char* name) {
 
 void ResetNativeReceiptCapture() {
     std::lock_guard<std::mutex> lock(gNativeReceiptMutex);
+    gMissingIdZeroBoneRecordLogged.store(false, std::memory_order_release);
     gNativeReceiptGeometries.clear();
     gNativeReceiptBones.clear();
     gNativeReceiptProxies.clear();
@@ -860,12 +888,8 @@ void CaptureNativeReceiptProxy(
                     *reinterpret_cast<const float*>(geometryBytes + 0x34)) * 30.48f,
             };
             int parentId = 0;
-            int lookupId = sourceBoneId;
-            auto* mapping = static_cast<ExportBoneMapping*>(
-                gFindExportBoneMapping(
-                    static_cast<unsigned char*>(exporter) + 0x60,
-                    &lookupId));
-            if (mapping != nullptr && mapping->boneRecord != nullptr) {
+            auto* mapping = FindExactExportBoneMapping(exporter, sourceBoneId);
+            if (mapping != nullptr) {
                 parentId = *reinterpret_cast<const int*>(
                     static_cast<const unsigned char*>(mapping->boneRecord) + 0x04);
             }
@@ -885,44 +909,57 @@ void CaptureNativeReceiptProxy(
                     : found->second;
             };
 
-            FbxWeightExportContext probe{};
-            probe.suppressWrite = true;
-            FbxWeightExportContext* previousContext = gFbxWeightExportContext;
-            gFbxWeightExportContext = &probe;
-            gOriginalExportVertexWeights(
-                exporter,
-                authoredSolver,
-                sourceBoneId,
-                vertexIndex,
-                clusterMap);
-            gFbxWeightExportContext = previousContext;
-            if (probe.additionCount > 0) {
+            if (sourceBoneId == 0 && mapping == nullptr) {
+                // This node is wholly attached to the authored Root wrapper.
+                // The stock serializer cannot write that absent ID-0 mapping,
+                // but the receipt must retain its exact runtime ownership so
+                // Blender can restore the omitted deform weight after import.
                 proxy.influences.push_back({
+                    0,
+                    "start",
+                    "",
+                    1.0,
+                });
+            } else {
+                FbxWeightExportContext probe{};
+                probe.suppressWrite = true;
+                FbxWeightExportContext* previousContext = gFbxWeightExportContext;
+                gFbxWeightExportContext = &probe;
+                gOriginalExportVertexWeights(
+                    exporter,
+                    authoredSolver,
                     sourceBoneId,
-                    "start",
-                    exportedNodeName(sourceBoneId),
-                    probe.additions[0].weight,
-                });
-            }
-            if (probe.additionCount > 1) {
-                proxy.influences.push_back({
-                    parentId,
-                    "start",
-                    exportedNodeName(parentId),
-                    probe.additions[1].weight,
-                });
-            } else if (sourceBoneId > 0 && parentId == 0 &&
-                       probe.additionCount == 1) {
-                const float childWeight = static_cast<float>(
-                    probe.additions[0].weight);
-                const float rootWeight = 1.0f - childWeight;
-                if (rootWeight > 0.0f) {
+                    vertexIndex,
+                    clusterMap);
+                gFbxWeightExportContext = previousContext;
+                if (probe.additionCount > 0) {
                     proxy.influences.push_back({
-                        0,
+                        sourceBoneId,
                         "start",
-                        exportedNodeName(0),
-                        static_cast<double>(rootWeight),
+                        exportedNodeName(sourceBoneId),
+                        probe.additions[0].weight,
                     });
+                }
+                if (probe.additionCount > 1) {
+                    proxy.influences.push_back({
+                        parentId,
+                        "start",
+                        exportedNodeName(parentId),
+                        probe.additions[1].weight,
+                    });
+                } else if (sourceBoneId > 0 && parentId == 0 &&
+                           probe.additionCount == 1) {
+                    const float childWeight = static_cast<float>(
+                        probe.additions[0].weight);
+                    const float rootWeight = 1.0f - childWeight;
+                    if (rootWeight > 0.0f) {
+                        proxy.influences.push_back({
+                            0,
+                            "start",
+                            exportedNodeName(0),
+                            static_cast<double>(rootWeight),
+                        });
+                    }
                 }
             }
         }
@@ -975,6 +1012,24 @@ void __fastcall HookedExportVertexWeights(
     int sourceBoneId,
     int vertexIndex,
     void* clusterMap) {
+    // The stock serializer assumes that an ID-0 request always has a matching
+    // export-bone record and dereferences that record without a null check.
+    // Some valid models begin at Bone 1 and deliberately have no deformable
+    // ID-0 record.  The hook used to manufacture an ID-0 request for those
+    // models while restoring complementary root weights, which crashed the
+    // Modeler at SpeedTree_Modeler+0x6B5185.  Preserve native behavior for
+    // that graph: there is no destination Root cluster to write.
+    if (sourceBoneId == 0 &&
+        FindExactExportBoneMapping(exporter, 0) == nullptr) {
+        CaptureNativeReceiptProxy(
+            exporter,
+            position,
+            sourceBoneId,
+            vertexIndex,
+            clusterMap);
+        LogMissingIdZeroBoneRecordOnce();
+        return;
+    }
     FbxWeightExportContext primary{};
     FbxWeightExportContext* previousContext = gFbxWeightExportContext;
     gFbxWeightExportContext = &primary;
@@ -1039,6 +1094,10 @@ void __fastcall HookedExportVertexWeights(
         }
         const float rootWeight = 1.0f - childWeight;
         if (rootWeight <= 0.0f) {
+            return;
+        }
+        if (FindExactExportBoneMapping(exporter, 0) == nullptr) {
+            LogMissingIdZeroBoneRecordOnce();
             return;
         }
 
@@ -4586,6 +4645,11 @@ bool WriteNativeReceipt() {
            << ", \"last_write_time_100ns\": " << sourceWriteTime << "},\n"
            << "  \"output\": {\"path\": \""
            << JsonEscape(WidePathToUtf8(gGuiExportPath)) << "\"},\n"
+           << "  \"id_zero_cluster_write\": \""
+           << (gMissingIdZeroBoneRecordLogged.load(std::memory_order_acquire)
+                   ? "omitted_no_exact_bone_record"
+                   : "native_exact_bone_record")
+           << "\",\n"
            << "  \"coordinate_contract\": {"
               "\"native_unit_to_meter\": 0.3048, "
               "\"native_unit_to_solver\": 30.48, "

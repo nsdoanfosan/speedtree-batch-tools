@@ -87,6 +87,15 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         self.assertIn("kFindExportBoneMappingRva = 0x6B4DF0", source)
         self.assertIn("if (parentId != 0)", weight_hook)
         self.assertIn("const float rootWeight = 1.0f - childWeight;", weight_hook)
+        self.assertIn('"omitted_no_exact_bone_record"', source)
+        self.assertIn(
+            "gMissingIdZeroBoneRecordLogged.store(false",
+            source,
+        )
+        missing_root_guard = (
+            "if (FindExactExportBoneMapping(exporter, 0) == nullptr)"
+        )
+        self.assertIn(missing_root_guard, weight_hook)
         self.assertIn(
             "gOriginalExportVertexWeights(\n"
             "            exporter,\n"
@@ -94,6 +103,16 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
             "            0,",
             weight_hook,
         )
+        self.assertLess(
+            weight_hook.index(missing_root_guard),
+            weight_hook.index(
+                "gOriginalExportVertexWeights(\n"
+                "            exporter,\n"
+                "            position,\n"
+                "            0,"
+            ),
+        )
+        self.assertIn("SpeedTree_Modeler+0x6B5185", weight_hook)
         self.assertIn("FbxSkeleton::eLimbNode", source)
         self.assertIn("No spatial lookup or normalization", weight_hook)
 
