@@ -65,6 +65,7 @@ MAX_SPEEDTREE_RENDER_FACE_MULTIPLICITY = 2
 MIN_FBX_COORDINATE_TOLERANCE_METERS = 1.0e-6
 PASS_THROUGH_PROVENANCE_SCHEMA_VERSION = 1
 ASSEMBLY_BUILD_CACHE_VERSION = 8
+FINAL_ASSEMBLY_NANITE_SHAPE_PRESERVATION = "preserve_area"
 PASS_THROUGH_PROVENANCE_REASON = (
     "selected_target_contract_handoff_pass_through"
 )
@@ -8018,6 +8019,88 @@ def validate_generated_assembly_reference_pose_sync(reference_pose_sync):
     return reference_pose_sync
 
 
+def _nanite_shape_preservation_preserve_area(unreal):
+    for enum_name in ("NaniteShapePreservation", "ENaniteShapePreservation"):
+        enum_type = getattr(unreal, enum_name, None)
+        if enum_type is None:
+            continue
+        for value_name in (
+            "PRESERVE_AREA",
+            "PreserveArea",
+            "preserve_area",
+        ):
+            value = getattr(enum_type, value_name, None)
+            if value is not None:
+                return value
+        for value_name in dir(enum_type):
+            normalized = value_name.replace("_", "").casefold()
+            if normalized == "preservearea":
+                value = getattr(enum_type, value_name, None)
+                if value is not None:
+                    return value
+    return None
+
+
+def _configure_final_assembly_preserve_area(unreal, builder):
+    """Override the duplicated Base setting before FinishAssemblyBuild.
+
+    UE duplicates the Voxelize-configured NA_Base when BeginNew creates the
+    target Assembly mesh.  FinishAssemblyBuild then consumes that duplicated
+    setting while building the combined DAG.  Changing the finished asset is
+    too late, so the in-progress target must be set to Preserve Area before
+    any final Assembly build occurs.  Base and part assets are left untouched.
+    """
+    get_target = getattr(builder, "get_target_mesh_object", None)
+    if not callable(get_target):
+        raise ClusterAssemblyBuildError(
+            "Nanite Assembly builder does not expose its target mesh"
+        )
+    target = get_target()
+    if target is None:
+        raise ClusterAssemblyBuildError(
+            "Nanite Assembly builder has no active target mesh"
+        )
+    preserve_area = _nanite_shape_preservation_preserve_area(unreal)
+    if preserve_area is None:
+        raise ClusterAssemblyBuildError(
+            "UE 5.8 Nanite Shape Preservation Preserve Area enum missing"
+        )
+    nanite = target.get_editor_property("nanite_settings")
+    before = nanite.get_editor_property("shape_preservation")
+    if before != preserve_area:
+        nanite.set_editor_property("shape_preservation", preserve_area)
+        target.set_editor_property("nanite_settings", nanite)
+    after = target.get_editor_property("nanite_settings").get_editor_property(
+        "shape_preservation"
+    )
+    if after != preserve_area:
+        raise ClusterAssemblyBuildError(
+            "Final Nanite Assembly target did not accept Preserve Area"
+        )
+    return {
+        "target": target.get_path_name(),
+        "policy": FINAL_ASSEMBLY_NANITE_SHAPE_PRESERVATION,
+        "before": str(before),
+        "after": str(after),
+        "changed": before != after,
+        "applied_before_finish": True,
+        "base_and_parts_unchanged": True,
+    }
+
+
+def _validate_final_assembly_preserve_area(unreal, assembly, report):
+    preserve_area = _nanite_shape_preservation_preserve_area(unreal)
+    nanite = assembly.get_editor_property("nanite_settings")
+    final_value = nanite.get_editor_property("shape_preservation")
+    report["finished"] = str(final_value)
+    report["preserved_through_finish"] = final_value == preserve_area
+    if preserve_area is None or final_value != preserve_area:
+        raise ClusterAssemblyBuildError(
+            "Finished Nanite Assembly is not Preserve Area"
+        )
+    return report
+
+
 def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
     """Build and save the separate UE 5.8 Assembly from imported inputs.
 
@@ -8123,6 +8206,10 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
         raise ClusterAssemblyBuildError(
             "BeginNewSkeletalMeshAssemblyBuild failed"
         )
+    final_nanite_shape_preservation = _configure_final_assembly_preserve_area(
+        unreal,
+        builder,
+    )
     built_parts = []
     for part in manifest.get("parts") or []:
         bindings = []
@@ -8201,6 +8288,11 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
     success, assembly = _unwrap_struct_result(finish, unreal.SkeletalMesh)
     if not success or assembly is None:
         raise ClusterAssemblyBuildError(f"FinishAssemblyBuild failed: {finish!r}")
+    _validate_final_assembly_preserve_area(
+        unreal,
+        assembly,
+        final_nanite_shape_preservation,
+    )
     assembly_skeleton = assembly.get_editor_property("skeleton")
     if (
         assembly_skeleton is None
@@ -8305,6 +8397,7 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
         "base_weighted_bone_count": len(base_weighted_bones),
         "base_weight_manifest_diagnostic": base_weight_manifest_diagnostic,
         "base_weights_in_final_wind": True,
+        "final_nanite_shape_preservation": final_nanite_shape_preservation,
         "reference_pose_sync": reference_pose_sync,
         "prototype_bounds_preflight": prototype_bounds_preflight,
         "bounds_completion": bounds_completion,
@@ -8316,7 +8409,9 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
 
 
 __all__ = [
+    "ASSEMBLY_BUILD_CACHE_VERSION",
     "ClusterAssemblyBuildError",
+    "FINAL_ASSEMBLY_NANITE_SHAPE_PRESERVATION",
     "MANIFEST_KIND",
     "SCHEMA_VERSION",
     "ancestor_chain",
