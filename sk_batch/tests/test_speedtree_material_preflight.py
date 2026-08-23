@@ -1488,7 +1488,7 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                 report["mesh_file_reference_contract"]["status"], "ok"
             )
 
-    def test_missing_visible_stem_blocks_with_all_export_issue(self):
+    def test_missing_expected_name_with_semantic_payload_is_diagnostic(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             spm = root / "SK_grass_missing_stem.spm"
@@ -1499,13 +1499,13 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
 
             exited, _export_mock = self.run_preflight(spm, report_path)
 
-            self.assertTrue(exited)
+            self.assertFalse(exited)
             report = json.loads(report_path.read_text(encoding="utf-8"))
             envelope = report["speedtree_pipeline_contract"]
-            self.assertEqual(report["status"], "blocked")
-            self.assertEqual(envelope["outcome"], "blocked")
+            self.assertEqual(report["status"], "ok")
+            self.assertEqual(envelope["outcome"], "ok")
             self.assertIn(
-                "ALL_EXPORT_MATERIAL_MISSING",
+                "MATERIAL_EXPORT_NAME_MISMATCH_DIAGNOSTIC",
                 {issue["code"] for issue in envelope["issues"]},
             )
             self.assertEqual(
@@ -1513,19 +1513,66 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                 ["M_stem_common_01"],
             )
             self.assertEqual(
-                report["classification"],
-                "asset_export_material_missing",
-            )
-            self.assertEqual(
                 report["missing_export_materials"],
                 ["M_stem_common_01"],
             )
-            self.assertIn("assign", report["remediation"].casefold())
-            self.assertEqual(spm.read_bytes(), source_before)
-            self.assertFalse(report["problem_node_marker"]["changed"])
             self.assertEqual(
-                report["problem_node_marker"]["status"], "reported_only"
+                report["material_export_admission"]["status"],
+                "diagnostic_only",
             )
+            self.assertEqual(spm.read_bytes(), source_before)
+
+    def test_empty_native_geometry_is_a_hard_structural_block(self):
+        result = preflight.classify_material_export_admission(
+            {"status": "ok", "actual_materials": ["M_leaf_Mat"]},
+            {"status": "ok", "actual_materials": ["M_leaf_Mat"]},
+            {"geometry_count": 0},
+        )
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["classification"], "asset_export_geometry_empty")
+
+    def test_missing_semantic_material_with_default_is_a_hard_block(self):
+        result = preflight.classify_material_export_admission(
+            {
+                "status": "missing_materials",
+                "missing_materials": ["M_leaf_willow_01"],
+                "actual_materials": ["Default_Mat", "M_bark_willow_Mat"],
+            },
+            {
+                "status": "missing_materials",
+                "missing_materials": ["M_leaf_willow_01"],
+                "actual_materials": ["Default_Mat", "M_bark_willow_Mat"],
+            },
+            {"geometry_count": 2},
+        )
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(
+            result["classification"],
+            "asset_export_material_placeholder_for_missing_semantic",
+        )
+
+    def test_missing_semantic_material_with_empty_payload_is_a_hard_block(self):
+        result = preflight.classify_material_export_admission(
+            {
+                "status": "missing_materials",
+                "missing_materials": ["M_bark_birch"],
+                "actual_materials": [],
+            },
+            {
+                "status": "missing_materials",
+                "missing_materials": ["M_bark_birch"],
+                "actual_materials": [],
+            },
+            {"geometry_count": 1},
+        )
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(
+            result["classification"],
+            "asset_export_material_payload_empty",
+        )
 
     def test_textureless_stmat_continues_after_material_name_match(self):
         with tempfile.TemporaryDirectory() as temporary:

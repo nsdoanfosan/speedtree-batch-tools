@@ -10740,6 +10740,11 @@ class App:
             Path(spm).parent / "reports" /
             f"{Path(spm).stem}_speedtree_assembly_pipeline_report_codex.json"
         )
+        if not report_path.is_file():
+            # No report means this asset has never published an Assembly
+            # manifest.  It is an ordinary asset; there is no stale manifest
+            # for Push to reject.
+            return True, ""
         try:
             pipeline = _read_assembly_pipeline_json(report_path)
             embedded = pipeline.get("cluster_assembly_manifest")
@@ -10943,15 +10948,18 @@ class App:
                 )
             return assembly_state
 
-        if receipt_current:
-            assembly_current, assembly_reason = assembly_inputs()
-            if not assembly_current:
-                return {
-                    "current": False,
-                    "push_ready": False,
-                    "kind": "assembly_stale",
-                    "reason": assembly_reason,
-                }
+        # Push validates materialized Assembly manifests unconditionally.  The
+        # scheduler must use the same rule even when an older content receipt
+        # is merely diagnostic; otherwise it skips ① and hands Push a manifest
+        # that Push correctly rejects under the current placement contract.
+        assembly_current, assembly_reason = assembly_inputs()
+        if not assembly_current:
+            return {
+                "current": False,
+                "push_ready": False,
+                "kind": "assembly_stale",
+                "reason": assembly_reason,
+            }
         if blend.stat().st_mtime < spm.stat().st_mtime and not receipt_current:
             return {
                 "current": False,

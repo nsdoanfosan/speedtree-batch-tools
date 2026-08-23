@@ -173,6 +173,105 @@ def problem_generators(contract, missing_materials):
     return rows
 
 
+def classify_material_export_admission(
+    material_contract,
+    all_material_contract,
+    native_receipt_summary=None,
+):
+    """Decide admission from exported structure, not expected-name equality.
+
+    A missing expected name can describe an unused generator slot and is not,
+    by itself, proof that the exported mesh is defective. Empty geometry,
+    absent/invalid material payloads, and a generic Default/Material payload
+    standing in for a missing semantic material are concrete output defects.
+    """
+    material_contract = material_contract or {}
+    all_material_contract = all_material_contract or {}
+    native_receipt_summary = native_receipt_summary or {}
+
+    geometry_count = native_receipt_summary.get("geometry_count")
+    try:
+        geometry_count = int(geometry_count)
+    except (TypeError, ValueError):
+        geometry_count = None
+    if geometry_count == 0:
+        return {
+            "status": "blocked",
+            "classification": "asset_export_geometry_empty",
+            "reason": "native_export_contains_no_geometry",
+        }
+
+    contracts = (material_contract, all_material_contract)
+    hard_statuses = {
+        "missing_stmat",
+        "invalid_stmat",
+        "stale",
+        "inspection_error",
+    }
+    failed_statuses = sorted({
+        str(contract.get("status") or "")
+        for contract in contracts
+        if str(contract.get("status") or "") in hard_statuses
+    })
+    if failed_statuses:
+        return {
+            "status": "blocked",
+            "classification": "asset_export_material_payload_invalid",
+            "reason": "material_payload_contract_failed",
+            "contract_statuses": failed_statuses,
+        }
+
+    missing = list(dict.fromkeys(
+        list(material_contract.get("missing_materials") or [])
+        + list(all_material_contract.get("missing_materials") or [])
+    ))
+    actual = list(dict.fromkeys(
+        list(material_contract.get("actual_materials") or [])
+        + list(all_material_contract.get("actual_materials") or [])
+    ))
+    if not missing:
+        return {
+            "status": "ok",
+            "reason": "exported_material_structure_complete",
+            "missing_materials": [],
+            "actual_materials": actual,
+        }
+    if not actual:
+        return {
+            "status": "blocked",
+            "classification": "asset_export_material_payload_empty",
+            "reason": "geometry_has_no_exported_material_identity",
+            "missing_materials": missing,
+            "actual_materials": [],
+        }
+
+    placeholder_materials = [
+        name for name in actual
+        if _material_contract_key(name) in {"default", "material"}
+    ]
+    if placeholder_materials:
+        return {
+            "status": "blocked",
+            "classification": (
+                "asset_export_material_placeholder_for_missing_semantic"
+            ),
+            "reason": (
+                "generic_material_placeholder_with_missing_semantic_material"
+            ),
+            "missing_materials": missing,
+            "actual_materials": actual,
+            "placeholder_materials": placeholder_materials,
+        }
+
+    return {
+        "status": "diagnostic_only",
+        "reason": "expected_name_mismatch_without_structural_export_defect",
+        "missing_materials": missing,
+        "actual_materials": actual,
+        "affects_pipeline_outcome": False,
+    }
+
+
 def _material_contract_key(value):
     value = str(value or "").strip()
     if value.casefold().endswith("_mat"):
@@ -1167,6 +1266,57 @@ def preflight_contract_issues(report):
             )
         )
 
+    material_admission = report.get("material_export_admission") or {}
+    structural_admission_block = bool(
+        material_admission.get("status") == "blocked"
+    )
+    structural_codes = {
+        "asset_export_geometry_empty": "ASSET_EXPORT_GEOMETRY_EMPTY",
+        "asset_export_material_payload_empty": (
+            "ASSET_EXPORT_MATERIAL_PAYLOAD_EMPTY"
+        ),
+        "asset_export_material_placeholder_for_missing_semantic": (
+            "ASSET_EXPORT_MATERIAL_PLACEHOLDER"
+        ),
+        "asset_export_material_payload_invalid": (
+            "ASSET_EXPORT_MATERIAL_PAYLOAD_INVALID"
+        ),
+    }
+    structural_classification = str(
+        material_admission.get("classification") or ""
+    )
+    if structural_admission_block:
+        issues.append(
+            _issue(
+                structural_codes.get(
+                    structural_classification,
+                    "ASSET_EXPORT_STRUCTURE_INVALID",
+                ),
+                "speedtree_export",
+                report.get("spm"),
+                material_admission.get("reason")
+                or structural_classification
+                or "SpeedTree export structure is invalid",
+                details={
+                    "classification": structural_classification,
+                    "missing_materials": material_admission.get(
+                        "missing_materials"
+                    ) or [],
+                    "actual_materials": material_admission.get(
+                        "actual_materials"
+                    ) or [],
+                    "placeholder_materials": material_admission.get(
+                        "placeholder_materials"
+                    ) or [],
+                },
+            )
+        )
+
+    material_name_diagnostics = report.get("material_name_diagnostics") or {}
+    name_mismatch_is_diagnostic = bool(
+        material_name_diagnostics.get("status") == "diagnostic_only"
+        and material_name_diagnostics.get("affects_pipeline_outcome") is False
+    )
     material = report.get("material_export_contract") or {}
     material_status = str(material.get("status") or "")
     material_codes = {
@@ -1175,7 +1325,10 @@ def preflight_contract_issues(report):
         "stale": "STMAT_STALE",
         "missing_materials": "MATERIAL_EXPORT_MISSING",
     }
-    if material_status in material_codes:
+    if material_status in material_codes and not (
+        material_status == "missing_materials"
+        and (name_mismatch_is_diagnostic or structural_admission_block)
+    ):
         issues.append(
             _issue(
                 material_codes[material_status],
@@ -1214,7 +1367,10 @@ def preflight_contract_issues(report):
                 all_material.get("error") or all_material_status,
             )
         )
-    elif all_material_status in material_codes:
+    elif all_material_status in material_codes and not (
+        all_material_status == "missing_materials"
+        and (name_mismatch_is_diagnostic or structural_admission_block)
+    ):
         code = (
             "ALL_EXPORT_MATERIAL_MISSING"
             if all_material_status == "missing_materials"
@@ -1232,6 +1388,29 @@ def preflight_contract_issues(report):
                         "missing_material_records"
                     )
                     or [],
+                },
+            )
+        )
+
+    if name_mismatch_is_diagnostic:
+        issues.append(
+            _issue(
+                "MATERIAL_EXPORT_NAME_MISMATCH_DIAGNOSTIC",
+                "stmat",
+                material.get("stmat") or all_material.get("stmat"),
+                (
+                    "Expected material names differ from the non-empty "
+                    "semantic material payload; final face-slot validation "
+                    "remains authoritative"
+                ),
+                severity="warning",
+                details={
+                    "missing_materials": material_name_diagnostics.get(
+                        "missing_materials"
+                    ) or [],
+                    "actual_materials": material_name_diagnostics.get(
+                        "actual_materials"
+                    ) or [],
                 },
             )
         )
@@ -1514,65 +1693,65 @@ def main():
                     "failure_reason", ""
                 )
                 report["remediation"] = textures.get("remediation", "")
-            if (
-                material.get("status") in {"ok", "not_applicable"}
-                and all_material.get("status") in {"ok", "not_applicable"}
-            ):
+            material_admission = classify_material_export_admission(
+                material,
+                all_material,
+                report.get("speedtree_native_receipt"),
+            )
+            report["material_export_admission"] = material_admission
+            if material_admission["status"] == "ok":
+                report["status"] = "ok"
+            elif material_admission["status"] == "diagnostic_only":
+                report["material_name_diagnostics"] = material_admission
+                report["missing_export_materials"] = missing
                 report["status"] = "ok"
             elif missing:
                 problems = problem_generators(leaf_contract, leaf_missing)
                 report["problem_generators"] = problems
-                report["classification"] = "asset_export_material_missing"
+                report["classification"] = material_admission.get(
+                    "classification", "asset_export_material_payload_invalid"
+                )
                 report["failure_reason"] = (
-                    "The live SpeedTree FBX/STMAT export does not contain "
-                    "materials referenced by visible SPM generators"
+                    "The live SpeedTree export has a concrete geometry/material "
+                    "payload defect; expected names are supporting diagnostics"
                 )
                 report["remediation"] = (
-                    "In SpeedTree Modeler, assign/export the listed materials "
-                    "on the reported visible generators, or remove obsolete "
-                    "material references, then save the SPM and rerun"
+                    "Repair the source SPM generator/material assignment or "
+                    "exported geometry, save the asset, and rerun"
                 )
                 report["missing_export_materials"] = missing
-                # Material preflight is a diagnostic boundary.  Never write a
-                # foreground marker into the source SPM here: that cosmetic
-                # edit invalidates the already-current Assembly and Unreal
-                # Push receipts.  The report contains
-                # the exact Generator GUIDs/names for UI-side highlighting.
                 report["problem_node_marker"] = {
                     "status": "reported_only",
                     "changed": False,
                     "marked": [],
                 }
                 report["status"] = "blocked"
-                if missing:
-                    names = ", ".join(missing)
-                    node_names = ", ".join(
-                        sorted({
-                            str(item.get("generator_name") or "<이름 없음>")
-                            for item in problems
-                        })
-                    )
-                    marker_note = (
-                        f" 문제 Generator: {node_names}."
-                        if problems
-                        else ""
-                    )
-                    report["error"] = (
-                        "현재 실제 내보내는 노드의 재질이 SpeedTree FBX에서 빠짐 — "
-                        + names + "." + marker_note + " SPM은 수정하지 않았습니다."
-                    )
-                else:
-                    report["error"] = (
-                        "SpeedTree FBX/XML 선행 생성 실패 — "
-                        + str(material.get("status") or "unknown")
-                    )
+                names = ", ".join(missing)
+                node_names = ", ".join(
+                    sorted({
+                        str(item.get("generator_name") or "<이름 없음>")
+                        for item in problems
+                    })
+                )
+                marker_note = (
+                    f" 문제 Generator: {node_names}."
+                    if problems
+                    else ""
+                )
+                report["error"] = (
+                    "SpeedTree 실제 출력 구조 결함 — "
+                    + str(material_admission.get("reason") or "unknown")
+                    + "; 누락 이름: " + names + "." + marker_note
+                    + " SPM은 수정하지 않았습니다."
+                )
             else:
                 report["status"] = "blocked"
+                report["classification"] = material_admission.get(
+                    "classification", "asset_export_material_payload_invalid"
+                )
                 report["error"] = (
-                    "SpeedTree material export preflight failed — material="
-                    + str(material.get("status") or "unknown")
-                    + ", all_material="
-                    + str(all_material.get("status") or "unknown")
+                    "SpeedTree 실제 출력 구조 결함 — "
+                    + str(material_admission.get("reason") or "unknown")
                 )
             emit_progress_marker(
                 MATERIAL_PREFLIGHT_INSPECTION_DONE_MARKER,
