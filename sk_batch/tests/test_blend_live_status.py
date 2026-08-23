@@ -2134,6 +2134,34 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.assertIn("재질이 SpeedTree FBX에서 빠짐", status)
             self.assertIn("M_leaf_atlas_01", status)
 
+    def test_material_postcheck_uses_structural_admission_for_name_mismatch(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        exported = {
+            "status": "missing_materials",
+            "missing_materials": ["M_branch_expected"],
+            "actual_materials": ["M_branch_exported_Mat"],
+        }
+        with mock.patch.object(
+            gui,
+            "inspect_spm_leaf_contract",
+            return_value={"status": "managed_connected"},
+        ), mock.patch.object(
+            gui,
+            "inspect_speedtree_material_export",
+            return_value=exported,
+        ), mock.patch.object(
+            gui,
+            "inspect_all_speedtree_material_export",
+            return_value=exported,
+        ):
+            ready, reason = app._material_export_ready(
+                Path("SK_tree_semantic_name_mismatch.spm")
+            )
+
+        self.assertTrue(ready, reason)
+        self.assertEqual(reason, "SpeedTree 재질 export 정상")
+
     def test_texture_preflight_ignores_files_but_keeps_structural_slot_gate(self):
         gui = load_gui_module()
         app = self.make_app(gui)

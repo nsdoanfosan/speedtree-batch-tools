@@ -544,6 +544,32 @@ class BlenderResumeQueueTests(unittest.TestCase):
         ]
         self.assertEqual(progress_events, [(0, 0)])
 
+    def test_stale_assembly_manifest_overrides_saved_resume_skip(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        spm = Path("SK_tree_stale_manifest.spm")
+        target = {"spm": spm, "wind_override": "auto"}
+        receipt = {"receipt_sha256": "saved"}
+        app.state[str(spm)] = {"blend_resume_receipt": receipt}
+        app._validated_blender_resume_state = mock.Mock(return_value={
+            "current": True,
+            "push_ready": True,
+            "kind": "ready",
+            "reason": "ready",
+        })
+        app._cluster_assembly_inputs_current = mock.Mock(
+            return_value=(False, "Assembly placement contract is invalid")
+        )
+        app._publish_current_assembly_skip = mock.Mock(return_value=True)
+
+        runnable, skipped = app._prefilter_blender_resume_targets([target])
+
+        self.assertEqual(runnable, [target])
+        self.assertEqual(skipped, [])
+        self.assertEqual(target["_blender_resume_policy"], "rebuild")
+        self.assertIn("placement", target["_blender_resume_reason"])
+        app._publish_current_assembly_skip.assert_not_called()
+
     def test_missing_receipt_migrates_from_current_stat_state_without_reads(self):
         gui = load_gui_module()
         app = self.make_app(gui)

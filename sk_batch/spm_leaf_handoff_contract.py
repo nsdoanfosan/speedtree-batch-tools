@@ -1025,6 +1025,99 @@ def _normalized_material_name(value):
     return normalize_material_key(value)
 
 
+def classify_material_export_admission(
+    material_contract,
+    all_material_contract,
+    native_receipt_summary=None,
+):
+    """Classify concrete export structure independently of expected names."""
+    material_contract = material_contract or {}
+    all_material_contract = all_material_contract or {}
+    native_receipt_summary = native_receipt_summary or {}
+
+    geometry_count = native_receipt_summary.get("geometry_count")
+    try:
+        geometry_count = int(geometry_count)
+    except (TypeError, ValueError):
+        geometry_count = None
+    if geometry_count == 0:
+        return {
+            "status": "blocked",
+            "classification": "asset_export_geometry_empty",
+            "reason": "native_export_contains_no_geometry",
+        }
+
+    hard_statuses = {
+        "missing_stmat",
+        "invalid_stmat",
+        "stale",
+        "inspection_error",
+    }
+    failed_statuses = sorted({
+        str(contract.get("status") or "")
+        for contract in (material_contract, all_material_contract)
+        if str(contract.get("status") or "") in hard_statuses
+    })
+    if failed_statuses:
+        return {
+            "status": "blocked",
+            "classification": "asset_export_material_payload_invalid",
+            "reason": "material_payload_contract_failed",
+            "contract_statuses": failed_statuses,
+        }
+
+    missing = list(dict.fromkeys(
+        list(material_contract.get("missing_materials") or [])
+        + list(all_material_contract.get("missing_materials") or [])
+    ))
+    actual = list(dict.fromkeys(
+        list(material_contract.get("actual_materials") or [])
+        + list(all_material_contract.get("actual_materials") or [])
+    ))
+    if not missing:
+        return {
+            "status": "ok",
+            "reason": "exported_material_structure_complete",
+            "missing_materials": [],
+            "actual_materials": actual,
+        }
+    if not actual:
+        return {
+            "status": "blocked",
+            "classification": "asset_export_material_payload_empty",
+            "reason": "geometry_has_no_exported_material_identity",
+            "missing_materials": missing,
+            "actual_materials": [],
+        }
+
+    placeholder_materials = [
+        name
+        for name in actual
+        if _normalized_material_name(name) in {"default", "material"}
+    ]
+    if placeholder_materials:
+        return {
+            "status": "blocked",
+            "classification": (
+                "asset_export_material_placeholder_for_missing_semantic"
+            ),
+            "reason": (
+                "generic_material_placeholder_with_missing_semantic_material"
+            ),
+            "missing_materials": missing,
+            "actual_materials": actual,
+            "placeholder_materials": placeholder_materials,
+        }
+
+    return {
+        "status": "diagnostic_only",
+        "reason": "expected_name_mismatch_without_structural_export_defect",
+        "missing_materials": missing,
+        "actual_materials": actual,
+        "affects_pipeline_outcome": False,
+    }
+
+
 @functools.lru_cache(maxsize=512)
 def _stmat_names_cached(path_text, _size, _mtime_ns):
     try:
