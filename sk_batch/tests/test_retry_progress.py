@@ -4,6 +4,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from unittest import mock
 
 
 REPO_DIR = Path(__file__).resolve().parents[2]
@@ -29,6 +30,7 @@ from retry_progress import (
     STALLED,
     UNREAL,
     RetryProgressReceipt,
+    _atomic_write_json,
     stage_for_send2ue_marker,
 )
 from shared_job_queue import SharedJobQueue
@@ -36,6 +38,29 @@ from shared_job_queue import SharedJobQueue
 
 HELPER = Path(__file__).with_name("retry_progress_helper.py")
 GUI_SOURCE = SK_BATCH_DIR / "sk_batch_gui.pyw"
+
+
+def test_atomic_write_retries_transient_windows_replace_lock(tmp_path):
+    target = tmp_path / "latest.json"
+    real_replace = __import__("os").replace
+    attempts = []
+
+    def transient_replace(source, destination):
+        attempts.append((source, destination))
+        if len(attempts) < 3:
+            raise PermissionError(5, "sharing violation")
+        return real_replace(source, destination)
+
+    with mock.patch("retry_progress.os.replace", side_effect=transient_replace), mock.patch(
+        "retry_progress.time.sleep"
+    ) as sleep:
+        _atomic_write_json(target, {"status": "current"})
+
+    assert len(attempts) == 3
+    assert sleep.call_count == 2
+    assert json.loads(target.read_text(encoding="utf-8")) == {
+        "status": "current"
+    }
 
 
 class FakeClock:

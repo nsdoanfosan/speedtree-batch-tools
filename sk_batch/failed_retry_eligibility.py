@@ -29,10 +29,18 @@ UNREAL_PARENT_DEPENDENCY_REBUILD = "dependency_rebuild_required"
 UNREAL_PARENT_EXPORT_STALE = "export_stale"
 
 UNREAL_RECOVERY_FAILURE_KINDS = frozenset({
+    "cancelled",
     "data_error",
     "manual_required",
     "unreal_crash",
     "not_run",
+    "rerun_pending",
+    "stopped",
+})
+INTERRUPTED_PUSH_KINDS = frozenset({
+    "cancelled",
+    "rerun_pending",
+    "stopped",
 })
 # Durable push states that are stamped *before* Unreal ingest is confirmed.
 # `ready` lands when Blender Repair finishes and the row is handed to the push
@@ -255,6 +263,18 @@ def classify_failed_retry(
                 parent,
             )
         if push_kind in UNREAL_RECOVERY_FAILURE_KINDS:
+            if push_kind in INTERRUPTED_PUSH_KINDS:
+                return _result(
+                    UNREAL_ONLY,
+                    "interrupted_push_current_parent",
+                    (
+                        "Interrupted Push has a current immutable Unreal "
+                        "parent; resume Unreal ingest without rebuilding "
+                        "Blender"
+                    ),
+                    repair_kind,
+                    parent,
+                )
             return _result(
                 UNREAL_ONLY,
                 "current_immutable_unreal_failure",
@@ -290,6 +310,25 @@ def classify_failed_retry(
             parent,
         )
     if parent in {UNREAL_PARENT_INCOMPLETE, UNREAL_PARENT_INVALID}:
+        if repair_current and push_kind in INTERRUPTED_PUSH_KINDS:
+            if force_full_rebuild:
+                return _result(
+                    BLENDER_REBUILD,
+                    "interrupted_push_forced_full_rebuild",
+                    unreal_parent_diagnostic or "Push was interrupted",
+                    repair_kind,
+                    parent,
+                )
+            return _result(
+                SEND2UE_REEXPORT,
+                "interrupted_push_reexport",
+                (
+                    "Blender output is current, but the interrupted Push "
+                    "parent cannot be resumed; restart at Send2UE"
+                ),
+                repair_kind,
+                parent,
+            )
         return _result(
             BLENDER_REBUILD,
             "unreal_parent_evidence_" + parent + "_full_rebuild",
@@ -324,6 +363,26 @@ def classify_failed_retry(
                 "Push failure has no export report or complete Unreal "
                 "manifest/checkpoint evidence; regenerate it through the "
                 "full Blender pipeline"
+            ),
+            repair_kind,
+            parent,
+        )
+
+    if repair_current and push_kind in INTERRUPTED_PUSH_KINDS:
+        if force_full_rebuild:
+            return _result(
+                BLENDER_REBUILD,
+                "interrupted_push_forced_full_rebuild",
+                "Explicit full rebuild requested for interrupted Push",
+                repair_kind,
+                parent,
+            )
+        return _result(
+            SEND2UE_REEXPORT,
+            "interrupted_push_reexport",
+            (
+                "Blender output is current and Push was interrupted; "
+                "restart at Send2UE instead of rebuilding Blender"
             ),
             repair_kind,
             parent,
@@ -379,6 +438,7 @@ __all__ = (
     "BLENDER_REBUILD",
     "BLOCKED",
     "CURRENT_BLENDER_EXCLUDED",
+    "INTERRUPTED_PUSH_KINDS",
     "PENDING_UNREAL_VALIDATION",
     "RETRY_ELIGIBILITY_SCHEMA_VERSION",
     "SEND2UE_REEXPORT",

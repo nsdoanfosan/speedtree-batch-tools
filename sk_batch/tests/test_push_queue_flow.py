@@ -6183,6 +6183,43 @@ class PushQueueFlowTests(unittest.TestCase):
         )
         app._validate_failed_retry_unreal_item_current.assert_not_called()
 
+    def test_rerun_pending_unreal_batch_resumes_from_current_parent(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        iid = "rerun_pending_unreal.spm"
+        jobs = self.configure_failed_retry_start(app, [iid])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest, checkpoint = self.write_unreal_retry_parent(
+                gui, root, iid, status="cancelled"
+            )
+            app.state[iid] = {
+                "push_status_kind": "rerun_pending",
+                "push_paths": {
+                    "manifest": str(manifest),
+                    "checkpoint": str(checkpoint),
+                },
+                "push_source_fingerprint_cache": {
+                    "fingerprint": "source-v1",
+                    "snapshot": {},
+                },
+            }
+            with mock.patch.object(gui, "save_config"):
+                app.start_failed_results_retry()
+
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["mode"], "unreal_recovery")
+        self.assertEqual(
+            jobs[0]["retry_metadata"]["execution_path"],
+            "immutable_unreal_only",
+        )
+        eligibility = jobs[0]["retry_metadata"]["eligibility"]["items"]
+        self.assertEqual(
+            eligibility[0]["reason_code"],
+            "interrupted_push_current_parent",
+        )
+
     def test_failed_results_retry_stale_blender_forces_full_pipeline(self):
         gui = load_gui_module()
         app = self.make_app(gui)

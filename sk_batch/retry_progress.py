@@ -22,6 +22,8 @@ RECEIPT_KIND = "failed_retry_progress_receipt"
 LATEST_KIND = "failed_retry_progress_latest"
 DIAGNOSTIC_LIMIT = 240
 LIFECYCLE_EVENT_LIMIT = 64
+ATOMIC_REPLACE_ATTEMPTS = 8
+ATOMIC_REPLACE_INITIAL_DELAY_SECONDS = 0.01
 
 PLANNING = "planning"
 SHARED_QUEUE_WAIT = "shared_queue_wait"
@@ -97,7 +99,19 @@ def _atomic_write_json(path, payload):
     )
     try:
         temporary.write_text(encoded, encoding="utf-8")
-        os.replace(temporary, target)
+        for attempt in range(ATOMIC_REPLACE_ATTEMPTS):
+            try:
+                os.replace(temporary, target)
+                break
+            except PermissionError:
+                if attempt + 1 >= ATOMIC_REPLACE_ATTEMPTS:
+                    raise
+                time.sleep(
+                    min(
+                        0.25,
+                        ATOMIC_REPLACE_INITIAL_DELAY_SECONDS * (2**attempt),
+                    )
+                )
     finally:
         try:
             temporary.unlink()
