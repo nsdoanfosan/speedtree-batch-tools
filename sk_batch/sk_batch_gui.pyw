@@ -273,6 +273,7 @@ from sk_common import (
     wind_preset_for_spm,
 )
 from spm_leaf_handoff_contract import (
+    classify_material_export_admission,
     inspect_all_speedtree_material_export,
     inspect_speedtree_material_export,
     inspect_spm_leaf_contract,
@@ -3870,6 +3871,14 @@ class App:
                 continue
             except (OSError, TypeError, ValueError):
                 item["_blender_resume_policy"] = "live_validation"
+                runnable.append(item)
+                continue
+            assembly_inputs_current, assembly_reason = (
+                self._cluster_assembly_inputs_current(spm)
+            )
+            if not assembly_inputs_current:
+                item["_blender_resume_policy"] = "rebuild"
+                item["_blender_resume_reason"] = assembly_reason
                 runnable.append(item)
                 continue
             if not self._publish_current_assembly_skip(
@@ -11126,20 +11135,32 @@ class App:
         )
         exported = inspect_speedtree_material_export(speedtree_spm, contract)
         all_exported = inspect_all_speedtree_material_export(speedtree_spm)
-        if all_exported.get("status") not in {"ok", "not_applicable"}:
-            exported = all_exported
-        status = exported.get("status")
-        if status in {"ok", "not_applicable"} or (
-            status == "stale" and content_receipt_current
-        ):
+        if content_receipt_current:
+            exported = dict(exported)
+            all_exported = dict(all_exported)
+            if exported.get("status") == "stale":
+                exported["status"] = "ok"
+            if all_exported.get("status") == "stale":
+                all_exported["status"] = "ok"
+        admission = classify_material_export_admission(
+            exported,
+            all_exported,
+        )
+        if admission.get("status") in {"ok", "diagnostic_only"}:
             return True, "SpeedTree 재질 export 정상"
-        missing = list(exported.get("missing_materials") or [])
+        failed_contract = (
+            all_exported
+            if all_exported.get("status") not in {"ok", "not_applicable"}
+            else exported
+        )
+        status = failed_contract.get("status")
+        missing = list(admission.get("missing_materials") or [])
         if status == "missing_stmat":
             return False, "SpeedTree .stmat 없음 → ① Blender Assembly"
         if status == "invalid_stmat":
             return False, (
                 "SpeedTree .stmat 파싱 실패 — "
-                + str(exported.get("error") or "파일 확인")
+                + str(failed_contract.get("error") or "파일 확인")
             )
         if status == "stale":
             return False, "SPM 변경 후 SpeedTree .stmat이 오래됨 → ① 다시 실행"

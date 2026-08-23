@@ -25,6 +25,7 @@ if str(BATCH_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(BATCH_TOOLS_DIR))
 
 from spm_leaf_handoff_contract import (  # noqa: E402
+    classify_material_export_admission,
     inspect_all_speedtree_material_export,
     inspect_speedtree_material_export,
     inspect_speedtree_texture_sources,
@@ -171,105 +172,6 @@ def problem_generators(contract, missing_materials):
             "generated_node_count": slot.get("generated_node_count", 0),
         })
     return rows
-
-
-def classify_material_export_admission(
-    material_contract,
-    all_material_contract,
-    native_receipt_summary=None,
-):
-    """Decide admission from exported structure, not expected-name equality.
-
-    A missing expected name can describe an unused generator slot and is not,
-    by itself, proof that the exported mesh is defective. Empty geometry,
-    absent/invalid material payloads, and a generic Default/Material payload
-    standing in for a missing semantic material are concrete output defects.
-    """
-    material_contract = material_contract or {}
-    all_material_contract = all_material_contract or {}
-    native_receipt_summary = native_receipt_summary or {}
-
-    geometry_count = native_receipt_summary.get("geometry_count")
-    try:
-        geometry_count = int(geometry_count)
-    except (TypeError, ValueError):
-        geometry_count = None
-    if geometry_count == 0:
-        return {
-            "status": "blocked",
-            "classification": "asset_export_geometry_empty",
-            "reason": "native_export_contains_no_geometry",
-        }
-
-    contracts = (material_contract, all_material_contract)
-    hard_statuses = {
-        "missing_stmat",
-        "invalid_stmat",
-        "stale",
-        "inspection_error",
-    }
-    failed_statuses = sorted({
-        str(contract.get("status") or "")
-        for contract in contracts
-        if str(contract.get("status") or "") in hard_statuses
-    })
-    if failed_statuses:
-        return {
-            "status": "blocked",
-            "classification": "asset_export_material_payload_invalid",
-            "reason": "material_payload_contract_failed",
-            "contract_statuses": failed_statuses,
-        }
-
-    missing = list(dict.fromkeys(
-        list(material_contract.get("missing_materials") or [])
-        + list(all_material_contract.get("missing_materials") or [])
-    ))
-    actual = list(dict.fromkeys(
-        list(material_contract.get("actual_materials") or [])
-        + list(all_material_contract.get("actual_materials") or [])
-    ))
-    if not missing:
-        return {
-            "status": "ok",
-            "reason": "exported_material_structure_complete",
-            "missing_materials": [],
-            "actual_materials": actual,
-        }
-    if not actual:
-        return {
-            "status": "blocked",
-            "classification": "asset_export_material_payload_empty",
-            "reason": "geometry_has_no_exported_material_identity",
-            "missing_materials": missing,
-            "actual_materials": [],
-        }
-
-    placeholder_materials = [
-        name for name in actual
-        if _material_contract_key(name) in {"default", "material"}
-    ]
-    if placeholder_materials:
-        return {
-            "status": "blocked",
-            "classification": (
-                "asset_export_material_placeholder_for_missing_semantic"
-            ),
-            "reason": (
-                "generic_material_placeholder_with_missing_semantic_material"
-            ),
-            "missing_materials": missing,
-            "actual_materials": actual,
-            "placeholder_materials": placeholder_materials,
-        }
-
-    return {
-        "status": "diagnostic_only",
-        "reason": "expected_name_mismatch_without_structural_export_defect",
-        "missing_materials": missing,
-        "actual_materials": actual,
-        "affects_pipeline_outcome": False,
-    }
 
 
 def _material_contract_key(value):
