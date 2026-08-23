@@ -7560,6 +7560,47 @@ class App:
                     "Unreal parent는 있으나 retryable ingest 실패 상태가 아님"
                 )
                 continue
+
+            # Waiting-import batches can be hundreds of MB because they
+            # aggregate every immutable item.  Retry planning intentionally
+            # caps one JSON document at 64 MiB, so inspect the exact per-item
+            # export manifest first.  A proven legacy root contract needs a
+            # Send2UE re-export and does not require loading the aggregate or
+            # rebuilding the current Blender Assembly.
+            export_manifest_value = str(
+                ((entry.get("push_export_cache") or {}).get("manifest") or "")
+            ).strip()
+            if export_manifest_value:
+                try:
+                    export_manifest = planning_context.load_json(
+                        export_manifest_value,
+                        namespace="exact_push_export_manifest",
+                    )
+                    export_item = next(
+                        row for row in (export_manifest.get("items") or ())
+                        if str((row or {}).get("queue_id")) == iid
+                    )
+                except (
+                    OSError,
+                    StopIteration,
+                    TypeError,
+                    ValueError,
+                    RetryPlanningSnapshotError,
+                ):
+                    export_item = None
+                if (
+                    export_item is not None
+                    and not manifest_item_has_current_skeleton_root_export(
+                        export_item
+                    )
+                ):
+                    parent_statuses[iid] = UNREAL_PARENT_EXPORT_STALE
+                    parent_diagnostics[iid] = (
+                        "exact Push export FBX가 authored Skeleton Root export "
+                        "계약보다 오래됨 · Blender Assembly는 유지하고 "
+                        "Send2UE부터 재실행"
+                    )
+                    continue
             try:
                 with planning_context.span("parent_grouping_validation"):
                     manifest_payload = planning_context.load_json(
