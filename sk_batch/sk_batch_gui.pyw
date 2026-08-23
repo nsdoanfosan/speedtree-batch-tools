@@ -302,11 +302,13 @@ from failed_retry_eligibility import (
     CURRENT_BLENDER_EXCLUDED,
     PENDING_UNREAL_VALIDATION,
     RETRY_ELIGIBILITY_SCHEMA_VERSION,
+    SEND2UE_REEXPORT,
     UNREAL_ONLY,
     UNREAL_PARENT_ABSENT,
     UNREAL_PARENT_CANDIDATE,
     UNREAL_PARENT_CURRENT,
     UNREAL_PARENT_DEPENDENCY_REBUILD,
+    UNREAL_PARENT_EXPORT_STALE,
     UNREAL_PARENT_INCOMPLETE,
     UNREAL_PARENT_INVALID,
     UNREAL_RECOVERY_FAILURE_KINDS,
@@ -321,6 +323,7 @@ from push_unreal_recovery import (
 )
 from send2ue_manifest_contract import (
     is_actionable_cluster_assembly_manifest,
+    manifest_item_has_current_skeleton_root_export,
 )
 from pcg_st9_texture_batch.pcg_cluster_assembly_contract import (
     ClusterAssemblyReceiptAmbiguityError,
@@ -6825,6 +6828,11 @@ class App:
         parent_source_record,
     ):
         """Use the execution validator before classifying as Unreal-only."""
+        if not manifest_item_has_current_skeleton_root_export(parent_item):
+            raise PushUnrealRecoveryError(
+                "parent Send2UE FBX predates the authored Skeleton Root "
+                "export contract; regenerate it through Send2UE"
+            )
         blend_value = str(parent_item.get("blend") or "")
         if not blend_value:
             raise PushUnrealRecoveryError(
@@ -7615,6 +7623,15 @@ class App:
                 parent_diagnostics[iid] = compact_error_message(exc, 160)
                 continue
 
+            parent_item = items_by_id[iid]
+            if not manifest_item_has_current_skeleton_root_export(parent_item):
+                parent_statuses[iid] = UNREAL_PARENT_EXPORT_STALE
+                parent_diagnostics[iid] = (
+                    "Send2UE FBX가 authored Skeleton Root export 계약보다 "
+                    "오래됨 · Blender Assembly는 유지하고 Send2UE부터 재실행"
+                )
+                continue
+
             key = str(manifest_path)
             group = grouped.setdefault(
                 key,
@@ -7817,13 +7834,23 @@ class App:
             if decisions[iid].classification == UNREAL_ONLY
             and iid not in bat_handled_ids
         ]
+        send2ue_iids = [
+            iid
+            for iid in candidate_iids
+            if decisions[iid].classification == SEND2UE_REEXPORT
+            and iid not in bat_handled_ids
+        ]
         skipped = []
         for iid in candidate_iids:
             if iid in bat_handled_ids:
                 continue
             decision = decisions[iid]
             if (
-                decision.classification in {BLENDER_REBUILD, UNREAL_ONLY}
+                decision.classification in {
+                    BLENDER_REBUILD,
+                    SEND2UE_REEXPORT,
+                    UNREAL_ONLY,
+                }
                 or iid in rebuild_ids
             ):
                 continue
@@ -7850,7 +7877,9 @@ class App:
             f"  details reason_codes={','.join(plan.reason_codes)}"
             for iid, plan in unsupported_plans.items()
         ]
-        eligible_set = set(export_iids) | set(unreal_iids)
+        eligible_set = (
+            set(export_iids) | set(send2ue_iids) | set(unreal_iids)
+        )
         eligible_iids = [
             iid for iid in candidate_iids if iid in eligible_set
         ]
@@ -8004,6 +8033,49 @@ class App:
                 "Retry run · Unreal-only current-code · "
                 f"{len(unreal_targets)} targets"
             )
+
+        send2ue_targets = [
+            targets_by_id[iid]
+            for iid in send2ue_iids
+            if iid in targets_by_id
+        ]
+        if send2ue_targets:
+            send2ue_ids = [str(item["spm"]) for item in send2ue_targets]
+            metadata = {
+                "schema_version": 1,
+                "kind": action_kind,
+                "partition": "send2ue_reexport",
+                "execution_path": "send2ue_then_unreal",
+                "selected_queue_ids": send2ue_ids,
+                "eligibility": eligibility_receipt(send2ue_ids),
+            }
+            if tracker is not None:
+                tracker.assign_partition(
+                    "send2ue_reexport",
+                    send2ue_ids,
+                    "send2ue_then_unreal",
+                )
+                metadata.update({
+                    "progress_run_id": tracker.run_id,
+                    "progress_receipt_path": str(tracker.path),
+                })
+            jobs.append({
+                "label": (
+                    "Retry run · Send2UE→Unreal · "
+                    f"{len(send2ue_targets)} targets"
+                ),
+                "mode": "push",
+                "phase": "push",
+                "terminal_phase": "push",
+                "selected_scope": True,
+                "targets": send2ue_targets,
+                "inventory": inventory,
+                "cfg": cfg,
+                "force_rerun": True,
+                "push_transport": "headless",
+                "retry_metadata": metadata,
+                "_retry_progress_tracker": tracker,
+            })
 
         repair_root_targets = [
             targets_by_id[iid]
@@ -8562,6 +8634,15 @@ class App:
                 "status": "stale",
                 "phase": "push",
                 "reason": f"Push export manifest의 exact 항목이 유효하지 않습니다: {exc}",
+            }
+        if not manifest_item_has_current_skeleton_root_export(manifest_item):
+            return {
+                "status": "stale",
+                "phase": "push",
+                "reason": (
+                    "Push export가 현재 Send2UE authored Skeleton Root "
+                    "계약보다 오래되었습니다."
+                ),
             }
         if not manifest_item_files_match(manifest_item):
             return {
@@ -16176,6 +16257,16 @@ class App:
         manifest_path = Path(export_cache.get("manifest") or "")
         if not manifest_path.is_file():
             return "Push 재확인 필요 — export manifest 없음"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest_item = next(
+                row for row in (manifest.get("items") or ())
+                if str((row or {}).get("queue_id")) == iid
+            )
+        except (OSError, ValueError, StopIteration, TypeError):
+            return "Push 재확인 필요 — export manifest 항목 오류"
+        if not manifest_item_has_current_skeleton_root_export(manifest_item):
+            return "Push 재확인 필요 — Skeleton Root export 계약 갱신"
         export_fingerprint = export_cache.get("fingerprint")
         if success_like:
             if entry.get("push_import_fingerprint") != export_fingerprint:
@@ -16251,7 +16342,11 @@ class App:
             )
         except (OSError, ValueError, StopIteration, TypeError):
             return None
-        if str(item.get("queue_id")) != iid or not manifest_item_files_match(item):
+        if (
+            str(item.get("queue_id")) != iid
+            or not manifest_item_has_current_skeleton_root_export(item)
+            or not manifest_item_files_match(item)
+        ):
             return None
         exported_files = item.get("exported_files") or []
         if exported_files:
@@ -16418,6 +16513,13 @@ class App:
                 log_file=log_file,
                 report_file=export_report,
             ) from exc
+        if not manifest_item_has_current_skeleton_root_export(item):
+            raise BatchItemError(
+                "Send2UE export omitted the authored Skeleton Root contract",
+                kind="data_error",
+                log_file=log_file,
+                report_file=export_report,
+            )
         if not manifest_item_files_match(item):
             raise BatchItemError(
                 "manifest exported-file fingerprint verification failed",

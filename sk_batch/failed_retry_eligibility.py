@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass
 RETRY_ELIGIBILITY_SCHEMA_VERSION = 1
 
 BLENDER_REBUILD = "blender_rebuild"
+SEND2UE_REEXPORT = "send2ue_reexport"
 UNREAL_ONLY = "unreal_only"
 CURRENT_BLENDER_EXCLUDED = "current_blender_excluded"
 BLOCKED = "blocked"
@@ -25,6 +26,7 @@ UNREAL_PARENT_CURRENT = "current"
 UNREAL_PARENT_INCOMPLETE = "incomplete"
 UNREAL_PARENT_INVALID = "invalid"
 UNREAL_PARENT_DEPENDENCY_REBUILD = "dependency_rebuild_required"
+UNREAL_PARENT_EXPORT_STALE = "export_stale"
 
 UNREAL_RECOVERY_FAILURE_KINDS = frozenset({
     "data_error",
@@ -208,6 +210,28 @@ def classify_failed_retry(
             parent,
         )
 
+    if parent == UNREAL_PARENT_EXPORT_STALE:
+        if force_full_rebuild:
+            return _result(
+                BLENDER_REBUILD,
+                "stale_send2ue_export_forced_full_rebuild",
+                unreal_parent_diagnostic
+                or "Send2UE export contract is stale",
+                repair_kind,
+                parent,
+            )
+        return _result(
+            SEND2UE_REEXPORT,
+            "stale_send2ue_root_export",
+            unreal_parent_diagnostic
+            or (
+                "Current Blender output is valid, but the Send2UE FBX "
+                "predates the authored Skeleton Root export contract"
+            ),
+            repair_kind,
+            parent,
+        )
+
     if parent == UNREAL_PARENT_DEPENDENCY_REBUILD:
         return _result(
             BLENDER_REBUILD,
@@ -357,11 +381,13 @@ __all__ = (
     "CURRENT_BLENDER_EXCLUDED",
     "PENDING_UNREAL_VALIDATION",
     "RETRY_ELIGIBILITY_SCHEMA_VERSION",
+    "SEND2UE_REEXPORT",
     "UNREAL_ONLY",
     "UNREAL_PARENT_ABSENT",
     "UNREAL_PARENT_CANDIDATE",
     "UNREAL_PARENT_CURRENT",
     "UNREAL_PARENT_DEPENDENCY_REBUILD",
+    "UNREAL_PARENT_EXPORT_STALE",
     "UNREAL_PARENT_INCOMPLETE",
     "UNREAL_PARENT_INVALID",
     "UNREAL_RECOVERY_FAILURE_KINDS",
