@@ -4279,14 +4279,37 @@ def _exact_native_attachment_influences(
         if int(row.get("index", -1)) > 0
         and int(row.get("parent_index", -1)) == 0
     ]
+    skeleton_bone_names = {
+        str(row.get("name") or "")
+        for row in (skeleton_snapshot or {}).get("bones") or []
+        if str(row.get("name") or "")
+    }
+    source_bone_id = instance.get("source_bone_id")
+    source_bone_candidates = []
+    if source_bone_id is not None:
+        source_bone_candidates = list(dict.fromkeys(
+            str(row.get("exported_cluster_name") or "")
+            for row in authored
+            if row.get("native_root") is not True
+            and row.get("bone_id") == source_bone_id
+            and str(row.get("exported_cluster_name") or "")
+            in skeleton_bone_names
+        ))
     if any(row.get("native_root") is True for row in authored):
-        if len(root_candidates) != 1:
+        if len(source_bone_candidates) == 1:
+            native_root_name = source_bone_candidates[0]
+            native_root_resolution = "exact_instance_source_bone"
+        elif len(root_candidates) == 1:
+            native_root_name = root_candidates[0]
+            native_root_resolution = "unique_native_fbx_root_child"
+        else:
             raise ClusterAssemblyBuildError(
-                f"{context} has no unique native FBX skeleton root"
+                f"{context} has no exact instance source bone and no unique "
+                "native FBX skeleton root"
             )
-        native_root_name = root_candidates[0]
     else:
         native_root_name = ""
+        native_root_resolution = "not_required"
     influences = [
         {
             "bone": (
@@ -4314,6 +4337,9 @@ def _exact_native_attachment_influences(
         ),
         "owner_selection_policy": instance.get("owner_selection_policy"),
         "native_instance_id": instance.get("native_instance_id"),
+        "source_bone_id": source_bone_id,
+        "native_root_bone": native_root_name,
+        "native_root_resolution": native_root_resolution,
         "node_guid": instance.get("node_guid"),
         "parent_guid": instance.get("parent_guid"),
         "generator_guid": instance.get("generator_guid"),
