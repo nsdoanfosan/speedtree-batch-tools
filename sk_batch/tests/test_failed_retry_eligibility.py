@@ -9,8 +9,10 @@ from failed_retry_eligibility import (  # noqa: E402
     BLENDER_REBUILD,
     BLOCKED,
     CURRENT_BLENDER_EXCLUDED,
+    SEND2UE_REEXPORT,
     UNREAL_ONLY,
     UNREAL_PARENT_CURRENT,
+    UNREAL_PARENT_EXPORT_STALE,
     UNREAL_PARENT_INCOMPLETE,
     classify_failed_retry,
 )
@@ -212,6 +214,31 @@ def test_current_immutable_unreal_failure_stays_unreal_only():
 
     assert decision.classification == UNREAL_ONLY
     assert decision.reason_code == "current_immutable_unreal_failure"
+
+
+def test_stale_send2ue_root_export_reexports_without_blender_rebuild():
+    decision = classify_failed_retry(
+        {"push_status_kind": "data_error"},
+        CURRENT_REPAIR,
+        unreal_parent_status=UNREAL_PARENT_EXPORT_STALE,
+        unreal_parent_diagnostic="legacy synthetic root FBX",
+    )
+
+    assert decision.classification == SEND2UE_REEXPORT
+    assert decision.reason_code == "stale_send2ue_root_export"
+
+
+def test_explicit_full_rebuild_overrides_send2ue_only_retry():
+    decision = classify_failed_retry(
+        {"push_status_kind": "data_error"},
+        CURRENT_REPAIR,
+        unreal_parent_status=UNREAL_PARENT_EXPORT_STALE,
+        force_rerun=True,
+        force_full_rebuild=True,
+    )
+
+    assert decision.classification == BLENDER_REBUILD
+    assert decision.reason_code == "stale_send2ue_export_forced_full_rebuild"
 
 
 def test_selected_retry_resumes_current_retryable_unreal_failure():

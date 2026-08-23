@@ -30,6 +30,53 @@ SIDECAR_DESCRIPTOR_REQUIRED_FIELDS = (
     "asset_kind",
     "mesh_name",
 )
+AUTHORED_SKELETON_ROOT_EXPORT_CONTRACT = (
+    "send2ue_fbx_authored_bone_root"
+)
+
+
+def authored_skeleton_root_export_record_is_current(record):
+    """Return whether Send2UE suppressed its synthetic armature-object root."""
+    if not isinstance(record, dict):
+        return False
+    after = record.get("after")
+    return bool(
+        record.get("contract") == AUTHORED_SKELETON_ROOT_EXPORT_CONTRACT
+        and isinstance(after, dict)
+        and after.get("export_object_name_as_root") is False
+        and str(after.get("export_custom_root_name") or "") == ""
+    )
+
+
+def manifest_item_has_current_skeleton_root_export(item):
+    """Reject stale Assembly FBXs produced with Send2UE's synthetic root.
+
+    Older manifests did not embed the export contract.  A report written by
+    the first authored-root implementation is still exact compatibility
+    evidence, so accept that report while requiring new manifests to carry
+    the contract directly.
+    """
+    if not isinstance(item, dict):
+        return False
+    assembly = item.get("cluster_assembly") or {}
+    ingest_plan = assembly.get("ingest_plan") or {}
+    if ingest_plan.get("status") != "ready":
+        return True
+
+    embedded = (item.get("export_contracts") or {}).get("skeleton_root")
+    if authored_skeleton_root_export_record_is_current(embedded):
+        return True
+
+    report_path = str(item.get("export_report_path") or "").strip()
+    if not report_path:
+        return False
+    try:
+        report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return False
+    return authored_skeleton_root_export_record_is_current(
+        report.get("send2ue_skeleton_root_export")
+    )
 
 
 def is_actionable_cluster_assembly_manifest(manifest):

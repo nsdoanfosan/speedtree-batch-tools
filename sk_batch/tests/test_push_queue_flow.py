@@ -5114,6 +5114,85 @@ class PushQueueFlowTests(unittest.TestCase):
 
         self.assertEqual(item["queue_id"], "tree")
 
+    def test_cached_assembly_manifest_without_authored_root_contract_is_stale(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.force_rerun = False
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifest_path = Path(temp_dir) / "stale_root_export.json"
+            manifest_path.write_text(
+                json.dumps({
+                    "items": [{
+                        "queue_id": "tree",
+                        "fingerprint": "tree-v2",
+                        "cluster_assembly": {
+                            "ingest_plan": {"status": "ready"},
+                        },
+                    }],
+                }),
+                encoding="utf-8",
+            )
+            app.state["tree"] = {
+                "push_export_cache": {
+                    "source_fingerprint": "source-v2",
+                    "manifest": str(manifest_path),
+                    "fingerprint": "tree-v2",
+                },
+            }
+            with mock.patch.object(
+                gui, "manifest_item_files_match", return_value=True
+            ):
+                item = app._cached_manifest_item("tree", "source-v2")
+
+        self.assertIsNone(item)
+
+    def test_cached_assembly_manifest_accepts_exact_authored_root_report(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.force_rerun = False
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            report_path = root / "export_report.json"
+            report_path.write_text(
+                json.dumps({
+                    "send2ue_skeleton_root_export": {
+                        "contract": "send2ue_fbx_authored_bone_root",
+                        "after": {
+                            "export_object_name_as_root": False,
+                            "export_custom_root_name": "",
+                        },
+                    },
+                }),
+                encoding="utf-8",
+            )
+            manifest_path = root / "current_root_export.json"
+            manifest_path.write_text(
+                json.dumps({
+                    "items": [{
+                        "queue_id": "tree",
+                        "fingerprint": "tree-v2",
+                        "export_report_path": str(report_path),
+                        "cluster_assembly": {
+                            "ingest_plan": {"status": "ready"},
+                        },
+                    }],
+                }),
+                encoding="utf-8",
+            )
+            app.state["tree"] = {
+                "push_export_cache": {
+                    "source_fingerprint": "source-v2",
+                    "manifest": str(manifest_path),
+                    "fingerprint": "tree-v2",
+                },
+            }
+            with mock.patch.object(
+                gui, "manifest_item_files_match", return_value=True
+            ):
+                item = app._cached_manifest_item("tree", "source-v2")
+
+        self.assertEqual(item["queue_id"], "tree")
+
     def test_cached_manifest_on_old_c_export_root_is_rebuilt_on_d(self):
         gui = load_gui_module()
         app = self.make_app(gui)
@@ -5196,6 +5275,36 @@ class PushQueueFlowTests(unittest.TestCase):
             computed_record,
         )
         app._failed_retry_state_entry.assert_not_called()
+
+    def test_retry_planning_rebuilds_assembly_export_without_root_contract(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app._source_push_fingerprint = mock.Mock(
+            side_effect=AssertionError(
+                "stale Assembly export must not enter Unreal-only validation"
+            )
+        )
+        parent_item = {
+            "schema_version": 1,
+            "queue_id": "tree.spm",
+            "source_fingerprint": "parent-source",
+            "blend": "tree.blend",
+            "cluster_assembly": {
+                "ingest_plan": {"status": "ready"},
+            },
+        }
+
+        with self.assertRaisesRegex(
+            gui.PushUnrealRecoveryError,
+            "predates the authored Skeleton Root export contract",
+        ):
+            app._validate_failed_retry_unreal_item_current(
+                "tree.spm",
+                parent_item,
+                {"fingerprint": "parent-source", "snapshot": {}},
+            )
+
+        app._source_push_fingerprint.assert_not_called()
 
     def test_unreal_only_recovery_rebinds_completed_export_code(self):
         gui = load_gui_module()
@@ -6009,6 +6118,66 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertEqual(jobs[0]["mode"], "pipeline")
         self.assertTrue(jobs[0]["force_rerun"])
         self.assertFalse(jobs[0]["force_full_rebuild"])
+
+    def test_failed_retry_stale_root_fbx_runs_send2ue_without_blender(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        iid = "stale_root_export.spm"
+        jobs = self.configure_failed_retry_start(app, [iid])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest_path = root / "parent.json"
+            checkpoint_path = root / "checkpoint.json"
+            manifest_path.write_text(
+                json.dumps({
+                    "schema_version": gui.PUSH_MANIFEST_SCHEMA_VERSION,
+                    "report_path": str(root / "parent_report.json"),
+                    "items": [{
+                        "schema_version": gui.PUSH_MANIFEST_SCHEMA_VERSION,
+                        "queue_id": iid,
+                        "source_fingerprint": "source-v1",
+                        "fingerprint": "item-v1",
+                        "blend": "stale_root_export.blend",
+                        "depends_on_queue_ids": [],
+                        "cluster_assembly": {
+                            "ingest_plan": {"status": "ready"},
+                        },
+                    }],
+                }),
+                encoding="utf-8",
+            )
+            checkpoint_path.write_text(
+                json.dumps({"items": {iid: {"status": "data_error"}}}),
+                encoding="utf-8",
+            )
+            app.state[iid] = {
+                "push_status_kind": "data_error",
+                "push_paths": {
+                    "manifest": str(manifest_path),
+                    "checkpoint": str(checkpoint_path),
+                },
+            }
+
+            with mock.patch.object(gui, "save_config"):
+                app.start_failed_results_retry()
+
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["mode"], "push")
+        self.assertEqual(jobs[0]["phase"], "push")
+        self.assertTrue(jobs[0]["force_rerun"])
+        self.assertFalse(jobs[0]["force_full_rebuild"])
+        self.assertEqual(
+            jobs[0]["retry_metadata"]["execution_path"],
+            "send2ue_then_unreal",
+        )
+        self.assertEqual(
+            jobs[0]["retry_metadata"]["eligibility"]["items"][0][
+                "reason_code"
+            ],
+            "stale_send2ue_root_export",
+        )
+        app._validate_failed_retry_unreal_item_current.assert_not_called()
 
     def test_failed_results_retry_stale_blender_forces_full_pipeline(self):
         gui = load_gui_module()

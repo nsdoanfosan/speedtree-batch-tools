@@ -66,6 +66,7 @@ from dynamic_wind_handoff_policy import (
     resolve_dynamic_wind_policy,
 )
 from send2ue_manifest_contract import (
+    AUTHORED_SKELETON_ROOT_EXPORT_CONTRACT,
     is_actionable_cluster_assembly_manifest,
     manifest_checkout_asset_paths,
     normalize_manifest_handoff_sidecars,
@@ -287,7 +288,7 @@ def configure_authored_skeleton_root_export(scene_props):
     scene_props.export_object_name_as_root = False
     scene_props.export_custom_root_name = ""
     return {
-        "contract": "send2ue_fbx_authored_bone_root",
+        "contract": AUTHORED_SKELETON_ROOT_EXPORT_CONTRACT,
         "before": before,
         "after": {
             "export_object_name_as_root": False,
@@ -1002,6 +1003,9 @@ def main():
             "cluster_assembly": cluster_assembly,
             "dependency_orchestrated": bool(args.dependency_orchestrated),
             "material_asset_scope": material_asset_scope,
+            "export_contracts": {
+                "skeleton_root": report["send2ue_skeleton_root_export"],
+            },
         }
         fingerprint = stable_fingerprint(contract)
         queue_id = args.queue_id or str(Path(blend_path).resolve())
