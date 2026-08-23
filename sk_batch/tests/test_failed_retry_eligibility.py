@@ -216,6 +216,28 @@ def test_current_immutable_unreal_failure_stays_unreal_only():
     assert decision.reason_code == "current_immutable_unreal_failure"
 
 
+def test_interrupted_push_with_current_parent_resumes_unreal_only():
+    for kind in ("cancelled", "rerun_pending", "stopped"):
+        decision = classify_failed_retry(
+            {"push_status_kind": kind},
+            CURRENT_REPAIR,
+            unreal_parent_status=UNREAL_PARENT_CURRENT,
+        )
+
+        assert decision.classification == UNREAL_ONLY
+        assert decision.reason_code == "interrupted_push_current_parent"
+
+
+def test_cancelled_push_without_resumable_parent_restarts_at_send2ue():
+    decision = classify_failed_retry(
+        {"push_status_kind": "cancelled"},
+        CURRENT_REPAIR,
+    )
+
+    assert decision.classification == SEND2UE_REEXPORT
+    assert decision.reason_code == "interrupted_push_reexport"
+
+
 def test_stale_send2ue_root_export_reexports_without_blender_rebuild():
     decision = classify_failed_retry(
         {"push_status_kind": "data_error"},

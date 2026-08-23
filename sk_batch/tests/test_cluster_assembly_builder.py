@@ -48,6 +48,8 @@ from cluster_assembly_builder import (  # noqa: E402
     _expected_normalized_bounds_for_variant,
     _exact_native_attachment_influences,
     _export_selected_fbx,
+    _configure_final_assembly_preserve_area,
+    _validate_final_assembly_preserve_area,
     _generated_material_sidecar,
     _normalized_prototype_for_component,
     _ordered_cross_object_correspondence,
@@ -69,6 +71,79 @@ from cluster_assembly_builder import (  # noqa: E402
     validate_persisted_residual_gate,
     validate_file_fingerprint,
 )
+
+
+class FakeEditorProperties:
+    def __init__(self, **values):
+        self.values = dict(values)
+
+    def get_editor_property(self, name):
+        return self.values[name]
+
+    def set_editor_property(self, name, value):
+        self.values[name] = value
+
+
+class FinalAssemblyNanitePolicyTests(unittest.TestCase):
+    def make_policy_subjects(self):
+        nanite = FakeEditorProperties(shape_preservation="VOXELIZE")
+        target = FakeEditorProperties(nanite_settings=nanite)
+        target.get_path_name = lambda: "/Game/Test/Final_NaniteAssembly"
+        builder = SimpleNamespace(get_target_mesh_object=lambda: target)
+        unreal = SimpleNamespace(
+            NaniteShapePreservation=SimpleNamespace(
+                PRESERVE_AREA="PRESERVE_AREA",
+            )
+        )
+        return unreal, builder, target
+
+    def test_final_assembly_switches_to_preserve_area_before_finish(self):
+        unreal, builder, target = self.make_policy_subjects()
+
+        report = _configure_final_assembly_preserve_area(unreal, builder)
+
+        self.assertEqual(report["before"], "VOXELIZE")
+        self.assertEqual(report["after"], "PRESERVE_AREA")
+        self.assertTrue(report["changed"])
+        self.assertTrue(report["applied_before_finish"])
+        self.assertTrue(report["base_and_parts_unchanged"])
+        self.assertEqual(
+            target.get_editor_property("nanite_settings").get_editor_property(
+                "shape_preservation"
+            ),
+            "PRESERVE_AREA",
+        )
+
+    def test_finished_assembly_must_keep_preserve_area(self):
+        unreal, builder, target = self.make_policy_subjects()
+        report = _configure_final_assembly_preserve_area(unreal, builder)
+
+        result = _validate_final_assembly_preserve_area(
+            unreal,
+            target,
+            report,
+        )
+
+        self.assertEqual(result["finished"], "PRESERVE_AREA")
+        self.assertTrue(result["preserved_through_finish"])
+
+    def test_finished_assembly_rejects_voxelize_regression(self):
+        unreal, builder, target = self.make_policy_subjects()
+        report = _configure_final_assembly_preserve_area(unreal, builder)
+        target.get_editor_property("nanite_settings").set_editor_property(
+            "shape_preservation",
+            "VOXELIZE",
+        )
+
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "Finished Nanite Assembly is not Preserve Area",
+        ):
+            _validate_final_assembly_preserve_area(
+                unreal,
+                target,
+                report,
+            )
 
 
 def exact_bone_skeleton(*rows):

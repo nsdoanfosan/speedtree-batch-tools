@@ -300,6 +300,7 @@ from failed_retry_eligibility import (
     BLENDER_EXPORT_RETRY_FAILURE_KINDS,
     BLENDER_REBUILD,
     CURRENT_BLENDER_EXCLUDED,
+    INTERRUPTED_PUSH_KINDS,
     PENDING_UNREAL_VALIDATION,
     RETRY_ELIGIBILITY_SCHEMA_VERSION,
     SEND2UE_REEXPORT,
@@ -7319,6 +7320,17 @@ class App:
                 ),
                 last_completed=iid,
             )
+            if str(
+                effective_entries[iid].get("push_status_kind") or ""
+            ).casefold() in INTERRUPTED_PUSH_KINDS:
+                # Cancellation/rerun markers are orchestration state, not an
+                # asset repair reason.  Leave them to the phase-aware retry
+                # classifier so a current parent resumes Unreal and a missing
+                # parent resumes Send2UE without rebuilding Blender.
+                planning_context.counters[
+                    "interrupted_push_routed_by_phase"
+                ] += 1
+                continue
             if not has_repair_contract_evidence(evidence):
                 continue
             reason_codes = (

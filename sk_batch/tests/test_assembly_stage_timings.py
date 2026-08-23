@@ -57,6 +57,7 @@ def load_reusable_export_bundle_helper():
     namespace = {
         "copy": copy,
         "hashlib": hashlib,
+        "json": json,
         "Path": Path,
         "NativeReceiptError": NativeReceiptError,
         "load_native_export_receipt": load_native_export_receipt,
@@ -66,6 +67,34 @@ def load_reusable_export_bundle_helper():
         namespace,
     )
     return namespace["reusable_preflight_export_bundle"]
+
+
+def attach_current_export_producer_cache(export, cache_path, cli, hook):
+    def identity(path, *, include_hash):
+        stat = path.stat()
+        result = {
+            "path": str(path.resolve()),
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        }
+        if include_hash:
+            result["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        return result
+
+    cache_path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "input_fingerprint": export["input_fingerprint"],
+                "inputs": {
+                    "speedtree_exe": identity(cli, include_hash=False),
+                    "speedtree_hook": identity(hook, include_hash=True),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    export["cache_path"] = str(cache_path)
 
 
 def write_native_receipt(spm, path):
@@ -181,12 +210,16 @@ def test_assembly_reuses_hash_verified_preflight_bundle_without_exporter():
         stmat = root / "fbx" / "SK_fern.stmat"
         receipt = root / "fbx" / "SK_fern.speedtree_native_receipt.json"
         xml = root / "xml" / "SK_fern.xml"
+        cli = root / "SpeedTreeCLI.exe"
+        hook = root / "speedtree_hook.dll"
         spm.write_bytes(b"spm")
         fbx.parent.mkdir()
         xml.parent.mkdir()
         fbx.write_bytes(b"fbx-with-native-skin")
         stmat.write_bytes(b"materials")
         xml.write_bytes(b"<SpeedTree />")
+        cli.write_bytes(b"cli")
+        hook.write_bytes(b"hook")
         write_native_receipt(spm, receipt)
         assert load_native_export_receipt(
             receipt,
@@ -221,7 +254,20 @@ def test_assembly_reuses_hash_verified_preflight_bundle_without_exporter():
             },
         }
 
-        result = helper(preflight, spm)
+        attach_current_export_producer_cache(
+            preflight["speedtree_export"],
+            root / "fbx_export_cache.json",
+            cli,
+            hook,
+        )
+        attach_current_export_producer_cache(
+            preflight["speedtree_xml_export"],
+            root / "xml_export_cache.json",
+            cli,
+            hook,
+        )
+
+        result = helper(preflight, spm, cli, hook)
 
         assert result["process_started"] is False
         assert result["assembly_preflight_reuse"] is True
@@ -239,11 +285,15 @@ def test_assembly_rejects_preflight_bundle_after_artifact_drift():
         fbx = root / "fbx" / "SK_fern.fbx"
         receipt = root / "fbx" / "SK_fern.speedtree_native_receipt.json"
         xml = root / "xml" / "SK_fern.xml"
+        cli = root / "SpeedTreeCLI.exe"
+        hook = root / "speedtree_hook.dll"
         spm.write_bytes(b"spm")
         fbx.parent.mkdir()
         xml.parent.mkdir()
         fbx.write_bytes(b"original")
         xml.write_bytes(b"xml")
+        cli.write_bytes(b"cli")
+        hook.write_bytes(b"hook")
         write_native_receipt(spm, receipt)
         preflight = {
             "status": "ok",
@@ -271,6 +321,18 @@ def test_assembly_rejects_preflight_bundle_after_artifact_drift():
                 "path": str(receipt),
             },
         }
+        attach_current_export_producer_cache(
+            preflight["speedtree_export"],
+            root / "fbx_export_cache.json",
+            cli,
+            hook,
+        )
+        attach_current_export_producer_cache(
+            preflight["speedtree_xml_export"],
+            root / "xml_export_cache.json",
+            cli,
+            hook,
+        )
         fbx.write_bytes(b"drifted!")
 
-        assert helper(preflight, spm) is None
+        assert helper(preflight, spm, cli, hook) is None
