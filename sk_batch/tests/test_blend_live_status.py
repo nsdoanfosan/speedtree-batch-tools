@@ -2231,6 +2231,11 @@ class BlendLiveStatusTests(unittest.TestCase):
                         "empty_material_slots": [],
                         "missing_outputs": [],
                         "missing_materials": ["M_cluster_detached"],
+                        "material_export": {
+                            "status": "missing_materials",
+                            "missing_materials": ["M_cluster_detached"],
+                            "actual_materials": [],
+                        },
                         "vertex_color_contract": {"status": "ok"},
                         "vertex_payload_contract": {"status": "ok"},
                     },
@@ -2250,6 +2255,47 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.assertFalse(ready)
             self.assertIn("M_cluster_detached", reason)
             live_check.assert_not_called()
+
+    def test_texture_preflight_does_not_reblock_diagnostic_name_mismatch(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_tree_material_name_mismatch.spm"
+            write_empty_spm(spm)
+            report = root / "reports" / (
+                "SK_tree_material_name_mismatch_"
+                "speedtree_assembly_pipeline_report_codex.json"
+            )
+            report.parent.mkdir()
+            report.write_text(
+                json.dumps({
+                    "speedtree_pipeline_contract": {},
+                    "texture_normalization": {"status": "ok", "missing": []},
+                    "handoff_preflight": {
+                        "status": "ok",
+                        "empty_material_slots": [],
+                        "missing_outputs": [],
+                        "missing_materials": ["M_branch_expected"],
+                        "material_export": {
+                            "status": "missing_materials",
+                            "missing_materials": ["M_branch_expected"],
+                            "actual_materials": ["M_branch_exported_Mat"],
+                        },
+                        "vertex_color_contract": {"status": "ok"},
+                        "vertex_payload_contract": {"status": "ok"},
+                    },
+                }),
+                encoding="utf-8",
+            )
+            self.set_time(spm, 1_000_000_000)
+            self.set_time(report, 2_000_000_000)
+
+            with mock.patch.object(gui, "validate_preflight_envelope"):
+                ready, reason = app._texture_normalization_ready(spm)
+
+            self.assertTrue(ready, reason)
+            self.assertEqual(reason, "머티리얼 준비 완료 · 텍스처 선택 연결")
 
     def test_new_report_marker_requires_the_versioned_envelope(self):
         gui = load_gui_module()

@@ -11219,10 +11219,16 @@ class App:
             return False, "① 사전검사 정보 없음 → ① Blender Assembly 다시 실행"
         slots = handoff.get("empty_material_slots") or []
         outputs = handoff.get("missing_outputs") or []
+        material_export = handoff.get("material_export") or {}
+        material_admission = classify_material_export_admission(
+            material_export,
+            {},
+            report.get("speedtree_native_receipt") or {},
+        )
         materials = (
-            handoff.get("missing_materials")
-            or (handoff.get("material_export") or {}).get("missing_materials")
-            or []
+            list(material_admission.get("missing_materials") or [])
+            if material_admission.get("status") == "blocked"
+            else []
         )
         collections = handoff.get("export_collection_issues") or []
         vertex_contract = handoff.get("vertex_color_contract") or {}

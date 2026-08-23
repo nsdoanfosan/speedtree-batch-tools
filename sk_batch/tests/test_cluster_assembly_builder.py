@@ -540,6 +540,46 @@ class ExactNativeAttachmentInfluenceTests(unittest.TestCase):
         self.assertEqual(source["unowned_native_vertex_count"], 2)
         self.assertIsNone(source["target_attachment_vertex_index"])
 
+    def test_multi_root_uses_exact_instance_source_bone(self):
+        skeleton = make_skeleton_snapshot([
+            {"index": 0, "name": "Root", "parent_index": -1},
+            {
+                "index": 1,
+                "name": "NativeRootA",
+                "parent_index": 0,
+                "parent_name": "Root",
+            },
+            {
+                "index": 2,
+                "name": "NativeRootB",
+                "parent_index": 0,
+                "parent_name": "Root",
+            },
+        ])
+        receipt = self._receipt()
+        instance = receipt["generated_instances"][0]
+        instance["source_bone_id"] = 7
+        instance["authored_position_influences"][1][
+            "exported_cluster_name"
+        ] = "NativeRootB"
+
+        influences, source = _exact_native_attachment_influences(
+            self._object([4, 4, 4], [2, 3, 4]),
+            {"vertices": [0, 1, 2]},
+            1,
+            receipt,
+            skeleton,
+            "multi-root native component",
+        )
+
+        self.assertEqual(influences[0]["bone"], "NativeRootB")
+        self.assertEqual(source["source_bone_id"], 7)
+        self.assertEqual(source["native_root_bone"], "NativeRootB")
+        self.assertEqual(
+            source["native_root_resolution"],
+            "exact_instance_source_bone",
+        )
+
     def test_rejects_component_spanning_native_geometries(self):
         obj = self._object([4, 5], [2, 3])
         with self.assertRaisesRegex(
