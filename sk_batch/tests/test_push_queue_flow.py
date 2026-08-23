@@ -6127,12 +6127,12 @@ class PushQueueFlowTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            manifest_path = root / "parent.json"
+            export_manifest_path = root / "exact_export.json"
+            manifest_path = root / "oversized_parent_placeholder.json"
             checkpoint_path = root / "checkpoint.json"
-            manifest_path.write_text(
+            export_manifest_path.write_text(
                 json.dumps({
                     "schema_version": gui.PUSH_MANIFEST_SCHEMA_VERSION,
-                    "report_path": str(root / "parent_report.json"),
                     "items": [{
                         "schema_version": gui.PUSH_MANIFEST_SCHEMA_VERSION,
                         "queue_id": iid,
@@ -6147,6 +6147,7 @@ class PushQueueFlowTests(unittest.TestCase):
                 }),
                 encoding="utf-8",
             )
+            manifest_path.write_text("not valid aggregate JSON", encoding="utf-8")
             checkpoint_path.write_text(
                 json.dumps({"items": {iid: {"status": "data_error"}}}),
                 encoding="utf-8",
@@ -6156,6 +6157,9 @@ class PushQueueFlowTests(unittest.TestCase):
                 "push_paths": {
                     "manifest": str(manifest_path),
                     "checkpoint": str(checkpoint_path),
+                },
+                "push_export_cache": {
+                    "manifest": str(export_manifest_path),
                 },
             }
 
