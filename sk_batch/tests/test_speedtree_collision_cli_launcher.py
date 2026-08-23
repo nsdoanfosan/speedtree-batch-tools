@@ -94,6 +94,15 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         self.assertIn('"omitted_no_exact_bone_record"', source)
         self.assertIn('"not_applicable_boneless_export"', source)
         self.assertIn(
+            "const char* idZeroClusterWrite =\n"
+            "        gNativeReceiptBones.empty()",
+            source,
+        )
+        self.assertNotIn(
+            "gNativeReceiptBones.empty() && gNativeReceiptProxies.empty()",
+            source,
+        )
+        self.assertIn(
             "gMissingIdZeroBoneRecordLogged.store(false",
             source,
         )

@@ -4623,8 +4623,13 @@ bool WriteNativeReceipt() {
         Log("native receipt temporary file could not be opened");
         return false;
     }
+    // Generated-instance proxy records describe geometry placement, not an
+    // exported deform skeleton.  Blender imports an armature only when the
+    // native FBX serializer emitted at least one exact bone record, so proxy
+    // presence must never turn a genuinely bone-less FBX into the ID-0 repair
+    // contract.
     const char* idZeroClusterWrite =
-        gNativeReceiptBones.empty() && gNativeReceiptProxies.empty()
+        gNativeReceiptBones.empty()
         ? "not_applicable_boneless_export"
         : (gMissingIdZeroBoneRecordLogged.load(std::memory_order_acquire)
                ? "omitted_no_exact_bone_record"
