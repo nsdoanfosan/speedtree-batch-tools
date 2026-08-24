@@ -34,6 +34,9 @@ class FakeObject:
     def get(self, key, default=None):
         return self._properties.get(key, default)
 
+    def __setitem__(self, key, value):
+        self._properties[key] = value
+
 
 class FakeObjectLinks(list):
     def link(self, obj):
@@ -178,6 +181,44 @@ class ClusterExportHandoffContractTests(unittest.TestCase):
                     cluster_export_contract_issues(data, stem),
                     [],
                 )
+
+    def test_first_exact_assembly_hierarchy_becomes_normalized_export_pivot(self):
+        stem = "SK_Cluster_nothofagusAlpina_03"
+        source_fbx = rf"C:\Sanitized\Cluster\fbx\{stem}.fbx"
+        source_identity = rf"C:\Sanitized\Cluster\{stem}.spm"
+        export = FakeCollection()
+        source = FakeCollection()
+        data = SimpleNamespace(collections={"Export": export})
+        before = capture_cluster_export_snapshot(data, stem)
+        hierarchy = transient_assembly_hierarchy(
+            stem,
+            source_fbx,
+            source_identity,
+        )
+        export.objects.extend(hierarchy)
+
+        report = reconcile_transient_cluster_export_root(
+            data,
+            source,
+            cluster_source_stem=stem,
+            source_fbx_path=source_fbx,
+            source_identity_path=source_identity,
+            before_snapshot=before,
+        )
+
+        root = hierarchy[1]
+        self.assertEqual(report["status"], "normalized")
+        self.assertEqual(report["normalized_export_pivot"], f"{stem}_01")
+        self.assertEqual(root.name, f"{stem}_01")
+        self.assertTrue(root.get("speedtree_cluster_generated"))
+        self.assertEqual(
+            root.get("speedtree_cluster_asset_role"),
+            "send2ue_pivot",
+        )
+        self.assertEqual(source.objects, [])
+        self.assertEqual(set(export.objects), set(hierarchy))
+        self.assertTrue(any(obj.type == "MESH" for obj in export.objects))
+        self.assertEqual(cluster_export_contract_issues(data, stem), [])
 
     def test_new_unowned_unsuffixed_root_remains_fail_closed(self):
         stem = "SK_cluster_densiflora_02"

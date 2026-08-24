@@ -273,6 +273,7 @@ from sk_common import (
     wind_preset_for_spm,
 )
 from spm_leaf_handoff_contract import (
+    classify_material_export_admission,
     inspect_all_speedtree_material_export,
     inspect_speedtree_material_export,
     inspect_spm_leaf_contract,
@@ -299,13 +300,16 @@ from failed_retry_eligibility import (
     BLENDER_EXPORT_RETRY_FAILURE_KINDS,
     BLENDER_REBUILD,
     CURRENT_BLENDER_EXCLUDED,
+    INTERRUPTED_PUSH_KINDS,
     PENDING_UNREAL_VALIDATION,
     RETRY_ELIGIBILITY_SCHEMA_VERSION,
+    SEND2UE_REEXPORT,
     UNREAL_ONLY,
     UNREAL_PARENT_ABSENT,
     UNREAL_PARENT_CANDIDATE,
     UNREAL_PARENT_CURRENT,
     UNREAL_PARENT_DEPENDENCY_REBUILD,
+    UNREAL_PARENT_EXPORT_STALE,
     UNREAL_PARENT_INCOMPLETE,
     UNREAL_PARENT_INVALID,
     UNREAL_RECOVERY_FAILURE_KINDS,
@@ -320,6 +324,7 @@ from push_unreal_recovery import (
 )
 from send2ue_manifest_contract import (
     is_actionable_cluster_assembly_manifest,
+    manifest_item_has_current_skeleton_root_export,
 )
 from pcg_st9_texture_batch.pcg_cluster_assembly_contract import (
     ClusterAssemblyReceiptAmbiguityError,
@@ -3872,6 +3877,14 @@ class App:
                 item["_blender_resume_policy"] = "live_validation"
                 runnable.append(item)
                 continue
+            assembly_inputs_current, assembly_reason = (
+                self._cluster_assembly_inputs_current(spm)
+            )
+            if not assembly_inputs_current:
+                item["_blender_resume_policy"] = "rebuild"
+                item["_blender_resume_reason"] = assembly_reason
+                runnable.append(item)
+                continue
             if not self._publish_current_assembly_skip(
                 iid,
                 spm,
@@ -6816,6 +6829,11 @@ class App:
         parent_source_record,
     ):
         """Use the execution validator before classifying as Unreal-only."""
+        if not manifest_item_has_current_skeleton_root_export(parent_item):
+            raise PushUnrealRecoveryError(
+                "parent Send2UE FBX predates the authored Skeleton Root "
+                "export contract; regenerate it through Send2UE"
+            )
         blend_value = str(parent_item.get("blend") or "")
         if not blend_value:
             raise PushUnrealRecoveryError(
@@ -7302,6 +7320,17 @@ class App:
                 ),
                 last_completed=iid,
             )
+            if str(
+                effective_entries[iid].get("push_status_kind") or ""
+            ).casefold() in INTERRUPTED_PUSH_KINDS:
+                # Cancellation/rerun markers are orchestration state, not an
+                # asset repair reason.  Leave them to the phase-aware retry
+                # classifier so a current parent resumes Unreal and a missing
+                # parent resumes Send2UE without rebuilding Blender.
+                planning_context.counters[
+                    "interrupted_push_routed_by_phase"
+                ] += 1
+                continue
             if not has_repair_contract_evidence(evidence):
                 continue
             reason_codes = (
@@ -7543,6 +7572,47 @@ class App:
                     "Unreal parent는 있으나 retryable ingest 실패 상태가 아님"
                 )
                 continue
+
+            # Waiting-import batches can be hundreds of MB because they
+            # aggregate every immutable item.  Retry planning intentionally
+            # caps one JSON document at 64 MiB, so inspect the exact per-item
+            # export manifest first.  A proven legacy root contract needs a
+            # Send2UE re-export and does not require loading the aggregate or
+            # rebuilding the current Blender Assembly.
+            export_manifest_value = str(
+                ((entry.get("push_export_cache") or {}).get("manifest") or "")
+            ).strip()
+            if export_manifest_value:
+                try:
+                    export_manifest = planning_context.load_json(
+                        export_manifest_value,
+                        namespace="exact_push_export_manifest",
+                    )
+                    export_item = next(
+                        row for row in (export_manifest.get("items") or ())
+                        if str((row or {}).get("queue_id")) == iid
+                    )
+                except (
+                    OSError,
+                    StopIteration,
+                    TypeError,
+                    ValueError,
+                    RetryPlanningSnapshotError,
+                ):
+                    export_item = None
+                if (
+                    export_item is not None
+                    and not manifest_item_has_current_skeleton_root_export(
+                        export_item
+                    )
+                ):
+                    parent_statuses[iid] = UNREAL_PARENT_EXPORT_STALE
+                    parent_diagnostics[iid] = (
+                        "exact Push export FBX가 authored Skeleton Root export "
+                        "계약보다 오래됨 · Blender Assembly는 유지하고 "
+                        "Send2UE부터 재실행"
+                    )
+                    continue
             try:
                 with planning_context.span("parent_grouping_validation"):
                     manifest_payload = planning_context.load_json(
@@ -7604,6 +7674,15 @@ class App:
             ) as exc:
                 parent_statuses[iid] = UNREAL_PARENT_INVALID
                 parent_diagnostics[iid] = compact_error_message(exc, 160)
+                continue
+
+            parent_item = items_by_id[iid]
+            if not manifest_item_has_current_skeleton_root_export(parent_item):
+                parent_statuses[iid] = UNREAL_PARENT_EXPORT_STALE
+                parent_diagnostics[iid] = (
+                    "Send2UE FBX가 authored Skeleton Root export 계약보다 "
+                    "오래됨 · Blender Assembly는 유지하고 Send2UE부터 재실행"
+                )
                 continue
 
             key = str(manifest_path)
@@ -7808,13 +7887,23 @@ class App:
             if decisions[iid].classification == UNREAL_ONLY
             and iid not in bat_handled_ids
         ]
+        send2ue_iids = [
+            iid
+            for iid in candidate_iids
+            if decisions[iid].classification == SEND2UE_REEXPORT
+            and iid not in bat_handled_ids
+        ]
         skipped = []
         for iid in candidate_iids:
             if iid in bat_handled_ids:
                 continue
             decision = decisions[iid]
             if (
-                decision.classification in {BLENDER_REBUILD, UNREAL_ONLY}
+                decision.classification in {
+                    BLENDER_REBUILD,
+                    SEND2UE_REEXPORT,
+                    UNREAL_ONLY,
+                }
                 or iid in rebuild_ids
             ):
                 continue
@@ -7841,7 +7930,9 @@ class App:
             f"  details reason_codes={','.join(plan.reason_codes)}"
             for iid, plan in unsupported_plans.items()
         ]
-        eligible_set = set(export_iids) | set(unreal_iids)
+        eligible_set = (
+            set(export_iids) | set(send2ue_iids) | set(unreal_iids)
+        )
         eligible_iids = [
             iid for iid in candidate_iids if iid in eligible_set
         ]
@@ -7995,6 +8086,49 @@ class App:
                 "Retry run · Unreal-only current-code · "
                 f"{len(unreal_targets)} targets"
             )
+
+        send2ue_targets = [
+            targets_by_id[iid]
+            for iid in send2ue_iids
+            if iid in targets_by_id
+        ]
+        if send2ue_targets:
+            send2ue_ids = [str(item["spm"]) for item in send2ue_targets]
+            metadata = {
+                "schema_version": 1,
+                "kind": action_kind,
+                "partition": "send2ue_reexport",
+                "execution_path": "send2ue_then_unreal",
+                "selected_queue_ids": send2ue_ids,
+                "eligibility": eligibility_receipt(send2ue_ids),
+            }
+            if tracker is not None:
+                tracker.assign_partition(
+                    "send2ue_reexport",
+                    send2ue_ids,
+                    "send2ue_then_unreal",
+                )
+                metadata.update({
+                    "progress_run_id": tracker.run_id,
+                    "progress_receipt_path": str(tracker.path),
+                })
+            jobs.append({
+                "label": (
+                    "Retry run · Send2UE→Unreal · "
+                    f"{len(send2ue_targets)} targets"
+                ),
+                "mode": "push",
+                "phase": "push",
+                "terminal_phase": "push",
+                "selected_scope": True,
+                "targets": send2ue_targets,
+                "inventory": inventory,
+                "cfg": cfg,
+                "force_rerun": True,
+                "push_transport": "headless",
+                "retry_metadata": metadata,
+                "_retry_progress_tracker": tracker,
+            })
 
         repair_root_targets = [
             targets_by_id[iid]
@@ -8553,6 +8687,15 @@ class App:
                 "status": "stale",
                 "phase": "push",
                 "reason": f"Push export manifest의 exact 항목이 유효하지 않습니다: {exc}",
+            }
+        if not manifest_item_has_current_skeleton_root_export(manifest_item):
+            return {
+                "status": "stale",
+                "phase": "push",
+                "reason": (
+                    "Push export가 현재 Send2UE authored Skeleton Root "
+                    "계약보다 오래되었습니다."
+                ),
             }
         if not manifest_item_files_match(manifest_item):
             return {
@@ -10740,6 +10883,11 @@ class App:
             Path(spm).parent / "reports" /
             f"{Path(spm).stem}_speedtree_assembly_pipeline_report_codex.json"
         )
+        if not report_path.is_file():
+            # No report means this asset has never published an Assembly
+            # manifest.  It is an ordinary asset; there is no stale manifest
+            # for Push to reject.
+            return True, ""
         try:
             pipeline = _read_assembly_pipeline_json(report_path)
             embedded = pipeline.get("cluster_assembly_manifest")
@@ -10943,15 +11091,18 @@ class App:
                 )
             return assembly_state
 
-        if receipt_current:
-            assembly_current, assembly_reason = assembly_inputs()
-            if not assembly_current:
-                return {
-                    "current": False,
-                    "push_ready": False,
-                    "kind": "assembly_stale",
-                    "reason": assembly_reason,
-                }
+        # Push validates materialized Assembly manifests unconditionally.  The
+        # scheduler must use the same rule even when an older content receipt
+        # is merely diagnostic; otherwise it skips ① and hands Push a manifest
+        # that Push correctly rejects under the current placement contract.
+        assembly_current, assembly_reason = assembly_inputs()
+        if not assembly_current:
+            return {
+                "current": False,
+                "push_ready": False,
+                "kind": "assembly_stale",
+                "reason": assembly_reason,
+            }
         if blend.stat().st_mtime < spm.stat().st_mtime and not receipt_current:
             return {
                 "current": False,
@@ -11118,20 +11269,32 @@ class App:
         )
         exported = inspect_speedtree_material_export(speedtree_spm, contract)
         all_exported = inspect_all_speedtree_material_export(speedtree_spm)
-        if all_exported.get("status") not in {"ok", "not_applicable"}:
-            exported = all_exported
-        status = exported.get("status")
-        if status in {"ok", "not_applicable"} or (
-            status == "stale" and content_receipt_current
-        ):
+        if content_receipt_current:
+            exported = dict(exported)
+            all_exported = dict(all_exported)
+            if exported.get("status") == "stale":
+                exported["status"] = "ok"
+            if all_exported.get("status") == "stale":
+                all_exported["status"] = "ok"
+        admission = classify_material_export_admission(
+            exported,
+            all_exported,
+        )
+        if admission.get("status") in {"ok", "diagnostic_only"}:
             return True, "SpeedTree 재질 export 정상"
-        missing = list(exported.get("missing_materials") or [])
+        failed_contract = (
+            all_exported
+            if all_exported.get("status") not in {"ok", "not_applicable"}
+            else exported
+        )
+        status = failed_contract.get("status")
+        missing = list(admission.get("missing_materials") or [])
         if status == "missing_stmat":
             return False, "SpeedTree .stmat 없음 → ① Blender Assembly"
         if status == "invalid_stmat":
             return False, (
                 "SpeedTree .stmat 파싱 실패 — "
-                + str(exported.get("error") or "파일 확인")
+                + str(failed_contract.get("error") or "파일 확인")
             )
         if status == "stale":
             return False, "SPM 변경 후 SpeedTree .stmat이 오래됨 → ① 다시 실행"
@@ -11190,10 +11353,16 @@ class App:
             return False, "① 사전검사 정보 없음 → ① Blender Assembly 다시 실행"
         slots = handoff.get("empty_material_slots") or []
         outputs = handoff.get("missing_outputs") or []
+        material_export = handoff.get("material_export") or {}
+        material_admission = classify_material_export_admission(
+            material_export,
+            {},
+            report.get("speedtree_native_receipt") or {},
+        )
         materials = (
-            handoff.get("missing_materials")
-            or (handoff.get("material_export") or {}).get("missing_materials")
-            or []
+            list(material_admission.get("missing_materials") or [])
+            if material_admission.get("status") == "blocked"
+            else []
         )
         collections = handoff.get("export_collection_issues") or []
         vertex_contract = handoff.get("vertex_color_contract") or {}
@@ -11218,7 +11387,7 @@ class App:
             reasons.append("버텍스 컬러 검사 실패")
         if payload_contract.get("status") == "blocked":
             reasons.append("AO/Nanite UV payload 검사 실패")
-        if leaf_contract.get("status") in {"blocked", "replacement_needed"}:
+        if leaf_contract.get("status") in {"blocked", "inspection_error", "invalid_references"}:
             reasons.append("SPM leaf 참조 실패")
         if reasons:
             return False, "① 사전검사 차단: " + " | ".join(reasons)
@@ -11698,7 +11867,7 @@ class App:
             return canonical_refresh
 
     def _refresh_canonical_atlas_manifests(self, spm):
-        """Synchronize canonical PCG output into Atlas before Blender starts."""
+        """Synchronize canonical PCG output for an explicit PCG repair action."""
         spm = Path(spm)
         if not should_refresh_canonical_atlas_manifests(spm):
             return {
@@ -14941,8 +15110,8 @@ class App:
         ):
             # The shared Assembly decision already validates the exact SPM,
             # blend, Assembly report, material/wind output and exact dependency
-            # artifacts.  Consult it before Atlas refresh, consumer audits or
-            # material preflight for ordinary non-Cluster rows. Relation rows
+            # artifacts.  Consult it before relation audits or material
+            # preflight for ordinary non-Cluster rows. Relation rows
             # reach this worker only when their fast receipt was unavailable
             # or changed, so they must refresh the relation once here.
             # Explicit force rebuild deliberately bypasses this fast path.
@@ -14953,7 +15122,10 @@ class App:
                 repair_state,
             ):
                 return
-        self._refresh_canonical_atlas_manifests(spm)
+        # Canonical PCG publication is owned by the PCG pipeline (or its
+        # explicit repair action).  A Blender assembly job consumes the live
+        # SPM/FBX/material inputs and must not be blocked by unrelated Atlas
+        # publication metadata before those inputs are even inspected.
         producer_spm = speedtree_output_spm_for(spm)
         speedtree_spm = producer_spm
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -16138,6 +16310,16 @@ class App:
         manifest_path = Path(export_cache.get("manifest") or "")
         if not manifest_path.is_file():
             return "Push 재확인 필요 — export manifest 없음"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest_item = next(
+                row for row in (manifest.get("items") or ())
+                if str((row or {}).get("queue_id")) == iid
+            )
+        except (OSError, ValueError, StopIteration, TypeError):
+            return "Push 재확인 필요 — export manifest 항목 오류"
+        if not manifest_item_has_current_skeleton_root_export(manifest_item):
+            return "Push 재확인 필요 — Skeleton Root export 계약 갱신"
         export_fingerprint = export_cache.get("fingerprint")
         if success_like:
             if entry.get("push_import_fingerprint") != export_fingerprint:
@@ -16213,7 +16395,11 @@ class App:
             )
         except (OSError, ValueError, StopIteration, TypeError):
             return None
-        if str(item.get("queue_id")) != iid or not manifest_item_files_match(item):
+        if (
+            str(item.get("queue_id")) != iid
+            or not manifest_item_has_current_skeleton_root_export(item)
+            or not manifest_item_files_match(item)
+        ):
             return None
         exported_files = item.get("exported_files") or []
         if exported_files:
@@ -16380,6 +16566,13 @@ class App:
                 log_file=log_file,
                 report_file=export_report,
             ) from exc
+        if not manifest_item_has_current_skeleton_root_export(item):
+            raise BatchItemError(
+                "Send2UE export omitted the authored Skeleton Root contract",
+                kind="data_error",
+                log_file=log_file,
+                report_file=export_report,
+            )
         if not manifest_item_files_match(item):
             raise BatchItemError(
                 "manifest exported-file fingerprint verification failed",

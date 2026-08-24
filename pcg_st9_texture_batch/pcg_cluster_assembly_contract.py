@@ -3493,10 +3493,12 @@ def _physical_target_registry_contract(source_blend):
             "Atlas physical target registry identifies another blend: "
             + str(registered_blend)
         )
-    targets = [
+    declared_targets = [
         Path(value).expanduser().absolute()
         for value in registry.get("target_spms") or []
     ]
+    targets = [path for path in declared_targets if path.is_file()]
+    retired_targets = [path for path in declared_targets if not path.is_file()]
     registry_fingerprint = file_fingerprint(registry["registry_path"])
     if (
         not registry_fingerprint.get("exists")
@@ -3509,6 +3511,7 @@ def _physical_target_registry_contract(source_blend):
     return {
         "fingerprint": registry_fingerprint,
         "target_spms": targets,
+        "retired_target_spms": retired_targets,
         "target_keys": {
             _normalized_identity_path(path): path for path in targets
         },

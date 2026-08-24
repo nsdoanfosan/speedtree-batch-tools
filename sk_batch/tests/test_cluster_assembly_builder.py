@@ -18,7 +18,6 @@ if str(SK_BATCH) not in sys.path:
 from cluster_assembly_builder import (  # noqa: E402
     ClusterAssemblyBuildError,
     ROLE_ORDER,
-    attachment_locked_safe_transform,
     build_blender_assembly_inputs,
     build_unreal_ingest_plan,
     compose_similarity_with_relative_matrix,
@@ -26,10 +25,10 @@ from cluster_assembly_builder import (  # noqa: E402
     derive_endpoint_uniform_similarity_transform,
     file_fingerprint,
     fit_trs_transform,
-    fit_uniform_similarity_transform,
     gate_assembly_transform_residuals,
     lowest_common_ancestor,
     make_skeleton_snapshot,
+    snapshot_blender_armature,
     scope_material_pipeline_for_destination,
     scope_material_pipeline_to_codex_tests,
     _attachment_vertex_correspondence,
@@ -47,9 +46,12 @@ from cluster_assembly_builder import (  # noqa: E402
     _expected_normalized_bounds_for_variant,
     _exact_native_attachment_influences,
     _export_selected_fbx,
+    _configure_final_assembly_preserve_area,
+    _validate_final_assembly_preserve_area,
     _generated_material_sidecar,
     _normalized_prototype_for_component,
     _ordered_cross_object_correspondence,
+    _partition_components_by_native_runtime_owner,
     _partition_normalized_render_components,
     _role_material_polygons,
     _strip_fbx_scene_textures,
@@ -67,6 +69,79 @@ from cluster_assembly_builder import (  # noqa: E402
     validate_persisted_residual_gate,
     validate_file_fingerprint,
 )
+
+
+class FakeEditorProperties:
+    def __init__(self, **values):
+        self.values = dict(values)
+
+    def get_editor_property(self, name):
+        return self.values[name]
+
+    def set_editor_property(self, name, value):
+        self.values[name] = value
+
+
+class FinalAssemblyNanitePolicyTests(unittest.TestCase):
+    def make_policy_subjects(self):
+        nanite = FakeEditorProperties(shape_preservation="VOXELIZE")
+        target = FakeEditorProperties(nanite_settings=nanite)
+        target.get_path_name = lambda: "/Game/Test/Final_NaniteAssembly"
+        builder = SimpleNamespace(get_target_mesh_object=lambda: target)
+        unreal = SimpleNamespace(
+            NaniteShapePreservation=SimpleNamespace(
+                PRESERVE_AREA="PRESERVE_AREA",
+            )
+        )
+        return unreal, builder, target
+
+    def test_final_assembly_switches_to_preserve_area_before_finish(self):
+        unreal, builder, target = self.make_policy_subjects()
+
+        report = _configure_final_assembly_preserve_area(unreal, builder)
+
+        self.assertEqual(report["before"], "VOXELIZE")
+        self.assertEqual(report["after"], "PRESERVE_AREA")
+        self.assertTrue(report["changed"])
+        self.assertTrue(report["applied_before_finish"])
+        self.assertTrue(report["base_and_parts_unchanged"])
+        self.assertEqual(
+            target.get_editor_property("nanite_settings").get_editor_property(
+                "shape_preservation"
+            ),
+            "PRESERVE_AREA",
+        )
+
+    def test_finished_assembly_must_keep_preserve_area(self):
+        unreal, builder, target = self.make_policy_subjects()
+        report = _configure_final_assembly_preserve_area(unreal, builder)
+
+        result = _validate_final_assembly_preserve_area(
+            unreal,
+            target,
+            report,
+        )
+
+        self.assertEqual(result["finished"], "PRESERVE_AREA")
+        self.assertTrue(result["preserved_through_finish"])
+
+    def test_finished_assembly_rejects_voxelize_regression(self):
+        unreal, builder, target = self.make_policy_subjects()
+        report = _configure_final_assembly_preserve_area(unreal, builder)
+        target.get_editor_property("nanite_settings").set_editor_property(
+            "shape_preservation",
+            "VOXELIZE",
+        )
+
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "Finished Nanite Assembly is not Preserve Area",
+        ):
+            _validate_final_assembly_preserve_area(
+                unreal,
+                target,
+                report,
+            )
 
 
 def exact_bone_skeleton(*rows):
@@ -95,6 +170,37 @@ def exact_bone_skeleton(*rows):
         })
         index_by_name[name] = index
     return make_skeleton_snapshot(bones)
+
+
+class BlenderSkeletonSnapshotTests(unittest.TestCase):
+    def test_authored_root_is_index_zero_without_armature_object_node(self):
+        identity = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+        root = SimpleNamespace(name="Root", parent=None, matrix_local=identity)
+        child = SimpleNamespace(
+            name="Bone_1_Start", parent=root, matrix_local=identity
+        )
+        armature = SimpleNamespace(
+            type="ARMATURE",
+            name="Armature",
+            data=SimpleNamespace(bones=[root, child]),
+            matrix_world=identity,
+        )
+
+        snapshot = snapshot_blender_armature(armature)
+
+        self.assertEqual(
+            [
+                (row["index"], row["name"], row["parent_index"])
+                for row in snapshot["bones"]
+            ],
+            [(0, "Root", -1), (1, "Bone_1_Start", 0)],
+        )
+        self.assertNotIn("Armature", [row["name"] for row in snapshot["bones"]])
 
 
 class AssemblyBuildCacheTests(unittest.TestCase):
@@ -411,9 +517,8 @@ class ExactNativeAttachmentInfluenceTests(unittest.TestCase):
     @staticmethod
     def _skeleton():
         return make_skeleton_snapshot([
-            {"index": 0, "name": "Armature", "parent_index": -1},
-            {"index": 1, "name": "NativeRoot", "parent_index": 0, "parent_name": "Armature"},
-            {"index": 2, "name": "CapturedChild", "parent_index": 1, "parent_name": "NativeRoot"},
+            {"index": 0, "name": "Root", "parent_index": -1},
+            {"index": 1, "name": "CapturedChild", "parent_index": 0, "parent_name": "Root"},
         ])
 
     @staticmethod
@@ -475,19 +580,20 @@ class ExactNativeAttachmentInfluenceTests(unittest.TestCase):
         )
 
         self.assertEqual(influences, [
-            {"bone": "NativeRoot", "weight": 0.25},
+            {"bone": "Root", "weight": 0.25},
             {"bone": "CapturedChild", "weight": 0.75},
         ])
         self.assertEqual(
             source["policy"],
-            "native_modeler_authored_proxy_weights_v1",
+            "native_modeler_authored_proxy_weights_v2_"
+            "exact_skeleton_index_zero",
         )
         self.assertEqual(source["geometry_ordinal"], 4)
         self.assertEqual(source["native_vertex_indices"], [3])
         self.assertEqual(source["target_attachment_vertex_index"], 1)
         self.assertEqual(
             source["owner_selection_policy"],
-            "sole_exact_native_range_intersection_v1",
+            "sole_exact_native_node_guid_range_intersection_v2",
         )
 
     def test_clipped_attachment_uses_sole_exact_component_intersection(self):
@@ -506,6 +612,46 @@ class ExactNativeAttachmentInfluenceTests(unittest.TestCase):
         self.assertEqual(source["queried_native_vertex_count"], 3)
         self.assertEqual(source["unowned_native_vertex_count"], 2)
         self.assertIsNone(source["target_attachment_vertex_index"])
+
+    def test_native_root_uses_exact_skeleton_index_zero_with_multiple_children(self):
+        skeleton = make_skeleton_snapshot([
+            {"index": 0, "name": "Root", "parent_index": -1},
+            {
+                "index": 1,
+                "name": "NativeRootA",
+                "parent_index": 0,
+                "parent_name": "Root",
+            },
+            {
+                "index": 2,
+                "name": "NativeRootB",
+                "parent_index": 0,
+                "parent_name": "Root",
+            },
+        ])
+        receipt = self._receipt()
+        instance = receipt["generated_instances"][0]
+        instance["source_bone_id"] = 7
+        instance["authored_position_influences"][1][
+            "exported_cluster_name"
+        ] = "NativeRootB"
+
+        influences, source = _exact_native_attachment_influences(
+            self._object([4, 4, 4], [2, 3, 4]),
+            {"vertices": [0, 1, 2]},
+            1,
+            receipt,
+            skeleton,
+            "multi-root native component",
+        )
+
+        self.assertEqual(influences[0]["bone"], "Root")
+        self.assertEqual(source["source_bone_id"], 7)
+        self.assertEqual(source["native_root_bone"], "Root")
+        self.assertEqual(
+            source["native_root_resolution"],
+            "exact_native_fbx_skeleton_index_zero",
+        )
 
     def test_rejects_component_spanning_native_geometries(self):
         obj = self._object([4, 5], [2, 3])
@@ -747,6 +893,109 @@ class ComponentTopologyTests(unittest.TestCase):
             2,
         )
 
+    def test_native_node_guid_splits_coincident_welded_card_instances(self):
+        target = seam_split_test_mesh(False)
+        vertex_offset = len(target.vertices)
+        loop_offset = len(target.loops)
+        target.vertices.extend([
+            SimpleNamespace(co=tuple(vertex.co))
+            for vertex in target.vertices[:vertex_offset]
+        ])
+        target.loops.extend([
+            SimpleNamespace(vertex_index=loop.vertex_index + vertex_offset)
+            for loop in target.loops[:loop_offset]
+        ])
+        target.uv_layers.active.data.extend([
+            SimpleNamespace(uv=SimpleNamespace(x=row.uv.x, y=row.uv.y))
+            for row in target.uv_layers.active.data[:loop_offset]
+        ])
+        target.polygons.extend([
+            SimpleNamespace(
+                index=polygon.index + 2,
+                vertices=tuple(
+                    value + vertex_offset for value in polygon.vertices
+                ),
+                loop_indices=tuple(
+                    value + loop_offset for value in polygon.loop_indices
+                ),
+            )
+            for polygon in target.polygons[:2]
+        ])
+        target.attributes = {
+            "speedtree_native_geometry_ordinal": SimpleNamespace(data=[
+                SimpleNamespace(value=3) for _vertex in target.vertices
+            ]),
+            "speedtree_native_vertex_index": SimpleNamespace(data=[
+                SimpleNamespace(value=index)
+                for index, _vertex in enumerate(target.vertices)
+            ]),
+        }
+        welded = _component_groups(target, [0, 1, 2, 3])
+        self.assertEqual(len(welded), 1)
+        receipt = {"generated_instances": [
+            {
+                "geometry_ordinal": 3,
+                "node_guid": "node-a",
+                "vertex_ranges": [(0, vertex_offset - 1)],
+            },
+            {
+                "geometry_ordinal": 3,
+                "node_guid": "node-b",
+                "vertex_ranges": [
+                    (vertex_offset, len(target.vertices) - 1)
+                ],
+            },
+        ]}
+
+        partitioned = _partition_components_by_native_runtime_owner(
+            SimpleNamespace(name="target", data=target),
+            welded,
+            receipt,
+        )
+
+        self.assertEqual(len(partitioned), 2)
+        self.assertEqual(
+            [row["native_runtime_owner"] for row in partitioned],
+            [["node_guid", "node-a"], ["node_guid", "node-b"]],
+        )
+        self.assertEqual(
+            [len(row["polygons"]) for row in partitioned],
+            [2, 2],
+        )
+
+    def test_same_native_node_guid_does_not_split_serializer_segments(self):
+        target = seam_split_test_mesh(False)
+        target.attributes = {
+            "speedtree_native_geometry_ordinal": SimpleNamespace(data=[
+                SimpleNamespace(value=3) for _vertex in target.vertices
+            ]),
+            "speedtree_native_vertex_index": SimpleNamespace(data=[
+                SimpleNamespace(value=index)
+                for index, _vertex in enumerate(target.vertices)
+            ]),
+        }
+        components = _component_groups(target, [0, 1])
+        receipt = {"generated_instances": [
+            {
+                "geometry_ordinal": 3,
+                "node_guid": "same-node",
+                "vertex_ranges": [(0, 1)],
+            },
+            {
+                "geometry_ordinal": 3,
+                "node_guid": "same-node",
+                "vertex_ranges": [(2, 3)],
+            },
+        ]}
+
+        partitioned = _partition_components_by_native_runtime_owner(
+            SimpleNamespace(name="target", data=target),
+            components,
+            receipt,
+        )
+
+        self.assertEqual(partitioned, components)
+
     def test_unique_uv_face_subset_uses_the_normalized_prototype(self):
         source = seam_split_test_mesh(False)
         target = seam_split_test_mesh(True)
@@ -813,6 +1062,55 @@ class ComponentTopologyTests(unittest.TestCase):
                 {"source": prototype}, object(), target_component
             )
         self.assertIs(selected_after_larger_clip, prototype)
+
+    def test_speedtree_boundary_retriangulation_uses_unique_exact_face_identity(self):
+        source_component = object()
+        other_component = object()
+        target_component = object()
+        prototype = {
+            "object": SimpleNamespace(data=object()),
+            "component": source_component,
+        }
+        other = {
+            "object": SimpleNamespace(data=object()),
+            "component": other_component,
+        }
+        source_faces = Counter({
+            ("kept", index): 1 for index in range(44)
+        })
+        source_faces.update({
+            ("clipped_source", index): 1 for index in range(6)
+        })
+        target_faces = Counter({
+            ("kept", index): 1 for index in range(44)
+        })
+        target_faces.update({
+            ("new_boundary", index): 1 for index in range(6)
+        })
+        other_faces = Counter({
+            ("other", index): 1 for index in range(50)
+        })
+
+        def select_counter(_mesh, component):
+            if component is source_component:
+                return source_faces
+            if component is other_component:
+                return other_faces
+            return target_faces
+
+        with mock.patch(
+            "cluster_assembly_builder._component_signature",
+            return_value="target",
+        ), mock.patch(
+            "cluster_assembly_builder._component_uv_face_counter",
+            side_effect=select_counter,
+        ):
+            selected = _normalized_prototype_for_component(
+                {"source": prototype, "other": other},
+                object(),
+                target_component,
+            )
+        self.assertIs(selected, prototype)
 
     def test_speedtree_two_sided_render_matches_clipped_normalized_prototype(self):
         source_component = object()
@@ -930,10 +1228,36 @@ class ComponentTopologyTests(unittest.TestCase):
             self.assertEqual(source_indices, [3, 5, 4])
             self.assertEqual(
                 evidence["policy"],
-                "all_candidates_topology_disambiguated_fail_closed_v1",
+                "exact_surviving_uv_identity_fail_closed_v2",
             )
             resolved.append(source_indices)
         self.assertEqual(resolved[0], resolved[1])
+
+    def test_new_clipped_boundary_uv_is_not_used_as_correspondence(self):
+        source = seam_split_test_mesh(False)
+        target = seam_split_test_mesh(False)
+        target.uv_layers.active.data[1].uv.x = 0.75
+        target.uv_layers.active.data[1].uv.y = 0.125
+        source_component = _component_groups(source, [0, 1])[0]
+        target_component = _component_groups(target, [0, 1])[0]
+
+        source_indices, target_indices, evidence = (
+            _ordered_cross_object_correspondence(
+                SimpleNamespace(data=source),
+                source_component,
+                SimpleNamespace(data=target),
+                target_component,
+                include_evidence=True,
+            )
+        )
+
+        self.assertEqual(len(source_indices), 3)
+        self.assertEqual(len(target_indices), 3)
+        self.assertEqual(evidence["target_only_uv_key_count"], 1)
+        self.assertEqual(
+            evidence["policy"],
+            "exact_surviving_uv_identity_fail_closed_v2",
+        )
 
     def test_distinct_duplicate_uv_without_unique_evidence_fails_closed(self):
         source = stacked_uv_test_mesh(identical_faces=True)
@@ -2992,59 +3316,6 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
             )
             self.assertNotIn("Plan", json.dumps(plan))
 
-    def test_uniform_similarity_fit_is_stable_for_planar_cards(self):
-        source = [
-            [-1.0, -1.0, 0.0],
-            [1.0, -1.0, 0.0],
-            [1.0, 1.0, 0.0],
-            [-1.0, 1.0, 0.0],
-        ]
-        target = [
-            [5.0 - point[1] * 2.5, -2.0 + point[0] * 2.5, 7.0]
-            for point in source
-        ]
-        transform = fit_uniform_similarity_transform(source, target)
-        self.assertEqual(transform["fit_mode"], "uniform_similarity_3d")
-        self.assertLess(transform["trs_relative_rms"], 1.0e-10)
-        self.assertEqual(transform["scale"], [2.5, 2.5, 2.5])
-        self.assertAlmostEqual(transform["translation"][0], 5.0, places=8)
-        self.assertAlmostEqual(transform["translation"][1], -2.0, places=8)
-        self.assertAlmostEqual(transform["translation"][2], 7.0, places=8)
-
-    def test_uniform_similarity_fit_locks_authored_root_on_deformed_plan(self):
-        source = [
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [1.0, 1.0, 0.0],
-            [0.0, 1.0, 0.0],
-        ]
-        target = [
-            [5.0, -2.0, 7.0],
-            [7.0, -2.0, 7.0],
-            [7.0, 1.0, 7.5],
-            [5.0, 1.0, 7.0],
-        ]
-        transform = fit_uniform_similarity_transform(
-            source,
-            target,
-            source_attachment=source[0],
-            target_attachment=target[0],
-        )
-        self.assertEqual(
-            transform["fit_mode"],
-            "uniform_similarity_3d_attachment_locked",
-        )
-        self.assertLess(transform["attachment_pivot_error"], 1.0e-12)
-        self.assertEqual(transform["translation"], target[0])
-        self.assertEqual(
-            transform["trs_relative_rms"],
-            transform["similarity_relative_rms"],
-        )
-        self.assertLess(
-            transform["affine_relative_rms"],
-            transform["similarity_relative_rms"],
-        )
-
     def test_endpoint_frame_locks_exact_attachment_pivot_and_preserves_rigid_plan(self):
         source = [
             [0.0, 0.0, 0.0],
@@ -3094,20 +3365,6 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
         self.assertEqual(transform["translation"], [5.0, -2.0, 7.0])
         self.assertLess(transform["attachment_pivot_error"], 1.0e-12)
         self.assertGreater(transform["similarity_relative_rms"], 0.0)
-
-    def test_safe_fallback_keeps_export_attached_with_uniform_scale(self):
-        transform = attachment_locked_safe_transform(
-            [1.0, 2.0, 3.0], "endpoint unavailable"
-        )
-        self.assertEqual(transform["translation"], [1.0, 2.0, 3.0])
-        self.assertEqual(transform["scale"], [1.0, 1.0, 1.0])
-        self.assertEqual(transform["rotation_xyzw"], [0.0, 0.0, 0.0, 1.0])
-        gate = gate_assembly_transform_residuals(
-            transform,
-            {"part_asset": "SK_part"},
-            block_geometry=False,
-        )
-        self.assertEqual(gate["status"], "warning")
 
     def test_residual_ready_gate_checks_pivot_and_all_metrics(self):
         transform = {

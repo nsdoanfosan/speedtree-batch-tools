@@ -63,7 +63,7 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         launcher = LAUNCHER_SOURCE.read_text(encoding="utf-8")
         contract = (
             "SPEEDTREE_COLLISION_CLI_CONTRACT="
-            "native-runtime-receipt-v6"
+            "native-runtime-receipt-v8"
         )
 
         self.assertIn(contract, launcher)
@@ -82,11 +82,50 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
             source.index("void __fastcall HookedExportVertexWeights"):
             source.index("void __fastcall HookedInsertExportBone")
         ]
+        entry_stub = source[
+            source.index("bool BuildExportVertexWeightsEntryStub"):
+            source.index("void FreeExportVertexWeightsEntryStub")
+        ]
 
         self.assertIn("kExportVertexWeightsRva = 0x6B4FE0", source)
         self.assertIn("kFindExportBoneMappingRva = 0x6B4DF0", source)
         self.assertIn("if (parentId != 0)", weight_hook)
         self.assertIn("const float rootWeight = 1.0f - childWeight;", weight_hook)
+        self.assertIn('"omitted_no_exact_bone_record"', source)
+        self.assertIn('"not_applicable_boneless_export"', source)
+        self.assertIn(
+            "const char* idZeroClusterWrite =\n"
+            "        gNativeReceiptBones.empty()",
+            source,
+        )
+        self.assertNotIn(
+            "gNativeReceiptBones.empty() && gNativeReceiptProxies.empty()",
+            source,
+        )
+        self.assertIn(
+            "gMissingIdZeroBoneRecordLogged.store(false",
+            source,
+        )
+        missing_root_guard = (
+            "if (FindExactExportBoneMapping(exporter, 0) == nullptr)"
+        )
+        self.assertIn(missing_root_guard, weight_hook)
+        primary_call = (
+            "gOriginalExportVertexWeights(\n"
+            "        exporter,\n"
+            "        position,\n"
+            "        sourceBoneId,"
+        )
+        self.assertIn(primary_call, weight_hook)
+        self.assertLess(
+            weight_hook.index(primary_call),
+            weight_hook.index(missing_root_guard),
+        )
+        self.assertNotIn(
+            "if (sourceBoneId == 0 &&\n"
+            "        FindExactExportBoneMapping(exporter, 0) == nullptr)",
+            weight_hook,
+        )
         self.assertIn(
             "gOriginalExportVertexWeights(\n"
             "            exporter,\n"
@@ -94,6 +133,21 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
             "            0,",
             weight_hook,
         )
+        self.assertLess(
+            weight_hook.index(missing_root_guard),
+            weight_hook.index(
+                "gOriginalExportVertexWeights(\n"
+                "            exporter,\n"
+                "            position,\n"
+                "            0,"
+            ),
+        )
+        self.assertIn("SpeedTree_Modeler+0x6B5185", weight_hook)
+        self.assertIn("test r8d, r8d", entry_stub)
+        self.assertIn("&gOriginalExportVertexWeights", entry_stub)
+        self.assertIn("CaptureNativeReceiptIdZero", entry_stub)
+        self.assertIn("tail-jump to", entry_stub)
+        self.assertIn("IDs enter the compiled weight hook", entry_stub)
         self.assertIn("FbxSkeleton::eLimbNode", source)
         self.assertIn("No spatial lookup or normalization", weight_hook)
 

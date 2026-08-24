@@ -767,6 +767,9 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "cluster_missing_normalized_export_pivot": ReasonRow(
         UNCLASSIFIED, "cluster_export_handoff_contract.py", "",
     ),
+    "first_exact_assembly_hierarchy_promoted_to_export_pivot": ReasonRow(
+        UNCLASSIFIED, "cluster_export_handoff_contract.py", "",
+    ),
     "cluster_canonical_spm_missing": ReasonRow(
         FATAL, "pcg_st9_texture_batch/pcg_cluster_assembly_contract.py",
         "cluster_identity",
@@ -1944,6 +1947,96 @@ _REASON_SEEDS: dict[str, ReasonRow] = {
     "unreal_crash": ReasonRow(
         INFORMATIONAL, "sk_batch/failed_retry_eligibility.py", "unreal_only_route",
     ),
+    "interrupted_push_current_parent": ReasonRow(
+        INFORMATIONAL,
+        "sk_batch/failed_retry_eligibility.py",
+        "unreal_only_route",
+    ),
+    "interrupted_push_forced_full_rebuild": ReasonRow(
+        INFORMATIONAL,
+        "sk_batch/failed_retry_eligibility.py",
+        "blender_rebuild_route",
+    ),
+    "interrupted_push_reexport": ReasonRow(
+        INFORMATIONAL,
+        "sk_batch/failed_retry_eligibility.py",
+        "retry_route_status",
+    ),
+    "rerun_pending": ReasonRow(
+        INFORMATIONAL,
+        "sk_batch/failed_retry_eligibility.py",
+        "durable_status",
+    ),
+    "stale_send2ue_export_forced_full_rebuild": ReasonRow(
+        INFORMATIONAL,
+        "sk_batch/failed_retry_eligibility.py",
+        "blender_rebuild_route",
+    ),
+    "stale_send2ue_root_export": ReasonRow(
+        INFORMATIONAL,
+        "sk_batch/failed_retry_eligibility.py",
+        "retry_route_status",
+    ),
+    "stopped": ReasonRow(
+        INFORMATIONAL,
+        "sk_batch/failed_retry_eligibility.py",
+        "durable_status",
+    ),
+    "asset_export_geometry_empty": ReasonRow(
+        UNSUPPORTED,
+        "sk_batch/spm_leaf_handoff_contract.py",
+        "export_material",
+    ),
+    "asset_export_material_payload_empty": ReasonRow(
+        UNSUPPORTED,
+        "sk_batch/spm_leaf_handoff_contract.py",
+        "export_material",
+    ),
+    "asset_export_material_payload_invalid": ReasonRow(
+        UNSUPPORTED,
+        "sk_batch/spm_leaf_handoff_contract.py",
+        "export_material",
+    ),
+    "asset_export_material_placeholder_for_missing_semantic": ReasonRow(
+        UNSUPPORTED,
+        "sk_batch/spm_leaf_handoff_contract.py",
+        "export_material",
+    ),
+    "generic_material_placeholder_with_missing_semantic_material": ReasonRow(
+        UNSUPPORTED,
+        "sk_batch/spm_leaf_handoff_contract.py",
+        "export_material",
+    ),
+    "geometry_has_no_exported_material_identity": ReasonRow(
+        UNSUPPORTED,
+        "sk_batch/spm_leaf_handoff_contract.py",
+        "export_material",
+    ),
+    "material_payload_contract_failed": ReasonRow(
+        UNSUPPORTED,
+        "sk_batch/spm_leaf_handoff_contract.py",
+        "export_material",
+    ),
+    "native_export_contains_no_geometry": ReasonRow(
+        UNSUPPORTED,
+        "sk_batch/spm_leaf_handoff_contract.py",
+        "export_material",
+    ),
+    "expected_name_mismatch_without_structural_export_defect": ReasonRow(
+        INFORMATIONAL,
+        "sk_batch/spm_leaf_handoff_contract.py",
+        "material_export_scope_diagnostic",
+    ),
+    "exported_material_structure_complete": ReasonRow(
+        INFORMATIONAL,
+        "sk_batch/spm_leaf_handoff_contract.py",
+        "material_export_scope_diagnostic",
+    ),
+    "material_export_name_mismatch_diagnostic": ReasonRow(
+        INFORMATIONAL,
+        "sk_batch/jobs/speedtree_material_preflight.py",
+        "material_export_scope_diagnostic",
+    ),
     "userdata_missing": ReasonRow(
         INFORMATIONAL, "sk_batch/atlas_consumer_integrity.py", "protected_manual_asset",
     ),
@@ -2146,6 +2239,7 @@ _classify(
 _classify(
     INFORMATIONAL, "cluster_handoff_diagnostic",
     "cluster_missing_normalized_export_pivot", "missing_export_collection",
+    "first_exact_assembly_hierarchy_promoted_to_export_pivot",
     "multiple_unsuffixed_export_roots", "new_exact_assembly_source_hierarchy",
     "no_unsuffixed_export_root", "persisted_unsuffixed_export_root",
     "assembly_source_fbx_pending_export", "hash_validated_cluster_assembly_source",

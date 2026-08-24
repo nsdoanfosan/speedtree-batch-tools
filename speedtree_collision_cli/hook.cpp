@@ -694,6 +694,33 @@ struct ExportBoneMapping {
     void* endNode;
 };
 
+std::atomic_bool gMissingIdZeroBoneRecordLogged{false};
+
+ExportBoneMapping* FindExactExportBoneMapping(void* exporter, int boneId) {
+    if (exporter == nullptr) {
+        return nullptr;
+    }
+    int lookupId = boneId;
+    auto* mapping = static_cast<ExportBoneMapping*>(gFindExportBoneMapping(
+        static_cast<unsigned char*>(exporter) + 0x60,
+        &lookupId));
+    return mapping != nullptr && mapping->boneRecord != nullptr
+        ? mapping
+        : nullptr;
+}
+
+void LogMissingIdZeroBoneRecordOnce() {
+    bool expected = false;
+    if (gMissingIdZeroBoneRecordLogged.compare_exchange_strong(
+            expected,
+            true,
+            std::memory_order_acq_rel)) {
+        Log(
+            "Synthetic complementary FBX ID-0 cluster write skipped because "
+            "this export has no exact ID-0 bone record");
+    }
+}
+
 void __fastcall HookedFbxClusterAddControlPoint(
     void* cluster,
     int vertexIndex,
@@ -744,6 +771,7 @@ void* __fastcall HookedFbxNodeCreate(void* manager, const char* name) {
 
 void ResetNativeReceiptCapture() {
     std::lock_guard<std::mutex> lock(gNativeReceiptMutex);
+    gMissingIdZeroBoneRecordLogged.store(false, std::memory_order_release);
     gNativeReceiptGeometries.clear();
     gNativeReceiptBones.clear();
     gNativeReceiptProxies.clear();
@@ -860,12 +888,8 @@ void CaptureNativeReceiptProxy(
                     *reinterpret_cast<const float*>(geometryBytes + 0x34)) * 30.48f,
             };
             int parentId = 0;
-            int lookupId = sourceBoneId;
-            auto* mapping = static_cast<ExportBoneMapping*>(
-                gFindExportBoneMapping(
-                    static_cast<unsigned char*>(exporter) + 0x60,
-                    &lookupId));
-            if (mapping != nullptr && mapping->boneRecord != nullptr) {
+            auto* mapping = FindExactExportBoneMapping(exporter, sourceBoneId);
+            if (mapping != nullptr) {
                 parentId = *reinterpret_cast<const int*>(
                     static_cast<const unsigned char*>(mapping->boneRecord) + 0x04);
             }
@@ -886,16 +910,28 @@ void CaptureNativeReceiptProxy(
             };
 
             FbxWeightExportContext probe{};
-            probe.suppressWrite = true;
-            FbxWeightExportContext* previousContext = gFbxWeightExportContext;
-            gFbxWeightExportContext = &probe;
-            gOriginalExportVertexWeights(
-                exporter,
-                authoredSolver,
-                sourceBoneId,
-                vertexIndex,
-                clusterMap);
-            gFbxWeightExportContext = previousContext;
+            if (sourceBoneId == 0) {
+                // The serializer's exact source ID is the authored root.  The
+                // entry stub preserves and executes the stock call unchanged;
+                // this receipt row records that same explicit ownership.
+                probe.additionCount = 1;
+                probe.additions[0] = {
+                    nullptr,
+                    vertexIndex,
+                    1.0,
+                };
+            } else {
+                probe.suppressWrite = true;
+                FbxWeightExportContext* previousContext = gFbxWeightExportContext;
+                gFbxWeightExportContext = &probe;
+                gOriginalExportVertexWeights(
+                    exporter,
+                    authoredSolver,
+                    sourceBoneId,
+                    vertexIndex,
+                    clusterMap);
+                gFbxWeightExportContext = previousContext;
+            }
             if (probe.additionCount > 0) {
                 proxy.influences.push_back({
                     sourceBoneId,
@@ -975,6 +1011,10 @@ void __fastcall HookedExportVertexWeights(
     int sourceBoneId,
     int vertexIndex,
     void* clusterMap) {
+    // Always preserve the stock call, including native sourceBoneId==0 calls.
+    // A valid no-generator model can use that implicit native path even though
+    // the export-bone map has no exact ID-0 record.  Only the later *synthetic*
+    // complementary Root call needs the exact-record guard.
     FbxWeightExportContext primary{};
     FbxWeightExportContext* previousContext = gFbxWeightExportContext;
     gFbxWeightExportContext = &primary;
@@ -1041,6 +1081,13 @@ void __fastcall HookedExportVertexWeights(
         if (rootWeight <= 0.0f) {
             return;
         }
+        // This call is manufactured by the hook, unlike the native call above.
+        // Without an exact ID-0 destination record it was observed to crash at
+        // SpeedTree_Modeler+0x6B5185, so guard only this complementary write.
+        if (FindExactExportBoneMapping(exporter, 0) == nullptr) {
+            LogMissingIdZeroBoneRecordOnce();
+            return;
+        }
 
         FbxWeightExportContext root{};
         root.overrideWeight = true;
@@ -1067,13 +1114,20 @@ void __fastcall HookedExportVertexWeights(
     }
 }
 
+void __fastcall CaptureNativeReceiptIdZero(
+    void* exporter,
+    const float* position,
+    int sourceBoneId,
+    int vertexIndex,
+    void* clusterMap);
+
 bool BuildExportVertexWeightsEntryStub() {
     if (gExportVertexWeightsEntryStub != nullptr) {
         return true;
     }
     auto* stub = static_cast<unsigned char*>(VirtualAlloc(
         nullptr,
-        64,
+        192,
         MEM_RESERVE | MEM_COMMIT,
         PAGE_EXECUTE_READWRITE));
     if (stub == nullptr) {
@@ -1097,11 +1151,101 @@ bool BuildExportVertexWeightsEntryStub() {
     stub[23] = 0x48;
     stub[24] = 0x89;
     stub[25] = 0x38;
-    WriteAbsoluteJump(stub + 26, reinterpret_cast<const void*>(
-        HookedExportVertexWeights));
-    FlushInstructionCache(GetCurrentProcess(), stub, 38);
+    // Native ID-0 is an implicit serializer path. Capture its exact serializer
+    // record while preserving the caller's volatile state, then tail-jump to
+    // the stock routine with the original stack and registers. Only positive
+    // IDs enter the compiled weight hook.
+    stub[26] = 0x45;
+    stub[27] = 0x85;
+    stub[28] = 0xC0;             // test r8d, r8d
+    stub[29] = 0x75;
+    stub[30] = 0x00;             // jne displacement filled below
+    std::size_t cursor = 31;
+    stub[cursor++] = 0x9C;       // pushfq
+    stub[cursor++] = 0x50;       // push rax
+    stub[cursor++] = 0x51;       // push rcx
+    stub[cursor++] = 0x52;       // push rdx
+    stub[cursor++] = 0x41;
+    stub[cursor++] = 0x50;       // push r8
+    stub[cursor++] = 0x41;
+    stub[cursor++] = 0x51;       // push r9
+    stub[cursor++] = 0x41;
+    stub[cursor++] = 0x52;       // push r10
+    stub[cursor++] = 0x41;
+    stub[cursor++] = 0x53;       // push r11
+    stub[cursor++] = 0x48;
+    stub[cursor++] = 0x83;
+    stub[cursor++] = 0xEC;
+    stub[cursor++] = 0x28;       // sub rsp, 0x28
+    stub[cursor++] = 0x48;
+    stub[cursor++] = 0x8B;
+    stub[cursor++] = 0x84;
+    stub[cursor++] = 0x24;
+    *reinterpret_cast<std::uint32_t*>(stub + cursor) = 0x90;
+    cursor += sizeof(std::uint32_t); // mov rax, [rsp+0x90]
+    stub[cursor++] = 0x48;
+    stub[cursor++] = 0x89;
+    stub[cursor++] = 0x44;
+    stub[cursor++] = 0x24;
+    stub[cursor++] = 0x20;       // mov [rsp+0x20], rax
+    stub[cursor++] = 0x48;
+    stub[cursor++] = 0xB8;
+    *reinterpret_cast<std::uintptr_t*>(stub + cursor) =
+        reinterpret_cast<std::uintptr_t>(CaptureNativeReceiptIdZero);
+    cursor += sizeof(std::uintptr_t);
+    stub[cursor++] = 0xFF;
+    stub[cursor++] = 0xD0;       // call rax
+    stub[cursor++] = 0x48;
+    stub[cursor++] = 0x83;
+    stub[cursor++] = 0xC4;
+    stub[cursor++] = 0x28;       // add rsp, 0x28
+    stub[cursor++] = 0x41;
+    stub[cursor++] = 0x5B;       // pop r11
+    stub[cursor++] = 0x41;
+    stub[cursor++] = 0x5A;       // pop r10
+    stub[cursor++] = 0x41;
+    stub[cursor++] = 0x59;       // pop r9
+    stub[cursor++] = 0x41;
+    stub[cursor++] = 0x58;       // pop r8
+    stub[cursor++] = 0x5A;       // pop rdx
+    stub[cursor++] = 0x59;       // pop rcx
+    stub[cursor++] = 0x58;       // pop rax
+    stub[cursor++] = 0x9D;       // popfq
+    stub[cursor++] = 0x48;
+    stub[cursor++] = 0xB8;
+    *reinterpret_cast<std::uintptr_t*>(stub + cursor) =
+        reinterpret_cast<std::uintptr_t>(&gOriginalExportVertexWeights);
+    cursor += sizeof(std::uintptr_t);
+    stub[cursor++] = 0xFF;
+    stub[cursor++] = 0x20;       // jmp qword ptr [rax]
+    const std::size_t positiveHookOffset = cursor;
+    const std::size_t positiveBranchDistance = positiveHookOffset - 31;
+    if (positiveBranchDistance > 0x7F) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        Log("FBX vertex-record entry stub positive branch exceeded rel8");
+        return false;
+    }
+    stub[30] = static_cast<unsigned char>(positiveBranchDistance);
+    WriteAbsoluteJump(
+        stub + positiveHookOffset,
+        reinterpret_cast<const void*>(HookedExportVertexWeights));
+    FlushInstructionCache(GetCurrentProcess(), stub, positiveHookOffset + 12);
     gExportVertexWeightsEntryStub = stub;
     return true;
+}
+
+void __fastcall CaptureNativeReceiptIdZero(
+    void* exporter,
+    const float* position,
+    int sourceBoneId,
+    int vertexIndex,
+    void* clusterMap) {
+    CaptureNativeReceiptProxy(
+        exporter,
+        position,
+        sourceBoneId,
+        vertexIndex,
+        clusterMap);
 }
 
 void FreeExportVertexWeightsEntryStub() {
@@ -4573,24 +4717,38 @@ bool WriteNativeReceipt() {
         Log("native receipt temporary file could not be opened");
         return false;
     }
+    // Generated-instance proxy records describe geometry placement, not an
+    // exported deform skeleton.  Blender imports an armature only when the
+    // native FBX serializer emitted at least one exact bone record, so proxy
+    // presence must never turn a genuinely bone-less FBX into the ID-0 repair
+    // contract.
+    const char* idZeroClusterWrite =
+        gNativeReceiptBones.empty()
+        ? "not_applicable_boneless_export"
+        : (gMissingIdZeroBoneRecordLogged.load(std::memory_order_acquire)
+               ? "omitted_no_exact_bone_record"
+               : "native_exact_bone_record");
     stream << std::setprecision(17);
     stream << "{\n"
-           << "  \"schema_version\": 2,\n"
+           << "  \"schema_version\": 3,\n"
            << "  \"kind\": \"speedtree_native_export_receipt\",\n"
            << "  \"status\": \"ready\",\n"
            << "  \"identity_policy\": "
-              "\"modeler_parsed_runtime_and_fbx_serializer_records_v1\",\n"
+              "\"modeler_parsed_runtime_and_fbx_serializer_records_v3\",\n"
            << "  \"source\": {\"path\": \""
            << JsonEscape(WidePathToUtf8(gNativeInputPath))
            << "\", \"size\": " << sourceSize
            << ", \"last_write_time_100ns\": " << sourceWriteTime << "},\n"
            << "  \"output\": {\"path\": \""
            << JsonEscape(WidePathToUtf8(gGuiExportPath)) << "\"},\n"
+           << "  \"id_zero_cluster_write\": \""
+           << idZeroClusterWrite
+           << "\",\n"
            << "  \"coordinate_contract\": {"
               "\"native_unit_to_meter\": 0.3048, "
               "\"native_unit_to_solver\": 30.48, "
               "\"blender_xyz_from_native_xyz\": ["
-              "\"x*0.3048\", \"z*0.3048\", \"-y*0.3048\"]},\n"
+              "\"x*0.3048\", \"y*0.3048\", \"z*0.3048\"]},\n"
            << "  \"geometry_count\": "
            << gNativeReceiptGeometries.size() << ",\n"
            << "  \"geometries\": [\n";

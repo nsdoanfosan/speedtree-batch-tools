@@ -1,0 +1,250 @@
+diff --git a/Engine/Source/Developer/NaniteBuilder/Private/Cluster.cpp b/Engine/Source/Developer/NaniteBuilder/Private/Cluster.cpp
+index 09ce258..c161b7d 100644
+--- a/Engine/Source/Developer/NaniteBuilder/Private/Cluster.cpp
++++ b/Engine/Source/Developer/NaniteBuilder/Private/Cluster.cpp
+@@ -1642,6 +1642,161 @@ void FCluster::Voxelize( FClusterDAG& DAG, TArrayView< const FClusterRef > Child
+ 	check( VoxelSize > 0.0f );
+ 	const float RcpVoxelSize = 1.0f / VoxelSize;
+ 
++	// Assembly parts have already built their own voxel hierarchy. When the
++	// final assembly level contains only voxel roots, inherit those bricks and
++	// their attributes instead of returning to the full source triangle scene.
++	// The destination grid is still rebuilt so transformed/overlapping parts can
++	// be combined at the parent LOD; only the redundant triangle ray tracing is
++	// skipped.
++	bool bInheritAssemblyVoxels = !DAG.AssemblyInstanceData.IsEmpty() && !Children.IsEmpty();
++	for( FClusterRef ChildRef : Children )
++	{
++		bInheritAssemblyVoxels &= ChildRef.GetCluster( DAG ).IsVoxel();
++	}
++
++	if( bInheritAssemblyVoxels )
++	{
++		struct FInheritedVoxel
++		{
++			uint32 ClusterIndex;
++			uint32 InstanceIndex;
++			uint32 VertIndex;
++			uint32 BrickIndex;
++			float DistanceSq;
++		};
++
++		TArray< FInheritedVoxel > InheritedVoxels;
++
++		for( FClusterRef ChildRef : Children )
++		{
++			const FCluster& Child = ChildRef.GetCluster( DAG );
++
++			FMatrix44f Transform = FMatrix44f::Identity;
++			if( ChildRef.IsInstance() )
++			{
++				Transform = ChildRef.GetTransform( DAG );
++			}
++
++			for( uint32 BrickIndex = 0; BrickIndex < (uint32)Child.Bricks.Num(); BrickIndex++ )
++			{
++				const FBrick& Brick = Child.Bricks[ BrickIndex ];
++				const uint32 NumVoxels = FMath::CountBits64( Brick.VoxelMask );
++
++				for( uint32 i = 0; i < NumVoxels; i++ )
++				{
++					const uint32 VertIndex = Brick.VertOffset + i;
++					const FVector3f LocalCenter = Child.Verts.GetPosition( VertIndex );
++					FVector3f WorldCenter = LocalCenter;
++					if( ChildRef.IsInstance() )
++					{
++						WorldCenter = Transform.TransformPosition( LocalCenter );
++					}
++
++					FBounds3f VoxelBounds = {
++						LocalCenter - Child.LODError * 0.5f,
++						LocalCenter + Child.LODError * 0.5f
++					};
++					if( ChildRef.IsInstance() )
++					{
++						VoxelBounds = VoxelBounds.TransformBy( Transform );
++					}
++
++					const FIntVector3 MinVoxel = FloorToInt( FVector3f( VoxelBounds.Min ) * RcpVoxelSize );
++					const FIntVector3 MaxVoxel = FloorToInt( FVector3f( VoxelBounds.Max ) * RcpVoxelSize );
++
++					for( int32 z = MinVoxel.Z; z <= MaxVoxel.Z; z++ )
++					{
++						for( int32 y = MinVoxel.Y; y <= MaxVoxel.Y; y++ )
++						{
++							for( int32 x = MinVoxel.X; x <= MaxVoxel.X; x++ )
++							{
++								const FIntVector3 Voxel( x, y, z );
++								const FVector3f DstCenter = ( Voxel + 0.5f ) * VoxelSize;
++								const float DistanceSq = FVector3f::DistSquared( DstCenter, WorldCenter );
++
++								uint32& VoxelIndex = VoxelMap.FindOrAdd( Voxel, VoxelMap.Num() );
++								if( VoxelIndex == (uint32)InheritedVoxels.Num() )
++								{
++									InheritedVoxels.Add( {
++										ChildRef.ClusterIndex,
++										ChildRef.InstanceIndex,
++										VertIndex,
++										BrickIndex,
++										DistanceSq
++									} );
++								}
++								else if( DistanceSq < InheritedVoxels[ VoxelIndex ].DistanceSq )
++								{
++									InheritedVoxels[ VoxelIndex ] = {
++										ChildRef.ClusterIndex,
++										ChildRef.InstanceIndex,
++										VertIndex,
++										BrickIndex,
++										DistanceSq
++									};
++								}
++							}
++						}
++					}
++				}
++			}
++		}
++
++		if( !VoxelMap.IsEmpty() )
++		{
++			for( auto& Voxel : VoxelMap )
++			{
++				const FInheritedVoxel& Source = InheritedVoxels[ Voxel.Value ];
++				const FCluster& Child = DAG.Clusters[ Source.ClusterIndex ];
++
++				const uint32 NewIndex = Verts.AddUninitialized();
++				Voxel.Value = NewIndex;
++
++				CopyAttributes( NewIndex, Source.VertIndex, Child );
++				Verts.GetPosition( NewIndex ) = ( Voxel.Key + 0.5f ) * VoxelSize;
++				MaterialIndexes.Add( Child.MaterialIndexes[ Source.BrickIndex ] );
++
++				if( Source.InstanceIndex != MAX_uint32 )
++				{
++					const FAssemblyInstanceData& InstanceData = DAG.AssemblyInstanceData[ Source.InstanceIndex ];
++					const FMatrix44f NormalTransform = InstanceData.Transform.GetMatrixWithoutScale();
++
++					FVector3f& Normal = Verts.GetNormal( NewIndex );
++					Normal = NormalTransform.TransformVector( Normal ).GetSafeNormal();
++
++					if( Verts.Format.bHasTangents )
++					{
++						FVector3f& TangentX = Verts.GetTangentX( NewIndex );
++						TangentX = NormalTransform.TransformVector( TangentX ).GetSafeNormal();
++					}
++
++					if( Verts.Format.bHasCurveRadius )
++					{
++						Verts.GetCurveRadius( NewIndex ) *= InstanceData.Transform.GetMaximumAxisScale();
++					}
++
++					if( InstanceData.NumBoneInfluences > 0 )
++					{
++						check( Verts.Format.NumBoneInfluences >= InstanceData.NumBoneInfluences );
++						FMemory::Memcpy(
++							Verts.GetBoneInfluences( NewIndex ),
++							&DAG.AssemblyBoneInfluences[ InstanceData.FirstBoneInfluence ],
++							InstanceData.NumBoneInfluences * sizeof( FVector2f ) );
++					}
++					FMemory::Memzero(
++						Verts.GetBoneInfluences( NewIndex ) + InstanceData.NumBoneInfluences,
++						( Verts.Format.NumBoneInfluences - InstanceData.NumBoneInfluences ) * sizeof( FVector2f ) );
++				}
++
++				CorrectAttributesFunctions[ Verts.Format.bHasTangents ][ Verts.Format.bHasCurveRadius ][ Verts.Format.bHasColors ]( Verts.GetAttributes( NewIndex ) );
++			}
++
++			check( MaterialIndexes.Num() > 0 );
++			VoxelsToBricks( VoxelMap );
++			return;
++		}
++	}
++
+ 	for( FClusterRef ChildRef : Children )
+ 	{
+ 		const FCluster& Child = ChildRef.GetCluster( DAG );
+diff --git a/Engine/Source/Developer/NaniteBuilder/Private/ClusterDAG.cpp b/Engine/Source/Developer/NaniteBuilder/Private/ClusterDAG.cpp
+index 07a67e1..9c38290 100644
+--- a/Engine/Source/Developer/NaniteBuilder/Private/ClusterDAG.cpp
++++ b/Engine/Source/Developer/NaniteBuilder/Private/ClusterDAG.cpp
+@@ -994,8 +994,10 @@ void FClusterDAG::GroupVoxelClusters( TArrayView< const FClusterRef > LevelClust
+ 						Group0.Children.Num() < MinGroupSize ||
+ 						Group1.Children.Num() < MinGroupSize;
+ 					bool bTooLarge = Group0.Children.Num() + Group1.Children.Num() > MaxGroupSize;
++					const bool bMixedReferenceKinds =
++						Group0.Children[0].IsInstance() != Group1.Children[0].IsInstance();
+ 
+-					if( bTooSmall && !bTooLarge )
++					if( bTooSmall && !bTooLarge && !bMixedReferenceKinds )
+ 					{
+ 						float Cost = ( Group0.Bounds + Group1.Bounds ).W;
+ 
+@@ -1159,7 +1161,21 @@ void FClusterDAG::ReduceMesh( uint32 MeshIndex )
+ 				MeshInput[ MeshIndex ].Add( FClusterRef( ClusterIndex ) );
+ 		};
+ 		
+-		if( LevelClusters.Num() <= MaxGroupSize )
++		bool bHasInstanceRef = false;
++		bool bHasDirectRef = false;
++		for( FClusterRef ClusterRef : LevelClusters )
++		{
++			bHasInstanceRef |= ClusterRef.IsInstance();
++			bHasDirectRef |= !ClusterRef.IsInstance();
++		}
++		const bool bMixedAssemblyRefs = bHasInstanceRef && bHasDirectRef;
++
++		// The small-level shortcut must not combine a direct base root with
++		// instanced part roots. Such a group owns the base page while also
++		// inheriting the part page ranges, creating a forward/circular streaming
++		// dependency. The normal voxel grouping path keeps those roots separate;
++		// their generated (non-instanced) parents can merge on the next level.
++		if( LevelClusters.Num() <= MaxGroupSize && !bMixedAssemblyRefs )
+ 		{
+ 			int32 GroupIndex = Groups.AddDefaulted();
+ 
+diff --git a/Engine/Source/Developer/NaniteBuilder/Private/NaniteBuilder.cpp b/Engine/Source/Developer/NaniteBuilder/Private/NaniteBuilder.cpp
+index 7b6ac01..260113a 100644
+--- a/Engine/Source/Developer/NaniteBuilder/Private/NaniteBuilder.cpp
++++ b/Engine/Source/Developer/NaniteBuilder/Private/NaniteBuilder.cpp
+@@ -128,6 +128,7 @@ const FString& FBuilderModule::GetVersionString() const
+ 		VersionString.Appendf(TEXT("_METIS_%d_%d_%d"), METIS_VER_MAJOR, METIS_VER_MINOR, METIS_VER_SUBMINOR);
+ 
+ 		VersionString.Appendf( TEXT("%i"), CVarFallbackThreshold.GetValueOnAnyThread() );
++		VersionString.Append( TEXT("_ASSEMBLY_VOXEL_REUSE4") );
+ 		if (bVoxelsSupported)
+ 		{
+ 			VersionString.Appendf( TEXT("_VOXELBONES%d"), NANITE_MAX_VOXEL_ANIMATION_BONE_INFLUENCES );
+@@ -701,6 +702,31 @@ static bool BuildIntermediateResources(
+ 		return false;
+ 	}
+ 
++	// A Voxelize assembly must enter its final reduction from already reduced
++	// voxel roots. Otherwise the base mesh is mixed with voxelized part roots and
++	// the assembly reduction falls back to tracing the full source triangle scene.
++	if (bIsAssembly && DAGSettings.ShapePreservation == ENaniteShapePreservation::Voxelize)
++	{
++		NANITE_BUILD_TIME_LOG_SCOPE(NaniteAssemblyBaseReduce);
++
++		for (int32 MeshIndex = 0; MeshIndex < InputMeshData.TriangleCounts.Num(); MeshIndex++)
++		{
++			Resources.ClusterDAG.ReduceMesh(MeshIndex);
++
++			// ReduceMesh terminates each standalone mesh with a synthetic root group.
++			// The base root is about to become a child of the combined assembly DAG, so
++			// keeping that standalone root would assign the same non-instanced cluster
++			// to two page groups. Preserve the generated voxel hierarchy and root
++			// cluster, but remove only the temporary standalone root wrapper.
++			check(!Resources.ClusterDAG.Groups.IsEmpty());
++			const FClusterGroup& BaseRootGroup = Resources.ClusterDAG.Groups.Last();
++			check(BaseRootGroup.bRoot && BaseRootGroup.MeshIndex == (uint32)MeshIndex);
++			Resources.ClusterDAG.Groups.Pop(EAllowShrinking::No);
++		}
++
++		UE_LOGF(LogStaticMesh, Display, "Nanite Assembly voxel reuse enabled: base and part voxel roots will be regridded without full-scene triangle tracing.");
++	}
++
+ 	if (bIsAssembly)
+ 	{
+ 		NANITE_BUILD_TIME_LOG_SCOPE(NaniteAssemblyBuild);
+

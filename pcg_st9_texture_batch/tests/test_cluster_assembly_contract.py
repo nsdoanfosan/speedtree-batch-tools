@@ -39,6 +39,7 @@ from pcg_cluster_assembly_contract import (
     _canonical_cluster_texture_refs,
     _current_live_pair_covered,
     _normalized_generator_delivery,
+    _physical_target_registry_contract,
     _rendered_provider_material_names,
     _tga_basename_validation,
     _validate_normalized_source_dependency,
@@ -1921,6 +1922,29 @@ class ClusterAssemblyContractTests(unittest.TestCase):
             self.assertEqual(
                 rendered_contract["target_registry_diagnostic"]["status"],
                 "stale_or_missing_for_rendered_full_fbx_role",
+            )
+
+    def test_physical_registry_excludes_deleted_targets_from_live_scope(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir) / "Tree_scotspine"
+            blend = folder / "SK_branch_scotspine_01.blend"
+            current = folder / "SK_tree_scotspine_drop_01.spm"
+            retired = folder / "SK_tree_scotspine_02.spm"
+            folder.mkdir(parents=True)
+            blend.write_bytes(b"blend")
+            current.write_bytes(b"current")
+            save_target_registry(blend, [current, retired])
+
+            contract = _physical_target_registry_contract(blend)
+
+            self.assertEqual(contract["target_spms"], [current.absolute()])
+            self.assertEqual(
+                contract["retired_target_spms"],
+                [retired.absolute()],
+            )
+            self.assertEqual(
+                set(contract["target_keys"]),
+                {os.path.normcase(str(current.absolute()))},
             )
 
     def test_same_delivery_to_several_targets_is_one_role_contract(self):

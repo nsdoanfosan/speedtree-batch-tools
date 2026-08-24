@@ -2086,7 +2086,7 @@ class BlendLiveStatusTests(unittest.TestCase):
         self.assertEqual(reason, "")
         validate_artifacts.assert_called_once()
 
-    def test_live_status_explains_unconnected_managed_atlas(self):
+    def test_live_status_does_not_block_on_unconnected_managed_atlas(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         contract = {
@@ -2100,9 +2100,8 @@ class BlendLiveStatusTests(unittest.TestCase):
         ):
             status = app._blend_status_text(Path("SK_tree_lauraceae_10.spm"))
 
-        self.assertIn("Atlas 연결 확인 필요", status)
-        self.assertIn("기존 재질을 사용 중", status)
-        self.assertIn("연결 후", status)
+        self.assertNotIn("Atlas 연결 확인 필요", status)
+        self.assertNotIn("기존 재질을 사용 중", status)
 
     def test_live_status_reports_missing_speedtree_export_materials(self):
         gui = load_gui_module()
@@ -2134,6 +2133,34 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.assertIn("Assembly 필요", status)
             self.assertIn("재질이 SpeedTree FBX에서 빠짐", status)
             self.assertIn("M_leaf_atlas_01", status)
+
+    def test_material_postcheck_uses_structural_admission_for_name_mismatch(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        exported = {
+            "status": "missing_materials",
+            "missing_materials": ["M_branch_expected"],
+            "actual_materials": ["M_branch_exported_Mat"],
+        }
+        with mock.patch.object(
+            gui,
+            "inspect_spm_leaf_contract",
+            return_value={"status": "managed_connected"},
+        ), mock.patch.object(
+            gui,
+            "inspect_speedtree_material_export",
+            return_value=exported,
+        ), mock.patch.object(
+            gui,
+            "inspect_all_speedtree_material_export",
+            return_value=exported,
+        ):
+            ready, reason = app._material_export_ready(
+                Path("SK_tree_semantic_name_mismatch.spm")
+            )
+
+        self.assertTrue(ready, reason)
+        self.assertEqual(reason, "SpeedTree 재질 export 정상")
 
     def test_texture_preflight_ignores_files_but_keeps_structural_slot_gate(self):
         gui = load_gui_module()
@@ -2204,6 +2231,11 @@ class BlendLiveStatusTests(unittest.TestCase):
                         "empty_material_slots": [],
                         "missing_outputs": [],
                         "missing_materials": ["M_cluster_detached"],
+                        "material_export": {
+                            "status": "missing_materials",
+                            "missing_materials": ["M_cluster_detached"],
+                            "actual_materials": [],
+                        },
                         "vertex_color_contract": {"status": "ok"},
                         "vertex_payload_contract": {"status": "ok"},
                     },
@@ -2223,6 +2255,47 @@ class BlendLiveStatusTests(unittest.TestCase):
             self.assertFalse(ready)
             self.assertIn("M_cluster_detached", reason)
             live_check.assert_not_called()
+
+    def test_texture_preflight_does_not_reblock_diagnostic_name_mismatch(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_tree_material_name_mismatch.spm"
+            write_empty_spm(spm)
+            report = root / "reports" / (
+                "SK_tree_material_name_mismatch_"
+                "speedtree_assembly_pipeline_report_codex.json"
+            )
+            report.parent.mkdir()
+            report.write_text(
+                json.dumps({
+                    "speedtree_pipeline_contract": {},
+                    "texture_normalization": {"status": "ok", "missing": []},
+                    "handoff_preflight": {
+                        "status": "ok",
+                        "empty_material_slots": [],
+                        "missing_outputs": [],
+                        "missing_materials": ["M_branch_expected"],
+                        "material_export": {
+                            "status": "missing_materials",
+                            "missing_materials": ["M_branch_expected"],
+                            "actual_materials": ["M_branch_exported_Mat"],
+                        },
+                        "vertex_color_contract": {"status": "ok"},
+                        "vertex_payload_contract": {"status": "ok"},
+                    },
+                }),
+                encoding="utf-8",
+            )
+            self.set_time(spm, 1_000_000_000)
+            self.set_time(report, 2_000_000_000)
+
+            with mock.patch.object(gui, "validate_preflight_envelope"):
+                ready, reason = app._texture_normalization_ready(spm)
+
+            self.assertTrue(ready, reason)
+            self.assertEqual(reason, "머티리얼 준비 완료 · 텍스처 선택 연결")
 
     def test_new_report_marker_requires_the_versioned_envelope(self):
         gui = load_gui_module()
@@ -6014,7 +6087,7 @@ class BlendLiveStatusTests(unittest.TestCase):
             app._execute_material_preflight.assert_not_called()
             app._run_limited.assert_not_called()
 
-    def test_relation_receipt_drift_refreshes_before_current_owner_skip(self):
+    def test_relation_receipt_drift_does_not_run_pcg_publication(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         with tempfile.TemporaryDirectory() as temporary:
@@ -6075,7 +6148,7 @@ class BlendLiveStatusTests(unittest.TestCase):
                 app._job_blender(str(spm), spm, item)
 
             self.assertEqual(events, ["relation_refresh", "output_state"])
-            app._refresh_canonical_atlas_manifests.assert_called_once_with(spm)
+            app._refresh_canonical_atlas_manifests.assert_not_called()
             app._publish_current_assembly_skip.assert_called_once()
             app._execute_material_preflight.assert_not_called()
 
