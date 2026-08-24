@@ -63,7 +63,7 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         launcher = LAUNCHER_SOURCE.read_text(encoding="utf-8")
         contract = (
             "SPEEDTREE_COLLISION_CLI_CONTRACT="
-            "native-runtime-receipt-v6"
+            "native-runtime-receipt-v8"
         )
 
         self.assertIn(contract, launcher)
@@ -145,7 +145,9 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         self.assertIn("SpeedTree_Modeler+0x6B5185", weight_hook)
         self.assertIn("test r8d, r8d", entry_stub)
         self.assertIn("&gOriginalExportVertexWeights", entry_stub)
-        self.assertIn("Only positive IDs enter compiled hook code", entry_stub)
+        self.assertIn("CaptureNativeReceiptIdZero", entry_stub)
+        self.assertIn("tail-jump to", entry_stub)
+        self.assertIn("IDs enter the compiled weight hook", entry_stub)
         self.assertIn("FbxSkeleton::eLimbNode", source)
         self.assertIn("No spatial lookup or normalization", weight_hook)
 

@@ -36,15 +36,21 @@ def exact_identity_contract(binding_count):
     }
     return {
         "placement_contract": {
-            "version": 2,
-            "identity_policy": "native_modeler_authored_position_receipt_v1",
-            "translation_source": "native_modeler_runtime_receipt",
-            "exact_render_attachment_binding_count": binding_count,
+            "version": 3,
+            "identity_policy": "exact_fbx_vertex_or_native_clipped_origin_v1",
+            "translation_source": (
+                "exact_fbx_attachment_vertex_else_native_receipt"
+            ),
+            "exact_attachment_binding_count": binding_count,
+            "exact_fbx_attachment_binding_count": binding_count,
+            "native_clipped_origin_attachment_binding_count": 0,
             "source_spm": source_spm,
         },
         "attachment_bone_contract": {
             "status": "ready",
-            "policy": "native_modeler_runtime_receipt_v1",
+            "policy": (
+                "native_modeler_runtime_receipt_v2_exact_skeleton_index_zero"
+            ),
             "source_spm": source_spm,
             "receipt": {
                 "path": "C:/target.speedtree_native_receipt.json",

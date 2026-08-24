@@ -12,7 +12,19 @@ from pathlib import Path
 
 
 RECEIPT_KIND = "speedtree_native_export_receipt"
-RECEIPT_SCHEMA_VERSION = 2
+RECEIPT_SCHEMA_VERSION = 3
+LEGACY_RECEIPT_SCHEMA_VERSION = 2
+NATIVE_UNIT_TO_METER = 0.3048
+BLENDER_XYZ_FROM_NATIVE_XYZ = (
+    "x*0.3048",
+    "y*0.3048",
+    "z*0.3048",
+)
+LEGACY_DECLARED_BLENDER_XYZ_FROM_NATIVE_XYZ = (
+    "x*0.3048",
+    "z*0.3048",
+    "-y*0.3048",
+)
 
 
 class NativeReceiptError(RuntimeError):
@@ -45,6 +57,47 @@ def _float3(value, context):
     return row
 
 
+def native_position_to_blender_world(receipt, coordinate):
+    """Convert an exact Modeler runtime position to Blender meter space.
+
+    SpeedTree's runtime node positions and the imported FBX mesh use the same
+    XYZ axis order.  Only the native foot-to-meter unit conversion belongs at
+    this boundary; FBX/Unreal axis conversion happens later.
+    """
+    contract = (receipt or {}).get("coordinate_contract") or {}
+    try:
+        scale = float(contract.get("native_unit_to_meter"))
+        mapping = tuple(contract.get("blender_xyz_from_native_xyz") or ())
+    except (TypeError, ValueError) as exc:
+        raise NativeReceiptError(
+            "native SpeedTree coordinate contract is invalid"
+        ) from exc
+    try:
+        schema_version = int((receipt or {}).get("schema_version") or 0)
+    except (TypeError, ValueError) as exc:
+        raise NativeReceiptError(
+            "native SpeedTree receipt schema is invalid"
+        ) from exc
+    current_contract = (
+        schema_version == RECEIPT_SCHEMA_VERSION
+        and mapping == BLENDER_XYZ_FROM_NATIVE_XYZ
+    )
+    legacy_contract = (
+        schema_version == LEGACY_RECEIPT_SCHEMA_VERSION
+        and mapping == LEGACY_DECLARED_BLENDER_XYZ_FROM_NATIVE_XYZ
+    )
+    if (
+        not math.isfinite(scale)
+        or abs(scale - NATIVE_UNIT_TO_METER) > 1.0e-12
+        or not (current_contract or legacy_contract)
+    ):
+        raise NativeReceiptError(
+            "native SpeedTree coordinate contract is unsupported"
+        )
+    native = _float3(coordinate, "authored node position")
+    return tuple(value * scale for value in native)
+
+
 def load_native_export_receipt(path, *, source_spm=None):
     """Load one fresh native receipt without any SPM-side reconstruction."""
     receipt_path = Path(path).resolve()
@@ -57,7 +110,8 @@ def load_native_export_receipt(path, *, source_spm=None):
     if (
         payload.get("kind") != RECEIPT_KIND
         or payload.get("status") != "ready"
-        or int(payload.get("schema_version") or 0) != RECEIPT_SCHEMA_VERSION
+        or int(payload.get("schema_version") or 0)
+        not in {LEGACY_RECEIPT_SCHEMA_VERSION, RECEIPT_SCHEMA_VERSION}
     ):
         raise NativeReceiptError("native SpeedTree receipt contract is unsupported")
     id_zero_cluster_write = str(
@@ -73,6 +127,18 @@ def load_native_export_receipt(path, *, source_spm=None):
             "native SpeedTree ID-0 cluster-write contract is unsupported"
         )
     payload["id_zero_cluster_write"] = id_zero_cluster_write
+    native_position_to_blender_world(payload, (0.0, 0.0, 0.0))
+    payload["coordinate_contract_interpretation"] = {
+        "status": "exact",
+        "native_axis_order": ["x", "y", "z"],
+        "unit_scale": NATIVE_UNIT_TO_METER,
+        "legacy_declared_axis_map_corrected": (
+            int(payload["schema_version"]) == LEGACY_RECEIPT_SCHEMA_VERSION
+        ),
+        "evidence": (
+            "native runtime positions match imported FBX attachment vertices"
+        ),
+    }
 
     source = payload.get("source") or {}
     source_path = Path(str(source.get("path") or "")).resolve()

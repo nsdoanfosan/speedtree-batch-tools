@@ -910,16 +910,28 @@ void CaptureNativeReceiptProxy(
             };
 
             FbxWeightExportContext probe{};
-            probe.suppressWrite = true;
-            FbxWeightExportContext* previousContext = gFbxWeightExportContext;
-            gFbxWeightExportContext = &probe;
-            gOriginalExportVertexWeights(
-                exporter,
-                authoredSolver,
-                sourceBoneId,
-                vertexIndex,
-                clusterMap);
-            gFbxWeightExportContext = previousContext;
+            if (sourceBoneId == 0) {
+                // The serializer's exact source ID is the authored root.  The
+                // entry stub preserves and executes the stock call unchanged;
+                // this receipt row records that same explicit ownership.
+                probe.additionCount = 1;
+                probe.additions[0] = {
+                    nullptr,
+                    vertexIndex,
+                    1.0,
+                };
+            } else {
+                probe.suppressWrite = true;
+                FbxWeightExportContext* previousContext = gFbxWeightExportContext;
+                gFbxWeightExportContext = &probe;
+                gOriginalExportVertexWeights(
+                    exporter,
+                    authoredSolver,
+                    sourceBoneId,
+                    vertexIndex,
+                    clusterMap);
+                gFbxWeightExportContext = previousContext;
+            }
             if (probe.additionCount > 0) {
                 proxy.influences.push_back({
                     sourceBoneId,
@@ -1102,13 +1114,20 @@ void __fastcall HookedExportVertexWeights(
     }
 }
 
+void __fastcall CaptureNativeReceiptIdZero(
+    void* exporter,
+    const float* position,
+    int sourceBoneId,
+    int vertexIndex,
+    void* clusterMap);
+
 bool BuildExportVertexWeightsEntryStub() {
     if (gExportVertexWeightsEntryStub != nullptr) {
         return true;
     }
     auto* stub = static_cast<unsigned char*>(VirtualAlloc(
         nullptr,
-        96,
+        192,
         MEM_RESERVE | MEM_COMMIT,
         PAGE_EXECUTE_READWRITE));
     if (stub == nullptr) {
@@ -1132,26 +1151,101 @@ bool BuildExportVertexWeightsEntryStub() {
     stub[23] = 0x48;
     stub[24] = 0x89;
     stub[25] = 0x38;
-    // Native ID-0 is an implicit serializer path. Tail-jump straight to the
-    // SpeedTree trampoline so its undocumented caller register/stack state is
-    // untouched. Only positive IDs enter compiled hook code.
+    // Native ID-0 is an implicit serializer path. Capture its exact serializer
+    // record while preserving the caller's volatile state, then tail-jump to
+    // the stock routine with the original stack and registers. Only positive
+    // IDs enter the compiled weight hook.
     stub[26] = 0x45;
     stub[27] = 0x85;
     stub[28] = 0xC0;             // test r8d, r8d
     stub[29] = 0x75;
-    stub[30] = 0x0C;             // jne HookedExportVertexWeights
-    stub[31] = 0x48;
-    stub[32] = 0xB8;
-    *reinterpret_cast<std::uintptr_t*>(stub + 33) =
+    stub[30] = 0x00;             // jne displacement filled below
+    std::size_t cursor = 31;
+    stub[cursor++] = 0x9C;       // pushfq
+    stub[cursor++] = 0x50;       // push rax
+    stub[cursor++] = 0x51;       // push rcx
+    stub[cursor++] = 0x52;       // push rdx
+    stub[cursor++] = 0x41;
+    stub[cursor++] = 0x50;       // push r8
+    stub[cursor++] = 0x41;
+    stub[cursor++] = 0x51;       // push r9
+    stub[cursor++] = 0x41;
+    stub[cursor++] = 0x52;       // push r10
+    stub[cursor++] = 0x41;
+    stub[cursor++] = 0x53;       // push r11
+    stub[cursor++] = 0x48;
+    stub[cursor++] = 0x83;
+    stub[cursor++] = 0xEC;
+    stub[cursor++] = 0x28;       // sub rsp, 0x28
+    stub[cursor++] = 0x48;
+    stub[cursor++] = 0x8B;
+    stub[cursor++] = 0x84;
+    stub[cursor++] = 0x24;
+    *reinterpret_cast<std::uint32_t*>(stub + cursor) = 0x90;
+    cursor += sizeof(std::uint32_t); // mov rax, [rsp+0x90]
+    stub[cursor++] = 0x48;
+    stub[cursor++] = 0x89;
+    stub[cursor++] = 0x44;
+    stub[cursor++] = 0x24;
+    stub[cursor++] = 0x20;       // mov [rsp+0x20], rax
+    stub[cursor++] = 0x48;
+    stub[cursor++] = 0xB8;
+    *reinterpret_cast<std::uintptr_t*>(stub + cursor) =
+        reinterpret_cast<std::uintptr_t>(CaptureNativeReceiptIdZero);
+    cursor += sizeof(std::uintptr_t);
+    stub[cursor++] = 0xFF;
+    stub[cursor++] = 0xD0;       // call rax
+    stub[cursor++] = 0x48;
+    stub[cursor++] = 0x83;
+    stub[cursor++] = 0xC4;
+    stub[cursor++] = 0x28;       // add rsp, 0x28
+    stub[cursor++] = 0x41;
+    stub[cursor++] = 0x5B;       // pop r11
+    stub[cursor++] = 0x41;
+    stub[cursor++] = 0x5A;       // pop r10
+    stub[cursor++] = 0x41;
+    stub[cursor++] = 0x59;       // pop r9
+    stub[cursor++] = 0x41;
+    stub[cursor++] = 0x58;       // pop r8
+    stub[cursor++] = 0x5A;       // pop rdx
+    stub[cursor++] = 0x59;       // pop rcx
+    stub[cursor++] = 0x58;       // pop rax
+    stub[cursor++] = 0x9D;       // popfq
+    stub[cursor++] = 0x48;
+    stub[cursor++] = 0xB8;
+    *reinterpret_cast<std::uintptr_t*>(stub + cursor) =
         reinterpret_cast<std::uintptr_t>(&gOriginalExportVertexWeights);
-    stub[41] = 0xFF;
-    stub[42] = 0x20;             // jmp qword ptr [rax]
+    cursor += sizeof(std::uintptr_t);
+    stub[cursor++] = 0xFF;
+    stub[cursor++] = 0x20;       // jmp qword ptr [rax]
+    const std::size_t positiveHookOffset = cursor;
+    const std::size_t positiveBranchDistance = positiveHookOffset - 31;
+    if (positiveBranchDistance > 0x7F) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        Log("FBX vertex-record entry stub positive branch exceeded rel8");
+        return false;
+    }
+    stub[30] = static_cast<unsigned char>(positiveBranchDistance);
     WriteAbsoluteJump(
-        stub + 43,
+        stub + positiveHookOffset,
         reinterpret_cast<const void*>(HookedExportVertexWeights));
-    FlushInstructionCache(GetCurrentProcess(), stub, 55);
+    FlushInstructionCache(GetCurrentProcess(), stub, positiveHookOffset + 12);
     gExportVertexWeightsEntryStub = stub;
     return true;
+}
+
+void __fastcall CaptureNativeReceiptIdZero(
+    void* exporter,
+    const float* position,
+    int sourceBoneId,
+    int vertexIndex,
+    void* clusterMap) {
+    CaptureNativeReceiptProxy(
+        exporter,
+        position,
+        sourceBoneId,
+        vertexIndex,
+        clusterMap);
 }
 
 void FreeExportVertexWeightsEntryStub() {
@@ -4636,11 +4730,11 @@ bool WriteNativeReceipt() {
                : "native_exact_bone_record");
     stream << std::setprecision(17);
     stream << "{\n"
-           << "  \"schema_version\": 2,\n"
+           << "  \"schema_version\": 3,\n"
            << "  \"kind\": \"speedtree_native_export_receipt\",\n"
            << "  \"status\": \"ready\",\n"
            << "  \"identity_policy\": "
-              "\"modeler_parsed_runtime_and_fbx_serializer_records_v1\",\n"
+              "\"modeler_parsed_runtime_and_fbx_serializer_records_v3\",\n"
            << "  \"source\": {\"path\": \""
            << JsonEscape(WidePathToUtf8(gNativeInputPath))
            << "\", \"size\": " << sourceSize
@@ -4654,7 +4748,7 @@ bool WriteNativeReceipt() {
               "\"native_unit_to_meter\": 0.3048, "
               "\"native_unit_to_solver\": 30.48, "
               "\"blender_xyz_from_native_xyz\": ["
-              "\"x*0.3048\", \"z*0.3048\", \"-y*0.3048\"]},\n"
+              "\"x*0.3048\", \"y*0.3048\", \"z*0.3048\"]},\n"
            << "  \"geometry_count\": "
            << gNativeReceiptGeometries.size() << ",\n"
            << "  \"geometries\": [\n";

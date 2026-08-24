@@ -18,7 +18,6 @@ if str(SK_BATCH) not in sys.path:
 from cluster_assembly_builder import (  # noqa: E402
     ClusterAssemblyBuildError,
     ROLE_ORDER,
-    attachment_locked_safe_transform,
     build_blender_assembly_inputs,
     build_unreal_ingest_plan,
     compose_similarity_with_relative_matrix,
@@ -26,7 +25,6 @@ from cluster_assembly_builder import (  # noqa: E402
     derive_endpoint_uniform_similarity_transform,
     file_fingerprint,
     fit_trs_transform,
-    fit_uniform_similarity_transform,
     gate_assembly_transform_residuals,
     lowest_common_ancestor,
     make_skeleton_snapshot,
@@ -519,9 +517,8 @@ class ExactNativeAttachmentInfluenceTests(unittest.TestCase):
     @staticmethod
     def _skeleton():
         return make_skeleton_snapshot([
-            {"index": 0, "name": "Armature", "parent_index": -1},
-            {"index": 1, "name": "NativeRoot", "parent_index": 0, "parent_name": "Armature"},
-            {"index": 2, "name": "CapturedChild", "parent_index": 1, "parent_name": "NativeRoot"},
+            {"index": 0, "name": "Root", "parent_index": -1},
+            {"index": 1, "name": "CapturedChild", "parent_index": 0, "parent_name": "Root"},
         ])
 
     @staticmethod
@@ -583,12 +580,13 @@ class ExactNativeAttachmentInfluenceTests(unittest.TestCase):
         )
 
         self.assertEqual(influences, [
-            {"bone": "NativeRoot", "weight": 0.25},
+            {"bone": "Root", "weight": 0.25},
             {"bone": "CapturedChild", "weight": 0.75},
         ])
         self.assertEqual(
             source["policy"],
-            "native_modeler_authored_proxy_weights_v1",
+            "native_modeler_authored_proxy_weights_v2_"
+            "exact_skeleton_index_zero",
         )
         self.assertEqual(source["geometry_ordinal"], 4)
         self.assertEqual(source["native_vertex_indices"], [3])
@@ -615,7 +613,7 @@ class ExactNativeAttachmentInfluenceTests(unittest.TestCase):
         self.assertEqual(source["unowned_native_vertex_count"], 2)
         self.assertIsNone(source["target_attachment_vertex_index"])
 
-    def test_multi_root_uses_exact_instance_source_bone(self):
+    def test_native_root_uses_exact_skeleton_index_zero_with_multiple_children(self):
         skeleton = make_skeleton_snapshot([
             {"index": 0, "name": "Root", "parent_index": -1},
             {
@@ -647,12 +645,12 @@ class ExactNativeAttachmentInfluenceTests(unittest.TestCase):
             "multi-root native component",
         )
 
-        self.assertEqual(influences[0]["bone"], "NativeRootB")
+        self.assertEqual(influences[0]["bone"], "Root")
         self.assertEqual(source["source_bone_id"], 7)
-        self.assertEqual(source["native_root_bone"], "NativeRootB")
+        self.assertEqual(source["native_root_bone"], "Root")
         self.assertEqual(
             source["native_root_resolution"],
-            "exact_instance_source_bone",
+            "exact_native_fbx_skeleton_index_zero",
         )
 
     def test_rejects_component_spanning_native_geometries(self):
@@ -1065,6 +1063,55 @@ class ComponentTopologyTests(unittest.TestCase):
             )
         self.assertIs(selected_after_larger_clip, prototype)
 
+    def test_speedtree_boundary_retriangulation_uses_unique_exact_face_identity(self):
+        source_component = object()
+        other_component = object()
+        target_component = object()
+        prototype = {
+            "object": SimpleNamespace(data=object()),
+            "component": source_component,
+        }
+        other = {
+            "object": SimpleNamespace(data=object()),
+            "component": other_component,
+        }
+        source_faces = Counter({
+            ("kept", index): 1 for index in range(44)
+        })
+        source_faces.update({
+            ("clipped_source", index): 1 for index in range(6)
+        })
+        target_faces = Counter({
+            ("kept", index): 1 for index in range(44)
+        })
+        target_faces.update({
+            ("new_boundary", index): 1 for index in range(6)
+        })
+        other_faces = Counter({
+            ("other", index): 1 for index in range(50)
+        })
+
+        def select_counter(_mesh, component):
+            if component is source_component:
+                return source_faces
+            if component is other_component:
+                return other_faces
+            return target_faces
+
+        with mock.patch(
+            "cluster_assembly_builder._component_signature",
+            return_value="target",
+        ), mock.patch(
+            "cluster_assembly_builder._component_uv_face_counter",
+            side_effect=select_counter,
+        ):
+            selected = _normalized_prototype_for_component(
+                {"source": prototype, "other": other},
+                object(),
+                target_component,
+            )
+        self.assertIs(selected, prototype)
+
     def test_speedtree_two_sided_render_matches_clipped_normalized_prototype(self):
         source_component = object()
         target_component = object()
@@ -1181,10 +1228,36 @@ class ComponentTopologyTests(unittest.TestCase):
             self.assertEqual(source_indices, [3, 5, 4])
             self.assertEqual(
                 evidence["policy"],
-                "all_candidates_topology_disambiguated_fail_closed_v1",
+                "exact_surviving_uv_identity_fail_closed_v2",
             )
             resolved.append(source_indices)
         self.assertEqual(resolved[0], resolved[1])
+
+    def test_new_clipped_boundary_uv_is_not_used_as_correspondence(self):
+        source = seam_split_test_mesh(False)
+        target = seam_split_test_mesh(False)
+        target.uv_layers.active.data[1].uv.x = 0.75
+        target.uv_layers.active.data[1].uv.y = 0.125
+        source_component = _component_groups(source, [0, 1])[0]
+        target_component = _component_groups(target, [0, 1])[0]
+
+        source_indices, target_indices, evidence = (
+            _ordered_cross_object_correspondence(
+                SimpleNamespace(data=source),
+                source_component,
+                SimpleNamespace(data=target),
+                target_component,
+                include_evidence=True,
+            )
+        )
+
+        self.assertEqual(len(source_indices), 3)
+        self.assertEqual(len(target_indices), 3)
+        self.assertEqual(evidence["target_only_uv_key_count"], 1)
+        self.assertEqual(
+            evidence["policy"],
+            "exact_surviving_uv_identity_fail_closed_v2",
+        )
 
     def test_distinct_duplicate_uv_without_unique_evidence_fails_closed(self):
         source = stacked_uv_test_mesh(identical_faces=True)
@@ -3243,59 +3316,6 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
             )
             self.assertNotIn("Plan", json.dumps(plan))
 
-    def test_uniform_similarity_fit_is_stable_for_planar_cards(self):
-        source = [
-            [-1.0, -1.0, 0.0],
-            [1.0, -1.0, 0.0],
-            [1.0, 1.0, 0.0],
-            [-1.0, 1.0, 0.0],
-        ]
-        target = [
-            [5.0 - point[1] * 2.5, -2.0 + point[0] * 2.5, 7.0]
-            for point in source
-        ]
-        transform = fit_uniform_similarity_transform(source, target)
-        self.assertEqual(transform["fit_mode"], "uniform_similarity_3d")
-        self.assertLess(transform["trs_relative_rms"], 1.0e-10)
-        self.assertEqual(transform["scale"], [2.5, 2.5, 2.5])
-        self.assertAlmostEqual(transform["translation"][0], 5.0, places=8)
-        self.assertAlmostEqual(transform["translation"][1], -2.0, places=8)
-        self.assertAlmostEqual(transform["translation"][2], 7.0, places=8)
-
-    def test_uniform_similarity_fit_locks_authored_root_on_deformed_plan(self):
-        source = [
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [1.0, 1.0, 0.0],
-            [0.0, 1.0, 0.0],
-        ]
-        target = [
-            [5.0, -2.0, 7.0],
-            [7.0, -2.0, 7.0],
-            [7.0, 1.0, 7.5],
-            [5.0, 1.0, 7.0],
-        ]
-        transform = fit_uniform_similarity_transform(
-            source,
-            target,
-            source_attachment=source[0],
-            target_attachment=target[0],
-        )
-        self.assertEqual(
-            transform["fit_mode"],
-            "uniform_similarity_3d_attachment_locked",
-        )
-        self.assertLess(transform["attachment_pivot_error"], 1.0e-12)
-        self.assertEqual(transform["translation"], target[0])
-        self.assertEqual(
-            transform["trs_relative_rms"],
-            transform["similarity_relative_rms"],
-        )
-        self.assertLess(
-            transform["affine_relative_rms"],
-            transform["similarity_relative_rms"],
-        )
-
     def test_endpoint_frame_locks_exact_attachment_pivot_and_preserves_rigid_plan(self):
         source = [
             [0.0, 0.0, 0.0],
@@ -3345,20 +3365,6 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
         self.assertEqual(transform["translation"], [5.0, -2.0, 7.0])
         self.assertLess(transform["attachment_pivot_error"], 1.0e-12)
         self.assertGreater(transform["similarity_relative_rms"], 0.0)
-
-    def test_safe_fallback_keeps_export_attached_with_uniform_scale(self):
-        transform = attachment_locked_safe_transform(
-            [1.0, 2.0, 3.0], "endpoint unavailable"
-        )
-        self.assertEqual(transform["translation"], [1.0, 2.0, 3.0])
-        self.assertEqual(transform["scale"], [1.0, 1.0, 1.0])
-        self.assertEqual(transform["rotation_xyzw"], [0.0, 0.0, 0.0, 1.0])
-        gate = gate_assembly_transform_residuals(
-            transform,
-            {"part_asset": "SK_part"},
-            block_geometry=False,
-        )
-        self.assertEqual(gate["status"], "warning")
 
     def test_residual_ready_gate_checks_pivot_and_all_metrics(self):
         transform = {

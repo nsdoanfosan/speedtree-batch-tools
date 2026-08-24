@@ -207,11 +207,11 @@ def validate_assembly_result(report_path, target):
     if report.get("status") != "ok":
         problems.append("assembly_not_ok")
     if (
-        placement.get("version") != 2
+        placement.get("version") != 3
         or placement.get("identity_policy")
-        != "native_modeler_authored_position_receipt_v1"
+        != "exact_fbx_vertex_or_native_clipped_origin_v1"
         or placement.get("translation_source")
-        != "native_modeler_runtime_receipt"
+        != "exact_fbx_attachment_vertex_else_native_receipt"
     ):
         problems.append("assembly_binding_policy_not_current")
     if any(
@@ -240,7 +240,7 @@ def validate_assembly_result(report_path, target):
     if (
         attachment_bones.get("status") != "ready"
         or attachment_bones.get("policy")
-        != "native_modeler_runtime_receipt_v1"
+        != "native_modeler_runtime_receipt_v2_exact_skeleton_index_zero"
         or declared_attachment_bone_count <= 0
         or generated_instance_count <= 0
         or not native_receipt.get("sha256")
@@ -267,12 +267,27 @@ def validate_assembly_result(report_path, target):
     if not parts or binding_count <= 0:
         problems.append("assembly_manifest_has_no_parts_or_bindings")
     exact_binding_count = int(
-        placement.get("exact_render_attachment_binding_count") or 0
+        placement.get("exact_attachment_binding_count") or 0
+    )
+    exact_fbx_binding_count = int(
+        placement.get("exact_fbx_attachment_binding_count") or 0
+    )
+    native_clipped_origin_binding_count = int(
+        placement.get("native_clipped_origin_attachment_binding_count") or 0
     )
     if exact_binding_count != binding_count:
         problems.append(
             "exact_attachment_binding_count_mismatch:"
             f"{exact_binding_count}!={binding_count}"
+        )
+    if (
+        exact_fbx_binding_count + native_clipped_origin_binding_count
+        != exact_binding_count
+    ):
+        problems.append(
+            "exact_attachment_source_count_mismatch:"
+            f"{exact_fbx_binding_count}+{native_clipped_origin_binding_count}"
+            f"!={exact_binding_count}"
         )
     return {
         "ok": not problems,
