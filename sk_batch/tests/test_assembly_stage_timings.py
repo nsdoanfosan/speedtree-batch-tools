@@ -110,6 +110,14 @@ def write_native_receipt(spm, path):
                 stat.st_mtime_ns // 100 + 116444736000000000
             ),
         },
+        "coordinate_contract": {
+            "native_unit_to_meter": 0.3048,
+            "blender_xyz_from_native_xyz": [
+                "x*0.3048",
+                "z*0.3048",
+                "-y*0.3048",
+            ],
+        },
         "geometry_count": 1,
         "geometries": [{"ordinal": 0, "vertex_count": 1}],
         "bones": [],
