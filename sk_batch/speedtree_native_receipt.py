@@ -12,7 +12,8 @@ from pathlib import Path
 
 
 RECEIPT_KIND = "speedtree_native_export_receipt"
-RECEIPT_SCHEMA_VERSION = 3
+RECEIPT_SCHEMA_VERSION = 5
+PREVIOUS_RECEIPT_SCHEMA_VERSION = 3
 LEGACY_RECEIPT_SCHEMA_VERSION = 2
 NATIVE_UNIT_TO_METER = 0.3048
 BLENDER_XYZ_FROM_NATIVE_XYZ = (
@@ -57,6 +58,14 @@ def _float3(value, context):
     return row
 
 
+def _unit_float3(value, context):
+    row = _float3(value, context)
+    length = math.sqrt(sum(item * item for item in row))
+    if abs(length - 1.0) > 2.0e-5:
+        raise NativeReceiptError(f"{context} is not a unit direction")
+    return row
+
+
 def native_position_to_blender_world(receipt, coordinate):
     """Convert an exact Modeler runtime position to Blender meter space.
 
@@ -79,7 +88,10 @@ def native_position_to_blender_world(receipt, coordinate):
             "native SpeedTree receipt schema is invalid"
         ) from exc
     current_contract = (
-        schema_version == RECEIPT_SCHEMA_VERSION
+        schema_version in {
+            PREVIOUS_RECEIPT_SCHEMA_VERSION,
+            RECEIPT_SCHEMA_VERSION,
+        }
         and mapping == BLENDER_XYZ_FROM_NATIVE_XYZ
     )
     legacy_contract = (
@@ -98,6 +110,12 @@ def native_position_to_blender_world(receipt, coordinate):
     return tuple(value * scale for value in native)
 
 
+def native_tangent_to_blender_world(receipt, direction):
+    """Return Modeler's exact runtime tangent in Blender's matching XYZ axes."""
+    native_position_to_blender_world(receipt, (0.0, 0.0, 0.0))
+    return _unit_float3(direction, "authored node tangent")
+
+
 def load_native_export_receipt(path, *, source_spm=None):
     """Load one fresh native receipt without any SPM-side reconstruction."""
     receipt_path = Path(path).resolve()
@@ -111,9 +129,21 @@ def load_native_export_receipt(path, *, source_spm=None):
         payload.get("kind") != RECEIPT_KIND
         or payload.get("status") != "ready"
         or int(payload.get("schema_version") or 0)
-        not in {LEGACY_RECEIPT_SCHEMA_VERSION, RECEIPT_SCHEMA_VERSION}
+        not in {
+            LEGACY_RECEIPT_SCHEMA_VERSION,
+            PREVIOUS_RECEIPT_SCHEMA_VERSION,
+            RECEIPT_SCHEMA_VERSION,
+        }
     ):
         raise NativeReceiptError("native SpeedTree receipt contract is unsupported")
+    if (
+        int(payload["schema_version"]) == RECEIPT_SCHEMA_VERSION
+        and payload.get("identity_policy")
+        != "modeler_runtime_pose_tangent_and_fbx_serializer_records_v5"
+    ):
+        raise NativeReceiptError(
+            "native SpeedTree receipt identity policy is unsupported"
+        )
     id_zero_cluster_write = str(
         payload.get("id_zero_cluster_write") or "legacy_unreported"
     )
@@ -240,6 +270,11 @@ def load_native_export_receipt(path, *, source_spm=None):
             checked["authored_position_native"] = _float3(
                 row.get("authored_position_native"), "authored node position"
             )
+            if int(payload["schema_version"]) == RECEIPT_SCHEMA_VERSION:
+                checked["authored_tangent_native_unit"] = _unit_float3(
+                    row.get("authored_tangent_native_unit"),
+                    "authored node tangent",
+                )
             influences = []
             for influence in row.get("authored_position_influences") or []:
                 try:
@@ -345,6 +380,7 @@ def exact_generated_instance(receipt, geometry_ordinal, vertex_indices):
                     "parent_guid",
                     "generator_guid",
                     "authored_position_native",
+                    "authored_tangent_native_unit",
                     "authored_position_influences",
                 )
                 if any(first.get(field) != row.get(field) for field in identity_fields):

@@ -36,11 +36,24 @@ def exact_identity_contract(binding_count):
     }
     return {
         "placement_contract": {
-            "version": 3,
+            "version": 9,
             "identity_policy": "exact_fbx_vertex_or_native_clipped_origin_v1",
             "translation_source": (
                 "exact_fbx_attachment_vertex_else_native_receipt"
             ),
+            "rotation_uniform_scale_source": (
+                "exact_modeler_runtime_tangent_and_uv_plan_line_length_v1"
+            ),
+            "exact_plan_line": {
+                "selection_policy": (
+                    "unique_source_and_target_uv_triangles_containing_exact_"
+                    "authored_line_endpoint_v1"
+                ),
+                "frame_policy": (
+                    "runtime_pose_tangent_preserve_plan_roll_and_exact_uv_length"
+                ),
+                "nearest_or_farthest_search": False,
+            },
             "exact_attachment_binding_count": binding_count,
             "exact_fbx_attachment_binding_count": binding_count,
             "native_clipped_origin_attachment_binding_count": 0,
@@ -49,7 +62,8 @@ def exact_identity_contract(binding_count):
         "attachment_bone_contract": {
             "status": "ready",
             "policy": (
-                "native_modeler_runtime_receipt_v2_exact_skeleton_index_zero"
+                "native_modeler_runtime_receipt_v5_exact_pose_"
+                "skeleton_index_zero"
             ),
             "source_spm": source_spm,
             "receipt": {

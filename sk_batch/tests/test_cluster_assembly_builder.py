@@ -19,13 +19,13 @@ from cluster_assembly_builder import (  # noqa: E402
     ClusterAssemblyBuildError,
     ROLE_ORDER,
     build_blender_assembly_inputs,
+    build_unreal_nanite_assembly,
     build_unreal_ingest_plan,
     compose_similarity_with_relative_matrix,
     content_build_decision,
-    derive_endpoint_uniform_similarity_transform,
+    derive_exact_plan_line_transform,
+    derive_exact_unreal_import_bone_name_map,
     file_fingerprint,
-    fit_trs_transform,
-    gate_assembly_transform_residuals,
     lowest_common_ancestor,
     make_skeleton_snapshot,
     snapshot_blender_armature,
@@ -59,14 +59,12 @@ from cluster_assembly_builder import (  # noqa: E402
     _validate_role_component_claims,
     _vertex_descriptors,
     validate_binding_hierarchy,
-    validate_generated_assembly_reference_pose_sync,
     validate_manifest_artifacts,
     validate_normalized_prototype_unit_contract,
     validate_unreal_asset_contract,
     validate_unreal_bounds_contract,
     validate_unreal_normalized_prototype_bounds,
     validate_wind_json_against_skeleton,
-    validate_persisted_residual_gate,
     validate_file_fingerprint,
 )
 
@@ -80,6 +78,68 @@ class FakeEditorProperties:
 
     def set_editor_property(self, name, value):
         self.values[name] = value
+
+
+class UnrealNaniteAssemblyCompilationTests(unittest.TestCase):
+    class FakeSystemLibrary:
+        value = 1
+        calls = []
+
+        @classmethod
+        def reset(cls, value=1):
+            cls.value = value
+            cls.calls = []
+
+        @classmethod
+        def get_console_variable_int_value(cls, name):
+            cls.calls.append(("get", name, cls.value))
+            return cls.value
+
+        @classmethod
+        def execute_console_command(cls, _world, command):
+            cls.calls.append(("execute", command))
+            if command.startswith("Editor.AsyncSkinnedAssetCompilation "):
+                cls.value = int(command.rsplit(" ", 1)[1])
+
+    def test_build_disables_async_compilation_and_restores_it(self):
+        self.FakeSystemLibrary.reset(value=1)
+        fake_unreal = SimpleNamespace(SystemLibrary=self.FakeSystemLibrary)
+        with mock.patch(
+            "cluster_assembly_builder._build_unreal_nanite_assembly_synchronous",
+            return_value={"status": "ok"},
+        ) as inner:
+            result = build_unreal_nanite_assembly(fake_unreal, {}, {})
+
+        inner.assert_called_once_with(fake_unreal, {}, {})
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(
+            result["skinned_asset_compilation"]["during_build"],
+            0,
+        )
+        self.assertEqual(result["skinned_asset_compilation"]["restored"], 1)
+        commands = [
+            row[1] for row in self.FakeSystemLibrary.calls if row[0] == "execute"
+        ]
+        self.assertEqual(
+            commands,
+            [
+                "Editor.AsyncSkinnedAssetCompilationFinishAll",
+                "Editor.AsyncSkinnedAssetCompilation 0",
+                "Editor.AsyncSkinnedAssetCompilationFinishAll",
+                "Editor.AsyncSkinnedAssetCompilation 1",
+            ],
+        )
+
+    def test_build_restores_async_compilation_after_failure(self):
+        self.FakeSystemLibrary.reset(value=2)
+        fake_unreal = SimpleNamespace(SystemLibrary=self.FakeSystemLibrary)
+        with mock.patch(
+            "cluster_assembly_builder._build_unreal_nanite_assembly_synchronous",
+            side_effect=RuntimeError("build failed"),
+        ), self.assertRaisesRegex(RuntimeError, "build failed"):
+            build_unreal_nanite_assembly(fake_unreal, {}, {})
+
+        self.assertEqual(self.FakeSystemLibrary.value, 2)
 
 
 class FinalAssemblyNanitePolicyTests(unittest.TestCase):
@@ -472,45 +532,37 @@ class AssemblyBaseRoleExclusionTests(unittest.TestCase):
         )
 
 
-class GeneratedAssemblyReferencePoseSyncTests(unittest.TestCase):
-    def test_accepts_changed_pose_as_generated_output(self):
-        result = validate_generated_assembly_reference_pose_sync({
-            "success": True,
-            "changed": True,
-            "before_mismatch_index": 14,
-            "after_mismatch_index": -1,
-            "before_mesh_transform": {
-                "translation": [-206.443969727, -127.724121094, -81.055458069],
-            },
-            "target_skeleton_transform": {
-                "translation": [-206.444091797, -127.722900391, -81.055458069],
-            },
-        })
-
-        self.assertTrue(result["changed_pose_accepted"])
-        self.assertEqual(
-            result["synchronization_contract"],
-            "generated_assembly_pose_sync_attempted_v1",
+class ExactUnrealImportBoneNameMapTests(unittest.TestCase):
+    def test_maps_dropped_armature_wrapper_by_proven_index_offset(self):
+        mapping, report = derive_exact_unreal_import_bone_name_map(
+            ["Armature", "Root", "Bone_1_Start", "Bone_1_End"],
+            ["Root", "Bone_1_Start", "Bone_1_End"],
         )
+        self.assertIsNone(mapping["Armature"])
+        self.assertEqual(mapping["Root"], "Root")
+        self.assertEqual(report["index_offset"], -1)
+        self.assertFalse(report["approximation_used"])
 
-    def test_remaining_mismatch_is_diagnostic_not_a_gate(self):
-        result = validate_generated_assembly_reference_pose_sync({
-            "success": True,
-            "changed": True,
-            "before_mismatch_index": 14,
-            "after_mismatch_index": 14,
-        })
-        self.assertTrue(result["changed_pose_accepted"])
+    def test_maps_importer_root_collision_renames_by_exact_index(self):
+        mapping, report = derive_exact_unreal_import_bone_name_map(
+            ["Armature", "Root", "Bone_1_Start", "Bone_1_End", "Bone_2_End"],
+            ["root", "Root1", "Bone_1_Start", "Bone_1_End", "Bone_2_End"],
+        )
+        self.assertEqual(mapping["Armature"], "root")
+        self.assertEqual(mapping["Root"], "Root1")
+        self.assertEqual(report["index_offset"], 0)
+        self.assertEqual(len(report["renamed_by_unreal_import"]), 2)
+        self.assertFalse(report["approximation_used"])
 
-    def test_rejects_failed_sync(self):
+    def test_rejects_a_mid_hierarchy_deletion(self):
         with self.assertRaisesRegex(
             ClusterAssemblyBuildError,
-            "could not be synchronized",
+            "changed bone order",
         ):
-            validate_generated_assembly_reference_pose_sync({
-                "success": False,
-                "error": "provider failed",
-            })
+            derive_exact_unreal_import_bone_name_map(
+                ["Root", "A", "B", "C"],
+                ["Root", "B", "C"],
+            )
 
 
 class ExactNativeAttachmentInfluenceTests(unittest.TestCase):
@@ -533,6 +585,7 @@ class ExactNativeAttachmentInfluenceTests(unittest.TestCase):
                 "parent_guid": "parent-guid",
                 "generator_guid": "generator-guid",
                 "authored_position_native": [1.0, 2.0, 3.0],
+                "authored_tangent_native_unit": [0.0, 1.0, 0.0],
                 "vertex_ranges": [(2, 7)],
                 "authored_position_influences": [
                     {
@@ -2140,7 +2193,7 @@ class PhysicalProductionContractTests(unittest.TestCase):
         transform["fit_mode"] = "uniform_similarity_3d"
         with self.assertRaisesRegex(
             ClusterAssemblyBuildError,
-            "uniform-similarity transforms",
+            "exact authored uniform-scale transforms",
         ):
             validate_normalized_prototype_unit_contract(manifest)
 
@@ -2160,7 +2213,7 @@ class PhysicalProductionContractTests(unittest.TestCase):
         ]
         with self.assertRaisesRegex(
             ClusterAssemblyBuildError,
-            "uniform-similarity transforms",
+            "exact authored uniform-scale transforms",
         ):
             validate_normalized_prototype_unit_contract(manifest)
 
@@ -3316,34 +3369,57 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
             )
             self.assertNotIn("Plan", json.dumps(plan))
 
-    def test_endpoint_frame_locks_exact_attachment_pivot_and_preserves_rigid_plan(self):
+    def test_exact_plan_line_uses_runtime_tangent_and_uv_length_separately(self):
         source = [
             [0.0, 0.0, 0.0],
             [2.0, 0.0, 0.0],
             [1.0, 0.5, 0.0],
             [1.0, -0.5, 0.0],
         ]
+        origin = [5.0, -2.0, 7.0]
+        axis_x = [1.0, 0.0, 0.0]
+        axis_y = [0.0, 0.0, 1.0]
+        scale = 3.0
         target = [
-            [5.0 - point[1] * 3.0, -2.0 + point[0] * 3.0, 7.0]
+            [
+                origin[axis]
+                + scale * (
+                    point[0] * axis_x[axis] + point[1] * axis_y[axis]
+                )
+                for axis in range(3)
+            ]
             for point in source
         ]
-        transform = derive_endpoint_uniform_similarity_transform(
+        transform = derive_exact_plan_line_transform(
             source,
             target,
-            source_attachment=[0.0, 0.0, 0.0],
-            target_attachment=[5.0, -2.0, 7.0],
+            source_attachment=source[0],
+            target_attachment=target[0],
+            source_line_length=0.5,
+            target_line_endpoint=[6.5, -2.0, 7.0],
+            target_tangent=axis_y,
         )
-        self.assertEqual(transform["translation"], [5.0, -2.0, 7.0])
-        self.assertEqual(transform["scale"], [3.0, 3.0, 3.0])
+        self.assertEqual(transform["translation"], origin)
+        self.assertEqual(transform["scale"], [scale, scale, scale])
         self.assertLess(transform["attachment_pivot_error"], 1.0e-12)
-        self.assertLess(transform["endpoint_error"], 1.0e-12)
         self.assertLess(transform["similarity_relative_rms"], 1.0e-12)
         self.assertEqual(
             transform["construction_mode"],
-            "exact_attachment_pivot_plus_surviving_root_tip_frame_v2",
+            "exact_attachment_runtime_tangent_and_uv_plan_length_v1",
+        )
+        self.assertEqual(
+            transform["frame_evidence"]["rotation_policy"],
+            "minimum_local_positive_y_to_exact_modeler_runtime_tangent_"
+            "preserve_normalized_plan_roll",
+        )
+        self.assertAlmostEqual(
+            transform["frame_evidence"][
+                "uv_scale_axis_to_runtime_tangent_degrees_diagnostic_only"
+            ],
+            90.0,
         )
 
-    def test_endpoint_frame_does_not_move_pivot_to_fit_nonrigid_curl(self):
+    def test_exact_plan_line_does_not_move_pivot_to_fit_other_vertices(self):
         source = [
             [0.0, 0.0, 0.0],
             [2.0, 0.0, 0.0],
@@ -3353,116 +3429,39 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
         target = [
             [5.0, -2.0, 7.0],
             [11.0, -2.0, 7.0],
-            [8.0, -0.5, 7.2],
-            [8.0, -3.5, 6.8],
+            [8.0, -0.5, 7.0],
+            [8.0, -3.5, 8.0],
         ]
-        transform = derive_endpoint_uniform_similarity_transform(
+        transform = derive_exact_plan_line_transform(
             source,
             target,
-            source_attachment=[0.0, 0.0, 0.0],
-            target_attachment=[5.0, -2.0, 7.0],
+            source_attachment=source[0],
+            target_attachment=target[0],
+            source_line_length=0.5,
+            target_line_endpoint=[5.0, -0.5, 7.0],
+            target_tangent=[0.0, 1.0, 0.0],
         )
         self.assertEqual(transform["translation"], [5.0, -2.0, 7.0])
         self.assertLess(transform["attachment_pivot_error"], 1.0e-12)
         self.assertGreater(transform["similarity_relative_rms"], 0.0)
 
-    def test_residual_ready_gate_checks_pivot_and_all_metrics(self):
+    def test_exact_plan_line_summary_has_no_acceptance_gate(self):
         transform = {
-            "attachment_pivot_error": 0.0,
-            "similarity_relative_rms": 0.009,
-            "trs_relative_rms": 0.009,
-            "affine_relative_rms": 0.001,
-            "placement_source": "test",
+            "similarity_relative_rms": 0.125,
+            "trs_relative_rms": 0.125,
+            "placement_source": (
+                "exact_fbx_attachment_vertex__runtime_tangent_uv_plan_length"
+            ),
         }
-        gate = gate_assembly_transform_residuals(
-            transform, {"full_asset": "SK_test", "part_asset": "SK_part"}
-        )
-        self.assertEqual(gate["status"], "pass")
-        self.assertEqual(gate["threshold"], 0.01)
-        self.assertEqual(
-            validate_persisted_residual_gate(transform)["status"], "pass"
-        )
-        exact_threshold = dict(transform)
-        exact_threshold.pop("residual_gate", None)
-        exact_threshold["similarity_relative_rms"] = 0.01
-        exact_threshold["trs_relative_rms"] = 0.01
-        self.assertEqual(
-            gate_assembly_transform_residuals(
-                exact_threshold,
-                {"full_asset": "SK_test", "part_asset": "SK_part"},
-            )["status"],
-            "pass",
-        )
         summary = _assembly_fit_summary(
             [{"transform": transform}], "uniform_similarity_3d"
         )
         self.assertEqual(summary["similarity_relative_rms_count"], 1)
-        self.assertEqual(summary["residual_ready_gate"]["status"], "pass")
-
-        authored_warning = dict(transform)
-        authored_warning.pop("residual_gate", None)
-        authored_warning["similarity_relative_rms"] = 0.05
-        authored_warning["trs_relative_rms"] = 0.05
-        warning_gate = gate_assembly_transform_residuals(
-            authored_warning,
-            {"full_asset": "SK_test", "part_asset": "SK_part"},
-            block_geometry=False,
-        )
-        self.assertEqual(warning_gate["status"], "warning")
         self.assertEqual(
-            validate_persisted_residual_gate(authored_warning)["status"],
-            "warning",
+            summary["residual_scope"],
+            "diagnostic_shape_difference_not_placement_fit",
         )
-
-        for field, value, message in (
-            ("similarity_relative_rms", 0.010001, "blocked placement"),
-            ("attachment_pivot_error", 1.0001e-8, "blocked placement"),
-            ("trs_relative_rms", float("nan"), "non-finite evidence"),
-        ):
-            blocked = dict(transform)
-            blocked.pop("residual_gate", None)
-            blocked[field] = value
-            with self.subTest(field=field), self.assertRaisesRegex(
-                ClusterAssemblyBuildError, message
-            ):
-                gate_assembly_transform_residuals(
-                    blocked,
-                    {"full_asset": "SK_test", "part_asset": "SK_part"},
-                )
-
-    def test_persisted_residual_gate_detects_receipt_drift(self):
-        transform = {
-            "attachment_pivot_error": 0.0,
-            "similarity_relative_rms": 0.001,
-            "trs_relative_rms": 0.001,
-            "affine_relative_rms": 0.0001,
-        }
-        gate_assembly_transform_residuals(transform, {"part_asset": "SK_part"})
-        transform["residual_gate"]["metrics"]["trs_relative_rms"] = 0.0
-        with self.assertRaisesRegex(
-            ClusterAssemblyBuildError, "evidence drifted"
-        ):
-            validate_persisted_residual_gate(transform)
-
-    def test_trs_fit_recovers_translation_rotation_and_scale(self):
-        source = [
-            [-1.0, -1.0, 0.0],
-            [1.0, -1.0, 0.0],
-            [1.0, 1.0, 0.0],
-            [-1.0, 1.0, 0.0],
-        ]
-        # Row-vector transform: rotate 90 degrees around Z, scale (2, 3, 1),
-        # then translate.
-        target = [
-            [5.0 + (-point[1]) * 2.0, -2.0 + point[0] * 3.0, 7.0]
-            for point in source
-        ]
-        transform = fit_trs_transform(source, target)
-        self.assertLess(transform["trs_relative_rms"], 1.0e-10)
-        self.assertTrue(all(math.isfinite(value) for value in transform["rotation_xyzw"]))
-        self.assertAlmostEqual(transform["translation"][0], 5.0, places=8)
-        self.assertAlmostEqual(transform["translation"][1], -2.0, places=8)
-        self.assertAlmostEqual(transform["translation"][2], 7.0, places=8)
+        self.assertNotIn("residual_ready_gate", summary)
 
     def test_bounds_gate_rejects_the_observed_unreal_yz_axis_swap(self):
         full = {

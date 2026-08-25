@@ -19,7 +19,8 @@ SpeedTree Modeler 10.1.0의 공식 `-export` 경로가 Collision과 Shade Prunin
 7. FBX serializer가 이미 계산한 ID 0/root influence와 단일 root의 Start
    cluster를 deform bone으로 보존합니다.
 8. 같은 serializer 호출에서 geometry/local vertex, runtime Node/Generator GUID,
-   authored position과 그 위치의 원본 bone influence를 native receipt로 기록합니다.
+   authored position, 런타임 pose의 단위 tangent와 그 위치의 원본 bone
+   influence를 native receipt로 기록합니다.
 
 Modeler 창, 파일 선택창, recovery Question, blank 문서, 마우스 포커스,
 Windows desktop 격리는 생산 경로에서 사용하지 않습니다.
@@ -97,7 +98,7 @@ child weight와 동일한 단정도 연산의 보수값을 Modeler 원본 ID 0 c
 영수증에는 다음 exact identity만 들어갑니다.
 
 - serializer geometry ordinal과 정확한 local vertex 범위
-- 실제 runtime Node/parent/Generator GUID와 authored position
+- 실제 runtime Node/parent/Generator GUID와 authored position 및 pose tangent
 - Modeler 원본 weight solver가 authored position에 반환한 양수 influence
 - 실제 생성된 FBX cluster node 이름과 native bone ID/parent ID
 
@@ -107,6 +108,12 @@ Assembly는 보존된 geometry/local vertex ID와 이 범위가 교차하는 run
 local vertex가 단 하나의 runtime Node 범위를 증명하면 그 원본 authored position과
 weight를 그대로 사용합니다. 최근접 검색, 비율 투표, 이름 매칭, weight 재계산은
 없습니다.
+
+Assembly의 물리 스케일은 runtime Node의 `extent`를 사용하지 않습니다. 해당 값은
+물리 길이가 아닌 Modeler 내부 무차원 파라미터입니다. 정규화 플랜의 authored +Y
+선 끝점을 동일 UV로 원본 FBX 플랜 표면에 옮긴 실제 거리만 스케일에 사용하고,
+회전은 runtime pose tangent만 사용합니다. 피봇은 원본 attachment 위치 그대로이며
+face normal, outline extent, 최근접/최원점, 기하 fit은 사용하지 않습니다.
 
 ## 사용법
 
