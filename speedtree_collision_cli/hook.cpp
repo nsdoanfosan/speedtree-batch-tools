@@ -472,6 +472,8 @@ struct NativeReceiptProxy {
     std::string generatorGuid;
     bool hasAuthoredPosition = false;
     float authoredPositionNative[3]{};
+    bool hasAuthoredTangent = false;
+    float authoredTangentNativeUnit[3]{};
     std::vector<NativeReceiptInfluence> influences;
     std::vector<NativeReceiptRange> vertexRanges;
 };
@@ -817,6 +819,39 @@ std::string Base64Guid(const unsigned char* bytes) {
     return encoded;
 }
 
+bool CaptureNativeAuthoredPose(
+    void* sourceObject,
+    NativeReceiptProxy* proxy) {
+    if (sourceObject == nullptr || proxy == nullptr) {
+        return false;
+    }
+    __try {
+        auto** vtable = *reinterpret_cast<void***>(sourceObject);
+        constexpr std::size_t kPlacementPoseMethod = 0xC58 / sizeof(void*);
+        if (vtable == nullptr ||
+            !IsInSpeedTreeImage(
+                vtable + kPlacementPoseMethod,
+                sizeof(void*)) ||
+            !IsInSpeedTreeImage(
+                vtable[kPlacementPoseMethod],
+                sizeof(unsigned char))) {
+            return false;
+        }
+        const auto readPose = reinterpret_cast<
+            void(__fastcall*)(void*, float*, float*)>(
+                vtable[kPlacementPoseMethod]);
+        readPose(
+            sourceObject,
+            proxy->authoredPositionNative,
+            proxy->authoredTangentNativeUnit);
+        proxy->hasAuthoredPosition = true;
+        proxy->hasAuthoredTangent = true;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 void CaptureNativeReceiptProxy(
     void* exporter,
     const float* /*serializedPosition*/,
@@ -871,11 +906,7 @@ void CaptureNativeReceiptProxy(
                 proxy.generatorGuid = Base64Guid(
                     static_cast<const unsigned char*>(generatorObject) + 0x10);
             }
-            std::memcpy(
-                proxy.authoredPositionNative,
-                sourceBytes + 0x110,
-                sizeof(proxy.authoredPositionNative));
-            proxy.hasAuthoredPosition = true;
+            CaptureNativeAuthoredPose(sourceObject, &proxy);
 
             const auto* geometryBytes = static_cast<const unsigned char*>(
                 gCurrentExportGeometry);
@@ -4720,7 +4751,7 @@ bool WriteNativeReceipt() {
     // Generated-instance proxy records describe geometry placement, not an
     // exported deform skeleton.  Blender imports an armature only when the
     // native FBX serializer emitted at least one exact bone record, so proxy
-    // presence must never turn a genuinely bone-less FBX into the ID-0 repair
+    // presence must never turn a genuinely bone-less FBX into the ID-0 deform
     // contract.
     const char* idZeroClusterWrite =
         gNativeReceiptBones.empty()
@@ -4730,11 +4761,11 @@ bool WriteNativeReceipt() {
                : "native_exact_bone_record");
     stream << std::setprecision(17);
     stream << "{\n"
-           << "  \"schema_version\": 3,\n"
+           << "  \"schema_version\": 5,\n"
            << "  \"kind\": \"speedtree_native_export_receipt\",\n"
            << "  \"status\": \"ready\",\n"
            << "  \"identity_policy\": "
-              "\"modeler_parsed_runtime_and_fbx_serializer_records_v3\",\n"
+               "\"modeler_runtime_pose_tangent_and_fbx_serializer_records_v5\",\n"
            << "  \"source\": {\"path\": \""
            << JsonEscape(WidePathToUtf8(gNativeInputPath))
            << "\", \"size\": " << sourceSize
@@ -4798,7 +4829,14 @@ bool WriteNativeReceipt() {
                    << proxy.authoredPositionNative[0] << ", "
                    << proxy.authoredPositionNative[1] << ", "
                    << proxy.authoredPositionNative[2]
-                   << "], \"authored_position_influences\": [";
+                   << "]";
+            if (proxy.hasAuthoredTangent) {
+                stream << ", \"authored_tangent_native_unit\": ["
+                       << proxy.authoredTangentNativeUnit[0] << ", "
+                       << proxy.authoredTangentNativeUnit[1] << ", "
+                       << proxy.authoredTangentNativeUnit[2] << "]";
+            }
+            stream << ", \"authored_position_influences\": [";
             for (std::size_t influenceIndex = 0;
                  influenceIndex < proxy.influences.size();
                  ++influenceIndex) {

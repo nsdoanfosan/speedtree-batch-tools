@@ -199,6 +199,7 @@ def validate_assembly_result(report_path, target):
     manifest_path = Path(target["manifest"])
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     placement = manifest.get("placement_contract") or {}
+    placement_frame = placement.get("exact_plan_line") or {}
     attachment_bones = manifest.get("attachment_bone_contract") or {}
     base = manifest.get("base") or {}
     preserved = list(manifest.get("preserved_render_components") or [])
@@ -207,11 +208,21 @@ def validate_assembly_result(report_path, target):
     if report.get("status") != "ok":
         problems.append("assembly_not_ok")
     if (
-        placement.get("version") != 3
+        placement.get("version") != 9
         or placement.get("identity_policy")
         != "exact_fbx_vertex_or_native_clipped_origin_v1"
         or placement.get("translation_source")
         != "exact_fbx_attachment_vertex_else_native_receipt"
+        or placement.get("rotation_uniform_scale_source")
+        != "exact_modeler_runtime_tangent_and_uv_plan_line_length_v1"
+        or placement_frame.get("selection_policy")
+        != (
+            "unique_source_and_target_uv_triangles_containing_exact_authored_"
+            "line_endpoint_v1"
+        )
+        or placement_frame.get("frame_policy")
+        != "runtime_pose_tangent_preserve_plan_roll_and_exact_uv_length"
+        or placement_frame.get("nearest_or_farthest_search") is not False
     ):
         problems.append("assembly_binding_policy_not_current")
     if any(
@@ -240,7 +251,7 @@ def validate_assembly_result(report_path, target):
     if (
         attachment_bones.get("status") != "ready"
         or attachment_bones.get("policy")
-        != "native_modeler_runtime_receipt_v2_exact_skeleton_index_zero"
+        != "native_modeler_runtime_receipt_v5_exact_pose_skeleton_index_zero"
         or declared_attachment_bone_count <= 0
         or generated_instance_count <= 0
         or not native_receipt.get("sha256")

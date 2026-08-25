@@ -17,6 +17,7 @@ from speedtree_native_receipt import (  # noqa: E402
     exact_generated_instance,
     load_native_export_receipt,
     native_position_to_blender_world,
+    native_tangent_to_blender_world,
 )
 
 
@@ -27,9 +28,12 @@ class NativeSpeedTreeReceiptTests(unittest.TestCase):
         stat = spm.stat()
         guid = base64.b64encode(bytes(range(16))).decode("ascii")
         payload = {
-            "schema_version": 3,
+            "schema_version": 5,
             "kind": "speedtree_native_export_receipt",
             "status": "ready",
+            "identity_policy": (
+                "modeler_runtime_pose_tangent_and_fbx_serializer_records_v5"
+            ),
             "coordinate_contract": {
                 "native_unit_to_meter": 0.3048,
                 "native_unit_to_solver": 30.48,
@@ -59,6 +63,7 @@ class NativeSpeedTreeReceiptTests(unittest.TestCase):
                 "source_bone_id": 7,
                 "node_guid": guid,
                 "authored_position_native": [1.0, 2.0, 3.0],
+                "authored_tangent_native_unit": [0.0, 1.0, 0.0],
                 "vertex_ranges": [[2, 5]],
                 "authored_position_influences": [{
                     "bone_id": 7,
@@ -89,6 +94,10 @@ class NativeSpeedTreeReceiptTests(unittest.TestCase):
             ],
             "CapturedNode",
         )
+        self.assertEqual(
+            instance["authored_tangent_native_unit"],
+            (0.0, 1.0, 0.0),
+        )
 
     def test_native_position_preserves_xyz_and_only_converts_units(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -110,11 +119,63 @@ class NativeSpeedTreeReceiptTests(unittest.TestCase):
         for observed, wanted in zip(actual, expected):
             self.assertAlmostEqual(observed, wanted, places=12)
 
+    def test_native_tangent_preserves_matching_xyz_without_unit_scale(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spm, receipt_path = self._write(Path(temporary))
+            receipt = load_native_export_receipt(
+                receipt_path,
+                source_spm=spm,
+            )
+
+        self.assertEqual(
+            native_tangent_to_blender_world(receipt, (0.0, 0.6, 0.8)),
+            (0.0, 0.6, 0.8),
+        )
+
+    def test_current_receipt_rejects_missing_runtime_tangent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spm, receipt_path = self._write(Path(temporary))
+            payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+            payload["generated_instances"][0].pop(
+                "authored_tangent_native_unit"
+            )
+            receipt_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(NativeReceiptError, "tangent"):
+                load_native_export_receipt(receipt_path, source_spm=spm)
+
+    def test_previous_v3_receipt_remains_readable_without_runtime_tangent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spm, receipt_path = self._write(Path(temporary))
+            payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+            payload["schema_version"] = 3
+            payload["identity_policy"] = (
+                "modeler_parsed_runtime_and_fbx_serializer_records_v3"
+            )
+            payload["generated_instances"][0].pop(
+                "authored_tangent_native_unit"
+            )
+            receipt_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            receipt = load_native_export_receipt(
+                receipt_path,
+                source_spm=spm,
+            )
+
+        self.assertNotIn(
+            "authored_tangent_native_unit",
+            receipt["generated_instances"][0],
+        )
+
     def test_legacy_receipt_uses_raw_native_xyz_not_declared_axis_swap(self):
         with tempfile.TemporaryDirectory() as temporary:
             spm, receipt_path = self._write(Path(temporary))
             payload = json.loads(receipt_path.read_text(encoding="utf-8"))
             payload["schema_version"] = 2
+            payload.pop("identity_policy", None)
+            payload["generated_instances"][0].pop(
+                "authored_tangent_native_unit"
+            )
             payload["coordinate_contract"][
                 "blender_xyz_from_native_xyz"
             ] = ["x*0.3048", "z*0.3048", "-y*0.3048"]
