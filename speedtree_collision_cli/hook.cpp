@@ -40,6 +40,7 @@ constexpr std::uintptr_t kNativeExportFinalizeGeometryRva = 0xA7580;
 constexpr std::uintptr_t kNativeExportFinalizeDocumentRva = 0xB1510;
 constexpr std::uintptr_t kResolveBranchBoneIdRva = 0x4B5C00;
 constexpr std::uintptr_t kInsertExportBoneRva = 0x37D4A0;
+constexpr std::uintptr_t kLeafMeshExportRva = 0x584620;
 constexpr std::uintptr_t kExportVertexWeightsRva = 0x6B4FE0;
 constexpr std::uintptr_t kFindExportBoneMappingRva = 0x6B4DF0;
 constexpr std::uintptr_t kFbxClusterAddControlPointRva = 0x1259E50;
@@ -142,6 +143,12 @@ constexpr unsigned char kInsertExportBonePrologue[15] = {
     0x48, 0x89, 0x70, 0x18,
 };
 
+constexpr unsigned char kLeafMeshExportPrologue[15] = {
+    0x48, 0x89, 0x5c, 0x24, 0x08,
+    0x48, 0x89, 0x74, 0x24, 0x10,
+    0x48, 0x89, 0x7c, 0x24, 0x18,
+};
+
 constexpr unsigned char kExportVertexWeightsPrologue[15] = {
     0x48, 0x8B, 0xC4,
     0x48, 0x89, 0x58, 0x08,
@@ -206,6 +213,7 @@ using InsertExportBoneFn = void(__fastcall*)(
     void* exportData,
     void* sourceBoneRecord,
     void* sourceBranch);
+using LeafMeshExportFn = void(__fastcall*)(void* leafNode, void* exportData);
 using ExportVertexWeightsFn = void(__fastcall*)(
     void* exporter,
     const float* position,
@@ -321,6 +329,7 @@ NativeExportFinalizeGeometryFn gOriginalNativeExportFinalizeGeometry = nullptr;
 NativeExportFinalizeDocumentFn gOriginalNativeExportFinalizeDocument = nullptr;
 ResolveBranchBoneIdFn gResolveBranchBoneId = nullptr;
 InsertExportBoneFn gOriginalInsertExportBone = nullptr;
+LeafMeshExportFn gOriginalLeafMeshExport = nullptr;
 ExportVertexWeightsFn gOriginalExportVertexWeights = nullptr;
 FindExportBoneMappingFn gFindExportBoneMapping = nullptr;
 FbxClusterAddControlPointFn gUnusedOriginalFbxClusterAddControlPoint = nullptr;
@@ -379,6 +388,7 @@ HookRecord gNativeModelUpdateHook;
 HookRecord gNativeExportFinalizeGeometryHook;
 HookRecord gNativeExportFinalizeDocumentHook;
 HookRecord gInsertExportBoneHook;
+HookRecord gLeafMeshExportHook;
 HookRecord gExportVertexWeightsHook;
 HookRecord gFbxClusterAddControlPointHook;
 HookRecord gFbxNodeCreateHook;
@@ -420,6 +430,17 @@ struct NativeReceiptBone {
     float end[3]{};
     std::string sourceType;
 };
+
+struct SyntheticLeafBoneRecord {
+    int boneId = 0;
+    int parentId = 0;
+    float start[3]{};
+    float end[3]{};
+    float startRadius = 0.0f;
+    float endRadius = 0.0f;
+};
+
+static_assert(sizeof(SyntheticLeafBoneRecord) == 0x28);
 
 struct NativeReceiptRange {
     int firstVertex = -1;
@@ -465,11 +486,19 @@ struct NativeReceiptProxyKeyHash {
 };
 
 struct NativeReceiptProxy {
+    struct Ancestor {
+        std::string sourceType;
+        std::string nodeGuid;
+    };
+
     NativeReceiptProxyKey key{};
     std::string sourceType;
     std::string nodeGuid;
     std::string parentGuid;
+    std::string parentType;
     std::string generatorGuid;
+    std::string generatorType;
+    std::vector<Ancestor> ancestors;
     bool hasAuthoredPosition = false;
     float authoredPositionNative[3]{};
     bool hasAuthoredTangent = false;
@@ -487,6 +516,10 @@ std::unordered_map<
     NativeReceiptProxyKey,
     std::size_t,
     NativeReceiptProxyKeyHash> gNativeReceiptProxyIndexes;
+std::unordered_map<void*, int> gSyntheticLeafBoneIds;
+constexpr int kSyntheticLeafBoneIdBase = 10000;
+constexpr int kSyntheticLeafBoneIdLimit = 30000;
+int gNextSyntheticLeafBoneId = kSyntheticLeafBoneIdBase;
 NativeStateProbe gNativeStateProbes[] = {
     {0x135A59, "native export probe 135A59"},
     {0x135A9D, "native export probe 135A9D"},
@@ -711,6 +744,70 @@ ExportBoneMapping* FindExactExportBoneMapping(void* exporter, int boneId) {
         : nullptr;
 }
 
+int FindSyntheticLeafBoneId(void* leafNode) {
+    std::lock_guard<std::mutex> lock(gNativeReceiptMutex);
+    const auto found = gSyntheticLeafBoneIds.find(leafNode);
+    return found == gSyntheticLeafBoneIds.end() ? 0 : found->second;
+}
+
+int ReserveSyntheticLeafBoneId(void* leafNode) {
+    std::lock_guard<std::mutex> lock(gNativeReceiptMutex);
+    const auto found = gSyntheticLeafBoneIds.find(leafNode);
+    if (found != gSyntheticLeafBoneIds.end()) {
+        return found->second;
+    }
+    if (gNextSyntheticLeafBoneId >= kSyntheticLeafBoneIdLimit) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "Leaf Mesh bone serialization exhausted its reserved exact-ID range");
+    }
+    const int boneId = gNextSyntheticLeafBoneId++;
+    gSyntheticLeafBoneIds.emplace(leafNode, boneId);
+    return boneId;
+}
+
+bool IsRootZoneLeafMesh(void* leafNode) {
+    if (leafNode == nullptr) {
+        return false;
+    }
+    __try {
+        void* visited[16]{};
+        std::size_t visitedCount = 0;
+        void* current = *reinterpret_cast<void* const*>(
+            static_cast<const unsigned char*>(leafNode) + 0x98);
+        bool sawZone = false;
+        while (current != nullptr && visitedCount < std::size(visited)) {
+            for (std::size_t index = 0; index < visitedCount; ++index) {
+                if (visited[index] == current) {
+                    return false;
+                }
+            }
+            visited[visitedCount++] = current;
+            const char* type = ReadSpeedTreeRttiName(current);
+            if (type == nullptr) {
+                return false;
+            }
+            if (std::strcmp(type, ".?AVCBranchNode@@") == 0 ||
+                std::strcmp(type, ".?AVCFrondNode@@") == 0 ||
+                std::strcmp(type, ".?AVCBaseNode@@") == 0) {
+                return false;
+            }
+            if (std::strcmp(type, ".?AVCZoneNode@@") == 0) {
+                sawZone = true;
+            } else if (std::strcmp(type, ".?AVCStartNode@@") == 0) {
+                return sawZone;
+            } else if (std::strcmp(type, ".?AVCLeafMeshNode@@") != 0) {
+                return false;
+            }
+            current = *reinterpret_cast<void* const*>(
+                static_cast<const unsigned char*>(current) + 0x98);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return false;
+}
+
 void LogMissingIdZeroBoneRecordOnce() {
     bool expected = false;
     if (gMissingIdZeroBoneRecordLogged.compare_exchange_strong(
@@ -778,6 +875,8 @@ void ResetNativeReceiptCapture() {
     gNativeReceiptBones.clear();
     gNativeReceiptProxies.clear();
     gNativeReceiptProxyIndexes.clear();
+    gSyntheticLeafBoneIds.clear();
+    gNextSyntheticLeafBoneId = kSyntheticLeafBoneIdBase;
 }
 
 int NativeReceiptGeometryOrdinal(void* geometry, int vertexIndex) {
@@ -852,6 +951,112 @@ bool CaptureNativeAuthoredPose(
     }
 }
 
+struct NativeNodeRelationshipSnapshot {
+    struct Node {
+        const char* sourceType = nullptr;
+        unsigned char guid[16]{};
+    };
+
+    bool hasParent = false;
+    Node parent{};
+    bool hasGenerator = false;
+    Node generator{};
+    Node ancestors[16]{};
+    std::size_t ancestorCount = 0;
+};
+
+bool TryReadNativeNodeRelationships(
+    void* sourceObject,
+    NativeNodeRelationshipSnapshot* snapshot) {
+    if (sourceObject == nullptr || snapshot == nullptr) {
+        return false;
+    }
+    __try {
+        const auto* sourceBytes = static_cast<const unsigned char*>(sourceObject);
+        void* parentObject = *reinterpret_cast<void* const*>(
+            sourceBytes + 0x98);
+        const char* parentType = ReadSpeedTreeRttiName(parentObject);
+        if (parentType != nullptr) {
+            snapshot->hasParent = true;
+            snapshot->parent.sourceType = parentType;
+            std::memcpy(
+                snapshot->parent.guid,
+                static_cast<const unsigned char*>(parentObject) + 0x10,
+                sizeof(snapshot->parent.guid));
+        }
+
+        void* generatorObject = *reinterpret_cast<void* const*>(
+            sourceBytes + 0x128);
+        const char* generatorType = ReadSpeedTreeRttiName(generatorObject);
+        if (generatorType != nullptr) {
+            snapshot->hasGenerator = true;
+            snapshot->generator.sourceType = generatorType;
+            std::memcpy(
+                snapshot->generator.guid,
+                static_cast<const unsigned char*>(generatorObject) + 0x10,
+                sizeof(snapshot->generator.guid));
+        }
+
+        void* visited[16]{};
+        std::size_t visitedCount = 0;
+        void* ancestorObject = parentObject;
+        while (ancestorObject != nullptr &&
+               snapshot->ancestorCount < std::size(snapshot->ancestors)) {
+            bool duplicate = false;
+            for (std::size_t index = 0; index < visitedCount; ++index) {
+                if (visited[index] == ancestorObject) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
+                break;
+            }
+            const char* ancestorType = ReadSpeedTreeRttiName(ancestorObject);
+            if (ancestorType == nullptr ||
+                std::strstr(ancestorType, "Node@@") == nullptr) {
+                break;
+            }
+            visited[visitedCount++] = ancestorObject;
+            auto& ancestor = snapshot->ancestors[snapshot->ancestorCount++];
+            ancestor.sourceType = ancestorType;
+            std::memcpy(
+                ancestor.guid,
+                static_cast<const unsigned char*>(ancestorObject) + 0x10,
+                sizeof(ancestor.guid));
+            ancestorObject = *reinterpret_cast<void* const*>(
+                static_cast<const unsigned char*>(ancestorObject) + 0x98);
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void CaptureNativeNodeRelationships(
+    void* sourceObject,
+    NativeReceiptProxy* proxy) {
+    NativeNodeRelationshipSnapshot snapshot{};
+    if (proxy == nullptr ||
+        !TryReadNativeNodeRelationships(sourceObject, &snapshot)) {
+        return;
+    }
+    if (snapshot.hasParent) {
+        proxy->parentType = snapshot.parent.sourceType;
+        proxy->parentGuid = Base64Guid(snapshot.parent.guid);
+    }
+    if (snapshot.hasGenerator) {
+        proxy->generatorType = snapshot.generator.sourceType;
+        proxy->generatorGuid = Base64Guid(snapshot.generator.guid);
+    }
+    for (std::size_t index = 0; index < snapshot.ancestorCount; ++index) {
+        proxy->ancestors.push_back({
+            snapshot.ancestors[index].sourceType,
+            Base64Guid(snapshot.ancestors[index].guid),
+        });
+    }
+}
+
 void CaptureNativeReceiptProxy(
     void* exporter,
     const float* /*serializedPosition*/,
@@ -894,18 +1099,7 @@ void CaptureNativeReceiptProxy(
             const auto* sourceBytes = static_cast<const unsigned char*>(
                 sourceObject);
             proxy.nodeGuid = Base64Guid(sourceBytes + 0x10);
-            void* parentObject = *reinterpret_cast<void* const*>(
-                sourceBytes + 0x98);
-            if (ReadSpeedTreeRttiName(parentObject) != nullptr) {
-                proxy.parentGuid = Base64Guid(
-                    static_cast<const unsigned char*>(parentObject) + 0x10);
-            }
-            void* generatorObject = *reinterpret_cast<void* const*>(
-                sourceBytes + 0x128);
-            if (ReadSpeedTreeRttiName(generatorObject) != nullptr) {
-                proxy.generatorGuid = Base64Guid(
-                    static_cast<const unsigned char*>(generatorObject) + 0x10);
-            }
+            CaptureNativeNodeRelationships(sourceObject, &proxy);
             CaptureNativeAuthoredPose(sourceObject, &proxy);
 
             const auto* geometryBytes = static_cast<const unsigned char*>(
@@ -941,10 +1135,15 @@ void CaptureNativeReceiptProxy(
             };
 
             FbxWeightExportContext probe{};
-            if (sourceBoneId == 0) {
+            const auto synthetic = gSyntheticLeafBoneIds.find(sourceObject);
+            const bool syntheticLeafWeight =
+                synthetic != gSyntheticLeafBoneIds.end() &&
+                synthetic->second == sourceBoneId;
+            if (sourceBoneId == 0 || syntheticLeafWeight) {
                 // The serializer's exact source ID is the authored root.  The
-                // entry stub preserves and executes the stock call unchanged;
-                // this receipt row records that same explicit ownership.
+                // entry stub preserves and executes the stock call unchanged.
+                // Root-zone Leaf Mesh records are intentionally rigid on
+                // their exact synthetic bone instead of inheriting Root.
                 probe.additionCount = 1;
                 probe.additions[0] = {
                     nullptr,
@@ -1042,11 +1241,27 @@ void __fastcall HookedExportVertexWeights(
     int sourceBoneId,
     int vertexIndex,
     void* clusterMap) {
-    // Always preserve the stock call, including native sourceBoneId==0 calls.
-    // A valid no-generator model can use that implicit native path even though
-    // the export-bone map has no exact ID-0 record.  Only the later *synthetic*
-    // complementary Root call needs the exact-record guard.
+    bool syntheticLeafWeight = false;
+    __try {
+        if (sourceBoneId > 0 && gCurrentExportSourceVertexRecord != nullptr) {
+            const auto* record = static_cast<const unsigned char*>(
+                gCurrentExportSourceVertexRecord);
+            void* sourceObject = *reinterpret_cast<void* const*>(record + 0x110);
+            syntheticLeafWeight =
+                FindSyntheticLeafBoneId(sourceObject) == sourceBoneId;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "Synthetic Leaf Mesh FBX weight mapping could not read its source record");
+    }
+
+    // Preserve the stock lookup and cluster selection. Root-zone Leaf Mesh
+    // ownership is rigid by construction, so only that path overrides the
+    // stock distance-derived scalar with an exact weight of one.
     FbxWeightExportContext primary{};
+    primary.overrideWeight = syntheticLeafWeight;
+    primary.replacementWeight = 1.0;
     FbxWeightExportContext* previousContext = gFbxWeightExportContext;
     gFbxWeightExportContext = &primary;
     gOriginalExportVertexWeights(
@@ -1063,6 +1278,16 @@ void __fastcall HookedExportVertexWeights(
         sourceBoneId,
         vertexIndex,
         clusterMap);
+    if (syntheticLeafWeight) {
+        if (primary.additionCount != 1 ||
+            primary.additions[0].vertexIndex != vertexIndex ||
+            primary.additions[0].weight != 1.0) {
+            AbortExport(
+                kHookRuntimeFailureExitCode,
+                "Synthetic Leaf Mesh FBX weight did not emit one exact rigid influence");
+        }
+        return;
+    }
     if (sourceBoneId <= 0 || exporter == nullptr || position == nullptr ||
         clusterMap == nullptr) {
         return;
@@ -1145,7 +1370,7 @@ void __fastcall HookedExportVertexWeights(
     }
 }
 
-void __fastcall CaptureNativeReceiptIdZero(
+int __fastcall CaptureNativeReceiptIdZero(
     void* exporter,
     const float* position,
     int sourceBoneId,
@@ -1183,9 +1408,10 @@ bool BuildExportVertexWeightsEntryStub() {
     stub[24] = 0x89;
     stub[25] = 0x38;
     // Native ID-0 is an implicit serializer path. Capture its exact serializer
-    // record while preserving the caller's volatile state, then tail-jump to
-    // the stock routine with the original stack and registers. Only positive
-    // IDs enter the compiled weight hook.
+    // record while preserving the caller's volatile state. Leaf Mesh records
+    // return their exact synthetic bone ID in EAX and place it into the saved
+    // R8 slot. Unchanged ID-0 records tail-jump to the stock routine. Both
+    // initially-positive and synthetically remapped IDs enter the compiled weight hook.
     stub[26] = 0x45;
     stub[27] = 0x85;
     stub[28] = 0xC0;             // test r8d, r8d
@@ -1227,6 +1453,11 @@ bool BuildExportVertexWeightsEntryStub() {
     stub[cursor++] = 0xFF;
     stub[cursor++] = 0xD0;       // call rax
     stub[cursor++] = 0x48;
+    stub[cursor++] = 0x89;
+    stub[cursor++] = 0x44;
+    stub[cursor++] = 0x24;
+    stub[cursor++] = 0x40;       // mov [rsp+0x40], rax (saved r8)
+    stub[cursor++] = 0x48;
     stub[cursor++] = 0x83;
     stub[cursor++] = 0xC4;
     stub[cursor++] = 0x28;       // add rsp, 0x28
@@ -1242,6 +1473,11 @@ bool BuildExportVertexWeightsEntryStub() {
     stub[cursor++] = 0x59;       // pop rcx
     stub[cursor++] = 0x58;       // pop rax
     stub[cursor++] = 0x9D;       // popfq
+    stub[cursor++] = 0x45;
+    stub[cursor++] = 0x85;
+    stub[cursor++] = 0xC0;       // test r8d, r8d
+    stub[cursor++] = 0x75;
+    const std::size_t remappedBranchOffset = cursor++;
     stub[cursor++] = 0x48;
     stub[cursor++] = 0xB8;
     *reinterpret_cast<std::uintptr_t*>(stub + cursor) =
@@ -1250,13 +1486,16 @@ bool BuildExportVertexWeightsEntryStub() {
     stub[cursor++] = 0xFF;
     stub[cursor++] = 0x20;       // jmp qword ptr [rax]
     const std::size_t positiveHookOffset = cursor;
+    const std::size_t remappedBranchDistance =
+        positiveHookOffset - (remappedBranchOffset + 1);
     const std::size_t positiveBranchDistance = positiveHookOffset - 31;
-    if (positiveBranchDistance > 0x7F) {
+    if (positiveBranchDistance > 0x7F || remappedBranchDistance > 0x7F) {
         VirtualFree(stub, 0, MEM_RELEASE);
-        Log("FBX vertex-record entry stub positive branch exceeded rel8");
+        Log("FBX vertex-record entry stub compiled branch exceeded rel8");
         return false;
     }
     stub[30] = static_cast<unsigned char>(positiveBranchDistance);
+    stub[remappedBranchOffset] = static_cast<unsigned char>(remappedBranchDistance);
     WriteAbsoluteJump(
         stub + positiveHookOffset,
         reinterpret_cast<const void*>(HookedExportVertexWeights));
@@ -1265,18 +1504,39 @@ bool BuildExportVertexWeightsEntryStub() {
     return true;
 }
 
-void __fastcall CaptureNativeReceiptIdZero(
+int __fastcall CaptureNativeReceiptIdZero(
     void* exporter,
     const float* position,
     int sourceBoneId,
     int vertexIndex,
     void* clusterMap) {
+    int effectiveBoneId = sourceBoneId;
+    __try {
+        if (sourceBoneId == 0 && gCurrentExportSourceVertexRecord != nullptr) {
+            const auto* record = static_cast<const unsigned char*>(
+                gCurrentExportSourceVertexRecord);
+            void* sourceObject = *reinterpret_cast<void* const*>(record + 0x110);
+            const char* sourceType = ReadSpeedTreeRttiName(sourceObject);
+            if (sourceType != nullptr &&
+                std::strcmp(sourceType, ".?AVCLeafMeshNode@@") == 0) {
+                const int syntheticBoneId = FindSyntheticLeafBoneId(sourceObject);
+                if (syntheticBoneId > 0) {
+                    effectiveBoneId = syntheticBoneId;
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "Leaf Mesh FBX weight mapping raised an exception while reading the source record");
+    }
     CaptureNativeReceiptProxy(
         exporter,
         position,
-        sourceBoneId,
+        effectiveBoneId,
         vertexIndex,
         clusterMap);
+    return effectiveBoneId;
 }
 
 void FreeExportVertexWeightsEntryStub() {
@@ -1391,6 +1651,76 @@ void __fastcall HookedInsertExportBone(
         CaptureNativeReceiptBone(sourceBoneRecord, sourceBranch);
     }
     gOriginalInsertExportBone(exportData, sourceBoneRecord, sourceBranch);
+}
+
+bool TryReadExportGeometryEnd(void* exportData, void** geometryEnd) {
+    if (exportData == nullptr || geometryEnd == nullptr) {
+        return false;
+    }
+    __try {
+        *geometryEnd = *reinterpret_cast<void**>(
+            static_cast<unsigned char*>(exportData) + 0x3BC);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void __fastcall HookedLeafMeshExport(void* leafNode, void* exportData) {
+    const bool needsSyntheticBone = IsRootZoneLeafMesh(leafNode);
+    void* geometryEndBefore = nullptr;
+    if (!TryReadExportGeometryEnd(exportData, &geometryEndBefore)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "Leaf Mesh bone serialization could not read the native geometry list");
+    }
+    gOriginalLeafMeshExport(leafNode, exportData);
+    void* geometryEndAfter = nullptr;
+    if (!TryReadExportGeometryEnd(exportData, &geometryEndAfter)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "Leaf Mesh bone serialization lost the native geometry list");
+    }
+    if (geometryEndBefore == geometryEndAfter || !needsSyntheticBone) {
+        return;
+    }
+
+    NativeReceiptProxy authoredPose{};
+    if (!CaptureNativeAuthoredPose(leafNode, &authoredPose) ||
+        !authoredPose.hasAuthoredPosition ||
+        !authoredPose.hasAuthoredTangent) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "Leaf Mesh bone serialization could not read its authored pose and tangent");
+    }
+    float tangentLengthSquared = 0.0f;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!std::isfinite(authoredPose.authoredPositionNative[axis]) ||
+            !std::isfinite(authoredPose.authoredTangentNativeUnit[axis])) {
+            AbortExport(
+                kHookRuntimeFailureExitCode,
+                "Leaf Mesh bone serialization rejected a non-finite authored pose");
+        }
+        tangentLengthSquared +=
+            authoredPose.authoredTangentNativeUnit[axis] *
+            authoredPose.authoredTangentNativeUnit[axis];
+    }
+    if (!(tangentLengthSquared > 0.25f) || tangentLengthSquared > 4.0f) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "Leaf Mesh bone serialization rejected an invalid authored tangent");
+    }
+
+    SyntheticLeafBoneRecord record{};
+    record.boneId = ReserveSyntheticLeafBoneId(leafNode);
+    record.parentId = 0;
+    for (int axis = 0; axis < 3; ++axis) {
+        record.start[axis] = authoredPose.authoredPositionNative[axis];
+        record.end[axis] =
+            authoredPose.authoredPositionNative[axis] +
+            authoredPose.authoredTangentNativeUnit[axis];
+    }
+    HookedInsertExportBone(exportData, &record, leafNode);
 }
 
 
@@ -1791,6 +2121,7 @@ bool SetRlmConnectFailFastPatch(bool enabled) {
 }
 
 void RemoveCommonHooks() {
+    RemoveHook(gLeafMeshExportHook);
     RemoveHook(gInsertExportBoneHook);
     RemoveHook(gExportVertexWeightsHook);
     FreeExportVertexWeightsEntryStub();
@@ -4821,10 +5152,33 @@ bool WriteNativeReceipt() {
                 stream << ", \"parent_guid\": \""
                        << proxy.parentGuid << "\"";
             }
+            if (!proxy.parentType.empty()) {
+                stream << ", \"parent_rtti\": \""
+                       << JsonEscape(proxy.parentType) << "\"";
+            }
             if (!proxy.generatorGuid.empty()) {
                 stream << ", \"generator_guid\": \""
                        << proxy.generatorGuid << "\"";
             }
+            if (!proxy.generatorType.empty()) {
+                stream << ", \"generator_rtti\": \""
+                       << JsonEscape(proxy.generatorType) << "\"";
+            }
+            stream << ", \"ancestor_chain\": [";
+            for (std::size_t ancestorIndex = 0;
+                 ancestorIndex < proxy.ancestors.size();
+                 ++ancestorIndex) {
+                const auto& ancestor = proxy.ancestors[ancestorIndex];
+                stream << "{\"depth\": " << ancestorIndex + 1
+                       << ", \"source_rtti\": \""
+                       << JsonEscape(ancestor.sourceType)
+                       << "\", \"node_guid\": \""
+                       << ancestor.nodeGuid << "\"}";
+                if (ancestorIndex + 1 != proxy.ancestors.size()) {
+                    stream << ", ";
+                }
+            }
+            stream << "]";
             stream << ", \"authored_position_native\": ["
                    << proxy.authoredPositionNative[0] << ", "
                    << proxy.authoredPositionNative[1] << ", "
@@ -5316,6 +5670,15 @@ bool InstallHooks() {
             HookedInsertExportBone,
             kInsertExportBonePrologue,
             reinterpret_cast<void**>(&gOriginalInsertExportBone))) {
+        RemoveCommonHooks();
+        return false;
+    }
+    if (!InstallHook(
+            gLeafMeshExportHook,
+            reinterpret_cast<void*>(gSpeedTreeBase + kLeafMeshExportRva),
+            HookedLeafMeshExport,
+            kLeafMeshExportPrologue,
+            reinterpret_cast<void**>(&gOriginalLeafMeshExport))) {
         RemoveCommonHooks();
         return false;
     }
