@@ -63,7 +63,7 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         launcher = LAUNCHER_SOURCE.read_text(encoding="utf-8")
         contract = (
             "SPEEDTREE_COLLISION_CLI_CONTRACT="
-            "native-runtime-receipt-v9"
+            "native-runtime-receipt-v10"
         )
 
         self.assertIn(contract, launcher)
@@ -150,6 +150,36 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         self.assertIn("IDs enter the compiled weight hook", entry_stub)
         self.assertIn("FbxSkeleton::eLimbNode", source)
         self.assertIn("No spatial lookup or normalization", weight_hook)
+
+    def test_root_zone_leaf_meshes_get_exact_rigid_bones_without_touching_trees(self):
+        source = HOOK_SOURCE.read_text(encoding="utf-8")
+
+        scope = source[
+            source.index("bool IsRootZoneLeafMesh"):
+            source.index("void LogMissingIdZeroBoneRecordOnce")
+        ]
+        leaf_export = source[
+            source.index("void __fastcall HookedLeafMeshExport"):
+            source.index("void LogCollisionInputTypes")
+        ]
+        weight_hook = source[
+            source.index("void __fastcall HookedExportVertexWeights"):
+            source.index("int __fastcall CaptureNativeReceiptIdZero")
+        ]
+
+        self.assertIn(".?AVCZoneNode@@", scope)
+        self.assertIn(".?AVCStartNode@@", scope)
+        self.assertIn(".?AVCBranchNode@@", scope)
+        self.assertIn(".?AVCFrondNode@@", scope)
+        self.assertIn(".?AVCBaseNode@@", scope)
+        self.assertIn("return sawZone", scope)
+        self.assertIn("const bool needsSyntheticBone = IsRootZoneLeafMesh", leaf_export)
+        self.assertIn("geometryEndBefore == geometryEndAfter || !needsSyntheticBone", leaf_export)
+        self.assertIn("ReserveSyntheticLeafBoneId", leaf_export)
+        self.assertIn("primary.overrideWeight = syntheticLeafWeight", weight_hook)
+        self.assertIn("primary.replacementWeight = 1.0", weight_hook)
+        self.assertIn("RemoveHook(gLeafMeshExportHook)", source)
+        self.assertIn("HookedLeafMeshExport", source[source.index("bool InstallHooks"):])
 
     def test_disappeared_persistent_pipe_starts_a_replacement(self):
         source = LAUNCHER_SOURCE.read_text(encoding="utf-8")

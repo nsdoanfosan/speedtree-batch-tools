@@ -18,7 +18,9 @@ SpeedTree Modeler 10.1.0의 공식 `-export` 경로가 Collision과 Shade Prunin
    FBX/XML serializer가 같은 정확한 계층을 사용하게 합니다.
 7. FBX serializer가 이미 계산한 ID 0/root influence와 단일 root의 Start
    cluster를 deform bone으로 보존합니다.
-8. 같은 serializer 호출에서 geometry/local vertex, runtime Node/Generator GUID,
+8. 지면형 `Leaf Mesh -> Zone -> Start` 배치에만 leaf별 export bone을 생성하고,
+   해당 Leaf Mesh의 ID 0 vertex를 그 bone에 정확히 연결합니다.
+9. 같은 serializer 호출에서 geometry/local vertex, runtime Node/Generator GUID,
    authored position, 런타임 pose의 단위 tangent와 그 위치의 원본 bone
    influence를 native receipt로 기록합니다.
 
@@ -80,6 +82,33 @@ child weight와 동일한 단정도 연산의 보수값을 Modeler 원본 ID 0 c
 - 1보다 큰 vertex 0개
 - bone이 아닌 vertex group으로 향한 양수 weight 0개
 - BaseRef 305개 XML parent 불일치 0개, FBX orphan 0개
+
+## 지면형 Leaf Mesh bone 생성
+
+SpeedTree 10.1.0은 branch나 frond 없이 루트 `Zone`에 바로 배치된 Leaf Mesh에서
+geometry는 만들지만 export bone record는 만들지 않습니다. 이 경우 serializer의
+source bone ID가 모두 0이 되어 grass 한 패치가 `Root` 하나에 붙습니다.
+
+확장은 런타임 부모 체인이 정확히 `CLeafMeshNode -> CZoneNode -> CStartNode`인
+배치에만 적용됩니다. 중첩된 `CLeafMeshNode`는 허용하지만 조상에
+`CBranchNode`, `CFrondNode`, `CBaseNode`가 하나라도 있으면 적용하지 않습니다.
+따라서 tree canopy나 `tree_densiflora`의 `Leaf Mesh -> Base` 구조에는 synthetic
+bone을 만들지 않습니다.
+
+대상 Leaf Mesh가 실제 geometry를 생성했을 때만 authored position과 pose tangent로
+export bone을 하나 삽입합니다. 기존 ID 0 record는 그 exact bone ID로 바꾸고 모든
+vertex를 weight 1로 기록합니다. SPM/FBX 사후 repair, 파일명 분류, 최근접 bone 검색,
+외부 weight 정규화는 사용하지 않습니다.
+
+`SK_Weed_Common_grass_a_01.spm` 검증 결과는 다음과 같습니다.
+
+- 기존 velvet bone record 99개 유지
+- 실제 export된 dead/green Leaf Mesh용 bone record 82개 추가
+- dead 12,615 vertex를 62개 leaf bone에 연결, Root-only 0개
+- green 4,387 vertex를 20개 leaf bone에 연결, Root-only 0개
+- Blender 5.1에서 두 mesh의 모든 vertex weight 합 1
+- Unreal 5.8 임시 import에서 LOD0 32,012 vertex, 3 section, 363 skeleton bone 확인
+- `tree_densiflora_01` 회귀검사에서 synthetic bone 0개
 
 ## Native runtime receipt
 
