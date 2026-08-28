@@ -2307,9 +2307,12 @@ def _material_compile_and_slot_validation(mesh_path):
             continue
         compiled_base_materials.add(base_path)
         usage = _ensure_nanite_voxel_material_usage(base_material)
-        errors = unreal.MaterialEditingLibrary.recompile_material(base_material) or []
-        compile_errors.extend(f"{base_path}: {error}" for error in errors)
         if usage["changed"]:
+            errors = (
+                unreal.MaterialEditingLibrary.recompile_material(base_material)
+                or []
+            )
+            compile_errors.extend(f"{base_path}: {error}" for error in errors)
             if not unreal.EditorAssetLibrary.save_asset(
                 base_path,
                 only_if_is_dirty=False,
@@ -2319,6 +2322,14 @@ def _material_compile_and_slot_validation(mesh_path):
                     + base_path
                 )
             usage["saved"] = True
+            usage["compile"] = "recompiled_after_usage_change"
+        else:
+            # Recompiling an unchanged master material invalidates every
+            # referring Nanite Assembly.  Large vegetation Assemblies can then
+            # spend minutes rebuilding even though neither the material nor
+            # the Assembly changed.  The existing compiled material is already
+            # authoritative when all required usage flags are present.
+            usage["compile"] = "skipped_unchanged"
         usage_validation.append(usage)
 
     if missing:
@@ -2509,7 +2520,22 @@ def _initial_checkpoint(manifest):
     }
 
 
-def _recover_interrupted_item(checkpoint, manifest_items, max_item_crash_retries):
+def _inherited_crash_count(previous, fingerprint):
+    """Carry a crash count only while the queued work is unchanged.
+
+    ``crash_count`` exists to stop an item that reproducibly kills
+    UnrealEditor-Cmd from looping forever.  A different ``fingerprint`` means
+    the FBX/manifest inputs were rebuilt, so it is new work and must start with
+    a clean budget.  Without this reset a freshly prepared asset could inherit
+    an exhausted count from an older attempt and be demoted straight to
+    ``manual_required`` without ever being imported once.
+    """
+    if previous.get("fingerprint") != fingerprint:
+        return 0
+    return int(previous.get("crash_count", 0))
+
+
+def _recover_interrupted_item(checkpoint, max_item_crash_retries):
     current_id = checkpoint.get("current_item")
     if not current_id:
         return
@@ -2533,7 +2559,8 @@ def _recover_interrupted_item(checkpoint, manifest_items, max_item_crash_retries
                 "status": "manual_required",
                 "message": (
                     "Unreal commandlet crash retry limit exceeded "
-                    f"({max_item_crash_retries})"
+                    f"({max_item_crash_retries}); an operator stop counts as a "
+                    "crash, so clear it with --reset-item-retries to requeue"
                 ),
             }
         )
@@ -2557,7 +2584,7 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
     manifest_items = _manifest_items_dependency_order(
         manifest.get("items") or []
     )
-    _recover_interrupted_item(checkpoint, manifest_items, max_retries)
+    _recover_interrupted_item(checkpoint, max_retries)
     _atomic_write_json(checkpoint_path, checkpoint)
 
     for item in manifest_items:
@@ -2592,7 +2619,7 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
             state = {
                 "status": "not_run",
                 "fingerprint": fingerprint,
-                "crash_count": int(previous.get("crash_count", 0)),
+                "crash_count": _inherited_crash_count(previous, fingerprint),
                 "message": dependency_message,
                 "completed_at": _now(),
                 "updated_at": _now(),
@@ -2615,7 +2642,7 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
         ):
             continue
 
-        crash_count = int(previous.get("crash_count", 0))
+        crash_count = _inherited_crash_count(previous, fingerprint)
         state = {
             "status": "importing",
             "fingerprint": fingerprint,

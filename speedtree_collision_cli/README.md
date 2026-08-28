@@ -18,9 +18,12 @@ SpeedTree Modeler 10.1.0의 공식 `-export` 경로가 Collision과 Shade Prunin
    FBX/XML serializer가 같은 정확한 계층을 사용하게 합니다.
 7. FBX serializer가 이미 계산한 ID 0/root influence와 단일 root의 Start
    cluster를 deform bone으로 보존합니다.
-8. 지면형 `Leaf Mesh -> Zone -> Start` 배치에만 leaf별 export bone을 생성하고,
-   해당 Leaf Mesh의 ID 0 vertex를 그 bone에 정확히 연결합니다.
-9. 같은 serializer 호출에서 geometry/local vertex, runtime Node/Generator GUID,
+8. SPM을 파싱한 export graph의 본 레코드가 0개이면 루트-절대 deform bone을
+   정확히 하나 생성하고 모든 ID 0 vertex를 weight 1로 연결합니다.
+9. 본이 이미 있는 지면형 `Leaf Mesh -> Zone -> Start` 배치와 유효한
+   `BaseRef -> target Branch`로 제작된 Branch Leaf에는 leaf별 export bone을
+   생성하고 해당 Leaf Mesh의 ID 0 vertex를 정확히 연결합니다.
+10. 같은 serializer 호출에서 geometry/local vertex, runtime Node/Generator GUID,
    authored position, 런타임 pose의 단위 tangent와 그 위치의 원본 bone
    influence를 native receipt로 기록합니다.
 
@@ -89,11 +92,16 @@ SpeedTree 10.1.0은 branch나 frond 없이 루트 `Zone`에 바로 배치된 Lea
 geometry는 만들지만 export bone record는 만들지 않습니다. 이 경우 serializer의
 source bone ID가 모두 0이 되어 grass 한 패치가 `Root` 하나에 붙습니다.
 
-확장은 런타임 부모 체인이 정확히 `CLeafMeshNode -> CZoneNode -> CStartNode`인
-배치에만 적용됩니다. 중첩된 `CLeafMeshNode`는 허용하지만 조상에
-`CBranchNode`, `CFrondNode`, `CBaseNode`가 하나라도 있으면 적용하지 않습니다.
-따라서 tree canopy나 `tree_densiflora`의 `Leaf Mesh -> Base` 구조에는 synthetic
-bone을 만들지 않습니다.
+지면 배치는 런타임 부모 체인이 정확히
+`CLeafMeshNode -> CZoneNode -> CStartNode`인 경우에 적용됩니다. 또한 과거의
+"Branch/Base 조상 Leaf Mesh 제외" 정책은 제거되었습니다. 현재는
+`Leaf Mesh -> Branch ... -> Base` 체인의 Base가 유효한
+`CBaseRefNode -> target CBranchNode` 역참조를 가질 때도 leaf별 exact bone을
+생성합니다. 불완전한 BaseRef 체인을 이름이나 위치로 추정하지 않습니다.
+
+이 변경은 최종 Tree/Grass SPM에만 적용됩니다. 부모 폴더가 `Cluster`이거나
+stem이 `SK_cluster_`인 클러스터 소스는 leaf별 synthetic bone 대상에서 제외하며,
+기존의 축 변환·방향 판정용 단일 절대 기준 본 정책을 유지합니다.
 
 대상 Leaf Mesh가 실제 geometry를 생성했을 때만 authored position과 pose tangent로
 export bone을 하나 삽입합니다. 기존 ID 0 record는 그 exact bone ID로 바꾸고 모든

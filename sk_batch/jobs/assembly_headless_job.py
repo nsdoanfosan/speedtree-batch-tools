@@ -123,6 +123,14 @@ def parse_args():
     parser.add_argument("--material-contract", required=True)
     parser.add_argument("--bark-normalization-manifest", default="")
     parser.add_argument("--cluster-source-build-only", action="store_true")
+    parser.add_argument(
+        "--force-native-export",
+        action="store_true",
+        help=(
+            "bypass a reusable material-preflight FBX bundle and serialize "
+            "a fresh native SpeedTree FBX/XML/receipt with the installed hook"
+        ),
+    )
     parser.add_argument("--report", required=True)
     return parser.parse_args(argv)
 
@@ -900,12 +908,14 @@ def main():
 
         export_settings = settings.as_dict()
         speedtree_export_started = perf_counter()
-        speedtree_export = reusable_preflight_export_bundle(
-            material_preflight,
-            speedtree_spm,
-            collision_cli,
-            collision_hook,
-        )
+        speedtree_export = None
+        if not args.force_native_export:
+            speedtree_export = reusable_preflight_export_bundle(
+                material_preflight,
+                speedtree_spm,
+                collision_cli,
+                collision_hook,
+            )
         if speedtree_export is None:
             speedtree_export = run_speedtree_cli_export(
                 str(speedtree_spm),
@@ -924,7 +934,11 @@ def main():
                 export_fbx=export_settings["speedtree_export_fbx"],
                 export_xml=export_settings["speedtree_export_xml"],
             )
-            report["speedtree_export_source"] = "export_helper"
+            report["speedtree_export_source"] = (
+                "forced_export_helper"
+                if args.force_native_export
+                else "export_helper"
+            )
         else:
             report["speedtree_export_source"] = "validated_material_preflight"
         record_stage_duration(

@@ -28,6 +28,7 @@ from process_lifecycle import owned_run  # noqa: E402
 from artifact_retention import estimate_output_reservation_bytes  # noqa: E402
 from sk_common import (  # noqa: E402
     DEFAULT_SEND2UE_DIR,
+    UNREAL_COMMANDLET_BASE_ARGS,
     send2ue_export_cache_root,
     unreal_remote_execution_settings,
     wind_preset_for_spm,
@@ -181,6 +182,7 @@ def build_assembly_refresh_command(
         wind_preset_for_spm(spm),
         "--material-contract",
         str(material_contract),
+        "--force-native-export",
         "--report",
         str(report_path),
     ]
@@ -307,6 +309,57 @@ def build_exact_push_command(
     return command, outputs
 
 
+# Checkpoint states that only exist because UnrealEditor-Cmd stopped while the
+# item was importing.  A deliberate operator stop is indistinguishable from a
+# real commandlet crash at the process level, so both land here and both are
+# safe to requeue on explicit request.
+OPERATOR_RETRYABLE_ITEM_STATES = ("unreal_crash", "manual_required")
+
+
+def reset_checkpoint_item_retries(checkpoint_path: Path) -> dict:
+    """Requeue items that only failed because the commandlet was stopped.
+
+    ``data_error`` and ``not_run`` are deliberately left alone: the former is a
+    real content failure that a retry cannot fix, and the latter resolves on its
+    own once its dependency imports.  Successful items keep ``imported_ok`` so
+    the resumed run still skips them.
+    """
+    checkpoint_path = Path(checkpoint_path).expanduser().resolve()
+    try:
+        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ExactPushError(
+            f"Unreal checkpoint is unreadable: {checkpoint_path}: {exc}"
+        ) from exc
+
+    reset = []
+    for queue_id, state in (checkpoint.get("items") or {}).items():
+        if not isinstance(state, dict):
+            continue
+        if state.get("status") not in OPERATOR_RETRYABLE_ITEM_STATES:
+            continue
+        state.update({
+            "status": "operator_retry_pending",
+            "crash_count": 0,
+            "message": (
+                "requeued by operator after "
+                f"{state.get('status')}; crash budget cleared"
+            ),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        })
+        reset.append(queue_id)
+
+    if reset:
+        checkpoint["current_item"] = None
+        checkpoint["complete"] = False
+        checkpoint["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        checkpoint_path.write_text(
+            json.dumps(checkpoint, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    return {"checkpoint": str(checkpoint_path), "reset": sorted(reset)}
+
+
 def run_headless_manifest(
     manifest_path: Path,
     checkpoint_path: Path,
@@ -336,10 +389,7 @@ def run_headless_manifest(
         str(unreal_project),
         "-run=pythonscript",
         f"-script={UNREAL_INGEST}",
-        "-unattended",
-        "-NoSplash",
-        "-NoSound",
-        "-UTF8Output",
+        *UNREAL_COMMANDLET_BASE_ARGS,
     ]
     environment = os.environ.copy()
     environment.update({
@@ -431,6 +481,8 @@ def parse_args(argv=None):
         default="headless",
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--defer-unreal", action="store_true")
+    parser.add_argument("--prepared-report", type=Path)
     return parser.parse_args(argv)
 
 
@@ -549,6 +601,26 @@ def main(argv=None):
                     "Blender export did not reach exported_pending_unreal: "
                     + str(export_report)
                 )
+            if args.defer_unreal:
+                if args.prepared_report is None:
+                    raise ExactPushError(
+                        "--defer-unreal requires --prepared-report"
+                    )
+                prepared_report = args.prepared_report.expanduser().resolve()
+                prepared_report.parent.mkdir(parents=True, exist_ok=True)
+                prepared_report.write_text(
+                    json.dumps({
+                        "schema_version": 1,
+                        "status": "prepared_pending_unreal",
+                        "outputs": {
+                            key: str(value) if value is not None else None
+                            for key, value in outputs.items()
+                        },
+                    }, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                print("SK_EXACT_PUSH_PREPARED=" + str(prepared_report))
+                return 0
             batch_result = run_headless_manifest(
                 outputs["manifest"],
                 outputs["checkpoint"],

@@ -143,9 +143,16 @@ def build_receipt_refresh_command(target, report_path):
     ]
 
 
-def build_assembly_command(target, blender, material_contract, report_path):
+def build_assembly_command(
+    target,
+    blender,
+    material_contract,
+    report_path,
+    *,
+    force_native_export=False,
+):
     spm = Path(target["spm"]).resolve()
-    return [
+    command = [
         str(Path(blender).resolve()),
         "--factory-startup",
         "-b",
@@ -165,6 +172,9 @@ def build_assembly_command(target, blender, material_contract, report_path):
         "--report",
         str(Path(report_path).resolve()),
     ]
+    if force_native_export:
+        command.insert(-2, "--force-native-export")
+    return command
 
 
 def validate_assembly_result(report_path, target):
@@ -679,6 +689,14 @@ def parse_args(argv=None):
     parser.add_argument("--only", action="append", default=[])
     parser.add_argument("--exclude", action="append", default=[])
     parser.add_argument("--skip-birch", action="store_true")
+    parser.add_argument(
+        "--force-native-export",
+        action="store_true",
+        help=(
+            "force every selected root Assembly to regenerate its native "
+            "SpeedTree FBX/XML/bone receipt instead of reusing preflight output"
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 
@@ -955,6 +973,7 @@ def main(argv=None):
                 args.blender,
                 outputs["material_contract"],
                 assembly_report,
+                force_native_export=args.force_native_export,
             )
             result["assembly_report"] = str(assembly_report)
             while True:

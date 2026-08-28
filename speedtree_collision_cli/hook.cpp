@@ -520,6 +520,7 @@ std::unordered_map<void*, int> gSyntheticLeafBoneIds;
 constexpr int kSyntheticLeafBoneIdBase = 10000;
 constexpr int kSyntheticLeafBoneIdLimit = 30000;
 int gNextSyntheticLeafBoneId = kSyntheticLeafBoneIdBase;
+int gZeroBoneAbsoluteFallbackId = 0;
 NativeStateProbe gNativeStateProbes[] = {
     {0x135A59, "native export probe 135A59"},
     {0x135A9D, "native export probe 135A9D"},
@@ -766,6 +767,25 @@ int ReserveSyntheticLeafBoneId(void* leafNode) {
     return boneId;
 }
 
+std::size_t NativeParsedBoneCount() {
+    std::lock_guard<std::mutex> lock(gNativeReceiptMutex);
+    return gNativeReceiptBones.size();
+}
+
+int ReserveZeroBoneAbsoluteFallbackId() {
+    std::lock_guard<std::mutex> lock(gNativeReceiptMutex);
+    if (gZeroBoneAbsoluteFallbackId > 0) {
+        return gZeroBoneAbsoluteFallbackId;
+    }
+    if (gNextSyntheticLeafBoneId >= kSyntheticLeafBoneIdLimit) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "Zero-bone SPM fallback exhausted its reserved exact-ID range");
+    }
+    gZeroBoneAbsoluteFallbackId = gNextSyntheticLeafBoneId++;
+    return gZeroBoneAbsoluteFallbackId;
+}
+
 bool IsRootZoneLeafMesh(void* leafNode) {
     if (leafNode == nullptr) {
         return false;
@@ -788,8 +808,7 @@ bool IsRootZoneLeafMesh(void* leafNode) {
                 return false;
             }
             if (std::strcmp(type, ".?AVCBranchNode@@") == 0 ||
-                std::strcmp(type, ".?AVCFrondNode@@") == 0 ||
-                std::strcmp(type, ".?AVCBaseNode@@") == 0) {
+                std::strcmp(type, ".?AVCFrondNode@@") == 0) {
                 return false;
             }
             if (std::strcmp(type, ".?AVCZoneNode@@") == 0) {
@@ -806,6 +825,63 @@ bool IsRootZoneLeafMesh(void* leafNode) {
         return false;
     }
     return false;
+}
+
+bool IsBaseRefBranchLeafMesh(void* leafNode) {
+    if (leafNode == nullptr) {
+        return false;
+    }
+    __try {
+        void* current = *reinterpret_cast<void* const*>(
+            static_cast<const unsigned char*>(leafNode) + 0x98);
+        bool sawBranch = false;
+        for (int depth = 0; current != nullptr && depth < 16; ++depth) {
+            const char* type = ReadSpeedTreeRttiName(current);
+            if (type == nullptr) {
+                return false;
+            }
+            if (std::strcmp(type, ".?AVCBranchNode@@") == 0) {
+                sawBranch = true;
+            } else if (std::strcmp(type, ".?AVCBaseNode@@") == 0) {
+                if (!sawBranch) {
+                    return false;
+                }
+                const auto* baseBytes = static_cast<const unsigned char*>(current);
+                void* targetBranch = *reinterpret_cast<void* const*>(
+                    baseBytes + 0x2C8);
+                void* baseRef = *reinterpret_cast<void* const*>(
+                    baseBytes + 0x2D0);
+                const char* targetType = ReadSpeedTreeRttiName(targetBranch);
+                const char* baseRefType = ReadSpeedTreeRttiName(baseRef);
+                return targetType != nullptr &&
+                    std::strcmp(targetType, ".?AVCBranchNode@@") == 0 &&
+                    baseRefType != nullptr &&
+                    std::strcmp(baseRefType, ".?AVCBaseRefNode@@") == 0 &&
+                    *reinterpret_cast<void* const*>(
+                        static_cast<const unsigned char*>(baseRef) + 0x98) ==
+                        targetBranch;
+            } else if (std::strcmp(type, ".?AVCLeafMeshNode@@") != 0) {
+                return false;
+            }
+            current = *reinterpret_cast<void* const*>(
+                static_cast<const unsigned char*>(current) + 0x98);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return false;
+}
+
+bool IsClusterSourceInput() {
+    if (gNativeInputPath[0] == L'\0') {
+        return false;
+    }
+    const std::filesystem::path input(gNativeInputPath);
+    const std::wstring parent = input.parent_path().filename().wstring();
+    const std::wstring stem = input.stem().wstring();
+    return _wcsicmp(parent.c_str(), L"cluster") == 0 ||
+        (stem.size() >= 11 &&
+         _wcsnicmp(stem.c_str(), L"SK_cluster_", 11) == 0);
 }
 
 void LogMissingIdZeroBoneRecordOnce() {
@@ -877,6 +953,7 @@ void ResetNativeReceiptCapture() {
     gNativeReceiptProxyIndexes.clear();
     gSyntheticLeafBoneIds.clear();
     gNextSyntheticLeafBoneId = kSyntheticLeafBoneIdBase;
+    gZeroBoneAbsoluteFallbackId = 0;
 }
 
 int NativeReceiptGeometryOrdinal(void* geometry, int vertexIndex) {
@@ -1241,9 +1318,11 @@ void __fastcall HookedExportVertexWeights(
     int sourceBoneId,
     int vertexIndex,
     void* clusterMap) {
-    bool syntheticLeafWeight = false;
+    bool syntheticLeafWeight = sourceBoneId > 0 &&
+        sourceBoneId == gZeroBoneAbsoluteFallbackId;
     __try {
-        if (sourceBoneId > 0 && gCurrentExportSourceVertexRecord != nullptr) {
+        if (!syntheticLeafWeight && sourceBoneId > 0 &&
+            gCurrentExportSourceVertexRecord != nullptr) {
             const auto* record = static_cast<const unsigned char*>(
                 gCurrentExportSourceVertexRecord);
             void* sourceObject = *reinterpret_cast<void* const*>(record + 0x110);
@@ -1513,11 +1592,14 @@ int __fastcall CaptureNativeReceiptIdZero(
     int effectiveBoneId = sourceBoneId;
     __try {
         if (sourceBoneId == 0 && gCurrentExportSourceVertexRecord != nullptr) {
+            if (gZeroBoneAbsoluteFallbackId > 0) {
+                effectiveBoneId = gZeroBoneAbsoluteFallbackId;
+            }
             const auto* record = static_cast<const unsigned char*>(
                 gCurrentExportSourceVertexRecord);
             void* sourceObject = *reinterpret_cast<void* const*>(record + 0x110);
             const char* sourceType = ReadSpeedTreeRttiName(sourceObject);
-            if (sourceType != nullptr &&
+            if (effectiveBoneId == 0 && sourceType != nullptr &&
                 std::strcmp(sourceType, ".?AVCLeafMeshNode@@") == 0) {
                 const int syntheticBoneId = FindSyntheticLeafBoneId(sourceObject);
                 if (syntheticBoneId > 0) {
@@ -1667,7 +1749,12 @@ bool TryReadExportGeometryEnd(void* exportData, void** geometryEnd) {
 }
 
 void __fastcall HookedLeafMeshExport(void* leafNode, void* exportData) {
-    const bool needsSyntheticBone = IsRootZoneLeafMesh(leafNode);
+    const bool clusterSource = IsClusterSourceInput();
+    const bool rootZoneLeaf =
+        !clusterSource && IsRootZoneLeafMesh(leafNode);
+    const bool baseRefBranchLeaf =
+        !clusterSource && IsBaseRefBranchLeafMesh(leafNode);
+    const bool needsSyntheticBone = rootZoneLeaf || baseRefBranchLeaf;
     void* geometryEndBefore = nullptr;
     if (!TryReadExportGeometryEnd(exportData, &geometryEndBefore)) {
         AbortExport(
@@ -1681,7 +1768,29 @@ void __fastcall HookedLeafMeshExport(void* leafNode, void* exportData) {
             kHookRuntimeFailureExitCode,
             "Leaf Mesh bone serialization lost the native geometry list");
     }
-    if (geometryEndBefore == geometryEndAfter || !needsSyntheticBone) {
+    if (geometryEndBefore == geometryEndAfter) {
+        return;
+    }
+
+    // Permanent native SPM rule: after Modeler parsed the export graph, a
+    // model with no bone records receives exactly one root-absolute deform
+    // bone. The ID-0 entry stub maps every otherwise unbound vertex to it at
+    // rigid weight 1. Existing nonzero model bones remain completely native.
+    if (!needsSyntheticBone && NativeParsedBoneCount() == 0) {
+        SyntheticLeafBoneRecord fallback{};
+        fallback.boneId = ReserveZeroBoneAbsoluteFallbackId();
+        fallback.parentId = 0;
+        fallback.start[0] = 0.0f;
+        fallback.start[1] = 0.0f;
+        fallback.start[2] = 0.0f;
+        fallback.end[0] = 0.0f;
+        fallback.end[1] = 0.0f;
+        fallback.end[2] = 1.0f;
+        HookedInsertExportBone(exportData, &fallback, leafNode);
+        Log("parsed zero-bone SPM received one absolute rigid fallback bone");
+        return;
+    }
+    if (!needsSyntheticBone) {
         return;
     }
 

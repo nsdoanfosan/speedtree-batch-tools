@@ -63,7 +63,7 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         launcher = LAUNCHER_SOURCE.read_text(encoding="utf-8")
         contract = (
             "SPEEDTREE_COLLISION_CLI_CONTRACT="
-            "native-runtime-receipt-v10"
+            "native-runtime-receipt-v13"
         )
 
         self.assertIn(contract, launcher)
@@ -151,7 +151,7 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         self.assertIn("FbxSkeleton::eLimbNode", source)
         self.assertIn("No spatial lookup or normalization", weight_hook)
 
-    def test_root_zone_leaf_meshes_get_exact_rigid_bones_without_touching_trees(self):
+    def test_root_zone_leaf_meshes_get_exact_rigid_bones(self):
         source = HOOK_SOURCE.read_text(encoding="utf-8")
 
         scope = source[
@@ -171,15 +171,80 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         self.assertIn(".?AVCStartNode@@", scope)
         self.assertIn(".?AVCBranchNode@@", scope)
         self.assertIn(".?AVCFrondNode@@", scope)
-        self.assertIn(".?AVCBaseNode@@", scope)
         self.assertIn("return sawZone", scope)
-        self.assertIn("const bool needsSyntheticBone = IsRootZoneLeafMesh", leaf_export)
-        self.assertIn("geometryEndBefore == geometryEndAfter || !needsSyntheticBone", leaf_export)
+        self.assertIn("!clusterSource && IsRootZoneLeafMesh", leaf_export)
+        self.assertIn("!clusterSource && IsBaseRefBranchLeafMesh", leaf_export)
+        self.assertIn("rootZoneLeaf || baseRefBranchLeaf", leaf_export)
+        self.assertIn("geometryEndBefore == geometryEndAfter", leaf_export)
+        self.assertIn("if (!needsSyntheticBone)", leaf_export)
         self.assertIn("ReserveSyntheticLeafBoneId", leaf_export)
         self.assertIn("primary.overrideWeight = syntheticLeafWeight", weight_hook)
         self.assertIn("primary.replacementWeight = 1.0", weight_hook)
         self.assertIn("RemoveHook(gLeafMeshExportHook)", source)
         self.assertIn("HookedLeafMeshExport", source[source.index("bool InstallHooks"):])
+
+    def test_baseref_branch_leaf_meshes_get_exact_rigid_bones(self):
+        source = HOOK_SOURCE.read_text(encoding="utf-8")
+        scope = source[
+            source.index("bool IsBaseRefBranchLeafMesh"):
+            source.index("void LogMissingIdZeroBoneRecordOnce")
+        ]
+
+        self.assertIn(".?AVCBranchNode@@", scope)
+        self.assertIn(".?AVCBaseNode@@", scope)
+        self.assertIn(".?AVCBaseRefNode@@", scope)
+        self.assertIn("baseBytes + 0x2C8", scope)
+        self.assertIn("baseBytes + 0x2D0", scope)
+        self.assertIn("targetBranch", scope)
+        root_scope = source[
+            source.index("bool IsRootZoneLeafMesh"):
+            source.index("bool IsBaseRefBranchLeafMesh")
+        ]
+        self.assertNotIn(
+            'std::strcmp(type, ".?AVCBaseNode@@") == 0', root_scope
+        )
+
+    def test_cluster_sources_keep_single_axis_reference_bone_policy(self):
+        source = HOOK_SOURCE.read_text(encoding="utf-8")
+        classifier = source[
+            source.index("bool IsClusterSourceInput"):
+            source.index("void LogMissingIdZeroBoneRecordOnce")
+        ]
+        leaf_export = source[
+            source.index("void __fastcall HookedLeafMeshExport"):
+            source.index("void LogCollisionInputTypes")
+        ]
+
+        self.assertIn('L"cluster"', classifier)
+        self.assertIn('L"SK_cluster_"', classifier)
+        self.assertIn("!clusterSource && IsRootZoneLeafMesh", leaf_export)
+        self.assertIn("!clusterSource && IsBaseRefBranchLeafMesh", leaf_export)
+        self.assertIn("NativeParsedBoneCount() == 0", leaf_export)
+
+    def test_zero_bone_spm_gets_one_absolute_rigid_fallback(self):
+        source = HOOK_SOURCE.read_text(encoding="utf-8")
+        leaf_export = source[
+            source.index("void __fastcall HookedLeafMeshExport"):
+            source.index("void LogCollisionInputTypes")
+        ]
+        id_zero = source[
+            source.index("int __fastcall CaptureNativeReceiptIdZero"):
+            source.index("void FreeExportVertexWeightsEntryStub")
+        ]
+        weight_hook = source[
+            source.index("void __fastcall HookedExportVertexWeights"):
+            source.index("int __fastcall CaptureNativeReceiptIdZero")
+        ]
+
+        self.assertIn("!needsSyntheticBone && NativeParsedBoneCount() == 0", leaf_export)
+        self.assertIn("ReserveZeroBoneAbsoluteFallbackId", leaf_export)
+        self.assertIn("fallback.parentId = 0", leaf_export)
+        self.assertIn("fallback.start[0] = 0.0f", leaf_export)
+        self.assertIn("fallback.end[2] = 1.0f", leaf_export)
+        self.assertIn("gZeroBoneAbsoluteFallbackId", id_zero)
+        self.assertIn("effectiveBoneId = gZeroBoneAbsoluteFallbackId", id_zero)
+        self.assertIn("sourceBoneId == gZeroBoneAbsoluteFallbackId", weight_hook)
+        self.assertIn("primary.replacementWeight = 1.0", weight_hook)
 
     def test_disappeared_persistent_pipe_starts_a_replacement(self):
         source = LAUNCHER_SOURCE.read_text(encoding="utf-8")
