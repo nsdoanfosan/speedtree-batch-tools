@@ -7,7 +7,7 @@ set "COLLISION_HOOK=%COLLISION_DIR%\bin\speedtree_collision_hook.dll"
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%COLLISION_DIR%\build.ps1" -IfNeeded
 if errorlevel 1 goto collision_build_failed
 
-"%COLLISION_CLI%" --diagnose 2>nul | %SystemRoot%\System32\findstr.exe /x /c:"SPEEDTREE_COLLISION_CLI_CONTRACT=native-runtime-receipt-v13"
+"%COLLISION_CLI%" --diagnose 2>nul | %SystemRoot%\System32\findstr.exe /x /c:"SPEEDTREE_COLLISION_CLI_CONTRACT=native-runtime-receipt-v14"
 if errorlevel 1 goto collision_diagnose_failed
 
 set "SPEEDTREE_BATCH_LAUNCH_SOURCE=bat:SK_Affected_Headless_Refresh.bat"

@@ -43,6 +43,27 @@ def native_receipt_path(target):
     return spm.parent / "fbx" / f"{target['stem']}.speedtree_native_receipt.json"
 
 
+def _vertex_ranges_are_exact_and_ordered(row):
+    """Mirror the receipt contract check in speedtree_native_receipt.
+
+    Ranges must be ascending, non-overlapping and non-empty.  Geometry bounds
+    are not re-checked here; the loader owns that.
+    """
+    ranges = row.get("vertex_ranges") or []
+    if not ranges:
+        return False
+    previous_last = -1
+    for value in ranges:
+        try:
+            first, last = int(value[0]), int(value[1])
+        except (IndexError, TypeError, ValueError):
+            return False
+        if first <= previous_last or first < 0 or last < first:
+            return False
+        previous_last = last
+    return True
+
+
 def audit_target(target):
     receipt_path = native_receipt_path(target)
     reasons = []
@@ -93,6 +114,18 @@ def audit_target(target):
             # A receipt that still carries them was written before the rule
             # existed, whatever its other counts look like.
             reasons.append("zero_bone_leaf_mesh_present")
+        invalid_range_instances = [
+            row
+            for row in receipt.get("generated_instances") or []
+            if not _vertex_ranges_are_exact_and_ordered(row)
+        ]
+        if invalid_range_instances:
+            # speedtree_native_receipt rejects the whole receipt when any
+            # instance carries overlapping or unordered vertex ranges, so the
+            # asset cannot be reassembled from it.  A receipt can otherwise look
+            # completely current, which is how assets imported on top of an
+            # invalid receipt escaped selection.
+            reasons.append("native_vertex_ranges_not_exact_and_ordered")
         if native_bone_count == 0:
             reasons.append("parsed_native_bone_count_zero")
         if base_ref_branch_zero_bone_leaf_instances:
@@ -233,6 +266,7 @@ def main(argv=None):
                 "native_receipt_missing_or_unreadable",
                 "native_receipt_schema_stale",
                 "zero_bone_leaf_mesh_present",
+                "native_vertex_ranges_not_exact_and_ordered",
                 "assembly_manifest_missing_or_unreadable",
                 "assembly_placement_contract_stale",
                 "parsed_native_bone_count_zero",

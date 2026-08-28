@@ -504,8 +504,36 @@ struct NativeReceiptProxy {
     bool hasAuthoredTangent = false;
     float authoredTangentNativeUnit[3]{};
     std::vector<NativeReceiptInfluence> influences;
-    std::vector<NativeReceiptRange> vertexRanges;
+    // Raw submission order, coalesced into exact ascending non-overlapping
+    // ranges only at serialization time.  Vertices do not arrive sorted: a
+    // per-instance proxy is fed in triangle order, which revisits indices, so
+    // an incremental "extend when lastVertex + 1" merge produced overlapping
+    // and unordered ranges that the receipt contract rejects.
+    std::vector<int> vertexIndices;
 };
+
+// Sort, de-duplicate and merge consecutive vertex indices into ranges.
+std::vector<NativeReceiptRange> CoalesceNativeReceiptVertexRanges(
+    std::vector<int> indices) {
+    std::vector<NativeReceiptRange> ranges;
+    if (indices.empty()) {
+        return ranges;
+    }
+    std::sort(indices.begin(), indices.end());
+    indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+    NativeReceiptRange current{indices.front(), indices.front()};
+    for (std::size_t index = 1; index < indices.size(); ++index) {
+        const int value = indices[index];
+        if (value == current.lastVertex + 1) {
+            current.lastVertex = value;
+            continue;
+        }
+        ranges.push_back(current);
+        current = NativeReceiptRange{value, value};
+    }
+    ranges.push_back(current);
+    return ranges;
+}
 
 std::mutex gNativeReceiptMutex;
 std::vector<NativeReceiptGeometry> gNativeReceiptGeometries;
@@ -1276,12 +1304,7 @@ void CaptureNativeReceiptProxy(
         proxyIndex = existing->second;
     }
 
-    auto& ranges = gNativeReceiptProxies[proxyIndex].vertexRanges;
-    if (!ranges.empty() && ranges.back().lastVertex + 1 == vertexIndex) {
-        ranges.back().lastVertex = vertexIndex;
-    } else {
-        ranges.push_back({vertexIndex, vertexIndex});
-    }
+    gNativeReceiptProxies[proxyIndex].vertexIndices.push_back(vertexIndex);
 }
 
 void CaptureNativeReceiptBone(const void* sourceBoneRecord, const void* sourceBranch) {
@@ -5318,13 +5341,15 @@ bool WriteNativeReceipt() {
             }
             stream << "]";
         }
+        const std::vector<NativeReceiptRange> vertexRanges =
+            CoalesceNativeReceiptVertexRanges(proxy.vertexIndices);
         stream << ", \"vertex_ranges\": [";
         for (std::size_t rangeIndex = 0;
-             rangeIndex < proxy.vertexRanges.size();
+             rangeIndex < vertexRanges.size();
              ++rangeIndex) {
-            const auto& range = proxy.vertexRanges[rangeIndex];
+            const auto& range = vertexRanges[rangeIndex];
             stream << "[" << range.firstVertex << ", " << range.lastVertex << "]";
-            if (rangeIndex + 1 != proxy.vertexRanges.size()) {
+            if (rangeIndex + 1 != vertexRanges.size()) {
                 stream << ", ";
             }
         }

@@ -25,7 +25,7 @@
 namespace {
 
 constexpr wchar_t kCapabilityContract[] =
-    L"SPEEDTREE_COLLISION_CLI_CONTRACT=native-runtime-receipt-v13";
+    L"SPEEDTREE_COLLISION_CLI_CONTRACT=native-runtime-receipt-v14";
 
 constexpr wchar_t kDefaultModelerPath[] =
     L"C:\\Program Files\\SpeedTree\\SpeedTree Modeler v10.1.0\\win64\\SpeedTree_Modeler.exe";

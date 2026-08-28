@@ -22,18 +22,14 @@ def test_audit_selects_zero_bone_spm_and_ignores_healthy_grass(tmp_path):
     current = _target(tmp_path, "SK_tree_current_01")
     grass = _target(tmp_path, "SK_weed_velvet_grass_01")
     for target, bone_ids in ((stale, []), (current, [42]), (grass, [42])):
-        receipt = refresh.native_receipt_path(target)
-        receipt.parent.mkdir(parents=True, exist_ok=True)
-        receipt.write_text(
-            json.dumps({
-                "schema_version": refresh.NATIVE_RECEIPT_SCHEMA_VERSION,
-                "bones": [{"id": bone_id} for bone_id in bone_ids],
-                "generated_instances": [{
-                    "source_rtti": refresh.LEAF_MESH_RTTI,
-                    "source_bone_id": bone_ids[0] if bone_ids else 0,
-                }],
-            }),
-            encoding="utf-8",
+        _write_receipt(
+            target,
+            schema_version=refresh.NATIVE_RECEIPT_SCHEMA_VERSION,
+            bones=[{"id": bone_id} for bone_id in bone_ids],
+            instances=[{
+                "source_rtti": refresh.LEAF_MESH_RTTI,
+                "source_bone_id": bone_ids[0] if bone_ids else 0,
+            }],
         )
         # Keep the Assembly manifest current so this case only exercises the
         # bone-shape reasons and not manifest staleness.
@@ -69,6 +65,7 @@ def test_audit_selects_zero_bone_baseref_branch_leaf(tmp_path):
             "generated_instances": [{
                 "source_rtti": refresh.LEAF_MESH_RTTI,
                 "source_bone_id": 0,
+                "vertex_ranges": [[0, 2]],
                 "ancestor_chain": [
                     {"source_rtti": refresh.BRANCH_RTTI},
                     {"source_rtti": refresh.BASE_RTTI},
@@ -239,11 +236,18 @@ def test_reset_checkpoint_item_retries_leaves_clean_checkpoint_untouched(tmp_pat
 def _write_receipt(target, *, schema_version, bones, instances):
     receipt = refresh.native_receipt_path(target)
     receipt.parent.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for offset, instance in enumerate(instances):
+        row = dict(instance)
+        # Every real instance carries ranges; default to a valid one so a case
+        # that is not about ranges does not trip the range reason.
+        row.setdefault("vertex_ranges", [[offset * 4, offset * 4 + 2]])
+        rows.append(row)
     receipt.write_text(
         json.dumps({
             "schema_version": schema_version,
             "bones": bones,
-            "generated_instances": instances,
+            "generated_instances": rows,
         }),
         encoding="utf-8",
     )
@@ -532,3 +536,77 @@ def test_repaired_baseref_branch_leaf_is_not_reselected(tmp_path):
     assert audit["baseref_branch_zero_bone_leaf_mesh_instance_count"] == 0
     assert audit["reasons"] == []
     assert audit["selected"] is False
+
+
+def test_overlapping_vertex_ranges_are_selected(tmp_path):
+    """The defect that let assets import on top of an unusable receipt.
+
+    The native hook emitted per-instance ranges in triangle submission order,
+    producing entries like [0,0],[0,1],[1,2] that the receipt contract rejects,
+    while every other field looked current.
+    """
+    target = _target(tmp_path, "SK_tree_overlapping_ranges_01")
+    _write_receipt(
+        target,
+        schema_version=refresh.NATIVE_RECEIPT_SCHEMA_VERSION,
+        bones=[{"id": SYNTHETIC_BONE_ID_BASE}],
+        instances=[{
+            "source_rtti": refresh.LEAF_MESH_RTTI,
+            "source_bone_id": SYNTHETIC_BONE_ID_BASE,
+            "vertex_ranges": [[0, 0], [0, 1], [1, 2], [2, 2]],
+        }],
+    )
+    _write_pass_through_manifest(target)
+
+    audit = refresh.audit_target(target)
+    assert "native_vertex_ranges_not_exact_and_ordered" in audit["reasons"]
+    assert audit["selected"] is True
+
+
+def test_coalesced_vertex_ranges_are_not_selected(tmp_path):
+    target = _target(tmp_path, "SK_tree_coalesced_ranges_01")
+    _write_receipt(
+        target,
+        schema_version=refresh.NATIVE_RECEIPT_SCHEMA_VERSION,
+        bones=[{"id": SYNTHETIC_BONE_ID_BASE}],
+        instances=[{
+            "source_rtti": refresh.LEAF_MESH_RTTI,
+            "source_bone_id": SYNTHETIC_BONE_ID_BASE,
+            "vertex_ranges": [[0, 2], [56, 58]],
+        }],
+    )
+    _write_pass_through_manifest(target)
+
+    audit = refresh.audit_target(target)
+    assert audit["reasons"] == []
+    assert audit["selected"] is False
+
+
+def test_missing_vertex_ranges_are_selected(tmp_path):
+    target = _target(tmp_path, "SK_tree_no_ranges_01")
+    _write_receipt(
+        target,
+        schema_version=refresh.NATIVE_RECEIPT_SCHEMA_VERSION,
+        bones=[{"id": SYNTHETIC_BONE_ID_BASE}],
+        instances=[{
+            "source_rtti": refresh.LEAF_MESH_RTTI,
+            "source_bone_id": SYNTHETIC_BONE_ID_BASE,
+            "vertex_ranges": [],
+        }],
+    )
+    _write_pass_through_manifest(target)
+
+    audit = refresh.audit_target(target)
+    assert "native_vertex_ranges_not_exact_and_ordered" in audit["reasons"]
+    assert audit["selected"] is True
+
+
+def test_vertex_range_helper_matches_receipt_contract():
+    ok = refresh._vertex_ranges_are_exact_and_ordered
+    assert ok({"vertex_ranges": [[0, 2], [4, 9]]}) is True
+    assert ok({"vertex_ranges": [[0, 0]]}) is True
+    assert ok({"vertex_ranges": [[0, 0], [0, 1]]}) is False
+    assert ok({"vertex_ranges": [[4, 9], [0, 2]]}) is False
+    assert ok({"vertex_ranges": [[2, 1]]}) is False
+    assert ok({"vertex_ranges": [[-1, 3]]}) is False
+    assert ok({"vertex_ranges": []}) is False
