@@ -1998,6 +1998,40 @@ def _save_final_skeleton_contract_assets(full_mesh):
     }
 
 
+def _save_large_assembly_without_thumbnail(asset_path):
+    """Persist a built Nanite Assembly without rendering its thumbnail.
+
+    UE 5.8's normal editor save path renders a missing SkeletalMesh thumbnail.
+    A production Assembly can exceed the practical preview-GPU budget even
+    though its Nanite build itself completed successfully.  The project plugin
+    exposes the same direct UPackage::SavePackage path already used for other
+    renderer-sensitive assets, so fail closed if that exact API is unavailable.
+    """
+    candidate = str(asset_path or "").split(".")[0]
+    asset = unreal.EditorAssetLibrary.load_asset(candidate) if candidate else None
+    library = getattr(unreal, "CodexMaterialToolsLibrary", None)
+    saver = getattr(
+        library,
+        "save_asset_package_without_thumbnail",
+        None,
+    )
+    if asset is None:
+        raise RuntimeError(
+            f"cannot save missing Cluster Assembly asset: {candidate}"
+        )
+    if not callable(saver):
+        raise RuntimeError(
+            "CodexMaterialToolsLibrary thumbnail-free package save API is "
+            "unavailable"
+        )
+    if not saver(asset):
+        raise RuntimeError(
+            "failed to persist Cluster Assembly without thumbnail rendering: "
+            + candidate
+        )
+    return candidate
+
+
 def _clear_generated_mesh_with_mismatched_skeleton(asset_path, expected_skeleton):
     """Make generated Assembly meshes fresh-import when reimport kept stale Skeletons.
 
@@ -2281,13 +2315,8 @@ def _ingest_cluster_assembly(send2ue_unreal, item, full_wind):
         save_writability.append(
             _ensure_declared_package_writable(item, assembly_path)
         )
-    if assembly_path and not unreal.EditorAssetLibrary.save_asset(
-        assembly_path,
-        only_if_is_dirty=False,
-    ):
-        raise RuntimeError(
-            f"failed to persist Cluster Assembly before runtime probe: {assembly_path}"
-        )
+    if assembly_path:
+        _save_large_assembly_without_thumbnail(assembly_path)
     materials = (
         _material_compile_and_slot_validation(assembly_path)
         if assembly_path

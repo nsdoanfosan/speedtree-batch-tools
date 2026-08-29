@@ -1378,6 +1378,41 @@ class UnrealIngestSaveTests(unittest.TestCase):
         self.assertEqual(save_calls, [(mesh_path, False)])
         self.assertEqual(directory_calls, [("/Game/Meshes/Trees/", True)])
 
+    def test_large_assembly_uses_thumbnail_free_package_save(self):
+        runner = load_runner()
+        assembly_path = "/Game/Meshes/Trees/Assembly/SK_Test_NaniteAssembly"
+        assembly = object()
+        saved = []
+        runner.unreal.EditorAssetLibrary = types.SimpleNamespace(
+            load_asset=lambda path: assembly if path == assembly_path else None,
+        )
+        runner.unreal.CodexMaterialToolsLibrary = types.SimpleNamespace(
+            save_asset_package_without_thumbnail=(
+                lambda asset: saved.append(asset) or True
+            ),
+        )
+
+        result = runner._save_large_assembly_without_thumbnail(
+            assembly_path + ".SK_Test_NaniteAssembly"
+        )
+
+        self.assertEqual(result, assembly_path)
+        self.assertEqual(saved, [assembly])
+
+    def test_large_assembly_save_fails_closed_without_native_helper(self):
+        runner = load_runner()
+        runner.unreal.EditorAssetLibrary = types.SimpleNamespace(
+            load_asset=lambda _path: object(),
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "thumbnail-free package save API is unavailable",
+        ):
+            runner._save_large_assembly_without_thumbnail(
+                "/Game/Meshes/Trees/Assembly/SK_Test_NaniteAssembly"
+            )
+
     def test_ingest_item_saves_once_before_material_validation(self):
         runner = load_runner()
         events = []
