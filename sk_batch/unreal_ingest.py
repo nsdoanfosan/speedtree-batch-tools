@@ -14,6 +14,7 @@ import importlib.util
 import json
 import os
 import re
+import stat
 import sys
 import traceback
 import uuid
@@ -216,6 +217,72 @@ def _checkout_existing_assets(item):
         "existing": existing,
         "checked_out": existing,
         "provider_binding": provider_binding,
+    }
+
+
+def _ensure_declared_package_writable(item, asset_path):
+    """Recheck one predeclared package immediately before a durable save.
+
+    Perforce checkout happens before Unreal starts and again through the editor
+    subsystem.  A generated Assembly rebuild can nevertheless leave the old
+    package's Windows read-only bit set before SavePackage replaces it.  Only
+    exact packages already frozen into ``checkout_asset_paths`` are eligible
+    for this final filesystem repair.
+    """
+    package = str(asset_path or "").split(".", 1)[0].replace("\\", "/")
+    declared = {
+        str(value or "").split(".", 1)[0].replace("\\", "/").casefold()
+        for value in (item.get("checkout_asset_paths") or [])
+        if str(value or "").strip()
+    }
+    if package.casefold() not in declared:
+        raise RuntimeError(
+            "durable save package is absent from the immutable checkout "
+            f"manifest: {package}"
+        )
+    if not package.casefold().startswith("/game/"):
+        raise RuntimeError(f"durable save package is outside /Game: {package}")
+    content_dir = Path(
+        unreal.Paths.convert_relative_path_to_full(
+            unreal.Paths.project_content_dir()
+        )
+    )
+    package_file = content_dir.joinpath(
+        *package[len("/Game/") :].split("/")
+    ).with_suffix(".uasset")
+    if not package_file.is_file():
+        return {
+            "asset": package,
+            "package_file": str(package_file),
+            "status": "new_package",
+            "read_only_cleared": False,
+        }
+
+    def is_read_only():
+        details = package_file.stat()
+        attributes = getattr(details, "st_file_attributes", None)
+        if attributes is not None:
+            return bool(
+                attributes
+                & getattr(stat, "FILE_ATTRIBUTE_READONLY", 1)
+            )
+        return not bool(details.st_mode & stat.S_IWUSR)
+
+    cleared = False
+    if is_read_only():
+        details = package_file.stat()
+        package_file.chmod(details.st_mode | stat.S_IWRITE | stat.S_IWUSR)
+        cleared = True
+    if is_read_only():
+        raise RuntimeError(
+            "prechecked package remains read-only immediately before save: "
+            + str(package_file)
+        )
+    return {
+        "asset": package,
+        "package_file": str(package_file),
+        "status": "writable",
+        "read_only_cleared": cleared,
     }
 
 
@@ -2193,9 +2260,13 @@ def _ingest_cluster_assembly(send2ue_unreal, item, full_wind):
     for optimization in optimizations:
         _finalize_speedtree_skeletal_optimization(optimization)
     persisted_generated_assets = []
+    save_writability = []
     for imported in generated_assets:
         asset_path = imported.get("asset_path") if isinstance(imported, dict) else None
         if asset_path:
+            save_writability.append(
+                _ensure_declared_package_writable(item, asset_path)
+            )
             if not unreal.EditorAssetLibrary.save_asset(
                 asset_path,
                 only_if_is_dirty=False,
@@ -2206,6 +2277,10 @@ def _ingest_cluster_assembly(send2ue_unreal, item, full_wind):
             persisted_generated_assets.append(asset_path)
     result = build_unreal_nanite_assembly(unreal, manifest, asset_contract)
     assembly_path = result.get("assembly")
+    if assembly_path:
+        save_writability.append(
+            _ensure_declared_package_writable(item, assembly_path)
+        )
     if assembly_path and not unreal.EditorAssetLibrary.save_asset(
         assembly_path,
         only_if_is_dirty=False,
@@ -2223,6 +2298,7 @@ def _ingest_cluster_assembly(send2ue_unreal, item, full_wind):
         "assets": generated_assets,
         "optimizations": optimizations,
         "persisted_generated_assets": persisted_generated_assets,
+        "save_writability": save_writability,
         "skeleton_reimports": skeleton_reimports,
         "build": result,
         "materials": materials,

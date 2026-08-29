@@ -4,6 +4,7 @@ import sys
 import tempfile
 import types
 import unittest
+import stat
 from pathlib import Path
 
 
@@ -129,6 +130,41 @@ class DynamicWindFinalSkeletonContractTests(unittest.TestCase):
                     }
                 },
                 {"status": "skipped"},
+            )
+
+    def test_prechecked_package_read_only_bit_is_repaired_before_save(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory() as temporary:
+            content = Path(temporary) / "Content"
+            package = content / "Trees" / "Assembly" / "SK_Tree.uasset"
+            package.parent.mkdir(parents=True)
+            package.write_bytes(b"asset")
+            package.chmod(stat.S_IREAD)
+            runner.unreal.Paths = types.SimpleNamespace(
+                project_content_dir=lambda: str(content),
+                convert_relative_path_to_full=lambda value: value,
+            )
+
+            result = runner._ensure_declared_package_writable(
+                {"checkout_asset_paths": [
+                    "/Game/Trees/Assembly/SK_Tree",
+                ]},
+                "/Game/Trees/Assembly/SK_Tree.SK_Tree",
+            )
+
+            self.assertEqual(result["status"], "writable")
+            self.assertTrue(result["read_only_cleared"])
+            self.assertTrue(package.stat().st_mode & stat.S_IWUSR)
+
+    def test_package_writability_repair_rejects_undeclared_asset(self):
+        runner = load_runner()
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "absent from the immutable checkout manifest",
+        ):
+            runner._ensure_declared_package_writable(
+                {"checkout_asset_paths": ["/Game/Trees/SK_Other"]},
+                "/Game/Trees/SK_Tree",
             )
 
     @staticmethod

@@ -30,6 +30,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from collections import Counter, defaultdict
 from pathlib import Path
+from time import perf_counter
 from types import SimpleNamespace
 
 REPO_DIR = Path(__file__).resolve().parent.parent
@@ -4304,6 +4305,7 @@ def _exact_native_attachment_influences(
     native_receipt,
     skeleton_snapshot,
     context,
+    skeleton_identity=None,
 ):
     """Read authored proxy weights captured inside Modeler's FBX serializer."""
 
@@ -4367,7 +4369,15 @@ def _exact_native_attachment_influences(
         raise ClusterAssemblyBuildError(
             f"{context} native receipt predates exact runtime tangent capture"
         )
-    skeleton_rows = list((skeleton_snapshot or {}).get("bones") or [])
+    if skeleton_identity is None:
+        skeleton_rows = list((skeleton_snapshot or {}).get("bones") or [])
+        skeleton_bone_names = {
+            str(row.get("name") or "")
+            for row in skeleton_rows
+            if str(row.get("name") or "")
+        }
+    else:
+        skeleton_rows, skeleton_bone_names = skeleton_identity
     if (
         not skeleton_rows
         or int(skeleton_rows[0].get("index", -1)) != 0
@@ -4378,11 +4388,6 @@ def _exact_native_attachment_influences(
             f"{context} has no exact native FBX skeleton index-zero root"
         )
     native_fbx_root_name = str(skeleton_rows[0]["name"])
-    skeleton_bone_names = {
-        str(row.get("name") or "")
-        for row in skeleton_rows
-        if str(row.get("name") or "")
-    }
     source_bone_id = instance.get("source_bone_id")
     missing_exported_bones = sorted({
         str(row.get("exported_cluster_name") or "")
@@ -4983,6 +4988,7 @@ def _weighted_bones_for_base(obj, skeleton_snapshot, skeleton_by_name=None):
 
 
 def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
+    export_started = perf_counter()
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     bpy.ops.object.mode_set(mode="OBJECT") if bpy.context.object and bpy.context.object.mode != "OBJECT" else None
@@ -5100,6 +5106,7 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
                     mesh_smooth_type="FACE",
                     use_mesh_edges=False,
                     use_subsurf=False,
+                    bake_anim=False,
                     bake_anim_use_nla_strips=True,
                     bake_anim_use_all_actions=False,
                     bake_anim_force_startend_keying=True,
@@ -5133,6 +5140,10 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
     )
     if addon_runtime is not None:
         validation["blender_addon_runtime"] = addon_runtime.receipt
+    validation["export_elapsed_seconds"] = round(
+        perf_counter() - export_started,
+        6,
+    )
     return validation
 
 
@@ -5150,15 +5161,24 @@ def _write_assembly_source_blend(bpy, path, objects, contract):
     collection = bpy.data.collections.new(target.stem + "_Objects")
     text = bpy.data.texts.new(target.stem + "_Contract.json")
     text.write(json.dumps(contract, ensure_ascii=False, indent=2))
+    timings = {}
     try:
         for obj in objects:
             collection.objects.link(obj)
+        library_write_started = perf_counter()
         bpy.data.libraries.write(
             str(library_path),
             {collection, text},
             path_remap="RELATIVE_ALL",
             fake_user=True,
-            compress=True,
+            # This private bridge is loaded once and deleted below. Avoid a
+            # first full zstd pass over a multi-thousand-bone armature; the
+            # durable public source is still compressed by the nested save.
+            compress=False,
+        )
+        timings["temporary_library_write"] = round(
+            perf_counter() - library_write_started,
+            6,
         )
         bootstrap = "\n".join(
             [
@@ -5173,9 +5193,10 @@ def _write_assembly_source_blend(bpy, path, objects, contract):
                 "bpy.context.scene.unit_settings.system = 'METRIC'",
                 "bpy.context.scene.unit_settings.scale_length = 1.0",
                 "bpy.context.scene.name = collection_name.rsplit('_Objects', 1)[0]",
-                "bpy.ops.wm.save_as_mainfile(filepath=target, check_existing=False)",
+                "bpy.ops.wm.save_as_mainfile(filepath=target, check_existing=False, compress=True)",
             ]
         )
+        standalone_save_started = perf_counter()
         completed = owned_run(
             [
                 bpy.app.binary_path,
@@ -5195,6 +5216,10 @@ def _write_assembly_source_blend(bpy, path, objects, contract):
             capture_output=True,
             text=True,
         )
+        timings["standalone_load_and_compressed_save"] = round(
+            perf_counter() - standalone_save_started,
+            6,
+        )
         if completed.returncode != 0 or not target.is_file():
             raise ClusterAssemblyBuildError(
                 "standalone Assembly Blender source creation failed: "
@@ -5207,7 +5232,9 @@ def _write_assembly_source_blend(bpy, path, objects, contract):
             bpy.data.texts.remove(text, do_unlink=True)
         if library_path.is_file():
             library_path.unlink()
-    return file_fingerprint(target)
+    fingerprint = file_fingerprint(target)
+    fingerprint["write_timings_seconds"] = timings
+    return fingerprint
 
 
 def _role_builder_key(row):
@@ -5643,6 +5670,19 @@ def build_blender_assembly_inputs(
     snapshot = snapshot_blender_armature(final_armature)
     checked_snapshot, skeleton_by_name = _skeleton_maps(snapshot)
     snapshot = checked_snapshot
+    # Exact attachment lookup is per rendered component, but final skeleton
+    # identity is immutable for the whole build. Willow-class assets can have
+    # thousands of leaf bindings and bones, so rebuilding this set for every
+    # binding creates a large avoidable O(bindings * bones) cost.
+    native_skeleton_rows = tuple(snapshot.get("bones") or ())
+    native_skeleton_identity = (
+        native_skeleton_rows,
+        frozenset(
+            str(row.get("name") or "")
+            for row in native_skeleton_rows
+            if str(row.get("name") or "")
+        ),
+    )
     role_inputs = list((handoff.get("assembly") or {}).get("part_builder_inputs") or [])
     roles, prepared_unused_roles, role_targets = _role_geometry_sources(
         bpy,
@@ -5976,6 +6016,7 @@ def build_blender_assembly_inputs(
                                     "normalized Assembly component "
                                     f"{part_asset_name}"
                                 ),
+                                skeleton_identity=native_skeleton_identity,
                             )
                         )
                         source_attachment = tuple(
