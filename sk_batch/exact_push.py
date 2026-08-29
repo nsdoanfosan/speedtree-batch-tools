@@ -316,13 +316,18 @@ def build_exact_push_command(
 OPERATOR_RETRYABLE_ITEM_STATES = ("unreal_crash", "manual_required")
 
 
-def reset_checkpoint_item_retries(checkpoint_path: Path) -> dict:
+def reset_checkpoint_item_retries(
+    checkpoint_path: Path,
+    *,
+    retry_data_errors: bool = False,
+) -> dict:
     """Requeue items that only failed because the commandlet was stopped.
 
-    ``data_error`` and ``not_run`` are deliberately left alone: the former is a
-    real content failure that a retry cannot fix, and the latter resolves on its
-    own once its dependency imports.  Successful items keep ``imported_ok`` so
-    the resumed run still skips them.
+    ``data_error`` is left alone by default because an unchanged retry cannot
+    fix content.  A caller resuming after an implementation/data repair may
+    explicitly requeue it with ``retry_data_errors=True``. ``not_run`` resolves
+    on its own once its dependency imports. Successful items keep
+    ``imported_ok`` so the resumed run still skips them.
     """
     checkpoint_path = Path(checkpoint_path).expanduser().resolve()
     try:
@@ -336,14 +341,18 @@ def reset_checkpoint_item_retries(checkpoint_path: Path) -> dict:
     for queue_id, state in (checkpoint.get("items") or {}).items():
         if not isinstance(state, dict):
             continue
-        if state.get("status") not in OPERATOR_RETRYABLE_ITEM_STATES:
+        old_status = state.get("status")
+        retryable = set(OPERATOR_RETRYABLE_ITEM_STATES)
+        if retry_data_errors:
+            retryable.add("data_error")
+        if old_status not in retryable:
             continue
         state.update({
             "status": "operator_retry_pending",
             "crash_count": 0,
             "message": (
                 "requeued by operator after "
-                f"{state.get('status')}; crash budget cleared"
+                f"{old_status}; crash budget cleared"
             ),
             "updated_at": datetime.now().isoformat(timespec="seconds"),
         })
@@ -357,7 +366,11 @@ def reset_checkpoint_item_retries(checkpoint_path: Path) -> dict:
             json.dumps(checkpoint, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-    return {"checkpoint": str(checkpoint_path), "reset": sorted(reset)}
+    return {
+        "checkpoint": str(checkpoint_path),
+        "reset": sorted(reset),
+        "retry_data_errors": bool(retry_data_errors),
+    }
 
 
 def run_headless_manifest(

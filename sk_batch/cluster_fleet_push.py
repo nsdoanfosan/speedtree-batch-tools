@@ -1326,7 +1326,13 @@ def main(argv=None):
         fleet["unreal_report"] = str(batch_report_path)
         if args.reset_item_retries and checkpoint_path.is_file():
             fleet["unreal_batch_retry_reset"] = (
-                reset_checkpoint_item_retries(checkpoint_path)
+                reset_checkpoint_item_retries(
+                    checkpoint_path,
+                    # This flag is used only on an explicit repaired resume.
+                    # The old terminal data_error otherwise prevents the new
+                    # Unreal implementation from ever reaching the item.
+                    retry_data_errors=True,
+                )
             )
         save_fleet()
         try:

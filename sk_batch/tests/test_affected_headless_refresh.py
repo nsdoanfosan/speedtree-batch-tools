@@ -242,6 +242,37 @@ def test_reset_checkpoint_item_retries_leaves_clean_checkpoint_untouched(tmp_pat
     assert json.loads(checkpoint.read_text(encoding="utf-8")) == payload
 
 
+def test_repaired_resume_can_explicitly_requeue_data_error(tmp_path):
+    import exact_push
+
+    checkpoint = tmp_path / "checkpoint.json"
+    checkpoint.write_text(
+        json.dumps({
+            "complete": True,
+            "current_item": None,
+            "items": {
+                "fixed.spm": {"status": "data_error", "crash_count": 0},
+                "done.spm": {"status": "imported_ok", "crash_count": 0},
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    result = exact_push.reset_checkpoint_item_retries(
+        checkpoint,
+        retry_data_errors=True,
+    )
+
+    assert result["reset"] == ["fixed.spm"]
+    assert result["retry_data_errors"] is True
+    written = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert written["items"]["fixed.spm"]["status"] == (
+        "operator_retry_pending"
+    )
+    assert written["items"]["done.spm"]["status"] == "imported_ok"
+    assert written["complete"] is False
+
+
 def _write_receipt(target, *, schema_version, bones, instances):
     receipt = refresh.native_receipt_path(target)
     receipt.parent.mkdir(parents=True, exist_ok=True)
