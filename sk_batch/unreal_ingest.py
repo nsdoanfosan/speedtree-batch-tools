@@ -2315,13 +2315,13 @@ def _ingest_cluster_assembly(send2ue_unreal, item, full_wind):
         save_writability.append(
             _ensure_declared_package_writable(item, assembly_path)
         )
-    if assembly_path:
-        _save_large_assembly_without_thumbnail(assembly_path)
     materials = (
         _material_compile_and_slot_validation(assembly_path)
         if assembly_path
         else None
     )
+    if assembly_path:
+        _save_large_assembly_without_thumbnail(assembly_path)
     return {
         "status": "ready_for_runtime",
         "assets": generated_assets,

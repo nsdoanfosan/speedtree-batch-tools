@@ -8668,25 +8668,6 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
     return result
 
 
-def _save_built_assembly_without_thumbnail(unreal, assembly):
-    library = getattr(unreal, "CodexMaterialToolsLibrary", None)
-    saver = getattr(
-        library,
-        "save_asset_package_without_thumbnail",
-        None,
-    )
-    if not callable(saver):
-        raise ClusterAssemblyBuildError(
-            "CodexMaterialToolsLibrary thumbnail-free package save API is "
-            "unavailable"
-        )
-    if not saver(assembly):
-        raise ClusterAssemblyBuildError(
-            "failed to persist finished Nanite Assembly without thumbnail "
-            "rendering"
-        )
-
-
 def _build_unreal_nanite_assembly_synchronous(unreal, manifest, asset_contract):
     """Build and save the separate UE 5.8 Assembly from imported inputs.
 
@@ -8952,7 +8933,6 @@ def _build_unreal_nanite_assembly_synchronous(unreal, manifest, asset_contract):
             "Assembly provenance could not be attached: "
             + str(provenance.get("error") or provenance)
         )
-    _save_built_assembly_without_thumbnail(unreal, assembly)
     return {
         "status": "ok",
         "full_skeletal_mesh": paths["full_skeletal_mesh"],

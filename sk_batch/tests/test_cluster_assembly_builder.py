@@ -50,7 +50,6 @@ from cluster_assembly_builder import (  # noqa: E402
     _exact_native_attachment_influences,
     _export_selected_fbx,
     _configure_final_assembly_preserve_area,
-    _save_built_assembly_without_thumbnail,
     _validate_final_assembly_preserve_area,
     _generated_material_sidecar,
     _normalized_prototype_for_component,
@@ -149,29 +148,6 @@ class UnrealNaniteAssemblyCompilationTests(unittest.TestCase):
             build_unreal_nanite_assembly(fake_unreal, {}, {})
 
         self.assertEqual(self.FakeSystemLibrary.value, 2)
-
-    def test_finished_assembly_uses_thumbnail_free_native_save(self):
-        assembly = object()
-        saved = []
-        fake_unreal = SimpleNamespace(
-            CodexMaterialToolsLibrary=SimpleNamespace(
-                save_asset_package_without_thumbnail=(
-                    lambda asset: saved.append(asset) or True
-                ),
-            ),
-        )
-
-        _save_built_assembly_without_thumbnail(fake_unreal, assembly)
-
-        self.assertEqual(saved, [assembly])
-
-    def test_finished_assembly_save_fails_closed_without_native_api(self):
-        with self.assertRaisesRegex(
-            ClusterAssemblyBuildError,
-            "thumbnail-free package save API is unavailable",
-        ):
-            _save_built_assembly_without_thumbnail(SimpleNamespace(), object())
-
 
 class FinalAssemblyNanitePolicyTests(unittest.TestCase):
     def make_policy_subjects(self):
