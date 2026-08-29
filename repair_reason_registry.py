@@ -450,6 +450,39 @@ for _policy_name in (
 
 
 _REASON_SEEDS: dict[str, ReasonRow] = {
+    # The affected headless refresh audit uses these as durable selection
+    # evidence. They describe why a current asset must be regenerated; they
+    # are not repair-planner failures and therefore remain informational.
+    "assembly_manifest_missing_or_unreadable": ReasonRow(
+        INFORMATIONAL, "sk_batch/affected_headless_refresh.py", "audit_detail",
+    ),
+    "assembly_placement_contract_stale": ReasonRow(
+        INFORMATIONAL, "sk_batch/affected_headless_refresh.py", "audit_detail",
+    ),
+    "baseref_branch_leaf_mesh_refresh_scope": ReasonRow(
+        INFORMATIONAL, "sk_batch/affected_headless_refresh.py", "audit_detail",
+    ),
+    "native_receipt_missing_or_unreadable": ReasonRow(
+        INFORMATIONAL, "sk_batch/affected_headless_refresh.py", "audit_detail",
+    ),
+    "native_receipt_schema_stale": ReasonRow(
+        INFORMATIONAL, "sk_batch/affected_headless_refresh.py", "audit_detail",
+    ),
+    "native_source_object_identity_missing": ReasonRow(
+        INFORMATIONAL, "sk_batch/affected_headless_refresh.py", "audit_detail",
+    ),
+    "native_vertex_ranges_not_exact_and_ordered": ReasonRow(
+        INFORMATIONAL, "sk_batch/affected_headless_refresh.py", "audit_detail",
+    ),
+    "parsed_native_bone_count_zero": ReasonRow(
+        INFORMATIONAL, "sk_batch/affected_headless_refresh.py", "audit_detail",
+    ),
+    "unreal_deployment_receipt_missing_or_stale": ReasonRow(
+        INFORMATIONAL, "sk_batch/affected_headless_refresh.py", "audit_detail",
+    ),
+    "zero_bone_leaf_mesh_present": ReasonRow(
+        INFORMATIONAL, "sk_batch/affected_headless_refresh.py", "audit_detail",
+    ),
     "already_current": ReasonRow(
         INFORMATIONAL, "sk_batch/sk_batch_gui.pyw",
         "relation_decision_diagnostic",
