@@ -857,6 +857,60 @@ def main(argv=None):
             flush=True,
         )
         try:
+            if args.resume_prepared:
+                prior_pattern = (
+                    f"{provider_spm.stem}_exact_push_fleet_{run_id}_"
+                    "provider_*.json"
+                )
+                for prior_report_path in sorted(
+                    args.log_dir.glob(prior_pattern), reverse=True
+                ):
+                    prior_report = json.loads(
+                        prior_report_path.read_text(encoding="utf-8")
+                    )
+                    if (
+                        prior_report.get("status") != "ok"
+                        or (prior_report.get("unreal_result") or {}).get(
+                            "status"
+                        ) != "imported_ok"
+                        or normalized_path_key(
+                            prior_report.get("canonical_spm") or ""
+                        ) != key
+                    ):
+                        continue
+                    exported_files = list(
+                        prior_report.get("exported_files") or []
+                    )
+                    if not exported_files or any(
+                        not Path(row.get("path") or "").is_file()
+                        or Path(row["path"]).stat().st_size
+                        != int(row.get("size") or -1)
+                        or Path(row["path"]).stat().st_mtime_ns
+                        != int(row.get("mtime_ns") or -1)
+                        for row in exported_files
+                    ):
+                        continue
+                    suffix = prior_report_path.stem.rsplit("_provider_", 1)[-1]
+                    prior_assembly_path = args.log_dir / (
+                        f"{provider_spm.stem}_fleet_provider_assembly_"
+                        f"{run_id}_{suffix}.json"
+                    )
+                    if not prior_assembly_path.is_file():
+                        continue
+                    prior_assembly = validate_provider_assembly_result(
+                        prior_assembly_path
+                    )
+                    if not prior_assembly["ok"]:
+                        continue
+                    result["assembly_report"] = str(prior_assembly_path)
+                    result["assembly_verification"] = prior_assembly
+                    result["report"] = str(prior_report_path)
+                    result["status"] = "verified_dependency_in_unreal"
+                    result["resume_policy"] = (
+                        "same_run_imported_provider_with_unchanged_export_files"
+                    )
+                    save_fleet()
+                    return result
             command, outputs = build_exact_push_command(
                 provider_spm,
                 blender=args.blender,
