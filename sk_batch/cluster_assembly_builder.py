@@ -30,6 +30,8 @@ from contextlib import contextmanager
 from copy import deepcopy
 from collections import Counter, defaultdict
 from pathlib import Path
+from time import perf_counter
+from types import SimpleNamespace
 
 REPO_DIR = Path(__file__).resolve().parent.parent
 if str(REPO_DIR) not in sys.path:
@@ -41,9 +43,12 @@ from artifact_content_key import (
 )
 from speedtree_native_receipt import (
     NativeReceiptError,
+    build_exact_native_receipt_index,
     exact_generated_instance,
     exact_geometry_ordinal,
     load_native_export_receipt,
+    native_position_to_blender_world,
+    native_tangent_to_blender_world,
 )
 
 from nanite_assembly_materials import (
@@ -52,9 +57,7 @@ from nanite_assembly_materials import (
 )
 SCHEMA_VERSION = 1
 MANIFEST_KIND = "sk_batch_cluster_nanite_assembly_inputs"
-PLACEMENT_CONTRACT_VERSION = 2
-MAX_ASSEMBLY_RESIDUAL_RELATIVE_RMS = 1.0e-2
-MAX_ASSEMBLY_PIVOT_ERROR_METERS = 1.0e-8
+PLACEMENT_CONTRACT_VERSION = 9
 MAX_SPEEDTREE_RENDER_FACE_MULTIPLICITY = 2
 # Blender stores imported FBX coordinates as 32-bit floats.  At the meter-scale
 # positions used by this pipeline, one exporter round-trip can separate an
@@ -64,7 +67,7 @@ MAX_SPEEDTREE_RENDER_FACE_MULTIPLICITY = 2
 # and ambiguous in the next.
 MIN_FBX_COORDINATE_TOLERANCE_METERS = 1.0e-6
 PASS_THROUGH_PROVENANCE_SCHEMA_VERSION = 1
-ASSEMBLY_BUILD_CACHE_VERSION = 8
+ASSEMBLY_BUILD_CACHE_VERSION = 20
 FINAL_ASSEMBLY_NANITE_SHAPE_PRESERVATION = "preserve_area"
 PASS_THROUGH_PROVENANCE_REASON = (
     "selected_target_contract_handoff_pass_through"
@@ -1276,29 +1279,37 @@ def validate_normalized_prototype_unit_contract(manifest):
     placement_contract = (manifest or {}).get("placement_contract")
     placement_v2 = placement_contract is not None
     if placement_v2:
-        try:
-            residual_gate_contract = (
-                placement_contract.get("residual_ready_gate") or {}
-            )
-            placement_threshold = float(
-                residual_gate_contract.get("threshold")
-            )
-            placement_pivot_threshold = float(
-                residual_gate_contract.get(
-                    "attachment_pivot_error_threshold_meters"
-                )
-            )
-        except (TypeError, ValueError) as exc:
-            raise ClusterAssemblyBuildError(
-                "Assembly placement residual ready gate is invalid"
-            ) from exc
+        frame_contract = placement_contract.get("exact_plan_line") or {}
         if (
             placement_contract.get("version") != PLACEMENT_CONTRACT_VERSION
             or placement_contract.get("status") != "ready"
             or placement_contract.get("identity_policy")
-            != "native_modeler_authored_position_receipt_v1"
+            != "exact_fbx_vertex_or_native_clipped_origin_v1"
             or placement_contract.get("translation_source")
-            != "native_modeler_runtime_receipt"
+            != "exact_fbx_attachment_vertex_else_native_receipt"
+            or placement_contract.get("rotation_uniform_scale_source")
+            != "exact_modeler_runtime_tangent_and_uv_plan_line_length_v1"
+            or frame_contract.get("status") != "ready"
+            or frame_contract.get("selection_policy")
+            != (
+                "unique_source_and_target_uv_triangles_containing_exact_"
+                "authored_line_endpoint_v1"
+            )
+            or frame_contract.get("correspondence_policy")
+            != (
+                "same_exact_uv_point_on_source_and_target_plan_surfaces_v1"
+            )
+            or frame_contract.get("frame_policy")
+            != (
+                "runtime_pose_tangent_preserve_plan_roll_and_exact_uv_length"
+            )
+            or frame_contract.get("scale_policy")
+            != "exact_authored_line_endpoint_length_ratio"
+            or frame_contract.get("asset_special_cases") is not False
+            or frame_contract.get("geometric_fitting") is not False
+            or frame_contract.get("nearest_or_farthest_search") is not False
+            or int(frame_contract.get("binding_count") or 0) <= 0
+            or "residual_ready_gate" in placement_contract
             or any(
                 key in placement_contract
                 for key in (
@@ -1307,18 +1318,6 @@ def validate_normalized_prototype_unit_contract(manifest):
                     "claimed_authored_node_count",
                 )
             )
-            or abs(
-                placement_threshold - MAX_ASSEMBLY_RESIDUAL_RELATIVE_RMS
-            ) > 1.0e-15
-            or abs(
-                placement_pivot_threshold - MAX_ASSEMBLY_PIVOT_ERROR_METERS
-            ) > 1.0e-15
-            or (
-                placement_contract.get("residual_ready_gate") or {}
-            ).get("status") not in {
-                "pass",
-                "pass_with_quality_warnings",
-            }
         ):
             raise ClusterAssemblyBuildError(
                 "Assembly placement contract is invalid or ungated"
@@ -1329,7 +1328,7 @@ def validate_normalized_prototype_unit_contract(manifest):
         if (
             checked_attachment_lineage.get("status") != "ready"
             or checked_attachment_lineage.get("policy")
-            != "native_modeler_runtime_receipt_v1"
+            != "native_modeler_runtime_receipt_v5_exact_pose_skeleton_index_zero"
             or not isinstance(checked_attachment_lineage.get("receipt"), dict)
             or int(checked_attachment_lineage.get("bone_count") or 0) <= 0
             or int(
@@ -1432,9 +1431,17 @@ def validate_normalized_prototype_unit_contract(manifest):
                     scale_values = [float(value) for value in scale]
                 except (TypeError, ValueError):
                     scale_values = None
+            exact_authored_transform = (
+                placement_v2
+                and fit_mode == "exact_authored_pose_and_plan_line_scale"
+            )
+            legacy_similarity_transform = (
+                not placement_v2
+                and fit_mode.startswith("uniform_similarity_3d")
+                and "attachment_locked" in fit_mode
+            )
             if (
-                not fit_mode.startswith("uniform_similarity_3d")
-                or "attachment_locked" not in fit_mode
+                not (exact_authored_transform or legacy_similarity_transform)
                 or transform.get("attachment_pivot_error") is None
                 or similarity_relative_rms is None
                 or scale_values is None
@@ -1445,7 +1452,8 @@ def validate_normalized_prototype_unit_contract(manifest):
                 or max(scale_values) - min(scale_values) > 1.0e-7
             ):
                 raise ClusterAssemblyBuildError(
-                    "normalized prototype instances require uniform-similarity transforms"
+                    "normalized prototype instances require exact authored "
+                    "uniform-scale transforms"
                 )
             try:
                 pivot_error = float(
@@ -1472,28 +1480,67 @@ def validate_normalized_prototype_unit_contract(manifest):
                     "normalized prototype instance similarity residual is invalid"
                 )
             if placement_v2:
-                validate_persisted_residual_gate(
-                    transform,
-                    expected_threshold=MAX_ASSEMBLY_RESIDUAL_RELATIVE_RMS,
-                )
                 placement_source = str(
                     transform.get("placement_source") or ""
                 )
-                if (
-                    placement_source
-                    != "native_modeler_authored_position__"
-                    "surviving_root_tip_rotation_uniform_scale"
+                frame_evidence = transform.get("frame_evidence") or {}
+                frame_policy = frame_evidence.get("policy")
+                common_invalid = (
+                    transform.get("correspondence_policy")
+                    != "exact_surviving_uv_identity_fail_closed_v2"
+                    or "residual_gate" in transform
+                    or "endpoint_evidence" in transform
                     or transform.get("authored_node") is not None
                     or "authored_node_match_warning" in transform
                     or "authored_to_render_attachment_error_meters" in transform
-                ):
+                )
+                if frame_policy == "exact_runtime_tangent_and_uv_plan_line_length_v1":
+                    mode_invalid = (
+                        placement_source not in {
+                            "exact_fbx_attachment_vertex__"
+                            "runtime_tangent_uv_plan_length",
+                            "native_modeler_authored_position__"
+                            "runtime_tangent_uv_plan_length",
+                        }
+                        or fit_mode
+                        != "exact_authored_pose_and_plan_line_scale"
+                        or transform.get("construction_mode")
+                        != "exact_attachment_runtime_tangent_and_uv_plan_length_v1"
+                        or frame_evidence.get("rotation_policy")
+                        != (
+                            "minimum_local_positive_y_to_exact_modeler_runtime_"
+                            "tangent_preserve_normalized_plan_roll"
+                        )
+                        or frame_evidence.get("scale_policy")
+                        != "exact_authored_line_endpoint_length_ratio"
+                        or frame_evidence.get("selection_policy")
+                        != (
+                            "unique_source_and_target_uv_triangles_containing_"
+                            "exact_authored_line_endpoint_v1"
+                        )
+                        or frame_evidence.get("correspondence_policy")
+                        != (
+                            "same_exact_uv_point_on_source_and_target_plan_"
+                            "surfaces_v1"
+                        )
+                        or not isinstance(
+                            frame_evidence.get("normalized_line_contract"),
+                            dict,
+                        )
+                    )
+                else:
+                    mode_invalid = True
+                if common_invalid or mode_invalid:
                     raise ClusterAssemblyBuildError(
-                        "normalized prototype placement used non-exact "
-                        "attachment identity"
+                        "normalized prototype placement did not use the exact "
+                        "authored placement frame"
                     )
                 influence_source = binding.get("bone_influence_source") or {}
                 influence_policy = str(influence_source.get("policy") or "")
-                if influence_policy != "native_modeler_authored_proxy_weights_v1":
+                if influence_policy != (
+                    "native_modeler_authored_proxy_weights_v2_"
+                    "exact_skeleton_index_zero"
+                ):
                     raise ClusterAssemblyBuildError(
                         "normalized rendered Assembly binding used a non-exact "
                         "bone identity policy"
@@ -1503,6 +1550,7 @@ def validate_normalized_prototype_unit_contract(manifest):
                     not in {
                         "sole_exact_native_range_intersection_v1",
                         "sole_exact_native_node_guid_range_intersection_v2",
+                        "sole_exact_native_runtime_owner_range_intersection_v3",
                     }
                     or not influence_source.get("native_vertex_indices")
                     or not influence_source.get("node_guid")
@@ -2376,233 +2424,42 @@ def validate_wind_json_against_skeleton(
     }
 
 
-def fit_trs_transform(source_points, target_points):
-    """Fit the best Blender-space TRS while reporting affine residuals."""
-    try:
-        import numpy as np
-    except ImportError as exc:  # pragma: no cover - Blender bundles NumPy.
-        raise ClusterAssemblyBuildError("NumPy is required for Assembly fitting") from exc
-    source = np.asarray(source_points, dtype=np.float64)
-    target = np.asarray(target_points, dtype=np.float64)
-    if source.shape != target.shape or source.ndim != 2 or source.shape[1] != 3:
-        raise ClusterAssemblyBuildError("TRS fit point arrays must both be Nx3")
-    if source.shape[0] < 3:
-        raise ClusterAssemblyBuildError("TRS fit needs at least three vertices")
-    augmented = np.concatenate(
-        [source, np.ones((source.shape[0], 1), dtype=np.float64)], axis=1
-    )
-    coefficients, _, _, _ = np.linalg.lstsq(augmented, target, rcond=None)
-    affine = coefficients[:3, :]
-    affine_translation = coefficients[3, :]
-    affine_prediction = source @ affine + affine_translation
-
-    unsigned_scale = np.linalg.norm(affine, axis=1)
-    unsigned_scale[unsigned_scale < 1.0e-12] = 1.0
-    normalized_rows = affine / unsigned_scale[:, None]
-    best = None
-    for signs in itertools.product((-1.0, 1.0), repeat=3):
-        signed_rows = np.diag(signs) @ normalized_rows
-        left, _, right = np.linalg.svd(signed_rows)
-        rotation_rows = left @ right
-        if np.linalg.det(rotation_rows) < 0.0:
-            left[:, -1] *= -1.0
-            rotation_rows = left @ right
-        scale = unsigned_scale * np.asarray(signs)
-        trs_affine = np.diag(scale) @ rotation_rows
-        error = float(np.linalg.norm(affine - trs_affine))
-        negative_scales = sum(value < 0.0 for value in scale)
-        score = error + 1.0e-8 * max(float(np.linalg.norm(affine)), 1.0) * negative_scales
-        if best is None or score < best[0]:
-            best = (score, scale, rotation_rows, trs_affine)
-    _, scale, rotation_rows, trs_affine = best
-    translation = np.mean(target - source @ trs_affine, axis=0)
-    prediction = source @ trs_affine + translation
-    diagonal = max(
-        float(np.linalg.norm(np.max(target, axis=0) - np.min(target, axis=0))),
-        1.0e-9,
-    )
-    affine_rms = float(
-        np.sqrt(np.mean(np.sum((target - affine_prediction) ** 2, axis=1)))
-    )
-    trs_rms = float(np.sqrt(np.mean(np.sum((target - prediction) ** 2, axis=1))))
-    quaternion = _rotation_matrix_to_quaternion(rotation_rows.T.tolist())
-    return {
-        "translation": [float(value) for value in translation],
-        "rotation_xyzw": quaternion,
-        "scale": [float(value) for value in scale],
-        "affine_relative_rms": affine_rms / diagonal,
-        "trs_relative_rms": trs_rms / diagonal,
-        "shear_relative_norm": float(
-            np.linalg.norm(affine - trs_affine)
-            / max(float(np.linalg.norm(affine)), 1.0e-9)
-        ),
-    }
-
-
-def fit_uniform_similarity_transform(
-    source_points,
-    target_points,
-    source_attachment=None,
-    target_attachment=None,
-):
-    """Fit a stable 3D rigid rotation plus uniform scale for planar cards.
-
-    A full affine/TRS decomposition is underdetermined when every source point
-    lies on a plane.  Normalized SpeedTree plans are intentionally planar, so
-    use orthogonal Procrustes/Kabsch fitting and one uniform scale.  This keeps
-    the normalized attachment origin meaningful instead of inventing enormous
-    scale on the plane normal.  When both attachment points are supplied, fit
-    root-relative vectors and constrain translation to map that authored pivot
-    exactly instead of allowing deformation residuals to move the stem root.
-    """
-    try:
-        import numpy as np
-    except ImportError as exc:  # pragma: no cover - Blender bundles NumPy.
-        raise ClusterAssemblyBuildError(
-            "NumPy is required for Assembly similarity fitting"
-        ) from exc
-    source = np.asarray(source_points, dtype=np.float64)
-    target = np.asarray(target_points, dtype=np.float64)
-    if source.shape != target.shape or source.ndim != 2 or source.shape[1] != 3:
-        raise ClusterAssemblyBuildError(
-            "similarity fit point arrays must both be Nx3"
-        )
-    if source.shape[0] < 3:
-        raise ClusterAssemblyBuildError(
-            "similarity fit needs at least three vertices"
-        )
-    if (source_attachment is None) != (target_attachment is None):
-        raise ClusterAssemblyBuildError(
-            "similarity fit requires both source and target attachments"
-        )
-    attachment_locked = source_attachment is not None
-    if attachment_locked:
-        source_origin = np.asarray(source_attachment, dtype=np.float64)
-        target_origin = np.asarray(target_attachment, dtype=np.float64)
-        if (
-            source_origin.shape != (3,)
-            or target_origin.shape != (3,)
-            or not np.all(np.isfinite(source_origin))
-            or not np.all(np.isfinite(target_origin))
-        ):
-            raise ClusterAssemblyBuildError(
-                "similarity fit attachment points must both be finite 3D vectors"
-            )
-    else:
-        source_origin = np.mean(source, axis=0)
-        target_origin = np.mean(target, axis=0)
-    source_centered = source - source_origin
-    target_centered = target - target_origin
-    source_energy = float(np.sum(source_centered * source_centered))
-    if source_energy <= 1.0e-18:
-        raise ClusterAssemblyBuildError(
-            "similarity fit source points have no spatial extent"
-        )
-    left, singular, right = np.linalg.svd(
-        source_centered.T @ target_centered
-    )
-    correction = np.ones(3, dtype=np.float64)
-    if np.linalg.det(left @ right) < 0.0:
-        correction[-1] = -1.0
-    rotation_rows = left @ np.diag(correction) @ right
-    scale_value = float(np.sum(singular * correction) / source_energy)
-    if not np.isfinite(scale_value) or abs(scale_value) <= 1.0e-12:
-        raise ClusterAssemblyBuildError(
-            "similarity fit produced an invalid uniform scale"
-        )
-    linear = scale_value * rotation_rows
-    translation = target_origin - source_origin @ linear
-    prediction = source @ linear + translation
-    diagonal = max(
-        float(np.linalg.norm(np.max(target, axis=0) - np.min(target, axis=0))),
-        1.0e-9,
-    )
-    rms = float(
-        np.sqrt(np.mean(np.sum((target - prediction) ** 2, axis=1)))
-    )
-    augmented = np.concatenate(
-        [source, np.ones((source.shape[0], 1), dtype=np.float64)],
-        axis=1,
-    )
-    coefficients, _, _, _ = np.linalg.lstsq(
-        augmented,
-        target,
-        rcond=None,
-    )
-    affine = coefficients[:3, :]
-    affine_translation = coefficients[3, :]
-    affine_prediction = source @ affine + affine_translation
-    affine_rms = float(
-        np.sqrt(
-            np.mean(
-                np.sum((target - affine_prediction) ** 2, axis=1)
-            )
-        )
-    )
-    pivot_error = None
-    if attachment_locked:
-        pivot_prediction = source_origin @ linear + translation
-        pivot_error = float(np.linalg.norm(target_origin - pivot_prediction))
-    quaternion = _rotation_matrix_to_quaternion(rotation_rows.T.tolist())
-    source_fit_rank = int(np.linalg.matrix_rank(source_centered))
-    affine_linear_delta = float(
-        np.linalg.norm(affine - linear)
-        / max(float(np.linalg.norm(affine)), 1.0e-9)
-    )
-    result = {
-        "translation": [float(value) for value in translation],
-        "rotation_xyzw": quaternion,
-        "scale": [scale_value, scale_value, scale_value],
-        "affine_relative_rms": affine_rms / diagonal,
-        "similarity_relative_rms": rms / diagonal,
-        "trs_relative_rms": rms / diagonal,
-        # A planar source has no observable normal-axis affine component.
-        # Keep its predictive residual, but do not present the decomposed
-        # linear delta as a trustworthy shear measurement.
-        "shear_relative_norm": (
-            affine_linear_delta if source_fit_rank == 3 else None
-        ),
-        "affine_linear_delta_relative_norm": affine_linear_delta,
-        "affine_diagnostic_only": source_fit_rank < 3,
-        "source_fit_rank": source_fit_rank,
-        "fit_mode": (
-            "uniform_similarity_3d_attachment_locked"
-            if attachment_locked
-            else "uniform_similarity_3d"
-        ),
-    }
-    if pivot_error is not None:
-        result["attachment_pivot_error"] = pivot_error
-        result["attachment_pivot_error_scope"] = (
-            "normalized_plan_attachment"
-        )
-    return result
-
-
-def derive_endpoint_uniform_similarity_transform(
+def derive_exact_plan_line_transform(
     source_points,
     target_points,
     source_attachment,
     target_attachment,
+    source_line_length,
+    target_line_endpoint,
+    target_tangent,
 ):
-    """Place a plan from its authored pivot and surviving root-to-tip frame.
+    """Place one prototype from Modeler's exact pose and plan-line length.
 
-    Translation is exactly the authored target attachment.  Rotation is the
-    minimum rotation that aligns the plan's pivot-to-tip vector, preserving
-    the remaining plan roll/twist, and scale is the positive endpoint-length
-    ratio.  All-point residuals are diagnostics/gates only; they do not fit or
-    move the placement.
+    The normalizer authors the attachment at local zero and its tangent on
+    local +Y. Modeler's runtime pose supplies the exact target tangent. The
+    exact same UV point on the normalized and target plan surfaces supplies
+    physical length only. The shortest +Y-to-tangent rotation preserves the
+    normalized prototype's authored roll. No extent, face-normal rotation,
+    nearest/farthest vertex, averaging, or geometric fit participates.
     """
     try:
         import numpy as np
     except ImportError as exc:  # pragma: no cover - Blender bundles NumPy.
         raise ClusterAssemblyBuildError(
-            "NumPy is required for Assembly endpoint placement"
+            "NumPy is required for exact Assembly plan-line placement"
         ) from exc
     source = np.asarray(source_points, dtype=np.float64)
     target = np.asarray(target_points, dtype=np.float64)
     source_origin = np.asarray(source_attachment, dtype=np.float64)
     target_origin = np.asarray(target_attachment, dtype=np.float64)
+    target_endpoint = np.asarray(target_line_endpoint, dtype=np.float64)
+    target_axis_y = np.asarray(target_tangent, dtype=np.float64)
+    try:
+        normalized_source_line_length = float(source_line_length)
+    except (TypeError, ValueError) as exc:
+        raise ClusterAssemblyBuildError(
+            "exact Assembly source line length is invalid"
+        ) from exc
     if (
         source.shape != target.shape
         or source.ndim != 2
@@ -2610,71 +2467,64 @@ def derive_endpoint_uniform_similarity_transform(
         or source.shape[0] < 3
         or source_origin.shape != (3,)
         or target_origin.shape != (3,)
+        or target_endpoint.shape != (3,)
+        or target_axis_y.shape != (3,)
         or not np.all(np.isfinite(source))
         or not np.all(np.isfinite(target))
         or not np.all(np.isfinite(source_origin))
         or not np.all(np.isfinite(target_origin))
+        or not np.all(np.isfinite(target_endpoint))
+        or not np.all(np.isfinite(target_axis_y))
+        or not math.isfinite(normalized_source_line_length)
+        or normalized_source_line_length <= 1.0e-12
     ):
         raise ClusterAssemblyBuildError(
-            "endpoint Assembly placement requires finite matching Nx3 points"
+            "exact Assembly plan-line placement requires finite matching "
+            "Nx3 points, a positive authored line, and an exact runtime tangent"
         )
-    source_lengths = np.linalg.norm(source - source_origin, axis=1)
-    maximum_source_length = float(np.max(source_lengths))
-    if maximum_source_length <= 1.0e-12:
-        raise ClusterAssemblyBuildError(
-            "endpoint Assembly placement source has no root-to-tip extent"
-        )
-    endpoint_band = max(maximum_source_length * 1.0e-6, 1.0e-9)
-    endpoint_indices = np.flatnonzero(
-        source_lengths >= maximum_source_length - endpoint_band
+    source_line_endpoint = source_origin + np.asarray(
+        (0.0, normalized_source_line_length, 0.0),
+        dtype=np.float64,
     )
-    source_endpoint = np.mean(source[endpoint_indices], axis=0)
-    target_endpoint = np.mean(target[endpoint_indices], axis=0)
-    source_vector = source_endpoint - source_origin
-    target_vector = target_endpoint - target_origin
-    source_length = float(np.linalg.norm(source_vector))
-    target_length = float(np.linalg.norm(target_vector))
-    if source_length <= 1.0e-12 or target_length <= 1.0e-12:
+    target_line = target_endpoint - target_origin
+    target_line_length = float(np.linalg.norm(target_line))
+    if target_line_length <= 1.0e-12:
         raise ClusterAssemblyBuildError(
-            "endpoint Assembly placement has a degenerate root-to-tip vector"
+            "exact Assembly target authored line is degenerate"
         )
-    source_direction = source_vector / source_length
-    target_direction = target_vector / target_length
-    cross = np.cross(source_direction, target_direction)
-    sine = float(np.linalg.norm(cross))
-    cosine = float(np.clip(
-        np.dot(source_direction, target_direction), -1.0, 1.0
-    ))
-    if sine > 1.0e-12:
-        axis = cross / sine
-        x, y, z = [float(value) for value in axis]
-        skew = np.asarray([
-            [0.0, -z, y],
-            [z, 0.0, -x],
-            [-y, x, 0.0],
-        ], dtype=np.float64)
-        rotation_columns = (
-            np.eye(3)
-            + skew * sine
-            + (skew @ skew) * (1.0 - cosine)
+    target_tangent_length = float(np.linalg.norm(target_axis_y))
+    if abs(target_tangent_length - 1.0) > 2.0e-5:
+        raise ClusterAssemblyBuildError(
+            "exact Assembly runtime tangent is not unit length"
         )
-    elif cosine >= 0.0:
-        rotation_columns = np.eye(3, dtype=np.float64)
+    target_axis_y /= target_tangent_length
+    source_axis_y = np.asarray((0.0, 1.0, 0.0), dtype=np.float64)
+    tangent_dot = float(np.dot(source_axis_y, target_axis_y))
+    tangent_dot = max(-1.0, min(1.0, tangent_dot))
+    if tangent_dot <= -1.0 + 1.0e-10:
+        raise ClusterAssemblyBuildError(
+            "exact Assembly runtime tangent is antiparallel to local +Y; "
+            "the authored roll would be ambiguous"
+        )
+    if tangent_dot >= 1.0 - 1.0e-15:
+        rotation_columns = np.identity(3, dtype=np.float64)
     else:
-        # A 180-degree alignment has no unique axis.  Pick the canonical axis
-        # least aligned with the source direction, then project it onto the
-        # perpendicular plane.  This is deterministic and preserves no hidden
-        # iteration-order state.
-        canonical = np.eye(3)[
-            int(np.argmin(np.abs(source_direction)))
-        ]
-        axis = canonical - source_direction * float(
-            np.dot(canonical, source_direction)
+        cross = np.cross(source_axis_y, target_axis_y)
+        skew = np.asarray(
+            (
+                (0.0, -cross[2], cross[1]),
+                (cross[2], 0.0, -cross[0]),
+                (-cross[1], cross[0], 0.0),
+            ),
+            dtype=np.float64,
         )
-        axis /= np.linalg.norm(axis)
-        rotation_columns = 2.0 * np.outer(axis, axis) - np.eye(3)
+        rotation_columns = (
+            np.identity(3, dtype=np.float64)
+            + skew
+            + (skew @ skew) / (1.0 + tangent_dot)
+        )
+    scale_value = target_line_length / normalized_source_line_length
     rotation_rows = rotation_columns.T
-    scale_value = target_length / source_length
     linear = scale_value * rotation_rows
     translation = target_origin - source_origin @ linear
     prediction = source @ linear + translation
@@ -2683,35 +2533,26 @@ def derive_endpoint_uniform_similarity_transform(
         1.0e-9,
     )
     rms = float(np.sqrt(np.mean(np.sum((target - prediction) ** 2, axis=1))))
-    augmented = np.concatenate(
-        [source, np.ones((source.shape[0], 1), dtype=np.float64)], axis=1
-    )
-    coefficients, _, _, _ = np.linalg.lstsq(augmented, target, rcond=None)
-    affine_prediction = source @ coefficients[:3, :] + coefficients[3, :]
-    affine_rms = float(np.sqrt(np.mean(
-        np.sum((target - affine_prediction) ** 2, axis=1)
-    )))
     pivot_prediction = source_origin @ linear + translation
-    endpoint_prediction = source_endpoint @ linear + translation
     source_fit_rank = int(np.linalg.matrix_rank(source - source_origin))
+    target_line_prediction = source_line_endpoint @ linear + translation
+    uv_scale_axis = target_line / target_line_length
+    direction_dot = max(-1.0, min(1.0, float(np.dot(
+        uv_scale_axis,
+        target_axis_y,
+    ))))
     return {
         "translation": [float(value) for value in translation],
         "rotation_xyzw": _rotation_matrix_to_quaternion(
             rotation_columns.tolist()
         ),
         "scale": [scale_value, scale_value, scale_value],
-        "affine_relative_rms": affine_rms / diagonal,
         "similarity_relative_rms": rms / diagonal,
         "trs_relative_rms": rms / diagonal,
-        "shear_relative_norm": None,
-        "affine_linear_delta_relative_norm": None,
-        "affine_diagnostic_only": True,
         "source_fit_rank": source_fit_rank,
-        "fit_mode": (
-            "uniform_similarity_3d_attachment_locked_endpoint_frame"
-        ),
+        "fit_mode": "exact_authored_pose_and_plan_line_scale",
         "construction_mode": (
-            "exact_attachment_pivot_plus_surviving_root_tip_frame_v2"
+            "exact_attachment_runtime_tangent_and_uv_plan_length_v1"
         ),
         "attachment_pivot_error": float(
             np.linalg.norm(target_origin - pivot_prediction)
@@ -2719,188 +2560,37 @@ def derive_endpoint_uniform_similarity_transform(
         "attachment_pivot_error_scope": (
             "exact_render_attachment_translation"
         ),
-        "endpoint_error": float(
-            np.linalg.norm(target_endpoint - endpoint_prediction)
-        ),
-        "endpoint_evidence": {
-            "policy": "mean_of_farthest_surviving_source_distance_band_v1",
-            "band_meters": endpoint_band,
-            "correspondence_indices": [
-                int(value) for value in endpoint_indices.tolist()
+        "frame_evidence": {
+            "policy": "exact_runtime_tangent_and_uv_plan_line_length_v1",
+            "source_line_start": [float(value) for value in source_origin],
+            "source_line_end": [
+                float(value) for value in source_line_endpoint
             ],
-            "source_endpoint": [float(value) for value in source_endpoint],
-            "target_endpoint": [float(value) for value in target_endpoint],
-            "source_length": source_length,
-            "target_length": target_length,
+            "source_line_length": normalized_source_line_length,
+            "target_line_start": [float(value) for value in target_origin],
+            "target_scale_endpoint": [
+                float(value) for value in target_endpoint
+            ],
+            "target_line_length": target_line_length,
+            "target_runtime_tangent_unit": [
+                float(value) for value in target_axis_y
+            ],
             "uniform_scale": scale_value,
-            "rotation_policy": "minimum_root_tip_vector_rotation_preserve_plan_roll",
+            "rotation_policy": (
+                "minimum_local_positive_y_to_exact_modeler_runtime_tangent_"
+                "preserve_normalized_plan_roll"
+            ),
+            "scale_policy": "exact_authored_line_endpoint_length_ratio",
+            "transformed_source_line_length_error": abs(
+                float(np.linalg.norm(target_line_prediction - target_origin))
+                - target_line_length
+            ),
+            "uv_scale_axis_to_runtime_tangent_degrees_diagnostic_only": (
+                math.degrees(math.acos(direction_dot))
+            ),
+            "all_correspondence_relative_rms_diagnostic_only": rms / diagonal,
         },
     }
-
-
-def attachment_locked_safe_transform(target_attachment, diagnostic):
-    """Last-resort rigid transform that keeps export attached and finite."""
-    try:
-        translation = [float(value) for value in target_attachment]
-    except (TypeError, ValueError) as exc:
-        raise ClusterAssemblyBuildError(
-            "safe Assembly fallback has no finite attachment"
-        ) from exc
-    if len(translation) != 3 or any(
-        not math.isfinite(value) for value in translation
-    ):
-        raise ClusterAssemblyBuildError(
-            "safe Assembly fallback has no finite attachment"
-        )
-    return {
-        "translation": translation,
-        "rotation_xyzw": [0.0, 0.0, 0.0, 1.0],
-        "scale": [1.0, 1.0, 1.0],
-        "affine_relative_rms": 1.0,
-        "similarity_relative_rms": 1.0,
-        "trs_relative_rms": 1.0,
-        "shear_relative_norm": None,
-        "affine_linear_delta_relative_norm": None,
-        "affine_diagnostic_only": True,
-        "source_fit_rank": 0,
-        "fit_mode": (
-            "uniform_similarity_3d_attachment_locked_safe_fallback"
-        ),
-        "construction_mode": (
-            "authored_or_render_attachment_identity_rotation_unit_scale_v1"
-        ),
-        "attachment_pivot_error": 0.0,
-        "attachment_pivot_error_scope": "attachment_translation_hard_lock",
-        "placement_quality_warning": str(diagnostic),
-    }
-
-
-def gate_assembly_transform_residuals(
-    transform,
-    evidence,
-    threshold=MAX_ASSEMBLY_RESIDUAL_RELATIVE_RMS,
-    block_geometry=True,
-):
-    """Hard-gate attachment; optionally downgrade rigid-fit error to warning."""
-    try:
-        limit = float(threshold)
-        pivot_error = float(transform.get("attachment_pivot_error"))
-        metrics = {
-            name: float(transform.get(name))
-            for name in (
-                "similarity_relative_rms",
-                "trs_relative_rms",
-                "affine_relative_rms",
-            )
-        }
-    except (TypeError, ValueError) as exc:
-        raise ClusterAssemblyBuildError(
-            "Assembly residual ready gate has missing or invalid metrics: "
-            + _canonical_json(evidence or {})
-        ) from exc
-    if (
-        not math.isfinite(limit)
-        or limit <= 0.0
-        or not math.isfinite(pivot_error)
-        or any(not math.isfinite(value) for value in metrics.values())
-    ):
-        raise ClusterAssemblyBuildError(
-            "Assembly residual ready gate has non-finite evidence: "
-            + _canonical_json({
-                "threshold": limit,
-                "metrics": metrics,
-                "attachment_pivot_error_meters": pivot_error,
-                "evidence": evidence or {},
-            })
-        )
-    failed = {
-        name: value for name, value in metrics.items()
-        if value > limit
-    }
-    pivot_failed = pivot_error > MAX_ASSEMBLY_PIVOT_ERROR_METERS
-    geometry_blocked = bool(failed and block_geometry)
-    gate = {
-        "status": (
-            "blocked"
-            if pivot_failed or geometry_blocked
-            else "warning" if failed else "pass"
-        ),
-        "policy": "all_recorded_relative_rms_at_or_below_global_threshold_v1",
-        "threshold": limit,
-        "metrics": metrics,
-        "maximum_metric": max(metrics, key=metrics.get),
-        "maximum_relative_rms": max(metrics.values()),
-        "attachment_pivot_error_meters": pivot_error,
-        "attachment_pivot_error_threshold_meters": (
-            MAX_ASSEMBLY_PIVOT_ERROR_METERS
-        ),
-        "geometry_residual_blocking": bool(block_geometry),
-        "evidence": deepcopy(evidence or {}),
-    }
-    if failed:
-        gate["failed_metrics"] = failed
-    if pivot_failed:
-        gate["attachment_pivot_failed"] = True
-    if geometry_blocked or pivot_failed:
-        raise ClusterAssemblyBuildError(
-            "Assembly residual ready gate blocked placement: "
-            + _canonical_json(gate)
-        )
-    transform["residual_gate"] = gate
-    return gate
-
-
-def validate_persisted_residual_gate(
-    transform,
-    expected_threshold=MAX_ASSEMBLY_RESIDUAL_RELATIVE_RMS,
-):
-    """Re-evaluate an additive v1 gate without trusting its saved verdict."""
-    recorded = deepcopy((transform or {}).get("residual_gate") or {})
-    if (
-        recorded.get("status") not in {"pass", "warning"}
-        or recorded.get("policy")
-        != "all_recorded_relative_rms_at_or_below_global_threshold_v1"
-    ):
-        raise ClusterAssemblyBuildError(
-            "normalized prototype instance has no passing residual ready gate"
-        )
-    try:
-        recorded_threshold = float(recorded.get("threshold"))
-    except (TypeError, ValueError) as exc:
-        raise ClusterAssemblyBuildError(
-            "normalized prototype residual ready gate threshold is invalid"
-        ) from exc
-    if abs(recorded_threshold - float(expected_threshold)) > 1.0e-15:
-        raise ClusterAssemblyBuildError(
-            "normalized prototype residual ready gate threshold changed"
-        )
-    checked = deepcopy(transform)
-    checked.pop("residual_gate", None)
-    recomputed = gate_assembly_transform_residuals(
-        checked,
-        recorded.get("evidence") or {},
-        threshold=expected_threshold,
-        block_geometry=bool(recorded.get("geometry_residual_blocking")),
-    )
-    for key in (
-        "status",
-        "policy",
-        "threshold",
-        "metrics",
-        "maximum_metric",
-        "maximum_relative_rms",
-        "attachment_pivot_error_meters",
-        "attachment_pivot_error_threshold_meters",
-        "geometry_residual_blocking",
-        "evidence",
-    ):
-        if _canonical_json(recorded.get(key)) != _canonical_json(
-            recomputed.get(key)
-        ):
-            raise ClusterAssemblyBuildError(
-                "normalized prototype residual ready gate evidence drifted"
-            )
-    return recomputed
 
 
 def _assembly_fit_summary(bindings, fit_mode):
@@ -2916,23 +2606,6 @@ def _assembly_fit_summary(bindings, fit_mode):
         for transform in transforms
     ]
     trs = [float(transform["trs_relative_rms"]) for transform in transforms]
-    affine = [
-        float(transform["affine_relative_rms"])
-        for transform in transforms
-    ]
-    gates = [transform.get("residual_gate") for transform in transforms]
-    gates_present = [gate for gate in gates if gate is not None]
-    if gates_present and len(gates_present) != len(gates):
-        raise ClusterAssemblyBuildError(
-            "Assembly fit summary mixes gated and legacy bindings"
-        )
-    if any(
-        gate.get("status") not in {"pass", "warning"}
-        for gate in gates_present
-    ):
-        raise ClusterAssemblyBuildError(
-            "Assembly fit summary cannot include an ungated ready binding"
-        )
     summary = {
         "fit_mode": fit_mode,
         "similarity_relative_rms_count": len(similarity),
@@ -2940,27 +2613,12 @@ def _assembly_fit_summary(bindings, fit_mode):
         "similarity_relative_rms_max": max(similarity),
         "trs_relative_rms_median": statistics.median(trs),
         "trs_relative_rms_max": max(trs),
-        "affine_relative_rms_median": statistics.median(affine),
-        "affine_relative_rms_max": max(affine),
+        "residual_scope": "diagnostic_shape_difference_not_placement_fit",
         "placement_sources": dict(sorted(Counter(
             str(transform.get("placement_source") or "unspecified")
             for transform in transforms
         ).items())),
     }
-    if gates_present:
-        summary["residual_ready_gate"] = {
-            "status": (
-                "warning"
-                if any(gate.get("status") == "warning" for gate in gates_present)
-                else "pass"
-            ),
-            "threshold": MAX_ASSEMBLY_RESIDUAL_RELATIVE_RMS,
-            "binding_count": len(gates_present),
-            "maximum_relative_rms": max(
-                float(gate["maximum_relative_rms"])
-                for gate in gates_present
-            ),
-        }
     return summary
 
 
@@ -3264,16 +2922,60 @@ def _exact_index_component_groups(mesh, polygon_indices):
     )
 
 
-def _partition_components_by_native_runtime_owner(obj, components, receipt):
-    """Split accidentally welded render components by exact runtime Node GUID.
+class _NativeRuntimeOwnerGroups:
+    """Union-find over owner keys joined by a shared polygon."""
+
+    def __init__(self):
+        self._parent = {}
+
+    def _find(self, owner):
+        root = self._parent.setdefault(owner, owner)
+        while root != self._parent[root]:
+            root = self._parent[root]
+        # Path compression keeps repeated lookups cheap on dense meshes.
+        while owner != root:
+            self._parent[owner], owner = root, self._parent[owner]
+        return root
+
+    def join(self, owners):
+        ordered = sorted(owners)
+        for owner in ordered[1:]:
+            first, second = self._find(ordered[0]), self._find(owner)
+            if first != second:
+                self._parent[max(first, second)] = min(first, second)
+
+    def representative(self, owners):
+        if not owners:
+            return None
+        return min(self._find(owner) for owner in owners)
+
+
+def _partition_components_by_native_runtime_owner(
+    obj,
+    components,
+    receipt,
+    *,
+    receipt_index=None,
+):
+    """Split accidentally welded render components by exact runtime Node identity.
 
     SpeedTree can place two independent cards on the same authored edge.  The
     FBX/BWR coordinate weld then correctly reconnects seam-split faces, but it
     cannot distinguish those coincident card instances by geometry alone.  The
     native serializer receipt can: every surviving vertex retains its exact
     geometry ordinal/local index, and each Node record carries its runtime
-    GUID.  Use that identity only when a welded component actually intersects
-    multiple Nodes; ordinary one-owner components remain untouched.
+    identity.  Use that identity only when a welded component actually
+    intersects multiple Nodes; ordinary one-owner components remain untouched.
+
+    Two records of the same native instance are one owner.  A branch strip whose
+    vertices alternate between bones is serialized as several records, so keying
+    the fallback on the record's position in the file invented separate owners
+    for one surface.
+
+    A polygon that spans several owners is authored, not broken.  Truly
+    coincident cards never share a polygon, so owners joined by one are joined
+    surfaces and belong in the same partition; they are merged transitively
+    instead of rejected.
     """
 
     ordinal_attribute = obj.data.attributes.get(
@@ -3282,49 +2984,46 @@ def _partition_components_by_native_runtime_owner(obj, components, receipt):
     vertex_attribute = obj.data.attributes.get("speedtree_native_vertex_index")
     if ordinal_attribute is None or vertex_attribute is None:
         return list(components)
-
-    owner_by_native_vertex = defaultdict(set)
-    for row_index, row in enumerate(receipt.get("generated_instances") or []):
-        node_guid = str(row.get("node_guid") or "")
-        owner = (
-            ("node_guid", node_guid)
-            if node_guid
-            else ("serializer_record", int(row_index))
+    if receipt_index is None:
+        receipt_index = build_exact_native_receipt_index(receipt)
+    if not receipt_index.belongs_to(receipt):
+        raise ClusterAssemblyBuildError(
+            "native runtime owner index belongs to a different receipt"
         )
-        geometry_ordinal = int(row["geometry_ordinal"])
-        for first, last in row.get("vertex_ranges") or []:
-            for native_vertex_index in range(int(first), int(last) + 1):
-                owner_by_native_vertex[
-                    (geometry_ordinal, native_vertex_index)
-                ].add(owner)
 
     def vertex_owners(vertex_index):
-        key = (
+        return receipt_index.owner_keys_at(
             int(ordinal_attribute.data[int(vertex_index)].value),
             int(vertex_attribute.data[int(vertex_index)].value),
         )
-        return owner_by_native_vertex.get(key, set())
 
     partitioned = []
     for component in components:
-        component_owners = set()
-        polygon_owners = {}
+        polygon_owner_sets = {}
+        joined = _NativeRuntimeOwnerGroups()
         for polygon_index in component["polygons"]:
             owners = set()
             for vertex_index in obj.data.polygons[polygon_index].vertices:
                 owners.update(vertex_owners(vertex_index))
-            if len(owners) > 1:
-                raise ClusterAssemblyBuildError(
-                    "one rendered polygon crosses multiple native runtime "
-                    f"Node owners: object={obj.name!r} polygon={polygon_index} "
-                    f"owners={sorted(owners)}"
-                )
-            owner = next(iter(owners)) if owners else None
-            polygon_owners[int(polygon_index)] = owner
+            polygon_owner_sets[int(polygon_index)] = owners
+            # One polygon cannot belong to two coincident cards, so every owner
+            # it touches describes the same joined surface.
+            joined.join(owners)
+
+        component_owners = set()
+        polygon_owners = {}
+        for polygon_index, owners in polygon_owner_sets.items():
+            owner = joined.representative(owners)
+            polygon_owners[polygon_index] = owner
             if owner is not None:
                 component_owners.add(owner)
         if len(component_owners) <= 1:
-            partitioned.append(component)
+            row = dict(component)
+            if component_owners:
+                row["native_runtime_owner"] = list(
+                    next(iter(component_owners))
+                )
+            partitioned.append(row)
             continue
         if any(owner is None for owner in polygon_owners.values()):
             raise ClusterAssemblyBuildError(
@@ -3346,7 +3045,40 @@ def _partition_components_by_native_runtime_owner(obj, components, receipt):
                 "polygons": polygons,
                 "native_runtime_owner": list(owner),
             })
-    return sorted(partitioned, key=lambda row: row["polygons"][0])
+    # One native runtime object can be clipped into disconnected render
+    # islands.  Connectivity alone must not publish one full replacement part
+    # per island: that duplicates the authored object and can leave a tiny
+    # island without the normalized plan's scale-line face.  Rejoin only the
+    # islands carrying the exact same runtime-owner key. Different source
+    # objects, Nodes, or fallback frames remain separate regardless of spatial
+    # proximity or shared bones.
+    unowned = []
+    by_owner = defaultdict(list)
+    for row in partitioned:
+        owner = row.get("native_runtime_owner")
+        if owner is None:
+            unowned.append(row)
+        else:
+            by_owner[tuple(owner)].append(row)
+    rejoined = list(unowned)
+    for owner, rows in by_owner.items():
+        polygons = sorted({
+            int(polygon)
+            for row in rows
+            for polygon in row["polygons"]
+        })
+        vertices = sorted({
+            int(vertex)
+            for row in rows
+            for vertex in row["vertices"]
+        })
+        rejoined.append({
+            "vertices": vertices,
+            "polygons": polygons,
+            "native_runtime_owner": list(owner),
+            "native_runtime_owner_island_count": len(rows),
+        })
+    return sorted(rejoined, key=lambda row: row["polygons"][0])
 
 
 def _component_signature(mesh, component):
@@ -3574,11 +3306,26 @@ def _match_uv_candidate_groups(
             "normalized plan duplicate UV has too many geometric candidates "
             f"for bounded disambiguation: uv={key} count={len(source_groups)}"
         )
+    if len(source_groups) == 1 and len(target_groups) == 1:
+        # SpeedTree may retriangulate only the clipped boundary while keeping
+        # the authored UV vertex itself.  With one geometric position on both
+        # sides, the UV identity is already unique; surrounding face identity
+        # is not needed and would reject that exact surviving vertex.
+        return [(
+            source_groups[0]["representative"],
+            target_groups[0]["representative"],
+        )], {
+            "uv": list(key),
+            "source_geometric_candidates": 1,
+            "target_geometric_candidates": 1,
+            "discarded_source_candidates": 0,
+            "topology_score": None,
+            "identity_resolution": "unique_uv_geometric_group_v1",
+        }
     possibilities = []
     for source_order in itertools.permutations(
         range(len(source_groups)), len(target_groups)
     ):
-        score = 0
         valid = True
         for target_index, source_index in enumerate(source_order):
             source = source_groups[source_index]
@@ -3589,28 +3336,19 @@ def _match_uv_candidate_groups(
             ):
                 valid = False
                 break
-            score += _counter_missing_identity_count(
-                source["faces"], target["faces"]
-            )
-            score += _counter_missing_identity_count(
-                source["neighbors"], target["neighbors"]
-            )
         if valid:
-            possibilities.append((score, source_order))
+            possibilities.append(source_order)
     if not possibilities:
         raise ClusterAssemblyBuildError(
             "normalized plan duplicate UV has no topology-compatible "
             f"surviving correspondence: uv={key}"
         )
-    possibilities.sort(key=lambda row: (row[0], row[1]))
-    best_score = possibilities[0][0]
-    best = [row for row in possibilities if row[0] == best_score]
-    if len(best) != 1:
+    if len(possibilities) != 1:
         raise ClusterAssemblyBuildError(
             "normalized plan duplicate UV correspondence is ambiguous: "
-            f"uv={key} equal_best_assignments={len(best)} score={best_score}"
+            f"uv={key} exact_assignments={len(possibilities)}"
         )
-    assignment = best[0][1]
+    assignment = possibilities[0]
     return [
         (
             source_groups[source_index]["representative"],
@@ -3622,7 +3360,8 @@ def _match_uv_candidate_groups(
         "source_geometric_candidates": len(source_groups),
         "target_geometric_candidates": len(target_groups),
         "discarded_source_candidates": len(source_groups) - len(target_groups),
-        "topology_score": best_score,
+        "topology_score": None,
+        "identity_resolution": "sole_exact_topology_assignment_v2",
     }
 
 
@@ -3724,7 +3463,7 @@ def _normalized_prototype_for_component(prototypes, target_mesh, target_componen
     target_faces = _component_uv_face_counter(target_mesh, target_component)
     if target_faces is None:
         return None
-    candidates = []
+    face_subset_candidates = []
     for prototype in prototypes.values():
         source_faces = _component_uv_face_counter(
             prototype["object"].data,
@@ -3734,28 +3473,61 @@ def _normalized_prototype_for_component(prototypes, target_mesh, target_componen
             target_faces, source_faces
         ):
             continue
-        missing_faces = _counter_missing_identity_count(
-            source_faces, target_faces
+        face_subset_candidates.append(prototype)
+    if len(face_subset_candidates) == 1:
+        return face_subset_candidates[0]
+
+    # Collision clipping can replace only the boundary triangles while every
+    # untouched interior triangle retains its authored UV face identity.  That
+    # makes strict whole-mesh subset tests too strong.  Accept a prototype only
+    # when it is the sole candidate sharing any exact UV-face identity with the
+    # rendered component.  This is set identity, not a similarity score or a
+    # best-candidate rank; zero or multiple candidates remain unresolved.
+    shared_face_identity_candidates = []
+    for prototype in prototypes.values():
+        source_faces = _component_uv_face_counter(
+            prototype["object"].data,
+            prototype["component"],
         )
-        # SpeedTree can remove any number of fully clipped boundary triangles
-        # while deriving the final rendered FBX from a provider plan.  The
-        # Full FBX is the geometry authority, so accept its exact UV-face
-        # subset and rank by the fewest provider-only faces.  Provider role
-        # identity and the unique-best check below prevent sibling plans from
-        # being conflated; a percentage threshold would incorrectly make the
-        # lower provider topology authoritative.
-        candidates.append((missing_faces, prototype))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda row: row[0])
-    best_missing = candidates[0][0]
-    best = [row[1] for row in candidates if row[0] == best_missing]
-    if len(best) != 1:
+        if source_faces is None:
+            continue
+        shared_keys = set(source_faces).intersection(target_faces)
+        if not shared_keys:
+            continue
+        if any(
+            int(target_faces[key])
+            > int(source_faces[key]) * MAX_SPEEDTREE_RENDER_FACE_MULTIPLICITY
+            for key in shared_keys
+        ):
+            continue
+        shared_face_identity_candidates.append(prototype)
+    if len(shared_face_identity_candidates) == 1:
+        return shared_face_identity_candidates[0]
+
+    exact_uv_candidates = []
+    candidates_to_check = (
+        shared_face_identity_candidates
+        or face_subset_candidates
+        or list(prototypes.values())
+    )
+    target_obj = SimpleNamespace(data=target_mesh)
+    for prototype in candidates_to_check:
+        try:
+            _ordered_cross_object_correspondence(
+                prototype["object"],
+                prototype["component"],
+                target_obj,
+                target_component,
+            )
+        except (AttributeError, ClusterAssemblyBuildError):
+            continue
+        exact_uv_candidates.append(prototype)
+    if len(exact_uv_candidates) > 1:
         raise ClusterAssemblyBuildError(
-            "normalized plan UV-subset match is ambiguous for component: "
+            "normalized plan exact UV identity is ambiguous for component: "
             + signature
         )
-    return best[0]
+    return exact_uv_candidates[0] if exact_uv_candidates else None
 
 
 def _normalized_prototype_match_diagnostics(
@@ -4055,16 +3827,11 @@ def _ordered_cross_object_correspondence(
         )
         source_by_uv = source_prepared["candidates"]
         target_by_uv = target_prepared["candidates"]
-        missing = sorted(set(target_by_uv) - set(source_by_uv))
-        if missing:
-            raise ClusterAssemblyBuildError(
-                "normalized plan UV correspondence does not cover the target "
-                f"instance: missing_uv_count={len(missing)} sample={missing[:5]}"
-            )
+        shared_uv_keys = sorted(set(target_by_uv).intersection(source_by_uv))
         source_indices = []
         target_indices = []
         duplicate_rows = []
-        for key in sorted(target_by_uv):
+        for key in shared_uv_keys:
             pairs, evidence = _match_uv_candidate_groups(
                 source_obj,
                 source_component,
@@ -4090,9 +3857,12 @@ def _ordered_cross_object_correspondence(
                 f"three geometric points: count={len(source_indices)}"
             )
         evidence = {
-            "policy": "all_candidates_topology_disambiguated_fail_closed_v1",
+            "policy": "exact_surviving_uv_identity_fail_closed_v2",
             "matched_point_count": len(source_indices),
             "target_uv_key_count": len(target_by_uv),
+            "target_only_uv_key_count": len(
+                set(target_by_uv) - set(source_by_uv)
+            ),
             "source_only_uv_key_count": len(
                 set(source_by_uv) - set(target_by_uv)
             ),
@@ -4190,6 +3960,513 @@ def _world_points(obj, vertex_indices):
     ]
 
 
+def _local_points(obj, vertex_indices):
+    return [
+        tuple(float(value) for value in obj.data.vertices[index].co)
+        for index in vertex_indices
+    ]
+
+
+def _exact_normalized_authored_line(
+    normalized_contract,
+    variant,
+    asset_name,
+):
+    """Read one normalizer-authored +Y placement line without deriving it."""
+    production_normalization = (
+        (normalized_contract or {}).get("production_normalization") or {}
+    )
+    capture = production_normalization.get("physical_capture_contract") or {}
+    frame = capture.get("frame") or {}
+    try:
+        fit_scale = float(frame.get("fit_scale"))
+        prototype_index = int((variant or {}).get("source_prototype_index"))
+    except (TypeError, ValueError) as exc:
+        raise ClusterAssemblyBuildError(
+            f"normalized Assembly authored line is invalid: {asset_name}"
+        ) from exc
+    if not math.isfinite(fit_scale) or fit_scale <= 0.0:
+        raise ClusterAssemblyBuildError(
+            f"normalized Assembly authored line fit scale is invalid: {asset_name}"
+        )
+    matches = []
+    for pivot in capture.get("attachment_pivots") or []:
+        if (
+            str(pivot.get("prototype_asset") or "") == str(asset_name or "")
+            and int(pivot.get("prototype_index") or 0) == prototype_index
+        ):
+            matches.append(pivot)
+    if len(matches) != 1:
+        raise ClusterAssemblyBuildError(
+            "normalized Assembly authored line identity is absent or ambiguous: "
+            f"asset={asset_name!r}, prototype_index={prototype_index}, "
+            f"matches={len(matches)}"
+        )
+    pivot = matches[0]
+    tangent = pivot.get("attachment_tangent_projection") or {}
+    aligned = tangent.get("aligned_capture_plane_world")
+    normalized_xy = tangent.get("normalized_local_xy")
+    try:
+        aligned = [float(value) for value in aligned]
+        normalized_xy = [float(value) for value in normalized_xy]
+    except (TypeError, ValueError) as exc:
+        raise ClusterAssemblyBuildError(
+            f"normalized Assembly authored line payload is invalid: {asset_name}"
+        ) from exc
+    if (
+        len(aligned) != 3
+        or any(not math.isfinite(value) for value in aligned)
+        or len(normalized_xy) != 2
+        or normalized_xy != [0.0, 1.0]
+        or tangent.get("direction_policy")
+        != "project_xml_attachment_into_capture_plane"
+    ):
+        raise ClusterAssemblyBuildError(
+            "normalized Assembly authored line does not declare the exact local "
+            f"+Y contract: {asset_name}"
+        )
+    source_length = math.sqrt(sum(value * value for value in aligned)) * fit_scale
+    if not math.isfinite(source_length) or source_length <= 1.0e-12:
+        raise ClusterAssemblyBuildError(
+            f"normalized Assembly authored line is degenerate: {asset_name}"
+        )
+    evidence = {
+        "policy": "physical_capture_exact_authored_positive_y_line_v1",
+        "length": source_length,
+        "fit_scale": fit_scale,
+        "aligned_capture_plane_world": aligned,
+        "normalized_local_xy": normalized_xy,
+        "direction_policy": tangent["direction_policy"],
+        "prototype_index": prototype_index,
+        "prototype_asset": str(asset_name),
+        "physical_capture_contract_sha256": str(
+            production_normalization.get("physical_capture_contract_sha256")
+            or ""
+        ),
+    }
+    evidence["contract_sha256"] = _sha256_bytes(
+        _canonical_json(evidence).encode("utf-8")
+    )
+    return evidence
+
+
+def _barycentric_xy(point, triangle):
+    ax, ay = triangle[0][0], triangle[0][1]
+    bx, by = triangle[1][0], triangle[1][1]
+    cx, cy = triangle[2][0], triangle[2][1]
+    px, py = point
+    denominator = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+    if abs(denominator) <= 1.0e-20:
+        return None
+    first = ((by - cy) * (px - cx) + (cx - bx) * (py - cy)) / denominator
+    second = ((cy - ay) * (px - cx) + (ax - cx) * (py - cy)) / denominator
+    return (first, second, 1.0 - first - second)
+
+
+def _mesh_runtime_identity(mesh):
+    as_pointer = getattr(mesh, "as_pointer", None)
+    return int(as_pointer()) if callable(as_pointer) else id(mesh)
+
+
+def _build_loop_triangle_polygon_index(mesh, polygon_indices):
+    """Index selected mesh loop triangles once without changing their order.
+
+    ``Mesh.loop_triangles`` belongs to the whole merged SpeedTree mesh.  An
+    Assembly binding, however, needs only the triangles of its small rendered
+    component.  Store the original global triangle ordinal so reconstructing a
+    component view remains byte-for-byte ordered like the former full scan.
+    """
+
+    requested = frozenset(int(value) for value in polygon_indices)
+    mesh.calc_loop_triangles()
+    by_polygon = {polygon_index: [] for polygon_index in requested}
+    total_triangle_count = 0
+    indexed_triangle_count = 0
+    for ordinal, triangle in enumerate(mesh.loop_triangles):
+        total_triangle_count += 1
+        polygon_index = int(triangle.polygon_index)
+        records = by_polygon.get(polygon_index)
+        if records is None:
+            continue
+        records.append({
+            "ordinal": ordinal,
+            "polygon_index": polygon_index,
+            "vertices": tuple(int(value) for value in triangle.vertices),
+            "loops": tuple(int(value) for value in triangle.loops),
+        })
+        indexed_triangle_count += 1
+    return {
+        "mesh_identity": _mesh_runtime_identity(mesh),
+        "polygon_indices": requested,
+        "by_polygon": {
+            polygon_index: tuple(records)
+            for polygon_index, records in by_polygon.items()
+        },
+        "total_triangle_count": total_triangle_count,
+        "indexed_triangle_count": indexed_triangle_count,
+    }
+
+
+def _component_loop_triangle_records(mesh, polygon_indices, triangle_index=None):
+    """Return one component's triangles in original global mesh order."""
+
+    requested = frozenset(int(value) for value in polygon_indices)
+    if triangle_index is None:
+        # Compatibility path for focused callers and tests. Production builds
+        # supply the per-mesh index prepared after all role matches are known.
+        return [
+            {
+                "ordinal": ordinal,
+                "polygon_index": int(triangle.polygon_index),
+                "vertices": tuple(int(value) for value in triangle.vertices),
+                "loops": tuple(int(value) for value in triangle.loops),
+            }
+            for ordinal, triangle in enumerate(
+                _calculated_loop_triangles(mesh)
+            )
+            if int(triangle.polygon_index) in requested
+        ]
+    if int(triangle_index.get("mesh_identity", -1)) != _mesh_runtime_identity(
+        mesh
+    ):
+        raise ClusterAssemblyBuildError(
+            "exact Assembly loop-triangle index belongs to another mesh"
+        )
+    indexed_polygons = frozenset(triangle_index.get("polygon_indices") or ())
+    missing = requested - indexed_polygons
+    if missing:
+        raise ClusterAssemblyBuildError(
+            "exact Assembly loop-triangle index does not cover component "
+            "polygons: " + ", ".join(str(value) for value in sorted(missing))
+        )
+    records = [
+        record
+        for polygon_index in requested
+        for record in (
+            (triangle_index.get("by_polygon") or {}).get(polygon_index) or ()
+        )
+    ]
+    records.sort(key=lambda row: int(row["ordinal"]))
+    return records
+
+
+def _calculated_loop_triangles(mesh):
+    """Calculate and return the mesh-wide loop-triangle collection once."""
+
+    mesh.calc_loop_triangles()
+    return mesh.loop_triangles
+
+
+def _build_target_loop_triangle_indices(role_build_plans):
+    """Build exactly one selected-polygon triangle index per target mesh."""
+
+    meshes = {}
+    polygons_by_mesh = defaultdict(set)
+    for plan in (role_build_plans or {}).values():
+        target_object = plan.get("target_object")
+        mesh = getattr(target_object, "data", None)
+        if mesh is None:
+            continue
+        mesh_identity = _mesh_runtime_identity(mesh)
+        meshes[mesh_identity] = mesh
+        for matched in (plan.get("matched") or {}).values():
+            for component in matched.get("instances") or ():
+                polygons_by_mesh[mesh_identity].update(
+                    int(value) for value in component.get("polygons") or ()
+                )
+    return {
+        mesh_identity: _build_loop_triangle_polygon_index(
+            meshes[mesh_identity],
+            polygons,
+        )
+        for mesh_identity, polygons in polygons_by_mesh.items()
+        if polygons
+    }
+
+
+def _prepare_exact_source_plan_line(
+    source_obj,
+    source_component,
+    source_attachment,
+    source_line_length,
+    *,
+    source_triangle_index=None,
+):
+    """Resolve the source-side authored line triangle once per prototype."""
+
+    source_origin = tuple(float(value) for value in source_attachment)
+    try:
+        normalized_line_length = float(source_line_length)
+    except (TypeError, ValueError) as exc:
+        raise ClusterAssemblyBuildError(
+            "exact Assembly plan-line length is invalid"
+        ) from exc
+    if (
+        not math.isfinite(normalized_line_length)
+        or normalized_line_length <= 1.0e-12
+    ):
+        raise ClusterAssemblyBuildError(
+            "exact Assembly plan-line length is degenerate"
+        )
+    source_endpoint_xy = (
+        source_origin[0],
+        source_origin[1] + normalized_line_length,
+    )
+    source_uv_layer = source_obj.data.uv_layers.active
+    if source_uv_layer is None:
+        raise ClusterAssemblyBuildError(
+            "exact Assembly authored-line mapping requires source and target UVs"
+        )
+    source_candidates = []
+    for triangle in _component_loop_triangle_records(
+        source_obj.data,
+        source_component["polygons"],
+        source_triangle_index,
+    ):
+        source_triangle_indices = list(triangle["vertices"])
+        source_points = _local_points(source_obj, source_triangle_indices)
+        weights = _barycentric_xy(source_endpoint_xy, source_points)
+        if (
+            weights is None
+            or min(weights) < -1.0e-12
+            or max(weights) > 1.0 + 1.0e-12
+        ):
+            continue
+        reconstructed_source = tuple(
+            sum(
+                weights[index] * source_points[index][axis]
+                for index in range(3)
+            )
+            for axis in range(3)
+        )
+        source_endpoint_error = math.dist(
+            source_endpoint_xy,
+            reconstructed_source[:2],
+        )
+        if source_endpoint_error > 1.0e-12:
+            continue
+        source_uv_points = [
+            tuple(float(value) for value in source_uv_layer.data[loop].uv)
+            for loop in triangle["loops"]
+        ]
+        source_endpoint_uv = tuple(
+            sum(
+                weights[index] * source_uv_points[index][axis]
+                for index in range(3)
+            )
+            for axis in range(2)
+        )
+        source_candidates.append({
+            "polygon_index": int(triangle["polygon_index"]),
+            "source_indices": source_triangle_indices,
+            "source_points": source_points,
+            "source_line_endpoint": list(reconstructed_source),
+            "source_geometry_barycentric_weights": [
+                float(value) for value in weights
+            ],
+            "source_line_endpoint_xy_error": source_endpoint_error,
+            "source_uv_points": source_uv_points,
+            "source_line_endpoint_uv": list(source_endpoint_uv),
+        })
+    if len(source_candidates) != 1:
+        raise ClusterAssemblyBuildError(
+            "exact Assembly authored line endpoint must belong to one exact "
+            f"source geometry triangle, got {len(source_candidates)}"
+        )
+    return {
+        "source_origin": source_origin,
+        "source_line_length": normalized_line_length,
+        "candidate": source_candidates[0],
+    }
+
+
+def _exact_plan_line_correspondence(
+    source_obj,
+    source_component,
+    source_indices,
+    target_obj,
+    target_component,
+    target_indices,
+    source_attachment,
+    target_attachment,
+    source_line_length,
+    *,
+    source_triangle_index=None,
+    target_triangle_index=None,
+    prepared_source_line=None,
+):
+    """Map the authored line endpoint through its exact UV/topology triangle."""
+    if len(source_indices) != len(target_indices):
+        raise ClusterAssemblyBuildError(
+            "exact Assembly plan-line correspondence lengths differ"
+        )
+    source_origin = tuple(float(value) for value in source_attachment)
+    target_origin = tuple(float(value) for value in target_attachment)
+    try:
+        source_line_length = float(source_line_length)
+    except (TypeError, ValueError) as exc:
+        raise ClusterAssemblyBuildError(
+            "exact Assembly plan-line length is invalid"
+        ) from exc
+    if not math.isfinite(source_line_length) or source_line_length <= 1.0e-12:
+        raise ClusterAssemblyBuildError(
+            "exact Assembly plan-line length is degenerate"
+        )
+    source_uv_layer = source_obj.data.uv_layers.active
+    target_uv_layer = target_obj.data.uv_layers.active
+    if source_uv_layer is None or target_uv_layer is None:
+        raise ClusterAssemblyBuildError(
+            "exact Assembly authored-line mapping requires source and target UVs"
+        )
+    if prepared_source_line is None:
+        prepared_source_line = _prepare_exact_source_plan_line(
+            source_obj,
+            source_component,
+            source_origin,
+            source_line_length,
+            source_triangle_index=source_triangle_index,
+        )
+    if (
+        tuple(prepared_source_line.get("source_origin") or ()) != source_origin
+        or float(prepared_source_line.get("source_line_length", -1.0))
+        != source_line_length
+    ):
+        raise ClusterAssemblyBuildError(
+            "prepared exact Assembly source line does not match this prototype"
+        )
+    source_candidate = prepared_source_line.get("candidate")
+    if not isinstance(source_candidate, dict):
+        raise ClusterAssemblyBuildError(
+            "prepared exact Assembly source line has no candidate"
+        )
+    target_candidates = []
+    source_endpoint_uv = source_candidate["source_line_endpoint_uv"]
+    target_triangles = _component_loop_triangle_records(
+        target_obj.data,
+        target_component["polygons"],
+        target_triangle_index,
+    )
+    for triangle in target_triangles:
+        target_polygon_index = int(triangle["polygon_index"])
+        target_uv_points = [
+            tuple(float(value) for value in target_uv_layer.data[loop].uv)
+            for loop in triangle["loops"]
+        ]
+        weights = _barycentric_xy(source_endpoint_uv, target_uv_points)
+        if weights is None or min(weights) < -1.0e-12 or max(weights) > 1.0 + 1.0e-12:
+            continue
+        reconstructed_uv = tuple(
+            sum(
+                weights[index] * target_uv_points[index][axis]
+                for index in range(3)
+            )
+            for axis in range(2)
+        )
+        target_uv_error = math.dist(source_endpoint_uv, reconstructed_uv)
+        if target_uv_error > 1.0e-12:
+            continue
+        target_triangle_indices = list(triangle["vertices"])
+        target_points = _world_points(target_obj, target_triangle_indices)
+        target_endpoint = tuple(
+            sum(
+                weights[index] * target_points[index][axis]
+                for index in range(3)
+            )
+            for axis in range(3)
+        )
+        target_candidates.append({
+            "target_polygon_index": target_polygon_index,
+            "target_indices": target_triangle_indices,
+            "target_points": target_points,
+            "target_uv_points": target_uv_points,
+            "target_uv_barycentric_weights": [
+                float(value) for value in weights
+            ],
+            "target_line_endpoint_uv_error": target_uv_error,
+            "target_line_endpoint": list(target_endpoint),
+        })
+    if len(target_candidates) != 1:
+        diagnostics = [
+            {
+                "target_polygon_index": row["target_polygon_index"],
+                "target_indices": row["target_indices"],
+                "target_line_endpoint": row["target_line_endpoint"],
+            }
+            for row in target_candidates[:8]
+        ]
+        nearest_uv_triangles = []
+        for triangle in target_triangles:
+            target_polygon_index = int(triangle["polygon_index"])
+            target_uv_points = [
+                tuple(float(value) for value in target_uv_layer.data[loop].uv)
+                for loop in triangle["loops"]
+            ]
+            weights = _barycentric_xy(source_endpoint_uv, target_uv_points)
+            if weights is None:
+                continue
+            violation = max(
+                0.0,
+                -min(weights),
+                max(weights) - 1.0,
+            )
+            nearest_uv_triangles.append({
+                "target_polygon_index": target_polygon_index,
+                "containment_violation": float(violation),
+                "weights": [float(value) for value in weights],
+                "target_uv_points": [list(point) for point in target_uv_points],
+            })
+        nearest_uv_triangles.sort(key=lambda row: (
+            row["containment_violation"],
+            row["target_polygon_index"],
+        ))
+        correspondence_scale_ratios = []
+        for source_index, target_index in zip(source_indices, target_indices):
+            source_point = tuple(
+                float(value) for value in source_obj.data.vertices[source_index].co
+            )
+            target_point = _world_coordinate(
+                target_obj,
+                target_obj.data.vertices[target_index].co,
+            )
+            source_distance = math.dist(source_origin, source_point)
+            if source_distance <= 1.0e-12:
+                continue
+            correspondence_scale_ratios.append(
+                math.dist(target_origin, target_point) / source_distance
+            )
+        scale_summary = None
+        if correspondence_scale_ratios:
+            scale_summary = {
+                "count": len(correspondence_scale_ratios),
+                "minimum": min(correspondence_scale_ratios),
+                "median": statistics.median(correspondence_scale_ratios),
+                "maximum": max(correspondence_scale_ratios),
+            }
+        raise ClusterAssemblyBuildError(
+            "exact Assembly authored line UV must belong to one target render "
+            "triangle: "
+            f"source_object={source_obj.name!r}, target_object={target_obj.name!r}, "
+            f"source_polygon={source_candidate['polygon_index']}, "
+            f"source_line_endpoint_uv={source_endpoint_uv}, "
+            f"target_matches={len(target_candidates)}, candidates={diagnostics}, "
+            f"target_component_owner={target_component.get('native_runtime_owner')}, "
+            f"target_component_polygons={len(set(target_component['polygons']))}, "
+            f"nearest_uv_triangles={nearest_uv_triangles[:4]}, "
+            f"correspondence_scale_ratio={scale_summary}"
+        )
+    selected = {**source_candidate, **target_candidates[0]}
+    selected["selection_policy"] = (
+        "unique_source_and_target_uv_triangles_containing_exact_authored_"
+        "line_endpoint_v1"
+    )
+    selected["correspondence_policy"] = (
+        "same_exact_uv_point_on_source_and_target_plan_surfaces_v1"
+    )
+    selected["source_line_start"] = list(source_origin)
+    selected["target_line_start"] = list(target_origin)
+    return selected
+
+
 def _world_coordinate(obj, coordinate):
     matrix = obj.matrix_world
     return tuple(
@@ -4204,11 +4481,6 @@ def _world_coordinate(obj, coordinate):
     )
 
 
-def _native_position_to_blender_world(coordinate):
-    x, y, z = (float(value) for value in coordinate)
-    return (x * 0.3048, z * 0.3048, -y * 0.3048)
-
-
 def _exact_native_attachment_influences(
     obj,
     target_component,
@@ -4216,6 +4488,8 @@ def _exact_native_attachment_influences(
     native_receipt,
     skeleton_snapshot,
     context,
+    skeleton_identity=None,
+    native_receipt_index=None,
 ):
     """Read authored proxy weights captured inside Modeler's FBX serializer."""
 
@@ -4270,44 +4544,51 @@ def _exact_native_attachment_influences(
             native_receipt,
             geometry_ordinal,
             native_vertices,
+            receipt_index=native_receipt_index,
         )
     except NativeReceiptError as exc:
         raise ClusterAssemblyBuildError(f"{context}: {exc}") from exc
     authored = list(instance.get("authored_position_influences") or [])
-    root_candidates = [
-        str(row["name"])
-        for row in (skeleton_snapshot or {}).get("bones") or []
-        if int(row.get("index", -1)) > 0
-        and int(row.get("parent_index", -1)) == 0
-    ]
-    skeleton_bone_names = {
-        str(row.get("name") or "")
-        for row in (skeleton_snapshot or {}).get("bones") or []
-        if str(row.get("name") or "")
-    }
+    authored_tangent = instance.get("authored_tangent_native_unit")
+    if authored_tangent is None:
+        raise ClusterAssemblyBuildError(
+            f"{context} native receipt predates exact runtime tangent capture"
+        )
+    if skeleton_identity is None:
+        skeleton_rows = list((skeleton_snapshot or {}).get("bones") or [])
+        skeleton_bone_names = {
+            str(row.get("name") or "")
+            for row in skeleton_rows
+            if str(row.get("name") or "")
+        }
+    else:
+        skeleton_rows, skeleton_bone_names = skeleton_identity
+    if (
+        not skeleton_rows
+        or int(skeleton_rows[0].get("index", -1)) != 0
+        or int(skeleton_rows[0].get("parent_index", -2)) != -1
+        or not str(skeleton_rows[0].get("name") or "")
+    ):
+        raise ClusterAssemblyBuildError(
+            f"{context} has no exact native FBX skeleton index-zero root"
+        )
+    native_fbx_root_name = str(skeleton_rows[0]["name"])
     source_bone_id = instance.get("source_bone_id")
-    source_bone_candidates = []
-    if source_bone_id is not None:
-        source_bone_candidates = list(dict.fromkeys(
-            str(row.get("exported_cluster_name") or "")
-            for row in authored
-            if row.get("native_root") is not True
-            and row.get("bone_id") == source_bone_id
-            and str(row.get("exported_cluster_name") or "")
-            in skeleton_bone_names
-        ))
+    missing_exported_bones = sorted({
+        str(row.get("exported_cluster_name") or "")
+        for row in authored
+        if row.get("native_root") is not True
+        and str(row.get("exported_cluster_name") or "")
+        not in skeleton_bone_names
+    })
+    if missing_exported_bones:
+        raise ClusterAssemblyBuildError(
+            f"{context} references native exported bones absent from the "
+            "exact FBX skeleton: " + ", ".join(missing_exported_bones)
+        )
     if any(row.get("native_root") is True for row in authored):
-        if len(source_bone_candidates) == 1:
-            native_root_name = source_bone_candidates[0]
-            native_root_resolution = "exact_instance_source_bone"
-        elif len(root_candidates) == 1:
-            native_root_name = root_candidates[0]
-            native_root_resolution = "unique_native_fbx_root_child"
-        else:
-            raise ClusterAssemblyBuildError(
-                f"{context} has no exact instance source bone and no unique "
-                "native FBX skeleton root"
-            )
+        native_root_name = native_fbx_root_name
+        native_root_resolution = "exact_native_fbx_skeleton_index_zero"
     else:
         native_root_name = ""
         native_root_resolution = "not_required"
@@ -4323,7 +4604,10 @@ def _exact_native_attachment_influences(
         for row in authored
     ]
     return influences, {
-        "policy": "native_modeler_authored_proxy_weights_v1",
+        "policy": (
+            "native_modeler_authored_proxy_weights_v2_"
+            "exact_skeleton_index_zero"
+        ),
         "identity_source": identity_source,
         "geometry_ordinal": geometry_ordinal,
         "native_vertex_indices": instance.get(
@@ -4345,6 +4629,8 @@ def _exact_native_attachment_influences(
         "parent_guid": instance.get("parent_guid"),
         "generator_guid": instance.get("generator_guid"),
         "authored_position_native": instance.get("authored_position_native"),
+        "authored_tangent_native_unit": authored_tangent,
+        "source_rtti": instance.get("source_rtti"),
         "receipt": native_receipt.get("receipt_path"),
     }
 
@@ -4887,6 +5173,7 @@ def _weighted_bones_for_base(obj, skeleton_snapshot, skeleton_by_name=None):
 
 
 def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
+    export_started = perf_counter()
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     bpy.ops.object.mode_set(mode="OBJECT") if bpy.context.object and bpy.context.object.mode != "OBJECT" else None
@@ -5004,6 +5291,7 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
                     mesh_smooth_type="FACE",
                     use_mesh_edges=False,
                     use_subsurf=False,
+                    bake_anim=False,
                     bake_anim_use_nla_strips=True,
                     bake_anim_use_all_actions=False,
                     bake_anim_force_startend_keying=True,
@@ -5037,6 +5325,10 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
     )
     if addon_runtime is not None:
         validation["blender_addon_runtime"] = addon_runtime.receipt
+    validation["export_elapsed_seconds"] = round(
+        perf_counter() - export_started,
+        6,
+    )
     return validation
 
 
@@ -5054,15 +5346,24 @@ def _write_assembly_source_blend(bpy, path, objects, contract):
     collection = bpy.data.collections.new(target.stem + "_Objects")
     text = bpy.data.texts.new(target.stem + "_Contract.json")
     text.write(json.dumps(contract, ensure_ascii=False, indent=2))
+    timings = {}
     try:
         for obj in objects:
             collection.objects.link(obj)
+        library_write_started = perf_counter()
         bpy.data.libraries.write(
             str(library_path),
             {collection, text},
             path_remap="RELATIVE_ALL",
             fake_user=True,
-            compress=True,
+            # This private bridge is loaded once and deleted below. Avoid a
+            # first full zstd pass over a multi-thousand-bone armature; the
+            # durable public source is still compressed by the nested save.
+            compress=False,
+        )
+        timings["temporary_library_write"] = round(
+            perf_counter() - library_write_started,
+            6,
         )
         bootstrap = "\n".join(
             [
@@ -5077,9 +5378,10 @@ def _write_assembly_source_blend(bpy, path, objects, contract):
                 "bpy.context.scene.unit_settings.system = 'METRIC'",
                 "bpy.context.scene.unit_settings.scale_length = 1.0",
                 "bpy.context.scene.name = collection_name.rsplit('_Objects', 1)[0]",
-                "bpy.ops.wm.save_as_mainfile(filepath=target, check_existing=False)",
+                "bpy.ops.wm.save_as_mainfile(filepath=target, check_existing=False, compress=True)",
             ]
         )
+        standalone_save_started = perf_counter()
         completed = owned_run(
             [
                 bpy.app.binary_path,
@@ -5099,6 +5401,10 @@ def _write_assembly_source_blend(bpy, path, objects, contract):
             capture_output=True,
             text=True,
         )
+        timings["standalone_load_and_compressed_save"] = round(
+            perf_counter() - standalone_save_started,
+            6,
+        )
         if completed.returncode != 0 or not target.is_file():
             raise ClusterAssemblyBuildError(
                 "standalone Assembly Blender source creation failed: "
@@ -5111,7 +5417,9 @@ def _write_assembly_source_blend(bpy, path, objects, contract):
             bpy.data.texts.remove(text, do_unlink=True)
         if library_path.is_file():
             library_path.unlink()
-    return file_fingerprint(target)
+    fingerprint = file_fingerprint(target)
+    fingerprint["write_timings_seconds"] = timings
+    return fingerprint
 
 
 def _role_builder_key(row):
@@ -5123,6 +5431,7 @@ def _role_material_polygons(
     role_inputs,
     *,
     allow_topology_fallback=True,
+    polygon_snapshot_cache=None,
 ):
     materials = list(merged_mesh.data.materials)
     slots_by_identity = defaultdict(set)
@@ -5132,8 +5441,11 @@ def _role_material_polygons(
     result = {}
     prepared_unused = {}
     claimed_slots = {}
+    row_slots_by_index = []
+    row_indices_by_slot = defaultdict(list)
+    prepared_rows = []
     missing_slot_rows = []
-    for row in role_inputs:
+    for row_index, row in enumerate(role_inputs):
         role = str(row["role"]).casefold()
         provider_key = _role_builder_key(row)
         identity_values = [
@@ -5163,11 +5475,44 @@ def _role_material_polygons(
                     f"slot={slot}, roles={owner},{provider_key}"
                 )
             claimed_slots[slot] = provider_key
-        polygons = [
-            int(polygon.index)
+            row_indices_by_slot[slot].append(row_index)
+        row_slots_by_index.append(slots)
+        prepared_rows.append((provider_key, role, row, identities))
+
+    # Resolve all exact role slots before touching polygon RNA, then route the
+    # mesh in one global-order pass.  The slot-to-row list deliberately keeps
+    # duplicate rows for one provider separate, matching the former per-row
+    # scans and their last-row-wins result semantics.  A slot claimed by two
+    # different providers has already failed above, before any mesh traversal.
+    snapshot_key = "polygon_material_rows_v1"
+    snapshot_mesh_key = "polygon_material_rows_mesh_identity"
+    if polygon_snapshot_cache is not None and snapshot_key in polygon_snapshot_cache:
+        if polygon_snapshot_cache.get(snapshot_mesh_key) != id(merged_mesh):
+            raise ClusterAssemblyBuildError(
+                "Assembly polygon snapshot was reused for a different mesh"
+            )
+        polygon_rows = polygon_snapshot_cache[snapshot_key]
+    else:
+        polygon_rows = tuple(
+            (int(polygon.index), int(polygon.material_index))
             for polygon in merged_mesh.data.polygons
-            if int(polygon.material_index) in slots
-        ]
+        )
+        if polygon_snapshot_cache is not None:
+            polygon_snapshot_cache[snapshot_mesh_key] = id(merged_mesh)
+            polygon_snapshot_cache[snapshot_key] = polygon_rows
+
+    polygons_by_row = [[] for _row in prepared_rows]
+    for polygon_index, material_index in polygon_rows:
+        row_indices = row_indices_by_slot.get(material_index)
+        if row_indices:
+            for row_index in row_indices:
+                polygons_by_row[row_index].append(polygon_index)
+
+    for row_index, (provider_key, role, row, identities) in enumerate(
+        prepared_rows
+    ):
+        slots = row_slots_by_index[row_index]
+        polygons = polygons_by_row[row_index]
         if not slots:
             missing_slot_rows.append((provider_key, role, row, identities))
             continue
@@ -5219,15 +5564,19 @@ def _role_material_polygons(
     # matcher inspect only polygons not already claimed by an exact material
     # role.  It will still fail closed later when no normalized prototype
     # actually matches.
+    # Build this from the final result, rather than from every claimed slot.
+    # Duplicate rows for one provider intentionally retain the historical
+    # last-row-wins behavior, including which polygons remain eligible for a
+    # later missing-slot topology fallback.
     claimed_polygons = {
         polygon
         for role_row in result.values()
         for polygon in role_row["polygon_indices"]
     }
     topology_candidates = [
-        int(polygon.index)
-        for polygon in merged_mesh.data.polygons
-        if int(polygon.index) not in claimed_polygons
+        polygon_index
+        for polygon_index, _material_index in polygon_rows
+        if polygon_index not in claimed_polygons
     ]
     for provider_key, role, row, identities in missing_slot_rows:
         normalized = deepcopy(row.get("normalized_variants"))
@@ -5297,10 +5646,12 @@ def _role_geometry_sources(bpy_module, final_merged_mesh, role_inputs):
     placement geometry. Prefer those exact source objects before falling back
     to topology search on the final merged base.
     """
+    final_polygon_snapshot = {}
     exact_final, _unused = _role_material_polygons(
         final_merged_mesh,
         role_inputs,
         allow_topology_fallback=False,
+        polygon_snapshot_cache=final_polygon_snapshot,
     )
     roles = dict(exact_final)
     targets = {
@@ -5337,6 +5688,7 @@ def _role_geometry_sources(bpy_module, final_merged_mesh, role_inputs):
             continue
         source_objects.append(obj)
 
+    source_polygon_snapshots = {id(obj): {} for obj in source_objects}
     still_unresolved = []
     for row in unresolved:
         provider_key = _role_builder_key(row)
@@ -5346,6 +5698,7 @@ def _role_geometry_sources(bpy_module, final_merged_mesh, role_inputs):
                 obj,
                 [row],
                 allow_topology_fallback=False,
+                polygon_snapshot_cache=source_polygon_snapshots[id(obj)],
             )
             if provider_key in rendered:
                 matches.append((obj, rendered[provider_key]))
@@ -5371,6 +5724,7 @@ def _role_geometry_sources(bpy_module, final_merged_mesh, role_inputs):
             final_merged_mesh,
             still_unresolved,
             allow_topology_fallback=True,
+            polygon_snapshot_cache=final_polygon_snapshot,
         )
         roles.update(fallback)
         targets.update({
@@ -5436,6 +5790,7 @@ def build_blender_assembly_inputs(
     pass_through_receipt_path=None,
     pass_through_target_contract=None,
     pass_through_target_spm=None,
+    force_rebuild=False,
 ):
     """Generate base/part FBXs and a strict builder manifest inside BWR.
 
@@ -5537,40 +5892,37 @@ def build_blender_assembly_inputs(
             else None
         ),
     )
-    reusable_manifest = _load_reusable_assembly_manifest(
-        manifest_path,
-        build_input_signature,
-        full_fingerprint_before,
-    )
+    reusable_manifest = None
+    if not force_rebuild:
+        reusable_manifest = _load_reusable_assembly_manifest(
+            manifest_path,
+            build_input_signature,
+            full_fingerprint_before,
+        )
     if reusable_manifest is not None:
         return reusable_manifest
     snapshot = snapshot_blender_armature(final_armature)
     checked_snapshot, skeleton_by_name = _skeleton_maps(snapshot)
     snapshot = checked_snapshot
+    # Exact attachment lookup is per rendered component, but final skeleton
+    # identity is immutable for the whole build. Willow-class assets can have
+    # thousands of leaf bindings and bones, so rebuilding this set for every
+    # binding creates a large avoidable O(bindings * bones) cost.
+    native_skeleton_rows = tuple(snapshot.get("bones") or ())
+    native_skeleton_identity = (
+        native_skeleton_rows,
+        frozenset(
+            str(row.get("name") or "")
+            for row in native_skeleton_rows
+            if str(row.get("name") or "")
+        ),
+    )
     role_inputs = list((handoff.get("assembly") or {}).get("part_builder_inputs") or [])
     roles, prepared_unused_roles, role_targets = _role_geometry_sources(
         bpy,
         final_merged_mesh,
         role_inputs,
     )
-    if prepared_unused_roles:
-        details = [
-            {
-                "role": role,
-                "role_identity": row.get("role_identity"),
-                "role_identity_aliases": row.get("role_identity_aliases") or [],
-                "matched_material_identities": (
-                    row.get("matched_material_identities") or []
-                ),
-                "reason": row.get("reason"),
-            }
-            for _provider_key, row in sorted(prepared_unused_roles.items())
-        ]
-        raise ClusterAssemblyBuildError(
-            "Assembly handoff requested rendered roles that disappeared before "
-            "the Blender Assembly build: "
-            + _canonical_json(details)
-        )
     created_objects = []
     parts = []
     all_bindings = []
@@ -5578,8 +5930,11 @@ def build_blender_assembly_inputs(
     preserved_render_components = []
     authored_spm_fingerprint = None
     native_receipt = None
+    native_receipt_index = None
     native_receipt_fingerprint = None
-    exact_render_attachment_binding_count = 0
+    exact_attachment_binding_count = 0
+    exact_fbx_attachment_binding_count = 0
+    native_clipped_origin_attachment_binding_count = 0
     source_correspondence_cache = {}
     base_obj = None
     base_armature = None
@@ -5607,6 +5962,9 @@ def build_blender_assembly_inputs(
             native_receipt = load_native_export_receipt(
                 target_native_receipt_path,
                 source_spm=authored_spm_fingerprint["path"],
+            )
+            native_receipt_index = build_exact_native_receipt_index(
+                native_receipt
             )
         except NativeReceiptError as exc:
             raise ClusterAssemblyBuildError(str(exc)) from exc
@@ -5658,6 +6016,7 @@ def build_blender_assembly_inputs(
                 target_object,
                 components,
                 native_receipt,
+                receipt_index=native_receipt_index,
             )
             matched, preserved = _partition_normalized_render_components(
                 prototypes,
@@ -5688,6 +6047,9 @@ def build_blender_assembly_inputs(
                     **row,
                 })
         _validate_role_component_claims(role_build_plans)
+        target_loop_triangle_indices = _build_target_loop_triangle_indices(
+            role_build_plans
+        )
         # No public Assembly artifact may exist until every requested rendered
         # role has proven at least one normalized prototype/component match.
         output.mkdir(parents=True, exist_ok=True)
@@ -5809,16 +6171,65 @@ def build_blender_assembly_inputs(
                     source_prepared = source_correspondence_cache[
                         source_correspondence_key
                     ]
-                    bindings = []
-                    for instance_index, component in enumerate(instances):
-                        source_attachment_index = attachment_vertex_index
-                        if not (
+                    authored_line = _exact_normalized_authored_line(
+                        normalized_contract,
+                        variant,
+                        part_asset_name,
+                    )
+                    target_triangle_index = target_loop_triangle_indices.get(
+                        _mesh_runtime_identity(target_object.data)
+                    )
+                    if instances and target_triangle_index is None:
+                        raise ClusterAssemblyBuildError(
+                            "normalized Assembly target mesh has no prepared "
+                            "loop-triangle index"
+                        )
+                    source_attachment_index = attachment_vertex_index
+                    source_attachment_coordinate = None
+                    prepared_source_line = None
+                    if instances:
+                        if (
                             0 <= source_attachment_index
                             < len(source_obj.data.vertices)
                         ):
-                            raise ClusterAssemblyBuildError(
-                                "normalized plan authored attachment vertex is invalid"
+                            source_attachment_coordinate = tuple(
+                                float(value)
+                                for value in source_obj.data.vertices[
+                                    source_attachment_index
+                                ].co
                             )
+                        elif str(variant.get("pivot_contract") or "") == (
+                            "normalized_attachment_origin_0_0_0"
+                        ):
+                            # FBX may omit or renumber the stored source index.
+                            # The normalized contract independently authors the
+                            # pivot at the exact origin; UV identity below must
+                            # still resolve any surviving source/target vertex.
+                            source_attachment_coordinate = (0.0, 0.0, 0.0)
+                        else:
+                            raise ClusterAssemblyBuildError(
+                                "normalized plan authored attachment vertex is invalid: "
+                                f"asset={part_asset_name!r} "
+                                f"index={source_attachment_index} "
+                                f"mesh_vertex_count={len(source_obj.data.vertices)} "
+                                f"component_vertex_count="
+                                f"{len(source_component['vertices'])}"
+                            )
+                        source_triangle_index = (
+                            _build_loop_triangle_polygon_index(
+                                source_obj.data,
+                                source_component["polygons"],
+                            )
+                        )
+                        prepared_source_line = _prepare_exact_source_plan_line(
+                            source_obj,
+                            source_component,
+                            source_attachment_coordinate,
+                            authored_line["length"],
+                            source_triangle_index=source_triangle_index,
+                        )
+                    bindings = []
+                    for instance_index, component in enumerate(instances):
                         try:
                             (
                                 resolved_source_attachment_index,
@@ -5840,12 +6251,6 @@ def build_blender_assembly_inputs(
                             # intersects one and only one runtime Node range.
                             resolved_source_attachment_index = None
                             target_attachment_index = None
-                        source_attachment_coordinate = tuple(
-                            float(value)
-                            for value in source_obj.data.vertices[
-                                source_attachment_index
-                            ].co
-                        )
                         if resolved_source_attachment_index is not None:
                             resolved_source_attachment_coordinate = tuple(
                                 float(value)
@@ -5877,24 +6282,56 @@ def build_blender_assembly_inputs(
                                     "normalized Assembly component "
                                     f"{part_asset_name}"
                                 ),
+                                skeleton_identity=native_skeleton_identity,
+                                native_receipt_index=native_receipt_index,
                             )
                         )
-                        source_attachment = _world_coordinate(
-                            source_obj,
-                            source_obj.data.vertices[
-                                source_attachment_index
-                            ].co,
+                        source_attachment = tuple(
+                            float(value)
+                            for value in source_attachment_coordinate
                         )
-                        target_attachment = _native_position_to_blender_world(
-                            influence_source["authored_position_native"]
+                        target_attachment = native_position_to_blender_world(
+                            native_receipt,
+                            influence_source["authored_position_native"],
                         )
+                        target_tangent = native_tangent_to_blender_world(
+                            native_receipt,
+                            influence_source["authored_tangent_native_unit"],
+                        )
+                        if target_attachment_index is not None:
+                            render_target_attachment = _world_coordinate(
+                                target_object,
+                                target_object.data.vertices[
+                                    target_attachment_index
+                                ].co,
+                            )
+                            native_render_error = math.dist(
+                                target_attachment,
+                                render_target_attachment,
+                            )
+                            influence_source[
+                                "native_render_attachment_error_meters"
+                            ] = native_render_error
+                            # This is the exact serializer vertex selected by
+                            # UV identity and the sole native Node range.  Use
+                            # the FBX coordinate itself so no float32 receipt
+                            # round-trip error is injected into placement.
+                            target_attachment = render_target_attachment
+                            attachment_position_source = (
+                                "exact_fbx_attachment_vertex"
+                            )
+                            exact_fbx_attachment_binding_count += 1
+                        else:
+                            # SpeedTree clipping can remove only the authored
+                            # origin vertex.  In that case the sole exact Node
+                            # range still supplies its authored native position.
+                            attachment_position_source = (
+                                "native_modeler_authored_position"
+                            )
+                            native_clipped_origin_attachment_binding_count += 1
                         fit_source_attachment = source_attachment
                         fit_target_attachment = target_attachment
-                        placement_source = (
-                            "native_modeler_authored_position__"
-                            "surviving_root_tip_rotation_uniform_scale"
-                        )
-                        exact_render_attachment_binding_count += 1
+                        exact_attachment_binding_count += 1
                         (
                             source_indices,
                             target_indices,
@@ -5907,7 +6344,7 @@ def build_blender_assembly_inputs(
                             include_evidence=True,
                             source_prepared=source_prepared,
                         )
-                        source_world = _world_points(
+                        source_local = _local_points(
                             source_obj,
                             source_indices,
                         )
@@ -5918,11 +6355,11 @@ def build_blender_assembly_inputs(
                         source_diagonal = max(
                             math.dist(
                                 [
-                                    min(point[axis] for point in source_world)
+                                    min(point[axis] for point in source_local)
                                     for axis in range(3)
                                 ],
                                 [
-                                    max(point[axis] for point in source_world)
+                                    max(point[axis] for point in source_local)
                                     for axis in range(3)
                                 ],
                             ),
@@ -5936,36 +6373,62 @@ def build_blender_assembly_inputs(
                                 "normalized plan attachment pivot is not at "
                                 "the authored local origin"
                             )
-                        try:
-                            transform = derive_endpoint_uniform_similarity_transform(
-                                source_world,
-                                target_world,
-                                source_attachment=fit_source_attachment,
-                                target_attachment=fit_target_attachment,
-                            )
-                        except ClusterAssemblyBuildError as exc:
-                            try:
-                                transform = fit_uniform_similarity_transform(
-                                    source_world,
-                                    target_world,
-                                    source_attachment=fit_source_attachment,
-                                    target_attachment=fit_target_attachment,
-                                )
-                                transform["construction_mode"] = (
-                                    "bounded_similarity_after_endpoint_"
-                                    "frame_failure_v1"
-                                )
-                                transform["placement_quality_warning"] = str(exc)
-                            except ClusterAssemblyBuildError as fit_exc:
-                                transform = attachment_locked_safe_transform(
-                                    fit_target_attachment,
-                                    f"endpoint={exc}; fit={fit_exc}",
-                                )
+                        exact_line = _exact_plan_line_correspondence(
+                            source_obj,
+                            source_component,
+                            source_indices,
+                            target_object,
+                            component,
+                            target_indices,
+                            fit_source_attachment,
+                            fit_target_attachment,
+                            authored_line["length"],
+                            target_triangle_index=target_triangle_index,
+                            prepared_source_line=prepared_source_line,
+                        )
+                        placement_source = (
+                            attachment_position_source
+                            + "__runtime_tangent_uv_plan_length"
+                        )
+                        transform = derive_exact_plan_line_transform(
+                            source_local,
+                            target_world,
+                            source_attachment=fit_source_attachment,
+                            target_attachment=fit_target_attachment,
+                            source_line_length=authored_line["length"],
+                            target_line_endpoint=exact_line[
+                                "target_line_endpoint"
+                            ],
+                            target_tangent=target_tangent,
+                        )
                         transform["placement_source"] = placement_source
                         transform["correspondence_policy"] = (
                             correspondence_evidence["policy"]
                         )
-                        transform.pop("endpoint_evidence", None)
+                        if exact_line is not None:
+                            transform["frame_evidence"].update({
+                                key: deepcopy(exact_line[key])
+                                for key in (
+                                    "selection_policy",
+                                    "correspondence_policy",
+                                    "polygon_index",
+                                    "target_polygon_index",
+                                    "source_indices",
+                                    "target_indices",
+                                    "source_geometry_barycentric_weights",
+                                    "source_line_endpoint_uv",
+                                    "target_uv_barycentric_weights",
+                                    "source_line_endpoint_xy_error",
+                                    "target_line_endpoint_uv_error",
+                                )
+                                if key in exact_line
+                            })
+                        transform["frame_evidence"][
+                            "normalized_line_contract"
+                        ] = deepcopy(authored_line)
+                        transform["frame_evidence"][
+                            "target_attachment_vertex_survived"
+                        ] = target_attachment_index is not None
                         transform["attachment_vertex_index"] = (
                             attachment_vertex_index
                         )
@@ -5976,14 +6439,6 @@ def build_blender_assembly_inputs(
                             float(value)
                             for value in attachment_vertex_uv
                         ]
-                        gate_assembly_transform_residuals(
-                            transform,
-                            {
-                                "part_asset": part_asset_name,
-                                "instance": instance_index,
-                            },
-                            block_geometry=False,
-                        )
                         persisted_influence_source = {
                             key: influence_source.get(key)
                             for key in (
@@ -5996,7 +6451,13 @@ def build_blender_assembly_inputs(
                                 "unowned_native_vertex_count",
                                 "owner_selection_policy",
                                 "native_instance_id",
+                                "source_bone_id",
+                                "native_root_bone",
+                                "native_root_resolution",
                                 "node_guid",
+                                "parent_guid",
+                                "generator_guid",
+                                "native_render_attachment_error_meters",
                                 "receipt",
                             )
                         }
@@ -6128,34 +6589,6 @@ def build_blender_assembly_inputs(
                                         base_binding["transform"],
                                         subpart.get("subpart_to_card_matrix"),
                                     )
-                                )
-                                base_gate_evidence = deepcopy(
-                                    (
-                                        base_binding["transform"].get(
-                                            "residual_gate"
-                                        )
-                                        or {}
-                                    ).get("evidence")
-                                    or {}
-                                )
-                                base_gate_evidence.update({
-                                    "part_asset": subpart_asset,
-                                    "composite_subpart_index": subpart_index,
-                                    "residual_scope": (
-                                        "parent_card_fit_before_composite"
-                                    ),
-                                })
-                                gate_assembly_transform_residuals(
-                                    composite_binding["transform"],
-                                    base_gate_evidence,
-                                    block_geometry=bool(
-                                        (
-                                            base_binding["transform"].get(
-                                                "residual_gate"
-                                            )
-                                            or {}
-                                        ).get("geometry_residual_blocking")
-                                    ),
                                 )
                                 hierarchy = validate_binding_hierarchy(
                                     composite_binding,
@@ -6338,53 +6771,60 @@ def build_blender_assembly_inputs(
             raise ClusterAssemblyBuildError(
                 "native SpeedTree runtime receipt changed while Assembly was built"
             )
-        persisted_residual_gates = [
-            (binding.get("transform") or {}).get("residual_gate") or {}
+        frame_bindings = [
+            binding.get("transform") or {}
             for part in parts
             for binding in part.get("bindings") or []
         ]
-        residual_warning_count = sum(
-            gate.get("status") == "warning"
-            for gate in persisted_residual_gates
+        exact_runtime_tangent_binding_count = sum(
+            1
+            for transform in frame_bindings
+            if (transform.get("frame_evidence") or {}).get("policy")
+            == "exact_runtime_tangent_and_uv_plan_line_length_v1"
         )
         placement_contract = {
             "version": PLACEMENT_CONTRACT_VERSION,
             "status": "ready",
             "source_spm": authored_spm_fingerprint,
-            "identity_policy": "native_modeler_authored_position_receipt_v1",
-            "translation_source": "native_modeler_runtime_receipt",
+            "identity_policy": "exact_fbx_vertex_or_native_clipped_origin_v1",
+            "translation_source": (
+                "exact_fbx_attachment_vertex_else_native_receipt"
+            ),
             "rotation_uniform_scale_source": (
-                "surviving_root_tip_frame_then_bounded_similarity_then_"
-                "identity_unit_scale_safe_fallback"
+                "exact_modeler_runtime_tangent_and_uv_plan_line_length_v1"
             ),
-            "exact_render_attachment_binding_count": (
-                exact_render_attachment_binding_count
+            "exact_attachment_binding_count": exact_attachment_binding_count,
+            "exact_fbx_attachment_binding_count": (
+                exact_fbx_attachment_binding_count
             ),
-            "residual_ready_gate": {
-                "status": (
-                    "pass_with_quality_warnings"
-                    if residual_warning_count
-                    else "pass"
+            "native_clipped_origin_attachment_binding_count": (
+                native_clipped_origin_attachment_binding_count
+            ),
+            "exact_plan_line": {
+                "status": "ready",
+                "selection_policy": (
+                    "unique_source_and_target_uv_triangles_containing_exact_"
+                    "authored_line_endpoint_v1"
                 ),
-                "policy": (
-                    "exact_attachment_pivot_with_recorded_geometry_quality_"
-                    "warning_v2"
+                "correspondence_policy": (
+                    "same_exact_uv_point_on_source_and_target_plan_surfaces_v1"
                 ),
-                "threshold": MAX_ASSEMBLY_RESIDUAL_RELATIVE_RMS,
-                "attachment_pivot_error_threshold_meters": (
-                    MAX_ASSEMBLY_PIVOT_ERROR_METERS
+                "frame_policy": (
+                    "runtime_pose_tangent_preserve_plan_roll_and_exact_uv_length"
                 ),
+                "scale_policy": "exact_authored_line_endpoint_length_ratio",
+                "geometric_fitting": False,
+                "nearest_or_farthest_search": False,
                 "asset_special_cases": False,
-                "tolerance_widening": False,
-                "geometry_residual_blocks_export": False,
-                "binding_count": len(persisted_residual_gates),
-                "quality_warning_binding_count": residual_warning_count,
-                "maximum_relative_rms": max(
-                    (
-                        float(gate.get("maximum_relative_rms") or 0.0)
-                        for gate in persisted_residual_gates
-                    ),
-                    default=0.0,
+                "binding_count": len(frame_bindings),
+                "exact_runtime_tangent_binding_count": (
+                    exact_runtime_tangent_binding_count
+                ),
+                "exact_fbx_attachment_binding_count": (
+                    exact_fbx_attachment_binding_count
+                ),
+                "native_clipped_origin_attachment_binding_count": (
+                    native_clipped_origin_attachment_binding_count
                 ),
             },
         }
@@ -6393,6 +6833,8 @@ def build_blender_assembly_inputs(
             "kind": MANIFEST_KIND,
             "status": "ready",
             "content_decision": "build",
+            "cache_reused": False,
+            "force_rebuild_requested": bool(force_rebuild),
             "full_skeletal_mesh_preserved": True,
             "full_asset_stem": stem,
             "full_fbx": full_fingerprint_before,
@@ -6412,15 +6854,17 @@ def build_blender_assembly_inputs(
             "parts": parts,
             "registered_variants": registered_variants,
             "prepared_unused_roles": [
-                prepared_unused_roles[role]
-                for role in ROLE_ORDER
-                if role in prepared_unused_roles
+                prepared_unused_roles[provider_key]
+                for provider_key in sorted(prepared_unused_roles)
             ],
             "preserved_render_components": preserved_render_components,
             "placement_contract": placement_contract,
             "attachment_bone_contract": {
                 "status": "ready",
-                "policy": "native_modeler_runtime_receipt_v1",
+                "policy": (
+                    "native_modeler_runtime_receipt_v5_exact_pose_"
+                    "skeleton_index_zero"
+                ),
                 "receipt": native_receipt_fingerprint,
                 "source_spm": authored_spm_fingerprint,
                 "bone_count": len(native_receipt.get("bones") or []),
@@ -6729,10 +7173,22 @@ def _generated_material_sidecar(
         materials = list(payload.get("materials") or [])
         by_key = defaultdict(list)
         for entry in materials:
-            slot_name = str(
-                entry.get("slot_name") or entry.get("name") or ""
-            ).strip()
-            by_key[_material_slot_key(slot_name)].append(entry)
+            intent = entry.get("speedtree_intent") or {}
+            # Full sidecars intentionally distinguish the production group
+            # slot (often ``M_*``) from SpeedTree's authored material-instance
+            # base (often the same name without ``M_``).  Both are explicit,
+            # authoritative identities for this one row; use those declared
+            # aliases instead of guessing by stripping prefixes.
+            aliases = {
+                str(entry.get("slot_name") or "").strip(),
+                str(entry.get("name") or "").strip(),
+                str(intent.get("material_instance_base") or "").strip(),
+                str(intent.get("production_group_base") or "").strip(),
+            }
+            for alias in aliases:
+                key = _material_slot_key(alias)
+                if key and entry not in by_key[key]:
+                    by_key[key].append(entry)
         selected = []
         seen_expected = set()
         for slot_index, slot_name in enumerate(expected_material_slots):
@@ -7385,6 +7841,78 @@ def _current_unreal_skeleton_diagnostic(expected_bones, actual_bones):
     }
 
 
+def derive_exact_unreal_import_bone_name_map(expected_bones, actual_bones):
+    """Map authored names through Unreal's deterministic FBX bone order.
+
+    Unreal may drop an FBX armature wrapper or rename a case-insensitive root
+    collision. The import still preserves reference-skeleton order. A map is
+    accepted only when all unchanged names prove one constant index offset;
+    any insertion, deletion, or reorder inside the hierarchy is rejected.
+    """
+    expected = [str(value) for value in expected_bones]
+    actual = [str(value) for value in actual_bones]
+    if not expected or not actual:
+        raise ClusterAssemblyBuildError(
+            "Cannot derive Unreal import bone names from an empty skeleton"
+        )
+    if len(set(expected)) != len(expected) or len(set(actual)) != len(actual):
+        raise ClusterAssemblyBuildError(
+            "Unreal import bone-name mapping requires unique skeleton names"
+        )
+
+    actual_indices = {name: index for index, name in enumerate(actual)}
+    anchors = [
+        (index, actual_indices[name], name)
+        for index, name in enumerate(expected)
+        if name in actual_indices
+    ]
+    minimum_anchors = min(3, len(expected), len(actual))
+    if len(anchors) < minimum_anchors:
+        raise ClusterAssemblyBuildError(
+            "Unreal import skeleton has insufficient exact ordered anchors"
+        )
+    offsets = {
+        actual_index - expected_index
+        for expected_index, actual_index, _ in anchors
+    }
+    if len(offsets) != 1:
+        raise ClusterAssemblyBuildError(
+            "Unreal import skeleton changed bone order; exact index mapping "
+            "is unavailable"
+        )
+    offset = offsets.pop()
+
+    name_map = {}
+    renamed = []
+    unmapped = []
+    for expected_index, expected_name in enumerate(expected):
+        actual_index = expected_index + offset
+        if not 0 <= actual_index < len(actual):
+            name_map[expected_name] = None
+            unmapped.append(expected_name)
+            continue
+        actual_name = actual[actual_index]
+        name_map[expected_name] = actual_name
+        if actual_name != expected_name:
+            renamed.append({
+                "expected_index": expected_index,
+                "actual_index": actual_index,
+                "authored_name": expected_name,
+                "unreal_name": actual_name,
+            })
+
+    return name_map, {
+        "status": "exact_constant_index_offset",
+        "index_offset": offset,
+        "exact_anchor_count": len(anchors),
+        "expected_bone_count": len(expected),
+        "actual_bone_count": len(actual),
+        "renamed_by_unreal_import": renamed,
+        "unmapped_authored_prefix_or_suffix": unmapped,
+        "approximation_used": False,
+    }
+
+
 def _base_weighted_bone_manifest_diagnostic(base_contract, actual_bones):
     """Describe stale Base weight metadata without overriding the live Base mesh."""
     declared = [
@@ -7991,34 +8519,6 @@ def validate_unreal_normalized_prototype_bounds(
     }
 
 
-def validate_generated_assembly_reference_pose_sync(reference_pose_sync):
-    """Accept an intentional generated-Assembly pose synchronization.
-
-    The Assembly is created from the current Full SK skeleton in this build;
-    it is not an authored asset whose previous reference pose must be kept.
-    Earlier contract checks already validate skeleton identity, bone order,
-    bounds, units, and wind hashes.  This boundary therefore requires only
-    that synchronization succeeded and removed every mesh/skeleton mismatch.
-    """
-    if not isinstance(reference_pose_sync, dict):
-        raise ClusterAssemblyBuildError(
-            "Assembly reference-pose synchronization result is not an object"
-        )
-    if not reference_pose_sync.get("success"):
-        raise ClusterAssemblyBuildError(
-            "Assembly reference pose could not be synchronized to the Full SK "
-            "final Skeleton: "
-            + str(reference_pose_sync.get("error") or reference_pose_sync)
-        )
-    reference_pose_sync["synchronization_contract"] = (
-        "generated_assembly_pose_sync_attempted_v1"
-    )
-    reference_pose_sync["changed_pose_accepted"] = bool(
-        reference_pose_sync.get("changed")
-    )
-    return reference_pose_sync
-
-
 def _nanite_shape_preservation_preserve_area(unreal):
     for enum_name in ("NaniteShapePreservation", "ENaniteShapePreservation"):
         enum_type = getattr(unreal, enum_name, None)
@@ -8101,7 +8601,74 @@ def _validate_final_assembly_preserve_area(unreal, assembly, report):
     return report
 
 
+_ASYNC_SKINNED_ASSET_CVAR = "Editor.AsyncSkinnedAssetCompilation"
+_FINISH_SKINNED_ASSET_COMPILATION_COMMAND = (
+    "Editor.AsyncSkinnedAssetCompilationFinishAll"
+)
+
+
+@contextmanager
+def _synchronous_unreal_skinned_asset_compilation(unreal):
+    """Keep UE's skeletal Assembly finalization on the game thread.
+
+    UE 5.8's experimental Nanite Assembly builder applies its new part table
+    and immediately calls ``PostEditChange`` without first recaching those
+    references. With async skinned-asset compilation enabled, the worker can
+    therefore enter ``BuildDerivedDataKey`` with an empty reference cache and
+    assert. The engine's synchronous path recaches in ``BeginBuildInternal``
+    before derived-data work starts, so production builds temporarily select
+    that exact path and restore the editor setting afterwards.
+    """
+    system_library = getattr(unreal, "SystemLibrary", None)
+    get_int = getattr(system_library, "get_console_variable_int_value", None)
+    execute = getattr(system_library, "execute_console_command", None)
+    if not callable(get_int) or not callable(execute):
+        raise ClusterAssemblyBuildError(
+            "Unreal SystemLibrary console-variable API is unavailable"
+        )
+
+    previous = int(get_int(_ASYNC_SKINNED_ASSET_CVAR))
+    execute(None, _FINISH_SKINNED_ASSET_COMPILATION_COMMAND)
+    if previous != 0:
+        execute(None, f"{_ASYNC_SKINNED_ASSET_CVAR} 0")
+    current = int(get_int(_ASYNC_SKINNED_ASSET_CVAR))
+    if current != 0:
+        raise ClusterAssemblyBuildError(
+            "Could not disable async skinned-asset compilation for the "
+            "Nanite Assembly build"
+        )
+
+    report = {
+        "cvar": _ASYNC_SKINNED_ASSET_CVAR,
+        "previous": previous,
+        "during_build": current,
+        "engine_reason": (
+            "UE 5.8 NaniteAssemblyEditorUtils does not recache the newly "
+            "applied skeletal Assembly part table before PostEditChange"
+        ),
+    }
+    try:
+        yield report
+    finally:
+        execute(None, _FINISH_SKINNED_ASSET_COMPILATION_COMMAND)
+        if previous != 0:
+            execute(None, f"{_ASYNC_SKINNED_ASSET_CVAR} {previous}")
+        report["restored"] = int(get_int(_ASYNC_SKINNED_ASSET_CVAR))
+
+
 def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
+    """Build with UE 5.8's unsafe async skeletal finalization disabled."""
+    with _synchronous_unreal_skinned_asset_compilation(unreal) as async_report:
+        result = _build_unreal_nanite_assembly_synchronous(
+            unreal,
+            manifest,
+            asset_contract,
+        )
+    result["skinned_asset_compilation"] = async_report
+    return result
+
+
+def _build_unreal_nanite_assembly_synchronous(unreal, manifest, asset_contract):
     """Build and save the separate UE 5.8 Assembly from imported inputs.
 
     The existing Full SK must already have its newly generated DynamicWind data.
@@ -8156,6 +8723,16 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
         expected_bones,
         actual_bones,
     )
+    unreal_bone_name_map, unreal_bone_name_map_diagnostic = (
+        derive_exact_unreal_import_bone_name_map(
+            expected_bones,
+            actual_bones,
+        )
+    )
+    actual_bone_indices = {
+        bone_name: bone_index
+        for bone_index, bone_name in enumerate(actual_bones)
+    }
     full_skeleton = full.get_editor_property("skeleton")
     base_skeleton = base.get_editor_property("skeleton")
     if full_skeleton is None or base_skeleton is None:
@@ -8181,7 +8758,7 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
     # Binding validity is defined by the final imported Skeleton.  Wind JSON
     # generation/import is verified independently and must not be used as a
     # second, narrower authority for which Assembly bones are allowed.
-    wind_bones = set(actual_bones)
+    authored_bones = set(expected_bones)
     base_contract = manifest.get("base") or {}
     base_weighted_bones = list(base_contract.get("weighted_bones") or [])
     base_weight_manifest_diagnostic = _base_weighted_bone_manifest_diagnostic(
@@ -8217,59 +8794,45 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
             validate_binding_hierarchy(
                 row,
                 manifest["final_skeleton"],
-                wind_bones=wind_bones,
+                wind_bones=authored_bones,
                 skeleton_by_name=skeleton_by_name,
             )
             influences = list(row["bone_influences"])
-            primary = influences[0]
-            result = builder.create_binding_by_bone_name(
-                primary["bone"],
-                float(primary["weight"]),
+            native_influences = []
+            for influence in influences:
+                unreal_bone = unreal_bone_name_map.get(influence["bone"])
+                if not unreal_bone:
+                    raise ClusterAssemblyBuildError(
+                        "Authored Assembly binding bone has no exact Unreal "
+                        f"import index mapping: {influence['bone']}"
+                    )
+                bone_index = actual_bone_indices.get(unreal_bone)
+                if bone_index is None:
+                    raise ClusterAssemblyBuildError(
+                        "Exact Unreal import bone has no reference-skeleton "
+                        f"index: {unreal_bone}"
+                    )
+                native_influence = unreal.NaniteAssemblyBoneInfluence()
+                native_influence.set_editor_property("bone_index", bone_index)
+                native_influence.set_editor_property(
+                    "bone_weight",
+                    float(influence["weight"]),
+                )
+                native_influences.append(native_influence)
+            binding = unreal.NaniteAssemblySkeletalMeshPartBinding()
+            binding.set_editor_property("bone_influences", native_influences)
+            binding.set_editor_property(
+                "transform",
                 _unreal_transform(
                     unreal,
                     row["transform"],
                     manifest["coordinate_contract"],
                 ),
+            )
+            binding.set_editor_property(
+                "transform_space",
                 unreal.NaniteAssemblyNodeTransformSpace.LOCAL,
             )
-            success, binding = _unwrap_struct_result(
-                result,
-                unreal.NaniteAssemblySkeletalMeshPartBinding,
-            )
-            if not success or binding is None:
-                raise ClusterAssemblyBuildError(
-                    f"primary Assembly binding failed: {primary['bone']}"
-                )
-            for influence in influences[1:]:
-                add_result = builder.add_bone_influence_by_name(
-                    binding,
-                    influence["bone"],
-                    float(influence["weight"]),
-                )
-                if isinstance(add_result, tuple):
-                    add_success = next(
-                        (value for value in add_result if isinstance(value, bool)),
-                        False,
-                    )
-                    updated = next(
-                        (
-                            value
-                            for value in add_result
-                            if isinstance(
-                                value,
-                                unreal.NaniteAssemblySkeletalMeshPartBinding,
-                            )
-                        ),
-                        None,
-                    )
-                    if updated is not None:
-                        binding = updated
-                else:
-                    add_success = bool(add_result)
-                if not add_success:
-                    raise ClusterAssemblyBuildError(
-                        f"additional Assembly binding failed: {influence['bone']}"
-                    )
             bindings.append(binding)
         if not builder.add_assembly_parts(
             part_assets[part["prototype_id"]],
@@ -8314,18 +8877,6 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
         ) from exc
     if not hasattr(unreal, "CodexDynamicWindImportLibrary"):
         raise ClusterAssemblyBuildError("CodexDynamicWindImportLibrary is unavailable")
-    pose_sync_result = (
-        unreal.CodexDynamicWindImportLibrary
-        .synchronize_mesh_reference_pose_to_skeleton(assembly)
-    )
-    try:
-        reference_pose_sync = json.loads(str(pose_sync_result))
-    except (TypeError, ValueError) as exc:
-        raise ClusterAssemblyBuildError(
-            "Assembly reference-pose synchronization returned invalid JSON: "
-            f"{pose_sync_result!r}"
-        ) from exc
-    validate_generated_assembly_reference_pose_sync(reference_pose_sync)
     result = unreal.CodexDynamicWindImportLibrary.import_dynamic_wind_json_to_skeletal_mesh(
         assembly,
         str(wind_path),
@@ -8391,6 +8942,12 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
         "final_skeleton": full_skeleton.get_path_name(),
         "final_skeleton_bones": len(actual_bones),
         "manifest_skeleton_diagnostic": skeleton_snapshot_diagnostic,
+        "unreal_bone_name_map": unreal_bone_name_map_diagnostic,
+        "native_binding_contract": {
+            "construction": "direct_exact_reference_skeleton_indices",
+            "all_authored_influences_preserved": True,
+            "weights_sum_to_one": True,
+        },
         "production_skeleton_required": False,
         "parts": built_parts,
         "binding_count": sum(row["bindings"] for row in built_parts),
@@ -8398,7 +8955,6 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
         "base_weight_manifest_diagnostic": base_weight_manifest_diagnostic,
         "base_weights_in_final_wind": True,
         "final_nanite_shape_preservation": final_nanite_shape_preservation,
-        "reference_pose_sync": reference_pose_sync,
         "prototype_bounds_preflight": prototype_bounds_preflight,
         "bounds_completion": bounds_completion,
         "material_normalization": material_normalization,
@@ -8419,9 +8975,8 @@ __all__ = [
     "build_unreal_ingest_plan",
     "build_unreal_nanite_assembly",
     "content_build_decision",
+    "derive_exact_plan_line_transform",
     "file_fingerprint",
-    "fit_uniform_similarity_transform",
-    "gate_assembly_transform_residuals",
     "lowest_common_ancestor",
     "make_skeleton_snapshot",
     "normalize_role_identity",

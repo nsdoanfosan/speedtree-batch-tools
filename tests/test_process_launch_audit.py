@@ -35,11 +35,13 @@ BAT_LAUNCHERS = {
     "SpeedTree_Batch_Tools.bat",
     "pcg_st9_texture_batch/PCG_ST9_Texture_Batch.bat",
     "sk_batch/SK_Batch.bat",
+    "sk_batch/SK_Affected_Headless_Refresh.bat",
     "sk_batch/SK_Cluster_Fleet_Push.bat",
     "sk_batch/SK_Exact_Push.bat",
     "spm_generator_sync/SPM_Generator_Sync.bat",
 }
 HEADLESS_BAT_LAUNCHERS = {
+    "sk_batch/SK_Affected_Headless_Refresh.bat",
     "sk_batch/SK_Cluster_Fleet_Push.bat",
     "sk_batch/SK_Exact_Push.bat",
 }

@@ -59,7 +59,7 @@ DEFAULT_CONFIG = {
     "pcg_positive_weight_only": True,
     "source_texture_roots": [r"D:\OneDrive\Forestportfolio\Texture"],
     "required_export_maps": ["color", "normal", "extra", "height", "opacity", "subsurface"],
-    "blender_exe": r"C:\Program Files\Blender Foundation\Blender 5.1\blender.exe",
+    "blender_exe": r"C:\Program Files\Blender Foundation\Blender 5.2\blender.exe",
     "designer_dir": r"C:\Program Files\Adobe\Adobe Substance 3D Designer",
     "cluster_sbsar": r"D:\OneDrive\Forestportfolio\substanceDesigner\Cluster_System_01.sbsar",
     "cluster_sbsar_normal_behavior": "opengl_to_directx",
@@ -89,11 +89,16 @@ def load_config():
             cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
         except Exception:
             pass
+    cfg["blender_exe"] = DEFAULT_CONFIG["blender_exe"]
     return cfg
 
 
 def save_config(cfg):
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+    normalized = dict(cfg)
+    normalized["blender_exe"] = DEFAULT_CONFIG["blender_exe"]
+    CONFIG_PATH.write_text(
+        json.dumps(normalized, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
 
 
 def load_state():

@@ -113,7 +113,7 @@ class AssemblyAtlasManifestBridgeTests(unittest.TestCase):
             SK_BATCH / "jobs" / "assembly_headless_job.py"
         ).read_text(encoding="utf-8")
         install_at = source.index("install_assembly_atlas_manifest_resolver(")
-        assembly_at = source.index("run_import_and_assemble(assembly_settings)")
+        assembly_at = source.index("result = run_import_and_assemble(")
         self.assertLess(install_at, assembly_at)
 
     def test_provider_disagreement_is_diagnostic_and_export_remains_reachable(self):

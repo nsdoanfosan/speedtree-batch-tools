@@ -40,6 +40,7 @@ constexpr std::uintptr_t kNativeExportFinalizeGeometryRva = 0xA7580;
 constexpr std::uintptr_t kNativeExportFinalizeDocumentRva = 0xB1510;
 constexpr std::uintptr_t kResolveBranchBoneIdRva = 0x4B5C00;
 constexpr std::uintptr_t kInsertExportBoneRva = 0x37D4A0;
+constexpr std::uintptr_t kLeafMeshExportRva = 0x584620;
 constexpr std::uintptr_t kExportVertexWeightsRva = 0x6B4FE0;
 constexpr std::uintptr_t kFindExportBoneMappingRva = 0x6B4DF0;
 constexpr std::uintptr_t kFbxClusterAddControlPointRva = 0x1259E50;
@@ -142,6 +143,12 @@ constexpr unsigned char kInsertExportBonePrologue[15] = {
     0x48, 0x89, 0x70, 0x18,
 };
 
+constexpr unsigned char kLeafMeshExportPrologue[15] = {
+    0x48, 0x89, 0x5c, 0x24, 0x08,
+    0x48, 0x89, 0x74, 0x24, 0x10,
+    0x48, 0x89, 0x7c, 0x24, 0x18,
+};
+
 constexpr unsigned char kExportVertexWeightsPrologue[15] = {
     0x48, 0x8B, 0xC4,
     0x48, 0x89, 0x58, 0x08,
@@ -206,6 +213,7 @@ using InsertExportBoneFn = void(__fastcall*)(
     void* exportData,
     void* sourceBoneRecord,
     void* sourceBranch);
+using LeafMeshExportFn = void(__fastcall*)(void* leafNode, void* exportData);
 using ExportVertexWeightsFn = void(__fastcall*)(
     void* exporter,
     const float* position,
@@ -321,6 +329,7 @@ NativeExportFinalizeGeometryFn gOriginalNativeExportFinalizeGeometry = nullptr;
 NativeExportFinalizeDocumentFn gOriginalNativeExportFinalizeDocument = nullptr;
 ResolveBranchBoneIdFn gResolveBranchBoneId = nullptr;
 InsertExportBoneFn gOriginalInsertExportBone = nullptr;
+LeafMeshExportFn gOriginalLeafMeshExport = nullptr;
 ExportVertexWeightsFn gOriginalExportVertexWeights = nullptr;
 FindExportBoneMappingFn gFindExportBoneMapping = nullptr;
 FbxClusterAddControlPointFn gUnusedOriginalFbxClusterAddControlPoint = nullptr;
@@ -379,6 +388,7 @@ HookRecord gNativeModelUpdateHook;
 HookRecord gNativeExportFinalizeGeometryHook;
 HookRecord gNativeExportFinalizeDocumentHook;
 HookRecord gInsertExportBoneHook;
+HookRecord gLeafMeshExportHook;
 HookRecord gExportVertexWeightsHook;
 HookRecord gFbxClusterAddControlPointHook;
 HookRecord gFbxNodeCreateHook;
@@ -420,6 +430,17 @@ struct NativeReceiptBone {
     float end[3]{};
     std::string sourceType;
 };
+
+struct SyntheticLeafBoneRecord {
+    int boneId = 0;
+    int parentId = 0;
+    float start[3]{};
+    float end[3]{};
+    float startRadius = 0.0f;
+    float endRadius = 0.0f;
+};
+
+static_assert(sizeof(SyntheticLeafBoneRecord) == 0x28);
 
 struct NativeReceiptRange {
     int firstVertex = -1;
@@ -465,26 +486,70 @@ struct NativeReceiptProxyKeyHash {
 };
 
 struct NativeReceiptProxy {
+    struct Ancestor {
+        std::string sourceType;
+        std::string nodeGuid;
+    };
+
     NativeReceiptProxyKey key{};
     std::string sourceType;
     std::string nodeGuid;
     std::string parentGuid;
+    std::string parentType;
     std::string generatorGuid;
+    std::string generatorType;
+    std::vector<Ancestor> ancestors;
     bool hasAuthoredPosition = false;
     float authoredPositionNative[3]{};
+    bool hasAuthoredTangent = false;
+    float authoredTangentNativeUnit[3]{};
     std::vector<NativeReceiptInfluence> influences;
-    std::vector<NativeReceiptRange> vertexRanges;
+    // Raw submission order, coalesced into exact ascending non-overlapping
+    // ranges only at serialization time.  Vertices do not arrive sorted: a
+    // per-instance proxy is fed in triangle order, which revisits indices, so
+    // an incremental "extend when lastVertex + 1" merge produced overlapping
+    // and unordered ranges that the receipt contract rejects.
+    std::vector<int> vertexIndices;
 };
+
+// Sort, de-duplicate and merge consecutive vertex indices into ranges.
+std::vector<NativeReceiptRange> CoalesceNativeReceiptVertexRanges(
+    std::vector<int> indices) {
+    std::vector<NativeReceiptRange> ranges;
+    if (indices.empty()) {
+        return ranges;
+    }
+    std::sort(indices.begin(), indices.end());
+    indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+    NativeReceiptRange current{indices.front(), indices.front()};
+    for (std::size_t index = 1; index < indices.size(); ++index) {
+        const int value = indices[index];
+        if (value == current.lastVertex + 1) {
+            current.lastVertex = value;
+            continue;
+        }
+        ranges.push_back(current);
+        current = NativeReceiptRange{value, value};
+    }
+    ranges.push_back(current);
+    return ranges;
+}
 
 std::mutex gNativeReceiptMutex;
 std::vector<NativeReceiptGeometry> gNativeReceiptGeometries;
 std::unordered_map<void*, std::string> gNativeReceiptFbxNodeNames;
 std::vector<NativeReceiptBone> gNativeReceiptBones;
+std::unordered_map<int, std::size_t> gNativeReceiptBoneIndexes;
 std::vector<NativeReceiptProxy> gNativeReceiptProxies;
 std::unordered_map<
     NativeReceiptProxyKey,
     std::size_t,
     NativeReceiptProxyKeyHash> gNativeReceiptProxyIndexes;
+std::unordered_map<void*, int> gSyntheticLeafBoneIds;
+constexpr int kSyntheticLeafBoneIdBase = 10000;
+constexpr int kSyntheticLeafBoneIdLimit = 30000;
+int gNextSyntheticLeafBoneId = kSyntheticLeafBoneIdBase;
+int gZeroBoneAbsoluteFallbackId = 0;
 NativeStateProbe gNativeStateProbes[] = {
     {0x135A59, "native export probe 135A59"},
     {0x135A9D, "native export probe 135A9D"},
@@ -584,6 +649,140 @@ void Log(const char* message) {
     static constexpr char newline[] = "\r\n";
     WriteFile(file, newline, 2, &written, nullptr);
     CloseHandle(file);
+}
+
+std::atomic<unsigned int> gNativeQpcExportSequence{0};
+std::atomic<unsigned int> gNativeQpcActiveExport{0};
+std::atomic<LONGLONG> gNativeQpcExportStartTicks{0};
+
+LONGLONG NativeQpcFrequency() {
+    static const LONGLONG frequency = []() {
+        LARGE_INTEGER value{};
+        return QueryPerformanceFrequency(&value) && value.QuadPart > 0
+            ? value.QuadPart
+            : 0;
+    }();
+    return frequency;
+}
+
+LONGLONG NativeQpcNow() {
+    LARGE_INTEGER value{};
+    return QueryPerformanceCounter(&value) ? value.QuadPart : 0;
+}
+
+void LogNativeQpcPhase(
+    const char* phase,
+    unsigned int exportSequence,
+    unsigned int collisionPass,
+    LONGLONG exportStartTicks,
+    LONGLONG phaseStartTicks,
+    LONGLONG phaseEndTicks) {
+    const LONGLONG frequency = NativeQpcFrequency();
+    if (phase == nullptr || phase[0] == '\0' || exportSequence == 0 ||
+        frequency <= 0 || exportStartTicks <= 0 ||
+        phaseStartTicks < exportStartTicks || phaseEndTicks < phaseStartTicks) {
+        return;
+    }
+    char message[512]{};
+    _snprintf_s(
+        message,
+        sizeof(message),
+        _TRUNCATE,
+        "QPC1 phase=%s export=%u collision_pass=%u start_ticks=%lld "
+        "duration_ticks=%lld frequency_hz=%lld thread_id=%lu",
+        phase,
+        exportSequence,
+        collisionPass,
+        phaseStartTicks - exportStartTicks,
+        phaseEndTicks - phaseStartTicks,
+        frequency,
+        static_cast<unsigned long>(GetCurrentThreadId()));
+    Log(message);
+}
+
+struct NativeQpcPhaseToken {
+    const char* phase = nullptr;
+    unsigned int collisionPass = 0;
+    unsigned int exportSequence = 0;
+    LONGLONG exportStartTicks = 0;
+    LONGLONG phaseStartTicks = 0;
+};
+
+NativeQpcPhaseToken BeginNativeQpcPhase(
+    const char* phase,
+    unsigned int collisionPass = 0) noexcept {
+    return {
+        phase,
+        collisionPass,
+        gNativeQpcActiveExport.load(std::memory_order_acquire),
+        gNativeQpcExportStartTicks.load(std::memory_order_acquire),
+        NativeQpcNow(),
+    };
+}
+
+void EndNativeQpcPhase(const NativeQpcPhaseToken& token) noexcept {
+    LogNativeQpcPhase(
+        token.phase,
+        token.exportSequence,
+        token.collisionPass,
+        token.exportStartTicks,
+        token.phaseStartTicks,
+        NativeQpcNow());
+}
+
+class NativeQpcPhase final {
+public:
+    explicit NativeQpcPhase(
+        const char* phase,
+        unsigned int collisionPass = 0) noexcept
+        : token_(BeginNativeQpcPhase(phase, collisionPass)) {}
+
+    ~NativeQpcPhase() noexcept {
+        EndNativeQpcPhase(token_);
+    }
+
+    NativeQpcPhase(const NativeQpcPhase&) = delete;
+    NativeQpcPhase& operator=(const NativeQpcPhase&) = delete;
+
+private:
+    NativeQpcPhaseToken token_{};
+};
+
+struct NativeQpcExportToken {
+    unsigned int exportSequence = 0;
+    LONGLONG exportStartTicks = 0;
+};
+
+NativeQpcExportToken BeginNativeQpcExport() noexcept {
+    NativeQpcExportToken token{};
+    token.exportSequence =
+        gNativeQpcExportSequence.fetch_add(1, std::memory_order_acq_rel) + 1;
+    token.exportStartTicks = NativeQpcNow();
+    gNativeQpcExportStartTicks.store(
+        token.exportStartTicks,
+        std::memory_order_release);
+    gNativeQpcActiveExport.store(
+        token.exportSequence,
+        std::memory_order_release);
+    return token;
+}
+
+void EndNativeQpcExport(const NativeQpcExportToken& token) noexcept {
+    const LONGLONG endTicks = NativeQpcNow();
+    LogNativeQpcPhase(
+        "native_export_total",
+        token.exportSequence,
+        0,
+        token.exportStartTicks,
+        token.exportStartTicks,
+        endTicks);
+    unsigned int expected = token.exportSequence;
+    if (gNativeQpcActiveExport.compare_exchange_strong(
+            expected,
+            0,
+            std::memory_order_acq_rel)) {
+        gNativeQpcExportStartTicks.store(0, std::memory_order_release);
+    }
 }
 
 void LogPointer(const char* prefix, const void* pointer) {
@@ -709,6 +908,145 @@ ExportBoneMapping* FindExactExportBoneMapping(void* exporter, int boneId) {
         : nullptr;
 }
 
+int FindSyntheticLeafBoneId(void* leafNode) {
+    std::lock_guard<std::mutex> lock(gNativeReceiptMutex);
+    const auto found = gSyntheticLeafBoneIds.find(leafNode);
+    return found == gSyntheticLeafBoneIds.end() ? 0 : found->second;
+}
+
+int ReserveSyntheticLeafBoneId(void* leafNode) {
+    std::lock_guard<std::mutex> lock(gNativeReceiptMutex);
+    const auto found = gSyntheticLeafBoneIds.find(leafNode);
+    if (found != gSyntheticLeafBoneIds.end()) {
+        return found->second;
+    }
+    if (gNextSyntheticLeafBoneId >= kSyntheticLeafBoneIdLimit) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "Leaf Mesh bone serialization exhausted its reserved exact-ID range");
+    }
+    const int boneId = gNextSyntheticLeafBoneId++;
+    gSyntheticLeafBoneIds.emplace(leafNode, boneId);
+    return boneId;
+}
+
+std::size_t NativeParsedBoneCount() {
+    std::lock_guard<std::mutex> lock(gNativeReceiptMutex);
+    return gNativeReceiptBones.size();
+}
+
+int ReserveZeroBoneAbsoluteFallbackId() {
+    std::lock_guard<std::mutex> lock(gNativeReceiptMutex);
+    if (gZeroBoneAbsoluteFallbackId > 0) {
+        return gZeroBoneAbsoluteFallbackId;
+    }
+    if (gNextSyntheticLeafBoneId >= kSyntheticLeafBoneIdLimit) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "Zero-bone SPM fallback exhausted its reserved exact-ID range");
+    }
+    gZeroBoneAbsoluteFallbackId = gNextSyntheticLeafBoneId++;
+    return gZeroBoneAbsoluteFallbackId;
+}
+
+bool IsRootZoneLeafMesh(void* leafNode) {
+    if (leafNode == nullptr) {
+        return false;
+    }
+    __try {
+        void* visited[16]{};
+        std::size_t visitedCount = 0;
+        void* current = *reinterpret_cast<void* const*>(
+            static_cast<const unsigned char*>(leafNode) + 0x98);
+        bool sawZone = false;
+        while (current != nullptr && visitedCount < std::size(visited)) {
+            for (std::size_t index = 0; index < visitedCount; ++index) {
+                if (visited[index] == current) {
+                    return false;
+                }
+            }
+            visited[visitedCount++] = current;
+            const char* type = ReadSpeedTreeRttiName(current);
+            if (type == nullptr) {
+                return false;
+            }
+            if (std::strcmp(type, ".?AVCBranchNode@@") == 0 ||
+                std::strcmp(type, ".?AVCFrondNode@@") == 0) {
+                return false;
+            }
+            if (std::strcmp(type, ".?AVCZoneNode@@") == 0) {
+                sawZone = true;
+            } else if (std::strcmp(type, ".?AVCStartNode@@") == 0) {
+                return sawZone;
+            } else if (std::strcmp(type, ".?AVCLeafMeshNode@@") != 0) {
+                return false;
+            }
+            current = *reinterpret_cast<void* const*>(
+                static_cast<const unsigned char*>(current) + 0x98);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return false;
+}
+
+bool IsBaseRefBranchLeafMesh(void* leafNode) {
+    if (leafNode == nullptr) {
+        return false;
+    }
+    __try {
+        void* current = *reinterpret_cast<void* const*>(
+            static_cast<const unsigned char*>(leafNode) + 0x98);
+        bool sawBranch = false;
+        for (int depth = 0; current != nullptr && depth < 16; ++depth) {
+            const char* type = ReadSpeedTreeRttiName(current);
+            if (type == nullptr) {
+                return false;
+            }
+            if (std::strcmp(type, ".?AVCBranchNode@@") == 0) {
+                sawBranch = true;
+            } else if (std::strcmp(type, ".?AVCBaseNode@@") == 0) {
+                if (!sawBranch) {
+                    return false;
+                }
+                const auto* baseBytes = static_cast<const unsigned char*>(current);
+                void* targetBranch = *reinterpret_cast<void* const*>(
+                    baseBytes + 0x2C8);
+                void* baseRef = *reinterpret_cast<void* const*>(
+                    baseBytes + 0x2D0);
+                const char* targetType = ReadSpeedTreeRttiName(targetBranch);
+                const char* baseRefType = ReadSpeedTreeRttiName(baseRef);
+                return targetType != nullptr &&
+                    std::strcmp(targetType, ".?AVCBranchNode@@") == 0 &&
+                    baseRefType != nullptr &&
+                    std::strcmp(baseRefType, ".?AVCBaseRefNode@@") == 0 &&
+                    *reinterpret_cast<void* const*>(
+                        static_cast<const unsigned char*>(baseRef) + 0x98) ==
+                        targetBranch;
+            } else if (std::strcmp(type, ".?AVCLeafMeshNode@@") != 0) {
+                return false;
+            }
+            current = *reinterpret_cast<void* const*>(
+                static_cast<const unsigned char*>(current) + 0x98);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return false;
+}
+
+bool IsClusterSourceInput() {
+    if (gNativeInputPath[0] == L'\0') {
+        return false;
+    }
+    const std::filesystem::path input(gNativeInputPath);
+    const std::wstring parent = input.parent_path().filename().wstring();
+    const std::wstring stem = input.stem().wstring();
+    return _wcsicmp(parent.c_str(), L"cluster") == 0 ||
+        (stem.size() >= 11 &&
+         _wcsnicmp(stem.c_str(), L"SK_cluster_", 11) == 0);
+}
+
 void LogMissingIdZeroBoneRecordOnce() {
     bool expected = false;
     if (gMissingIdZeroBoneRecordLogged.compare_exchange_strong(
@@ -773,9 +1111,14 @@ void ResetNativeReceiptCapture() {
     std::lock_guard<std::mutex> lock(gNativeReceiptMutex);
     gMissingIdZeroBoneRecordLogged.store(false, std::memory_order_release);
     gNativeReceiptGeometries.clear();
+    gNativeReceiptFbxNodeNames.clear();
     gNativeReceiptBones.clear();
+    gNativeReceiptBoneIndexes.clear();
     gNativeReceiptProxies.clear();
     gNativeReceiptProxyIndexes.clear();
+    gSyntheticLeafBoneIds.clear();
+    gNextSyntheticLeafBoneId = kSyntheticLeafBoneIdBase;
+    gZeroBoneAbsoluteFallbackId = 0;
 }
 
 int NativeReceiptGeometryOrdinal(void* geometry, int vertexIndex) {
@@ -815,6 +1158,145 @@ std::string Base64Guid(const unsigned char* bytes) {
     encoded.push_back(alphabet[(tail >> 12) & 0x3F]);
     encoded += "==";
     return encoded;
+}
+
+bool CaptureNativeAuthoredPose(
+    void* sourceObject,
+    NativeReceiptProxy* proxy) {
+    if (sourceObject == nullptr || proxy == nullptr) {
+        return false;
+    }
+    __try {
+        auto** vtable = *reinterpret_cast<void***>(sourceObject);
+        constexpr std::size_t kPlacementPoseMethod = 0xC58 / sizeof(void*);
+        if (vtable == nullptr ||
+            !IsInSpeedTreeImage(
+                vtable + kPlacementPoseMethod,
+                sizeof(void*)) ||
+            !IsInSpeedTreeImage(
+                vtable[kPlacementPoseMethod],
+                sizeof(unsigned char))) {
+            return false;
+        }
+        const auto readPose = reinterpret_cast<
+            void(__fastcall*)(void*, float*, float*)>(
+                vtable[kPlacementPoseMethod]);
+        readPose(
+            sourceObject,
+            proxy->authoredPositionNative,
+            proxy->authoredTangentNativeUnit);
+        proxy->hasAuthoredPosition = true;
+        proxy->hasAuthoredTangent = true;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+struct NativeNodeRelationshipSnapshot {
+    struct Node {
+        const char* sourceType = nullptr;
+        unsigned char guid[16]{};
+    };
+
+    bool hasParent = false;
+    Node parent{};
+    bool hasGenerator = false;
+    Node generator{};
+    Node ancestors[16]{};
+    std::size_t ancestorCount = 0;
+};
+
+bool TryReadNativeNodeRelationships(
+    void* sourceObject,
+    NativeNodeRelationshipSnapshot* snapshot) {
+    if (sourceObject == nullptr || snapshot == nullptr) {
+        return false;
+    }
+    __try {
+        const auto* sourceBytes = static_cast<const unsigned char*>(sourceObject);
+        void* parentObject = *reinterpret_cast<void* const*>(
+            sourceBytes + 0x98);
+        const char* parentType = ReadSpeedTreeRttiName(parentObject);
+        if (parentType != nullptr) {
+            snapshot->hasParent = true;
+            snapshot->parent.sourceType = parentType;
+            std::memcpy(
+                snapshot->parent.guid,
+                static_cast<const unsigned char*>(parentObject) + 0x10,
+                sizeof(snapshot->parent.guid));
+        }
+
+        void* generatorObject = *reinterpret_cast<void* const*>(
+            sourceBytes + 0x128);
+        const char* generatorType = ReadSpeedTreeRttiName(generatorObject);
+        if (generatorType != nullptr) {
+            snapshot->hasGenerator = true;
+            snapshot->generator.sourceType = generatorType;
+            std::memcpy(
+                snapshot->generator.guid,
+                static_cast<const unsigned char*>(generatorObject) + 0x10,
+                sizeof(snapshot->generator.guid));
+        }
+
+        void* visited[16]{};
+        std::size_t visitedCount = 0;
+        void* ancestorObject = parentObject;
+        while (ancestorObject != nullptr &&
+               snapshot->ancestorCount < std::size(snapshot->ancestors)) {
+            bool duplicate = false;
+            for (std::size_t index = 0; index < visitedCount; ++index) {
+                if (visited[index] == ancestorObject) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
+                break;
+            }
+            const char* ancestorType = ReadSpeedTreeRttiName(ancestorObject);
+            if (ancestorType == nullptr ||
+                std::strstr(ancestorType, "Node@@") == nullptr) {
+                break;
+            }
+            visited[visitedCount++] = ancestorObject;
+            auto& ancestor = snapshot->ancestors[snapshot->ancestorCount++];
+            ancestor.sourceType = ancestorType;
+            std::memcpy(
+                ancestor.guid,
+                static_cast<const unsigned char*>(ancestorObject) + 0x10,
+                sizeof(ancestor.guid));
+            ancestorObject = *reinterpret_cast<void* const*>(
+                static_cast<const unsigned char*>(ancestorObject) + 0x98);
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void CaptureNativeNodeRelationships(
+    void* sourceObject,
+    NativeReceiptProxy* proxy) {
+    NativeNodeRelationshipSnapshot snapshot{};
+    if (proxy == nullptr ||
+        !TryReadNativeNodeRelationships(sourceObject, &snapshot)) {
+        return;
+    }
+    if (snapshot.hasParent) {
+        proxy->parentType = snapshot.parent.sourceType;
+        proxy->parentGuid = Base64Guid(snapshot.parent.guid);
+    }
+    if (snapshot.hasGenerator) {
+        proxy->generatorType = snapshot.generator.sourceType;
+        proxy->generatorGuid = Base64Guid(snapshot.generator.guid);
+    }
+    for (std::size_t index = 0; index < snapshot.ancestorCount; ++index) {
+        proxy->ancestors.push_back({
+            snapshot.ancestors[index].sourceType,
+            Base64Guid(snapshot.ancestors[index].guid),
+        });
+    }
 }
 
 void CaptureNativeReceiptProxy(
@@ -859,23 +1341,8 @@ void CaptureNativeReceiptProxy(
             const auto* sourceBytes = static_cast<const unsigned char*>(
                 sourceObject);
             proxy.nodeGuid = Base64Guid(sourceBytes + 0x10);
-            void* parentObject = *reinterpret_cast<void* const*>(
-                sourceBytes + 0x98);
-            if (ReadSpeedTreeRttiName(parentObject) != nullptr) {
-                proxy.parentGuid = Base64Guid(
-                    static_cast<const unsigned char*>(parentObject) + 0x10);
-            }
-            void* generatorObject = *reinterpret_cast<void* const*>(
-                sourceBytes + 0x128);
-            if (ReadSpeedTreeRttiName(generatorObject) != nullptr) {
-                proxy.generatorGuid = Base64Guid(
-                    static_cast<const unsigned char*>(generatorObject) + 0x10);
-            }
-            std::memcpy(
-                proxy.authoredPositionNative,
-                sourceBytes + 0x110,
-                sizeof(proxy.authoredPositionNative));
-            proxy.hasAuthoredPosition = true;
+            CaptureNativeNodeRelationships(sourceObject, &proxy);
+            CaptureNativeAuthoredPose(sourceObject, &proxy);
 
             const auto* geometryBytes = static_cast<const unsigned char*>(
                 gCurrentExportGeometry);
@@ -910,16 +1377,33 @@ void CaptureNativeReceiptProxy(
             };
 
             FbxWeightExportContext probe{};
-            probe.suppressWrite = true;
-            FbxWeightExportContext* previousContext = gFbxWeightExportContext;
-            gFbxWeightExportContext = &probe;
-            gOriginalExportVertexWeights(
-                exporter,
-                authoredSolver,
-                sourceBoneId,
-                vertexIndex,
-                clusterMap);
-            gFbxWeightExportContext = previousContext;
+            const auto synthetic = gSyntheticLeafBoneIds.find(sourceObject);
+            const bool syntheticLeafWeight =
+                synthetic != gSyntheticLeafBoneIds.end() &&
+                synthetic->second == sourceBoneId;
+            if (sourceBoneId == 0 || syntheticLeafWeight) {
+                // The serializer's exact source ID is the authored root.  The
+                // entry stub preserves and executes the stock call unchanged.
+                // Root-zone Leaf Mesh records are intentionally rigid on
+                // their exact synthetic bone instead of inheriting Root.
+                probe.additionCount = 1;
+                probe.additions[0] = {
+                    nullptr,
+                    vertexIndex,
+                    1.0,
+                };
+            } else {
+                probe.suppressWrite = true;
+                FbxWeightExportContext* previousContext = gFbxWeightExportContext;
+                gFbxWeightExportContext = &probe;
+                gOriginalExportVertexWeights(
+                    exporter,
+                    authoredSolver,
+                    sourceBoneId,
+                    vertexIndex,
+                    clusterMap);
+                gFbxWeightExportContext = previousContext;
+            }
             if (probe.additionCount > 0) {
                 proxy.influences.push_back({
                     sourceBoneId,
@@ -957,12 +1441,7 @@ void CaptureNativeReceiptProxy(
         proxyIndex = existing->second;
     }
 
-    auto& ranges = gNativeReceiptProxies[proxyIndex].vertexRanges;
-    if (!ranges.empty() && ranges.back().lastVertex + 1 == vertexIndex) {
-        ranges.back().lastVertex = vertexIndex;
-    } else {
-        ranges.push_back({vertexIndex, vertexIndex});
-    }
+    gNativeReceiptProxies[proxyIndex].vertexIndices.push_back(vertexIndex);
 }
 
 void CaptureNativeReceiptBone(const void* sourceBoneRecord, const void* sourceBranch) {
@@ -982,14 +1461,23 @@ void CaptureNativeReceiptBone(const void* sourceBoneRecord, const void* sourceBr
         row.sourceType = sourceType;
     }
     std::lock_guard<std::mutex> lock(gNativeReceiptMutex);
-    const auto duplicate = std::find_if(
-        gNativeReceiptBones.begin(),
-        gNativeReceiptBones.end(),
-        [&row](const NativeReceiptBone& existing) {
-            return existing.boneId == row.boneId;
-        });
-    if (duplicate == gNativeReceiptBones.end()) {
+    const auto duplicate = gNativeReceiptBoneIndexes.find(row.boneId);
+    if (duplicate == gNativeReceiptBoneIndexes.end()) {
+        const std::size_t ordinal = gNativeReceiptBones.size();
         gNativeReceiptBones.push_back(std::move(row));
+        gNativeReceiptBoneIndexes.emplace(
+            gNativeReceiptBones[ordinal].boneId,
+            ordinal);
+        return;
+    }
+    const NativeReceiptBone& existing =
+        gNativeReceiptBones.at(duplicate->second);
+    if (existing.parentId != row.parentId ||
+        std::memcmp(existing.start, row.start, sizeof(row.start)) != 0 ||
+        std::memcmp(existing.end, row.end, sizeof(row.end)) != 0) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "Native receipt observed conflicting parent or coordinates for one exact bone ID");
     }
 }
 
@@ -999,11 +1487,29 @@ void __fastcall HookedExportVertexWeights(
     int sourceBoneId,
     int vertexIndex,
     void* clusterMap) {
-    // Always preserve the stock call, including native sourceBoneId==0 calls.
-    // A valid no-generator model can use that implicit native path even though
-    // the export-bone map has no exact ID-0 record.  Only the later *synthetic*
-    // complementary Root call needs the exact-record guard.
+    bool syntheticLeafWeight = sourceBoneId > 0 &&
+        sourceBoneId == gZeroBoneAbsoluteFallbackId;
+    __try {
+        if (!syntheticLeafWeight && sourceBoneId > 0 &&
+            gCurrentExportSourceVertexRecord != nullptr) {
+            const auto* record = static_cast<const unsigned char*>(
+                gCurrentExportSourceVertexRecord);
+            void* sourceObject = *reinterpret_cast<void* const*>(record + 0x110);
+            syntheticLeafWeight =
+                FindSyntheticLeafBoneId(sourceObject) == sourceBoneId;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "Synthetic Leaf Mesh FBX weight mapping could not read its source record");
+    }
+
+    // Preserve the stock lookup and cluster selection. Root-zone Leaf Mesh
+    // ownership is rigid by construction, so only that path overrides the
+    // stock distance-derived scalar with an exact weight of one.
     FbxWeightExportContext primary{};
+    primary.overrideWeight = syntheticLeafWeight;
+    primary.replacementWeight = 1.0;
     FbxWeightExportContext* previousContext = gFbxWeightExportContext;
     gFbxWeightExportContext = &primary;
     gOriginalExportVertexWeights(
@@ -1020,6 +1526,16 @@ void __fastcall HookedExportVertexWeights(
         sourceBoneId,
         vertexIndex,
         clusterMap);
+    if (syntheticLeafWeight) {
+        if (primary.additionCount != 1 ||
+            primary.additions[0].vertexIndex != vertexIndex ||
+            primary.additions[0].weight != 1.0) {
+            AbortExport(
+                kHookRuntimeFailureExitCode,
+                "Synthetic Leaf Mesh FBX weight did not emit one exact rigid influence");
+        }
+        return;
+    }
     if (sourceBoneId <= 0 || exporter == nullptr || position == nullptr ||
         clusterMap == nullptr) {
         return;
@@ -1102,13 +1618,20 @@ void __fastcall HookedExportVertexWeights(
     }
 }
 
+int __fastcall CaptureNativeReceiptIdZero(
+    void* exporter,
+    const float* position,
+    int sourceBoneId,
+    int vertexIndex,
+    void* clusterMap);
+
 bool BuildExportVertexWeightsEntryStub() {
     if (gExportVertexWeightsEntryStub != nullptr) {
         return true;
     }
     auto* stub = static_cast<unsigned char*>(VirtualAlloc(
         nullptr,
-        96,
+        192,
         MEM_RESERVE | MEM_COMMIT,
         PAGE_EXECUTE_READWRITE));
     if (stub == nullptr) {
@@ -1132,26 +1655,139 @@ bool BuildExportVertexWeightsEntryStub() {
     stub[23] = 0x48;
     stub[24] = 0x89;
     stub[25] = 0x38;
-    // Native ID-0 is an implicit serializer path. Tail-jump straight to the
-    // SpeedTree trampoline so its undocumented caller register/stack state is
-    // untouched. Only positive IDs enter compiled hook code.
+    // Native ID-0 is an implicit serializer path. Capture its exact serializer
+    // record while preserving the caller's volatile state. Leaf Mesh records
+    // return their exact synthetic bone ID in EAX and place it into the saved
+    // R8 slot. Unchanged ID-0 records tail-jump to the stock routine. Both
+    // initially-positive and synthetically remapped IDs enter the compiled weight hook.
     stub[26] = 0x45;
     stub[27] = 0x85;
     stub[28] = 0xC0;             // test r8d, r8d
     stub[29] = 0x75;
-    stub[30] = 0x0C;             // jne HookedExportVertexWeights
-    stub[31] = 0x48;
-    stub[32] = 0xB8;
-    *reinterpret_cast<std::uintptr_t*>(stub + 33) =
+    stub[30] = 0x00;             // jne displacement filled below
+    std::size_t cursor = 31;
+    stub[cursor++] = 0x9C;       // pushfq
+    stub[cursor++] = 0x50;       // push rax
+    stub[cursor++] = 0x51;       // push rcx
+    stub[cursor++] = 0x52;       // push rdx
+    stub[cursor++] = 0x41;
+    stub[cursor++] = 0x50;       // push r8
+    stub[cursor++] = 0x41;
+    stub[cursor++] = 0x51;       // push r9
+    stub[cursor++] = 0x41;
+    stub[cursor++] = 0x52;       // push r10
+    stub[cursor++] = 0x41;
+    stub[cursor++] = 0x53;       // push r11
+    stub[cursor++] = 0x48;
+    stub[cursor++] = 0x83;
+    stub[cursor++] = 0xEC;
+    stub[cursor++] = 0x28;       // sub rsp, 0x28
+    stub[cursor++] = 0x48;
+    stub[cursor++] = 0x8B;
+    stub[cursor++] = 0x84;
+    stub[cursor++] = 0x24;
+    *reinterpret_cast<std::uint32_t*>(stub + cursor) = 0x90;
+    cursor += sizeof(std::uint32_t); // mov rax, [rsp+0x90]
+    stub[cursor++] = 0x48;
+    stub[cursor++] = 0x89;
+    stub[cursor++] = 0x44;
+    stub[cursor++] = 0x24;
+    stub[cursor++] = 0x20;       // mov [rsp+0x20], rax
+    stub[cursor++] = 0x48;
+    stub[cursor++] = 0xB8;
+    *reinterpret_cast<std::uintptr_t*>(stub + cursor) =
+        reinterpret_cast<std::uintptr_t>(CaptureNativeReceiptIdZero);
+    cursor += sizeof(std::uintptr_t);
+    stub[cursor++] = 0xFF;
+    stub[cursor++] = 0xD0;       // call rax
+    stub[cursor++] = 0x48;
+    stub[cursor++] = 0x89;
+    stub[cursor++] = 0x44;
+    stub[cursor++] = 0x24;
+    stub[cursor++] = 0x40;       // mov [rsp+0x40], rax (saved r8)
+    stub[cursor++] = 0x48;
+    stub[cursor++] = 0x83;
+    stub[cursor++] = 0xC4;
+    stub[cursor++] = 0x28;       // add rsp, 0x28
+    stub[cursor++] = 0x41;
+    stub[cursor++] = 0x5B;       // pop r11
+    stub[cursor++] = 0x41;
+    stub[cursor++] = 0x5A;       // pop r10
+    stub[cursor++] = 0x41;
+    stub[cursor++] = 0x59;       // pop r9
+    stub[cursor++] = 0x41;
+    stub[cursor++] = 0x58;       // pop r8
+    stub[cursor++] = 0x5A;       // pop rdx
+    stub[cursor++] = 0x59;       // pop rcx
+    stub[cursor++] = 0x58;       // pop rax
+    stub[cursor++] = 0x9D;       // popfq
+    stub[cursor++] = 0x45;
+    stub[cursor++] = 0x85;
+    stub[cursor++] = 0xC0;       // test r8d, r8d
+    stub[cursor++] = 0x75;
+    const std::size_t remappedBranchOffset = cursor++;
+    stub[cursor++] = 0x48;
+    stub[cursor++] = 0xB8;
+    *reinterpret_cast<std::uintptr_t*>(stub + cursor) =
         reinterpret_cast<std::uintptr_t>(&gOriginalExportVertexWeights);
-    stub[41] = 0xFF;
-    stub[42] = 0x20;             // jmp qword ptr [rax]
+    cursor += sizeof(std::uintptr_t);
+    stub[cursor++] = 0xFF;
+    stub[cursor++] = 0x20;       // jmp qword ptr [rax]
+    const std::size_t positiveHookOffset = cursor;
+    const std::size_t remappedBranchDistance =
+        positiveHookOffset - (remappedBranchOffset + 1);
+    const std::size_t positiveBranchDistance = positiveHookOffset - 31;
+    if (positiveBranchDistance > 0x7F || remappedBranchDistance > 0x7F) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        Log("FBX vertex-record entry stub compiled branch exceeded rel8");
+        return false;
+    }
+    stub[30] = static_cast<unsigned char>(positiveBranchDistance);
+    stub[remappedBranchOffset] = static_cast<unsigned char>(remappedBranchDistance);
     WriteAbsoluteJump(
-        stub + 43,
+        stub + positiveHookOffset,
         reinterpret_cast<const void*>(HookedExportVertexWeights));
-    FlushInstructionCache(GetCurrentProcess(), stub, 55);
+    FlushInstructionCache(GetCurrentProcess(), stub, positiveHookOffset + 12);
     gExportVertexWeightsEntryStub = stub;
     return true;
+}
+
+int __fastcall CaptureNativeReceiptIdZero(
+    void* exporter,
+    const float* position,
+    int sourceBoneId,
+    int vertexIndex,
+    void* clusterMap) {
+    int effectiveBoneId = sourceBoneId;
+    __try {
+        if (sourceBoneId == 0 && gCurrentExportSourceVertexRecord != nullptr) {
+            if (gZeroBoneAbsoluteFallbackId > 0) {
+                effectiveBoneId = gZeroBoneAbsoluteFallbackId;
+            }
+            const auto* record = static_cast<const unsigned char*>(
+                gCurrentExportSourceVertexRecord);
+            void* sourceObject = *reinterpret_cast<void* const*>(record + 0x110);
+            const char* sourceType = ReadSpeedTreeRttiName(sourceObject);
+            if (effectiveBoneId == 0 && sourceType != nullptr &&
+                std::strcmp(sourceType, ".?AVCLeafMeshNode@@") == 0) {
+                const int syntheticBoneId = FindSyntheticLeafBoneId(sourceObject);
+                if (syntheticBoneId > 0) {
+                    effectiveBoneId = syntheticBoneId;
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "Leaf Mesh FBX weight mapping raised an exception while reading the source record");
+    }
+    CaptureNativeReceiptProxy(
+        exporter,
+        position,
+        effectiveBoneId,
+        vertexIndex,
+        clusterMap);
+    return effectiveBoneId;
 }
 
 void FreeExportVertexWeightsEntryStub() {
@@ -1266,6 +1902,103 @@ void __fastcall HookedInsertExportBone(
         CaptureNativeReceiptBone(sourceBoneRecord, sourceBranch);
     }
     gOriginalInsertExportBone(exportData, sourceBoneRecord, sourceBranch);
+}
+
+bool TryReadExportGeometryEnd(void* exportData, void** geometryEnd) {
+    if (exportData == nullptr || geometryEnd == nullptr) {
+        return false;
+    }
+    __try {
+        *geometryEnd = *reinterpret_cast<void**>(
+            static_cast<unsigned char*>(exportData) + 0x3BC);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void __fastcall HookedLeafMeshExport(void* leafNode, void* exportData) {
+    const bool clusterSource = IsClusterSourceInput();
+    const bool rootZoneLeaf =
+        !clusterSource && IsRootZoneLeafMesh(leafNode);
+    const bool baseRefBranchLeaf =
+        !clusterSource && IsBaseRefBranchLeafMesh(leafNode);
+    const bool needsSyntheticBone = rootZoneLeaf || baseRefBranchLeaf;
+    void* geometryEndBefore = nullptr;
+    if (!TryReadExportGeometryEnd(exportData, &geometryEndBefore)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "Leaf Mesh bone serialization could not read the native geometry list");
+    }
+    gOriginalLeafMeshExport(leafNode, exportData);
+    void* geometryEndAfter = nullptr;
+    if (!TryReadExportGeometryEnd(exportData, &geometryEndAfter)) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "Leaf Mesh bone serialization lost the native geometry list");
+    }
+    if (geometryEndBefore == geometryEndAfter) {
+        return;
+    }
+
+    // Permanent native SPM rule: after Modeler parsed the export graph, a
+    // model with no bone records receives exactly one root-absolute deform
+    // bone. The ID-0 entry stub maps every otherwise unbound vertex to it at
+    // rigid weight 1. Existing nonzero model bones remain completely native.
+    if (!needsSyntheticBone && NativeParsedBoneCount() == 0) {
+        SyntheticLeafBoneRecord fallback{};
+        fallback.boneId = ReserveZeroBoneAbsoluteFallbackId();
+        fallback.parentId = 0;
+        fallback.start[0] = 0.0f;
+        fallback.start[1] = 0.0f;
+        fallback.start[2] = 0.0f;
+        fallback.end[0] = 0.0f;
+        fallback.end[1] = 0.0f;
+        fallback.end[2] = 1.0f;
+        HookedInsertExportBone(exportData, &fallback, leafNode);
+        Log("parsed zero-bone SPM received one absolute rigid fallback bone");
+        return;
+    }
+    if (!needsSyntheticBone) {
+        return;
+    }
+
+    NativeReceiptProxy authoredPose{};
+    if (!CaptureNativeAuthoredPose(leafNode, &authoredPose) ||
+        !authoredPose.hasAuthoredPosition ||
+        !authoredPose.hasAuthoredTangent) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "Leaf Mesh bone serialization could not read its authored pose and tangent");
+    }
+    float tangentLengthSquared = 0.0f;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!std::isfinite(authoredPose.authoredPositionNative[axis]) ||
+            !std::isfinite(authoredPose.authoredTangentNativeUnit[axis])) {
+            AbortExport(
+                kHookRuntimeFailureExitCode,
+                "Leaf Mesh bone serialization rejected a non-finite authored pose");
+        }
+        tangentLengthSquared +=
+            authoredPose.authoredTangentNativeUnit[axis] *
+            authoredPose.authoredTangentNativeUnit[axis];
+    }
+    if (!(tangentLengthSquared > 0.25f) || tangentLengthSquared > 4.0f) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "Leaf Mesh bone serialization rejected an invalid authored tangent");
+    }
+
+    SyntheticLeafBoneRecord record{};
+    record.boneId = ReserveSyntheticLeafBoneId(leafNode);
+    record.parentId = 0;
+    for (int axis = 0; axis < 3; ++axis) {
+        record.start[axis] = authoredPose.authoredPositionNative[axis];
+        record.end[axis] =
+            authoredPose.authoredPositionNative[axis] +
+            authoredPose.authoredTangentNativeUnit[axis];
+    }
+    HookedInsertExportBone(exportData, &record, leafNode);
 }
 
 
@@ -1666,6 +2399,7 @@ bool SetRlmConnectFailFastPatch(bool enabled) {
 }
 
 void RemoveCommonHooks() {
+    RemoveHook(gLeafMeshExportHook);
     RemoveHook(gInsertExportBoneHook);
     RemoveHook(gExportVertexWeightsHook);
     FreeExportVertexWeightsEntryStub();
@@ -1849,8 +2583,16 @@ void __fastcall HookedQThreadStart(void* thread, int priority) {
             LogCollisionResultState(
                 "native CLI export collision refresh started",
                 collisionModel);
+            const NativeQpcPhaseToken collisionCompute = BeginNativeQpcPhase(
+                "collision_post_regeneration_compute",
+                2);
             gCollisionCompute(collisionModel);
+            EndNativeQpcPhase(collisionCompute);
+            const NativeQpcPhaseToken collisionDone = BeginNativeQpcPhase(
+                "collision_post_regeneration_done",
+                2);
             gCollisionDone(collisionModel);
+            EndNativeQpcPhase(collisionDone);
             gSynchronousCollisionCompleted.store(true, std::memory_order_release);
             LogCollisionResultState(
                 "native CLI export collision refresh completed",
@@ -2408,14 +3150,25 @@ bool __fastcall HookedNativeModelUpdate(void* model, int variation) {
         LogCollisionResultState(phase, model);
         return guiResult;
     }
-    if (!EnsureHeadlessOpenGlContext()) {
+    const NativeQpcPhaseToken modelUpdateTotal = BeginNativeQpcPhase(
+        "native_model_update_total");
+    bool hasHeadlessContext = false;
+    const NativeQpcPhaseToken headlessContext = BeginNativeQpcPhase(
+        "headless_opengl_context");
+    hasHeadlessContext = EnsureHeadlessOpenGlContext();
+    EndNativeQpcPhase(headlessContext);
+    if (!hasHeadlessContext) {
         AbortExport(
             kHookRuntimeFailureExitCode,
             "native CLI model update could not create its headless render context");
     }
     auto* modelBytes = static_cast<unsigned char*>(model);
     modelBytes[0x9BDC] = 1;
-    const bool result = gOriginalNativeModelUpdate(model, variation);
+    bool result = false;
+    const NativeQpcPhaseToken rawModelUpdate = BeginNativeQpcPhase(
+        "native_raw_model_update");
+    result = gOriginalNativeModelUpdate(model, variation);
+    EndNativeQpcPhase(rawModelUpdate);
     LogCollisionResultState(
         "native CLI raw model update with headless render context",
         model);
@@ -2428,8 +3181,14 @@ bool __fastcall HookedNativeModelUpdate(void* model, int variation) {
         reinterpret_cast<bool(__fastcall*)(void*)>(gSpeedTreeBase + 0x3DA640);
     const auto rebuildInteractiveGenerators =
         reinterpret_cast<void(__fastcall*)(void*, bool)>(gSpeedTreeBase + 0x3E9490);
+    const NativeQpcPhaseToken generatorPrepare = BeginNativeQpcPhase(
+        "interactive_generator_prepare");
     prepareInteractiveGenerators(model);
+    EndNativeQpcPhase(generatorPrepare);
+    const NativeQpcPhaseToken generatorRebuild = BeginNativeQpcPhase(
+        "interactive_generator_rebuild");
     rebuildInteractiveGenerators(model, true);
+    EndNativeQpcPhase(generatorRebuild);
     auto* generatorState = *reinterpret_cast<unsigned char**>(modelBytes + 0x7B0);
     auto* generatorStateEnd = *reinterpret_cast<unsigned char**>(modelBytes + 0x7B8);
     for (; generatorState < generatorStateEnd; generatorState += 0x2420) {
@@ -2449,6 +3208,8 @@ bool __fastcall HookedNativeModelUpdate(void* model, int variation) {
         gSpeedTreeBase + kTreeDocumentPrepareRva);
     const auto stageTreeDocumentModel = reinterpret_cast<TreeDocumentModelStageFn>(
         gSpeedTreeBase + kTreeDocumentModelStageRva);
+    const NativeQpcPhaseToken documentStage = BeginNativeQpcPhase(
+        "native_full_document_stage");
     prepareTreeDocument(treeDocument);
     void* modelInterface = static_cast<unsigned char*>(treeDocument) + 0x18;
     stageTreeDocumentModel(modelInterface);
@@ -2456,12 +3217,16 @@ bool __fastcall HookedNativeModelUpdate(void* model, int variation) {
     auto finishModelStage = reinterpret_cast<bool(__fastcall*)(void*)>(
         modelInterfaceVtable[0xD8 / sizeof(void*)]);
     finishModelStage(modelInterface);
+    EndNativeQpcPhase(documentStage);
     LogCollisionResultState(
         "native CLI full document stage after raw generation",
         model);
     const auto generateShadeVolume = reinterpret_cast<void(__fastcall*)(void*, int)>(
         gSpeedTreeBase + kGenerateShadeVolumeRva);
+    const NativeQpcPhaseToken shadeVolume = BeginNativeQpcPhase(
+        "shade_pruning_volume_generation");
     generateShadeVolume(model, 5);
+    EndNativeQpcPhase(shadeVolume);
     Log("native CLI shade-pruning volume generation completed");
     gMarkCollisionDirty(model);
     modelBytes[0x9C68] = 1;
@@ -2471,8 +3236,16 @@ bool __fastcall HookedNativeModelUpdate(void* model, int variation) {
     LogCollisionResultState(
         "native CLI model marked dirty after full input generation",
         model);
+    const NativeQpcPhaseToken collisionCompute = BeginNativeQpcPhase(
+        "collision_post_input_compute",
+        1);
     gCollisionCompute(model);
+    EndNativeQpcPhase(collisionCompute);
+    const NativeQpcPhaseToken collisionDone = BeginNativeQpcPhase(
+        "collision_post_input_done",
+        1);
     gCollisionDone(model);
+    EndNativeQpcPhase(collisionDone);
     gSynchronousCollisionCompleted.store(true, std::memory_order_release);
     LogCollisionResultState(
         "native CLI full post-input collision computation completed",
@@ -2567,7 +3340,11 @@ bool __fastcall HookedNativeModelUpdate(void* model, int variation) {
     void* const originalIdleViewState =
         *reinterpret_cast<void**>(nativeMainWindow + 0x4B0);
     nativeMainWindow[0x615] = 0;
-    const bool postCollisionResult = gOriginalNativeModelUpdate(model, variation);
+    bool postCollisionResult = false;
+    const NativeQpcPhaseToken postCollisionUpdate = BeginNativeQpcPhase(
+        "native_post_collision_model_update");
+    postCollisionResult = gOriginalNativeModelUpdate(model, variation);
+    EndNativeQpcPhase(postCollisionUpdate);
     // Restore UI-only idle state changed by the scoped interactive rebuild.
     // The model itself remains regenerated, while the native exporter's
     // original non-interactive window state is preserved.
@@ -2580,11 +3357,23 @@ bool __fastcall HookedNativeModelUpdate(void* model, int variation) {
     gSynchronousCollisionCompleted.store(false, std::memory_order_release);
     const auto scheduleCollision =
         reinterpret_cast<void(__fastcall*)(void*, bool)>(gSpeedTreeBase + 0x3BF790);
+    const NativeQpcPhaseToken collisionSchedule = BeginNativeQpcPhase(
+        "collision_post_regeneration_schedule",
+        2);
     scheduleCollision(model, false);
+    EndNativeQpcPhase(collisionSchedule);
     if (!gSynchronousCollisionCompleted.load(std::memory_order_acquire)) {
         Log("native CLI collision scheduler did not start a worker; using direct fallback");
+        const NativeQpcPhaseToken fallbackCompute = BeginNativeQpcPhase(
+            "collision_post_regeneration_direct_fallback_compute",
+            2);
         gCollisionCompute(model);
+        EndNativeQpcPhase(fallbackCompute);
+        const NativeQpcPhaseToken fallbackDone = BeginNativeQpcPhase(
+            "collision_post_regeneration_direct_fallback_done",
+            2);
         gCollisionDone(model);
+        EndNativeQpcPhase(fallbackDone);
         gSynchronousCollisionCompleted.store(true, std::memory_order_release);
     }
     LogCollisionScheduleState(
@@ -2592,7 +3381,11 @@ bool __fastcall HookedNativeModelUpdate(void* model, int variation) {
         model);
     const auto commitCollisionGeneratorChanges =
         reinterpret_cast<void(__fastcall*)(void*, bool)>(gSpeedTreeBase + 0x3DDD30);
+    const NativeQpcPhaseToken collisionCommit = BeginNativeQpcPhase(
+        "collision_generator_commit",
+        2);
     commitCollisionGeneratorChanges(model, true);
+    EndNativeQpcPhase(collisionCommit);
     LogCollisionResultState(
         "native CLI collision-complete generator commit finished",
         model);
@@ -2683,6 +3476,7 @@ bool __fastcall HookedNativeModelUpdate(void* model, int variation) {
     LogCollisionResultState(
         "native CLI post-prune model regeneration completed",
         model);
+    EndNativeQpcPhase(modelUpdateTotal);
     return result && postCollisionResult;
 }
 
@@ -2692,7 +3486,10 @@ void __fastcall HookedNativeExportFinalizeGeometry(void* exportBuilder, bool sep
             "native CLI finalize geometry entry",
             gCollisionModel.load(std::memory_order_acquire));
     }
-    gOriginalNativeExportFinalizeGeometry(exportBuilder, separate);
+    {
+        NativeQpcPhase finalizeGeometry("native_export_finalize_geometry");
+        gOriginalNativeExportFinalizeGeometry(exportBuilder, separate);
+    }
     if (gNativeCliExportActive.load(std::memory_order_acquire)) {
         LogCollisionResultState(
             "native CLI finalize geometry exit",
@@ -2706,7 +3503,10 @@ void __fastcall HookedNativeExportFinalizeDocument(void* exportBuilder) {
             "native CLI finalize document entry",
             gCollisionModel.load(std::memory_order_acquire));
     }
-    gOriginalNativeExportFinalizeDocument(exportBuilder);
+    {
+        NativeQpcPhase finalizeDocument("native_export_finalize_document");
+        gOriginalNativeExportFinalizeDocument(exportBuilder);
+    }
     if (gNativeCliExportActive.load(std::memory_order_acquire)) {
         LogCollisionResultState(
             "native CLI finalize document exit",
@@ -2734,14 +3534,27 @@ void __fastcall HookedNativeExportBuild(void* exportBuilder) {
             "native CLI collision state normalized for full pruning",
             collisionModel);
         Log("executing collision core before native CLI geometry build");
-        gCollisionCompute(collisionModel);
-        gCollisionDone(collisionModel);
+        {
+            NativeQpcPhase fallbackCompute(
+                "collision_prebuild_safety_fallback_compute",
+                2);
+            gCollisionCompute(collisionModel);
+        }
+        {
+            NativeQpcPhase fallbackDone(
+                "collision_prebuild_safety_fallback_done",
+                2);
+            gCollisionDone(collisionModel);
+        }
         gSynchronousCollisionCompleted.store(true, std::memory_order_release);
         LogCollisionResultState(
             "native CLI pre-build collision computation completed",
             collisionModel);
     }
-    gOriginalNativeExportBuild(exportBuilder);
+    {
+        NativeQpcPhase exportBuild("native_export_geometry_build");
+        gOriginalNativeExportBuild(exportBuilder);
+    }
 }
 
 [[noreturn]] void AbortExport(DWORD exitCode, const char* reason) {
@@ -4581,13 +5394,25 @@ bool WriteNativeReceipt() {
         return true;
     }
 
+    NativeQpcPhase receiptTotal("native_receipt_total");
     std::lock_guard<std::mutex> lock(gNativeReceiptMutex);
-    std::sort(
-        gNativeReceiptBones.begin(),
-        gNativeReceiptBones.end(),
-        [](const NativeReceiptBone& left, const NativeReceiptBone& right) {
-            return left.boneId < right.boneId;
-        });
+    {
+        NativeQpcPhase boneSort("native_receipt_bone_sort");
+        std::sort(
+            gNativeReceiptBones.begin(),
+            gNativeReceiptBones.end(),
+            [](const NativeReceiptBone& left, const NativeReceiptBone& right) {
+                return left.boneId < right.boneId;
+            });
+        gNativeReceiptBoneIndexes.clear();
+        for (std::size_t index = 0;
+             index < gNativeReceiptBones.size();
+             ++index) {
+            gNativeReceiptBoneIndexes.emplace(
+                gNativeReceiptBones[index].boneId,
+                index);
+        }
+    }
 
     const std::filesystem::path destination(gNativeReceiptPath);
     std::error_code directoryError;
@@ -4618,15 +5443,18 @@ bool WriteNativeReceipt() {
             sourceAttributes.ftLastWriteTime.dwLowDateTime
         : 0;
 
+    const NativeQpcPhaseToken receiptSerialization = BeginNativeQpcPhase(
+        "native_receipt_json_serialization");
     std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
     if (!stream) {
+        EndNativeQpcPhase(receiptSerialization);
         Log("native receipt temporary file could not be opened");
         return false;
     }
     // Generated-instance proxy records describe geometry placement, not an
     // exported deform skeleton.  Blender imports an armature only when the
     // native FBX serializer emitted at least one exact bone record, so proxy
-    // presence must never turn a genuinely bone-less FBX into the ID-0 repair
+    // presence must never turn a genuinely bone-less FBX into the ID-0 deform
     // contract.
     const char* idZeroClusterWrite =
         gNativeReceiptBones.empty()
@@ -4636,11 +5464,11 @@ bool WriteNativeReceipt() {
                : "native_exact_bone_record");
     stream << std::setprecision(17);
     stream << "{\n"
-           << "  \"schema_version\": 2,\n"
+           << "  \"schema_version\": 5,\n"
            << "  \"kind\": \"speedtree_native_export_receipt\",\n"
            << "  \"status\": \"ready\",\n"
            << "  \"identity_policy\": "
-              "\"modeler_parsed_runtime_and_fbx_serializer_records_v1\",\n"
+               "\"modeler_runtime_pose_tangent_and_fbx_serializer_records_v5\",\n"
            << "  \"source\": {\"path\": \""
            << JsonEscape(WidePathToUtf8(gNativeInputPath))
            << "\", \"size\": " << sourceSize
@@ -4654,7 +5482,7 @@ bool WriteNativeReceipt() {
               "\"native_unit_to_meter\": 0.3048, "
               "\"native_unit_to_solver\": 30.48, "
               "\"blender_xyz_from_native_xyz\": ["
-              "\"x*0.3048\", \"z*0.3048\", \"-y*0.3048\"]},\n"
+              "\"x*0.3048\", \"y*0.3048\", \"z*0.3048\"]},\n"
            << "  \"geometry_count\": "
            << gNativeReceiptGeometries.size() << ",\n"
            << "  \"geometries\": [\n";
@@ -4684,6 +5512,8 @@ bool WriteNativeReceipt() {
         const auto& proxy = gNativeReceiptProxies[index];
         stream << "    {\"geometry_ordinal\": " << proxy.key.geometryOrdinal
                << ", \"native_instance_id\": " << proxy.key.instanceId
+               << ", \"native_source_object_id\": "
+               << static_cast<unsigned long long>(proxy.key.sourceObject)
                << ", \"record_type\": " << proxy.key.recordType
                << ", \"source_bone_id\": " << proxy.key.sourceBoneId
                << ", \"source_rtti\": \""
@@ -4696,15 +5526,45 @@ bool WriteNativeReceipt() {
                 stream << ", \"parent_guid\": \""
                        << proxy.parentGuid << "\"";
             }
+            if (!proxy.parentType.empty()) {
+                stream << ", \"parent_rtti\": \""
+                       << JsonEscape(proxy.parentType) << "\"";
+            }
             if (!proxy.generatorGuid.empty()) {
                 stream << ", \"generator_guid\": \""
                        << proxy.generatorGuid << "\"";
             }
+            if (!proxy.generatorType.empty()) {
+                stream << ", \"generator_rtti\": \""
+                       << JsonEscape(proxy.generatorType) << "\"";
+            }
+            stream << ", \"ancestor_chain\": [";
+            for (std::size_t ancestorIndex = 0;
+                 ancestorIndex < proxy.ancestors.size();
+                 ++ancestorIndex) {
+                const auto& ancestor = proxy.ancestors[ancestorIndex];
+                stream << "{\"depth\": " << ancestorIndex + 1
+                       << ", \"source_rtti\": \""
+                       << JsonEscape(ancestor.sourceType)
+                       << "\", \"node_guid\": \""
+                       << ancestor.nodeGuid << "\"}";
+                if (ancestorIndex + 1 != proxy.ancestors.size()) {
+                    stream << ", ";
+                }
+            }
+            stream << "]";
             stream << ", \"authored_position_native\": ["
                    << proxy.authoredPositionNative[0] << ", "
                    << proxy.authoredPositionNative[1] << ", "
                    << proxy.authoredPositionNative[2]
-                   << "], \"authored_position_influences\": [";
+                   << "]";
+            if (proxy.hasAuthoredTangent) {
+                stream << ", \"authored_tangent_native_unit\": ["
+                       << proxy.authoredTangentNativeUnit[0] << ", "
+                       << proxy.authoredTangentNativeUnit[1] << ", "
+                       << proxy.authoredTangentNativeUnit[2] << "]";
+            }
+            stream << ", \"authored_position_influences\": [";
             for (std::size_t influenceIndex = 0;
                  influenceIndex < proxy.influences.size();
                  ++influenceIndex) {
@@ -4723,13 +5583,15 @@ bool WriteNativeReceipt() {
             }
             stream << "]";
         }
+        const std::vector<NativeReceiptRange> vertexRanges =
+            CoalesceNativeReceiptVertexRanges(proxy.vertexIndices);
         stream << ", \"vertex_ranges\": [";
         for (std::size_t rangeIndex = 0;
-             rangeIndex < proxy.vertexRanges.size();
+             rangeIndex < vertexRanges.size();
              ++rangeIndex) {
-            const auto& range = proxy.vertexRanges[rangeIndex];
+            const auto& range = vertexRanges[rangeIndex];
             stream << "[" << range.firstVertex << ", " << range.lastVertex << "]";
-            if (rangeIndex + 1 != proxy.vertexRanges.size()) {
+            if (rangeIndex + 1 != vertexRanges.size()) {
                 stream << ", ";
             }
         }
@@ -4739,14 +5601,20 @@ bool WriteNativeReceipt() {
     stream << "  ]\n}\n";
     stream.close();
     if (!stream) {
+        EndNativeQpcPhase(receiptSerialization);
         DeleteFileW(temporary.c_str());
         Log("native receipt write did not complete");
         return false;
     }
-    if (!MoveFileExW(
-            temporary.c_str(),
-            destination.c_str(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    EndNativeQpcPhase(receiptSerialization);
+    const NativeQpcPhaseToken receiptPromotion = BeginNativeQpcPhase(
+        "native_receipt_atomic_promotion");
+    const bool promoted = MoveFileExW(
+        temporary.c_str(),
+        destination.c_str(),
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+    EndNativeQpcPhase(receiptPromotion);
+    if (!promoted) {
         DeleteFileW(temporary.c_str());
         Log("native receipt atomic promotion failed");
         return false;
@@ -4776,11 +5644,14 @@ void RunSecondaryNativeExport(void* mainWindow, bool gameExport) {
     }
     Log("native CLI starting bundled secondary export in the loaded process");
     gSecondaryNativeSerializationActive.store(true, std::memory_order_release);
-    gOriginalSpeedTreeExport(
-        mainWindow,
-        &secondaryOutput,
-        &secondaryOptions,
-        gameExport);
+    {
+        NativeQpcPhase secondaryExport("native_secondary_export_total");
+        gOriginalSpeedTreeExport(
+            mainWindow,
+            &secondaryOutput,
+            &secondaryOptions,
+            gameExport);
+    }
     gSecondaryNativeSerializationActive.store(false, std::memory_order_release);
     if (!gVerificationOnly &&
         !gSynchronousCollisionCompleted.load(std::memory_order_acquire)) {
@@ -4792,6 +5663,7 @@ void RunSecondaryNativeExport(void* mainWindow, bool gameExport) {
 }
 
 void __fastcall HookedSpeedTreeExport(void* arg1, void* arg2, void* arg3, bool gameExport) {
+    const NativeQpcExportToken exportTelemetry = BeginNativeQpcExport();
     Log("SpeedTree native CLI export intercepted");
     ResetNativeReceiptCapture();
     __try {
@@ -4813,10 +5685,14 @@ void __fastcall HookedSpeedTreeExport(void* arg1, void* arg2, void* arg3, bool g
 
     if (gVerificationOnly) {
         Log("native CLI verification-only export skips Collision/Prune bake");
+        const NativeQpcPhaseToken primaryExport = BeginNativeQpcPhase(
+            "native_primary_export_total");
         gOriginalSpeedTreeExport(arg1, arg2, arg3, gameExport);
+        EndNativeQpcPhase(primaryExport);
         WriteNativeReceipt();
         RunSecondaryNativeExport(arg1, gameExport);
         Log("native CLI bundled verification export completed");
+        EndNativeQpcExport(exportTelemetry);
         return;
     }
 
@@ -4848,6 +5724,8 @@ void __fastcall HookedSpeedTreeExport(void* arg1, void* arg2, void* arg3, bool g
             kHookRuntimeFailureExitCode,
             "native CLI could not disable deferred UI updates during export");
     }
+    const NativeQpcPhaseToken modelFinalization = BeginNativeQpcPhase(
+        "native_cli_model_finalization");
     __try {
         auto* mainWindow = static_cast<unsigned char*>(arg1);
         if (mainWindow[0x615] == 0) {
@@ -4899,7 +5777,11 @@ void __fastcall HookedSpeedTreeExport(void* arg1, void* arg2, void* arg3, bool g
             kHookRuntimeFailureExitCode,
             "native CLI model finalization raised an internal exception");
     }
+    EndNativeQpcPhase(modelFinalization);
+    const NativeQpcPhaseToken primaryExport = BeginNativeQpcPhase(
+        "native_primary_export_total");
     gOriginalSpeedTreeExport(arg1, arg2, arg3, gameExport);
+    EndNativeQpcPhase(primaryExport);
     WriteNativeReceipt();
     RunSecondaryNativeExport(arg1, gameExport);
     if (!SetNativeDeferredUiUpdateNoop(false)) {
@@ -4919,6 +5801,7 @@ void __fastcall HookedSpeedTreeExport(void* arg1, void* arg2, void* arg3, bool g
             "native CLI exporter never produced collision inputs before serialization");
     }
     Log("native CLI post-collision export completed");
+    EndNativeQpcExport(exportTelemetry);
 }
 
 template <typename FunctionType>
@@ -5184,6 +6067,15 @@ bool InstallHooks() {
             HookedInsertExportBone,
             kInsertExportBonePrologue,
             reinterpret_cast<void**>(&gOriginalInsertExportBone))) {
+        RemoveCommonHooks();
+        return false;
+    }
+    if (!InstallHook(
+            gLeafMeshExportHook,
+            reinterpret_cast<void*>(gSpeedTreeBase + kLeafMeshExportRva),
+            HookedLeafMeshExport,
+            kLeafMeshExportPrologue,
+            reinterpret_cast<void**>(&gOriginalLeafMeshExport))) {
         RemoveCommonHooks();
         return false;
     }

@@ -95,7 +95,7 @@ DEFAULT_SPEEDTREE = Path(
     r"C:\Program Files\SpeedTree\SpeedTree Modeler v10.1.0\win64\SpeedTree_Modeler.exe"
 )
 DEFAULT_BLENDER = Path(
-    r"C:\Program Files\Blender Foundation\Blender 5.1\blender.exe"
+    r"C:\Program Files\Blender Foundation\Blender 5.2\blender.exe"
 )
 DEFAULT_CLUSTER_UNIT_PROBE = Path(
     r"C:\UnrealProjects\MyProject2\work\branch_cluster_uv_audit"
@@ -144,12 +144,15 @@ def load_config() -> dict:
             default.update({key: value for key, value in loaded.items() if value is not None})
         except (OSError, json.JSONDecodeError):
             pass
+    default["blender_exe"] = str(DEFAULT_BLENDER)
     return default
 
 
 def save_config(config: dict) -> None:
+    normalized = dict(config)
+    normalized["blender_exe"] = str(DEFAULT_BLENDER)
     CONFIG_PATH.write_text(
-        json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+        json.dumps(normalized, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
 
@@ -2204,7 +2207,7 @@ class App:
                     "정규화 3D prototype/plan/texture와 Atlas 설정을 자동 재생성한 뒤 "
                     "현재 ON 대상 SPM의 Generator 연결을 갱신합니다."
                     if refresh_only else
-                    "Blender 5.1 백그라운드에서 Cluster Normalizer와 Atlas를 연속 실행해 "
+                    "Blender 5.2 백그라운드에서 Cluster Normalizer와 Atlas를 연속 실행해 "
                     "정규화 prototype/plan을 준비하고 대상 SPM의 기존 M_ 재료 mesh를 "
                     "교체합니다."
                 )

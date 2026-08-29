@@ -20,6 +20,7 @@ from pathlib import Path
 CONTRACT_SCHEMA_VERSION = 1
 GATEWAY_API_NAME = "speedtree_batch_tools.blender_addon_gateway"
 GATEWAY_API_VERSION = 1
+BLENDER_RUNTIME_VERSION = "5.2"
 
 
 OWNERSHIP = {
@@ -386,7 +387,7 @@ def discover_installed_addon_source(
     appdata=None,
     resolve_junction=True,
 ):
-    """Find the newest Blender junction/package for one known add-on.
+    """Find the Blender 5.2 junction/package for one known add-on.
 
     Source validation normally wants the resolved Git checkout. Export cache
     handoff instead needs the junction entry path Blender reports from
@@ -399,31 +400,22 @@ def discover_installed_addon_source(
         return None
     blender_root = Path(appdata) / "Blender Foundation" / "Blender"
 
-    def version_key(path):
-        parts = []
-        for value in path.name.split("."):
-            try:
-                parts.append((1, int(value)))
-            except ValueError:
-                parts.append((0, value.casefold()))
-        return tuple(parts)
-
-    versions = sorted(
-        (path for path in blender_root.iterdir() if path.is_dir()),
-        key=version_key,
-        reverse=True,
-    ) if blender_root.is_dir() else []
     module_name = ADDONS[addon_id]["module"]
-    for version in versions:
-        candidate = version / "scripts" / "addons" / module_name
-        if candidate.is_dir():
-            if not resolve_junction:
-                return candidate.absolute()
-            try:
-                return candidate.resolve()
-            except OSError:
-                return candidate.absolute()
-    return None
+    candidate = (
+        blender_root
+        / BLENDER_RUNTIME_VERSION
+        / "scripts"
+        / "addons"
+        / module_name
+    )
+    if not candidate.is_dir():
+        return None
+    if not resolve_junction:
+        return candidate.absolute()
+    try:
+        return candidate.resolve()
+    except OSError:
+        return candidate.absolute()
 
 
 def operations_for_requirements(requirements, addon_id):

@@ -63,7 +63,7 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         launcher = LAUNCHER_SOURCE.read_text(encoding="utf-8")
         contract = (
             "SPEEDTREE_COLLISION_CLI_CONTRACT="
-            "native-runtime-receipt-v6"
+            "native-runtime-receipt-v15"
         )
 
         self.assertIn(contract, launcher)
@@ -145,9 +145,106 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         self.assertIn("SpeedTree_Modeler+0x6B5185", weight_hook)
         self.assertIn("test r8d, r8d", entry_stub)
         self.assertIn("&gOriginalExportVertexWeights", entry_stub)
-        self.assertIn("Only positive IDs enter compiled hook code", entry_stub)
+        self.assertIn("CaptureNativeReceiptIdZero", entry_stub)
+        self.assertIn("tail-jump to", entry_stub)
+        self.assertIn("IDs enter the compiled weight hook", entry_stub)
         self.assertIn("FbxSkeleton::eLimbNode", source)
         self.assertIn("No spatial lookup or normalization", weight_hook)
+
+    def test_root_zone_leaf_meshes_get_exact_rigid_bones(self):
+        source = HOOK_SOURCE.read_text(encoding="utf-8")
+
+        scope = source[
+            source.index("bool IsRootZoneLeafMesh"):
+            source.index("void LogMissingIdZeroBoneRecordOnce")
+        ]
+        leaf_export = source[
+            source.index("void __fastcall HookedLeafMeshExport"):
+            source.index("void LogCollisionInputTypes")
+        ]
+        weight_hook = source[
+            source.index("void __fastcall HookedExportVertexWeights"):
+            source.index("int __fastcall CaptureNativeReceiptIdZero")
+        ]
+
+        self.assertIn(".?AVCZoneNode@@", scope)
+        self.assertIn(".?AVCStartNode@@", scope)
+        self.assertIn(".?AVCBranchNode@@", scope)
+        self.assertIn(".?AVCFrondNode@@", scope)
+        self.assertIn("return sawZone", scope)
+        self.assertIn("!clusterSource && IsRootZoneLeafMesh", leaf_export)
+        self.assertIn("!clusterSource && IsBaseRefBranchLeafMesh", leaf_export)
+        self.assertIn("rootZoneLeaf || baseRefBranchLeaf", leaf_export)
+        self.assertIn("geometryEndBefore == geometryEndAfter", leaf_export)
+        self.assertIn("if (!needsSyntheticBone)", leaf_export)
+        self.assertIn("ReserveSyntheticLeafBoneId", leaf_export)
+        self.assertIn("primary.overrideWeight = syntheticLeafWeight", weight_hook)
+        self.assertIn("primary.replacementWeight = 1.0", weight_hook)
+        self.assertIn("RemoveHook(gLeafMeshExportHook)", source)
+        self.assertIn("HookedLeafMeshExport", source[source.index("bool InstallHooks"):])
+
+    def test_baseref_branch_leaf_meshes_get_exact_rigid_bones(self):
+        source = HOOK_SOURCE.read_text(encoding="utf-8")
+        scope = source[
+            source.index("bool IsBaseRefBranchLeafMesh"):
+            source.index("void LogMissingIdZeroBoneRecordOnce")
+        ]
+
+        self.assertIn(".?AVCBranchNode@@", scope)
+        self.assertIn(".?AVCBaseNode@@", scope)
+        self.assertIn(".?AVCBaseRefNode@@", scope)
+        self.assertIn("baseBytes + 0x2C8", scope)
+        self.assertIn("baseBytes + 0x2D0", scope)
+        self.assertIn("targetBranch", scope)
+        root_scope = source[
+            source.index("bool IsRootZoneLeafMesh"):
+            source.index("bool IsBaseRefBranchLeafMesh")
+        ]
+        self.assertNotIn(
+            'std::strcmp(type, ".?AVCBaseNode@@") == 0', root_scope
+        )
+
+    def test_cluster_sources_keep_single_axis_reference_bone_policy(self):
+        source = HOOK_SOURCE.read_text(encoding="utf-8")
+        classifier = source[
+            source.index("bool IsClusterSourceInput"):
+            source.index("void LogMissingIdZeroBoneRecordOnce")
+        ]
+        leaf_export = source[
+            source.index("void __fastcall HookedLeafMeshExport"):
+            source.index("void LogCollisionInputTypes")
+        ]
+
+        self.assertIn('L"cluster"', classifier)
+        self.assertIn('L"SK_cluster_"', classifier)
+        self.assertIn("!clusterSource && IsRootZoneLeafMesh", leaf_export)
+        self.assertIn("!clusterSource && IsBaseRefBranchLeafMesh", leaf_export)
+        self.assertIn("NativeParsedBoneCount() == 0", leaf_export)
+
+    def test_zero_bone_spm_gets_one_absolute_rigid_fallback(self):
+        source = HOOK_SOURCE.read_text(encoding="utf-8")
+        leaf_export = source[
+            source.index("void __fastcall HookedLeafMeshExport"):
+            source.index("void LogCollisionInputTypes")
+        ]
+        id_zero = source[
+            source.index("int __fastcall CaptureNativeReceiptIdZero"):
+            source.index("void FreeExportVertexWeightsEntryStub")
+        ]
+        weight_hook = source[
+            source.index("void __fastcall HookedExportVertexWeights"):
+            source.index("int __fastcall CaptureNativeReceiptIdZero")
+        ]
+
+        self.assertIn("!needsSyntheticBone && NativeParsedBoneCount() == 0", leaf_export)
+        self.assertIn("ReserveZeroBoneAbsoluteFallbackId", leaf_export)
+        self.assertIn("fallback.parentId = 0", leaf_export)
+        self.assertIn("fallback.start[0] = 0.0f", leaf_export)
+        self.assertIn("fallback.end[2] = 1.0f", leaf_export)
+        self.assertIn("gZeroBoneAbsoluteFallbackId", id_zero)
+        self.assertIn("effectiveBoneId = gZeroBoneAbsoluteFallbackId", id_zero)
+        self.assertIn("sourceBoneId == gZeroBoneAbsoluteFallbackId", weight_hook)
+        self.assertIn("primary.replacementWeight = 1.0", weight_hook)
 
     def test_disappeared_persistent_pipe_starts_a_replacement(self):
         source = LAUNCHER_SOURCE.read_text(encoding="utf-8")
@@ -255,6 +352,77 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
             "bundled secondary collision refresh suppressed",
             hook,
         )
+
+    def test_native_cli_logs_large_native_phases_with_qpc(self):
+        hook = HOOK_SOURCE.read_text(encoding="utf-8")
+        receipt_capture = hook[
+            hook.index("void CaptureNativeReceiptProxy"):
+            hook.index("void CaptureNativeReceiptBone")
+        ]
+        vertex_weights = hook[
+            hook.index("void __fastcall HookedExportVertexWeights"):
+            hook.index("int __fastcall CaptureNativeReceiptIdZero")
+        ]
+
+        self.assertIn("QueryPerformanceCounter", hook)
+        self.assertIn("QueryPerformanceFrequency", hook)
+        self.assertIn(
+            '"QPC1 phase=%s export=%u collision_pass=%u start_ticks=%lld "',
+            hook,
+        )
+        for phase in (
+            "native_raw_model_update",
+            "interactive_generator_prepare",
+            "interactive_generator_rebuild",
+            "native_full_document_stage",
+            "shade_pruning_volume_generation",
+            "native_export_geometry_build",
+            "native_receipt_json_serialization",
+            "native_secondary_export_total",
+        ):
+            self.assertIn(f'"{phase}"', hook)
+        self.assertIn('"collision_post_input_compute",\n        1', hook)
+        self.assertIn('"collision_post_regeneration_compute",\n                2', hook)
+        self.assertIn(
+            '"collision_post_regeneration_direct_fallback_compute",',
+            hook,
+        )
+        self.assertIn('"collision_prebuild_safety_fallback_compute"', hook)
+        self.assertNotIn("QueryPerformanceCounter", receipt_capture)
+        self.assertNotIn("BeginNativeQpcPhase", receipt_capture)
+        self.assertNotIn("QueryPerformanceCounter", vertex_weights)
+        self.assertNotIn("BeginNativeQpcPhase", vertex_weights)
+
+    def test_native_receipt_bone_identity_lookup_is_exact_and_reset(self):
+        hook = HOOK_SOURCE.read_text(encoding="utf-8")
+        capture = hook[
+            hook.index("void CaptureNativeReceiptBone"):
+            hook.index("void __fastcall HookedExportVertexWeights")
+        ]
+        reset = hook[
+            hook.index("void ResetNativeReceiptCapture"):
+            hook.index("int NativeReceiptGeometryOrdinal")
+        ]
+
+        self.assertIn(
+            "std::unordered_map<int, std::size_t> "
+            "gNativeReceiptBoneIndexes;",
+            hook,
+        )
+        self.assertIn("gNativeReceiptBoneIndexes.find(row.boneId)", capture)
+        self.assertNotIn("std::find_if", capture)
+        self.assertIn("existing.parentId != row.parentId", capture)
+        self.assertIn(
+            "std::memcmp(existing.start, row.start, sizeof(row.start)) != 0",
+            capture,
+        )
+        self.assertIn(
+            "std::memcmp(existing.end, row.end, sizeof(row.end)) != 0",
+            capture,
+        )
+        self.assertIn("conflicting parent or coordinates", capture)
+        self.assertIn("gNativeReceiptFbxNodeNames.clear();", reset)
+        self.assertIn("gNativeReceiptBoneIndexes.clear();", reset)
 
     def test_verification_exports_skip_only_the_expensive_post_bake(self):
         launcher = LAUNCHER_SOURCE.read_text(encoding="utf-8")

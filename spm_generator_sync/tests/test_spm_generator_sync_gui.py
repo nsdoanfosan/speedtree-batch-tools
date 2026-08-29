@@ -1,6 +1,7 @@
 import gc
 import importlib.machinery
 import importlib.util
+import json
 import queue
 import sys
 import tempfile
@@ -58,6 +59,27 @@ class GeneratorSyncGuiCacheTests(unittest.TestCase):
         # on the test runner's main thread before a later background-job test
         # can become the thread that happens to trigger cyclic collection.
         gc.collect()
+
+    def test_config_is_blender_52_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path = Path(temporary) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "blender_exe": (
+                            r"C:\Program Files\Blender Foundation"
+                            r"\Blender 5.1\blender.exe"
+                        )
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(GUI, "CONFIG_PATH", config_path):
+                loaded = GUI.load_config()
+                self.assertEqual(loaded["blender_exe"], str(GUI.DEFAULT_BLENDER))
+                GUI.save_config(loaded | {"blender_exe": "legacy.exe"})
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["blender_exe"], str(GUI.DEFAULT_BLENDER))
 
     def test_connected_report_checkpoint_is_fsynced_and_atomic_on_failure(self):
         with tempfile.TemporaryDirectory() as temporary:

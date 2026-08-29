@@ -4,6 +4,7 @@ import sys
 import tempfile
 import types
 import unittest
+import stat
 from pathlib import Path
 
 
@@ -129,6 +130,41 @@ class DynamicWindFinalSkeletonContractTests(unittest.TestCase):
                     }
                 },
                 {"status": "skipped"},
+            )
+
+    def test_prechecked_package_read_only_bit_is_repaired_before_save(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory() as temporary:
+            content = Path(temporary) / "Content"
+            package = content / "Trees" / "Assembly" / "SK_Tree.uasset"
+            package.parent.mkdir(parents=True)
+            package.write_bytes(b"asset")
+            package.chmod(stat.S_IREAD)
+            runner.unreal.Paths = types.SimpleNamespace(
+                project_content_dir=lambda: str(content),
+                convert_relative_path_to_full=lambda value: value,
+            )
+
+            result = runner._ensure_declared_package_writable(
+                {"checkout_asset_paths": [
+                    "/Game/Trees/Assembly/SK_Tree",
+                ]},
+                "/Game/Trees/Assembly/SK_Tree.SK_Tree",
+            )
+
+            self.assertEqual(result["status"], "writable")
+            self.assertTrue(result["read_only_cleared"])
+            self.assertTrue(package.stat().st_mode & stat.S_IWUSR)
+
+    def test_package_writability_repair_rejects_undeclared_asset(self):
+        runner = load_runner()
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "absent from the immutable checkout manifest",
+        ):
+            runner._ensure_declared_package_writable(
+                {"checkout_asset_paths": ["/Game/Trees/SK_Other"]},
+                "/Game/Trees/SK_Tree",
             )
 
     @staticmethod
@@ -1233,6 +1269,55 @@ class NaniteVoxelMaterialUsageTests(unittest.TestCase):
         result = runner._ensure_nanite_voxel_material_usage(material)
 
         self.assertFalse(result["changed"])
+
+    def test_unchanged_usage_does_not_recompile_assembly_referencers(self):
+        runner = load_runner()
+        base = self.FakeMaterial({
+            "used_with_skeletal_mesh": True,
+            "used_with_nanite": True,
+            "used_with_voxels": True,
+        })
+
+        class FakeInterface:
+            def get_path_name(self):
+                return "/Game/Material/MI_Tree.MI_Tree"
+
+            def get_base_material(self):
+                return base
+
+        class FakeSlot:
+            def get_editor_property(self, name):
+                return "M_Tree" if name == "material_slot_name" else FakeInterface()
+
+        class FakeMesh:
+            def get_editor_property(self, name):
+                assert name == "materials"
+                return [FakeSlot()]
+
+        runner.unreal.EditorAssetSubsystem = object()
+        runner.unreal.get_editor_subsystem = lambda _type: self.fail(
+            "unchanged material must not be checked out"
+        )
+        runner.unreal.EditorAssetLibrary = types.SimpleNamespace(
+            load_asset=lambda _path: FakeMesh()
+        )
+        runner.unreal.MaterialEditingLibrary = types.SimpleNamespace(
+            recompile_material=lambda _material: self.fail(
+                "unchanged master material must not be recompiled"
+            )
+        )
+        runner.audit_unreal_skeletal_mesh_material_sections = (
+            lambda *_args: {"status": "ok"}
+        )
+
+        result = runner._material_compile_and_slot_validation(
+            "/Game/Meshes/SK_Tree"
+        )
+
+        self.assertEqual(
+            result["nanite_voxel_material_usage"][0]["compile"],
+            "skipped_unchanged",
+        )
 
 
 class UnrealIngestSaveTests(unittest.TestCase):
@@ -2811,3 +2896,32 @@ class PreImportMaterialSlotNormalizationTests(unittest.TestCase):
             runner._clear_unreferenced_canonical_redirector(canonical)
 
         self.assertIn(canonical, assets)
+
+
+class UnrealIngestCrashBudgetTests(unittest.TestCase):
+    """A crash budget must gate reproducible crashes, not fresh work."""
+
+    def test_crash_count_carries_while_the_queued_work_is_unchanged(self):
+        runner = load_runner()
+
+        self.assertEqual(
+            runner._inherited_crash_count(
+                {"fingerprint": "abc", "crash_count": 2}, "abc"
+            ),
+            2,
+        )
+
+    def test_rebuilt_inputs_start_with_a_clean_crash_budget(self):
+        runner = load_runner()
+
+        self.assertEqual(
+            runner._inherited_crash_count(
+                {"fingerprint": "old", "crash_count": 2}, "new"
+            ),
+            0,
+        )
+
+    def test_missing_previous_state_starts_at_zero(self):
+        runner = load_runner()
+
+        self.assertEqual(runner._inherited_crash_count({}, "new"), 0)

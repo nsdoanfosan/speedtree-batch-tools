@@ -14,6 +14,7 @@ import importlib.util
 import json
 import os
 import re
+import stat
 import sys
 import traceback
 import uuid
@@ -216,6 +217,72 @@ def _checkout_existing_assets(item):
         "existing": existing,
         "checked_out": existing,
         "provider_binding": provider_binding,
+    }
+
+
+def _ensure_declared_package_writable(item, asset_path):
+    """Recheck one predeclared package immediately before a durable save.
+
+    Perforce checkout happens before Unreal starts and again through the editor
+    subsystem.  A generated Assembly rebuild can nevertheless leave the old
+    package's Windows read-only bit set before SavePackage replaces it.  Only
+    exact packages already frozen into ``checkout_asset_paths`` are eligible
+    for this final filesystem repair.
+    """
+    package = str(asset_path or "").split(".", 1)[0].replace("\\", "/")
+    declared = {
+        str(value or "").split(".", 1)[0].replace("\\", "/").casefold()
+        for value in (item.get("checkout_asset_paths") or [])
+        if str(value or "").strip()
+    }
+    if package.casefold() not in declared:
+        raise RuntimeError(
+            "durable save package is absent from the immutable checkout "
+            f"manifest: {package}"
+        )
+    if not package.casefold().startswith("/game/"):
+        raise RuntimeError(f"durable save package is outside /Game: {package}")
+    content_dir = Path(
+        unreal.Paths.convert_relative_path_to_full(
+            unreal.Paths.project_content_dir()
+        )
+    )
+    package_file = content_dir.joinpath(
+        *package[len("/Game/") :].split("/")
+    ).with_suffix(".uasset")
+    if not package_file.is_file():
+        return {
+            "asset": package,
+            "package_file": str(package_file),
+            "status": "new_package",
+            "read_only_cleared": False,
+        }
+
+    def is_read_only():
+        details = package_file.stat()
+        attributes = getattr(details, "st_file_attributes", None)
+        if attributes is not None:
+            return bool(
+                attributes
+                & getattr(stat, "FILE_ATTRIBUTE_READONLY", 1)
+            )
+        return not bool(details.st_mode & stat.S_IWUSR)
+
+    cleared = False
+    if is_read_only():
+        details = package_file.stat()
+        package_file.chmod(details.st_mode | stat.S_IWRITE | stat.S_IWUSR)
+        cleared = True
+    if is_read_only():
+        raise RuntimeError(
+            "prechecked package remains read-only immediately before save: "
+            + str(package_file)
+        )
+    return {
+        "asset": package,
+        "package_file": str(package_file),
+        "status": "writable",
+        "read_only_cleared": cleared,
     }
 
 
@@ -2193,9 +2260,13 @@ def _ingest_cluster_assembly(send2ue_unreal, item, full_wind):
     for optimization in optimizations:
         _finalize_speedtree_skeletal_optimization(optimization)
     persisted_generated_assets = []
+    save_writability = []
     for imported in generated_assets:
         asset_path = imported.get("asset_path") if isinstance(imported, dict) else None
         if asset_path:
+            save_writability.append(
+                _ensure_declared_package_writable(item, asset_path)
+            )
             if not unreal.EditorAssetLibrary.save_asset(
                 asset_path,
                 only_if_is_dirty=False,
@@ -2206,6 +2277,10 @@ def _ingest_cluster_assembly(send2ue_unreal, item, full_wind):
             persisted_generated_assets.append(asset_path)
     result = build_unreal_nanite_assembly(unreal, manifest, asset_contract)
     assembly_path = result.get("assembly")
+    if assembly_path:
+        save_writability.append(
+            _ensure_declared_package_writable(item, assembly_path)
+        )
     if assembly_path and not unreal.EditorAssetLibrary.save_asset(
         assembly_path,
         only_if_is_dirty=False,
@@ -2223,6 +2298,7 @@ def _ingest_cluster_assembly(send2ue_unreal, item, full_wind):
         "assets": generated_assets,
         "optimizations": optimizations,
         "persisted_generated_assets": persisted_generated_assets,
+        "save_writability": save_writability,
         "skeleton_reimports": skeleton_reimports,
         "build": result,
         "materials": materials,
@@ -2307,9 +2383,12 @@ def _material_compile_and_slot_validation(mesh_path):
             continue
         compiled_base_materials.add(base_path)
         usage = _ensure_nanite_voxel_material_usage(base_material)
-        errors = unreal.MaterialEditingLibrary.recompile_material(base_material) or []
-        compile_errors.extend(f"{base_path}: {error}" for error in errors)
         if usage["changed"]:
+            errors = (
+                unreal.MaterialEditingLibrary.recompile_material(base_material)
+                or []
+            )
+            compile_errors.extend(f"{base_path}: {error}" for error in errors)
             if not unreal.EditorAssetLibrary.save_asset(
                 base_path,
                 only_if_is_dirty=False,
@@ -2319,6 +2398,14 @@ def _material_compile_and_slot_validation(mesh_path):
                     + base_path
                 )
             usage["saved"] = True
+            usage["compile"] = "recompiled_after_usage_change"
+        else:
+            # Recompiling an unchanged master material invalidates every
+            # referring Nanite Assembly.  Large vegetation Assemblies can then
+            # spend minutes rebuilding even though neither the material nor
+            # the Assembly changed.  The existing compiled material is already
+            # authoritative when all required usage flags are present.
+            usage["compile"] = "skipped_unchanged"
         usage_validation.append(usage)
 
     if missing:
@@ -2509,7 +2596,22 @@ def _initial_checkpoint(manifest):
     }
 
 
-def _recover_interrupted_item(checkpoint, manifest_items, max_item_crash_retries):
+def _inherited_crash_count(previous, fingerprint):
+    """Carry a crash count only while the queued work is unchanged.
+
+    ``crash_count`` exists to stop an item that reproducibly kills
+    UnrealEditor-Cmd from looping forever.  A different ``fingerprint`` means
+    the FBX/manifest inputs were rebuilt, so it is new work and must start with
+    a clean budget.  Without this reset a freshly prepared asset could inherit
+    an exhausted count from an older attempt and be demoted straight to
+    ``manual_required`` without ever being imported once.
+    """
+    if previous.get("fingerprint") != fingerprint:
+        return 0
+    return int(previous.get("crash_count", 0))
+
+
+def _recover_interrupted_item(checkpoint, max_item_crash_retries):
     current_id = checkpoint.get("current_item")
     if not current_id:
         return
@@ -2533,7 +2635,8 @@ def _recover_interrupted_item(checkpoint, manifest_items, max_item_crash_retries
                 "status": "manual_required",
                 "message": (
                     "Unreal commandlet crash retry limit exceeded "
-                    f"({max_item_crash_retries})"
+                    f"({max_item_crash_retries}); an operator stop counts as a "
+                    "crash, so clear it with --reset-item-retries to requeue"
                 ),
             }
         )
@@ -2557,7 +2660,7 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
     manifest_items = _manifest_items_dependency_order(
         manifest.get("items") or []
     )
-    _recover_interrupted_item(checkpoint, manifest_items, max_retries)
+    _recover_interrupted_item(checkpoint, max_retries)
     _atomic_write_json(checkpoint_path, checkpoint)
 
     for item in manifest_items:
@@ -2592,7 +2695,7 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
             state = {
                 "status": "not_run",
                 "fingerprint": fingerprint,
-                "crash_count": int(previous.get("crash_count", 0)),
+                "crash_count": _inherited_crash_count(previous, fingerprint),
                 "message": dependency_message,
                 "completed_at": _now(),
                 "updated_at": _now(),
@@ -2615,7 +2718,7 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
         ):
             continue
 
-        crash_count = int(previous.get("crash_count", 0))
+        crash_count = _inherited_crash_count(previous, fingerprint)
         state = {
             "status": "importing",
             "fingerprint": fingerprint,

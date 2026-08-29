@@ -18,16 +18,14 @@ if str(SK_BATCH) not in sys.path:
 from cluster_assembly_builder import (  # noqa: E402
     ClusterAssemblyBuildError,
     ROLE_ORDER,
-    attachment_locked_safe_transform,
     build_blender_assembly_inputs,
+    build_unreal_nanite_assembly,
     build_unreal_ingest_plan,
     compose_similarity_with_relative_matrix,
     content_build_decision,
-    derive_endpoint_uniform_similarity_transform,
+    derive_exact_plan_line_transform,
+    derive_exact_unreal_import_bone_name_map,
     file_fingerprint,
-    fit_trs_transform,
-    fit_uniform_similarity_transform,
-    gate_assembly_transform_residuals,
     lowest_common_ancestor,
     make_skeleton_snapshot,
     snapshot_blender_armature,
@@ -46,6 +44,9 @@ from cluster_assembly_builder import (  # noqa: E402
     _component_signature,
     _current_unreal_skeleton_diagnostic,
     _expected_normalized_bounds_for_variant,
+    _build_loop_triangle_polygon_index,
+    _build_target_loop_triangle_indices,
+    _exact_plan_line_correspondence,
     _exact_native_attachment_influences,
     _export_selected_fbx,
     _configure_final_assembly_preserve_area,
@@ -55,21 +56,24 @@ from cluster_assembly_builder import (  # noqa: E402
     _ordered_cross_object_correspondence,
     _partition_components_by_native_runtime_owner,
     _partition_normalized_render_components,
+    _prepare_exact_source_plan_line,
+    _role_geometry_sources,
     _role_material_polygons,
     _strip_fbx_scene_textures,
     _validate_capture_receipt,
     _validate_role_component_claims,
     _vertex_descriptors,
     validate_binding_hierarchy,
-    validate_generated_assembly_reference_pose_sync,
     validate_manifest_artifacts,
     validate_normalized_prototype_unit_contract,
     validate_unreal_asset_contract,
     validate_unreal_bounds_contract,
     validate_unreal_normalized_prototype_bounds,
     validate_wind_json_against_skeleton,
-    validate_persisted_residual_gate,
     validate_file_fingerprint,
+)
+from speedtree_native_receipt import (  # noqa: E402
+    build_exact_native_receipt_index,
 )
 
 
@@ -82,6 +86,68 @@ class FakeEditorProperties:
 
     def set_editor_property(self, name, value):
         self.values[name] = value
+
+
+class UnrealNaniteAssemblyCompilationTests(unittest.TestCase):
+    class FakeSystemLibrary:
+        value = 1
+        calls = []
+
+        @classmethod
+        def reset(cls, value=1):
+            cls.value = value
+            cls.calls = []
+
+        @classmethod
+        def get_console_variable_int_value(cls, name):
+            cls.calls.append(("get", name, cls.value))
+            return cls.value
+
+        @classmethod
+        def execute_console_command(cls, _world, command):
+            cls.calls.append(("execute", command))
+            if command.startswith("Editor.AsyncSkinnedAssetCompilation "):
+                cls.value = int(command.rsplit(" ", 1)[1])
+
+    def test_build_disables_async_compilation_and_restores_it(self):
+        self.FakeSystemLibrary.reset(value=1)
+        fake_unreal = SimpleNamespace(SystemLibrary=self.FakeSystemLibrary)
+        with mock.patch(
+            "cluster_assembly_builder._build_unreal_nanite_assembly_synchronous",
+            return_value={"status": "ok"},
+        ) as inner:
+            result = build_unreal_nanite_assembly(fake_unreal, {}, {})
+
+        inner.assert_called_once_with(fake_unreal, {}, {})
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(
+            result["skinned_asset_compilation"]["during_build"],
+            0,
+        )
+        self.assertEqual(result["skinned_asset_compilation"]["restored"], 1)
+        commands = [
+            row[1] for row in self.FakeSystemLibrary.calls if row[0] == "execute"
+        ]
+        self.assertEqual(
+            commands,
+            [
+                "Editor.AsyncSkinnedAssetCompilationFinishAll",
+                "Editor.AsyncSkinnedAssetCompilation 0",
+                "Editor.AsyncSkinnedAssetCompilationFinishAll",
+                "Editor.AsyncSkinnedAssetCompilation 1",
+            ],
+        )
+
+    def test_build_restores_async_compilation_after_failure(self):
+        self.FakeSystemLibrary.reset(value=2)
+        fake_unreal = SimpleNamespace(SystemLibrary=self.FakeSystemLibrary)
+        with mock.patch(
+            "cluster_assembly_builder._build_unreal_nanite_assembly_synchronous",
+            side_effect=RuntimeError("build failed"),
+        ), self.assertRaisesRegex(RuntimeError, "build failed"):
+            build_unreal_nanite_assembly(fake_unreal, {}, {})
+
+        self.assertEqual(self.FakeSystemLibrary.value, 2)
 
 
 class FinalAssemblyNanitePolicyTests(unittest.TestCase):
@@ -441,6 +507,41 @@ class GeneratedMaterialSlotContractTests(unittest.TestCase):
                 ["M_leaf_tree_01.001", "M_bark_tree_01"],
             )
 
+    def test_generated_sidecar_uses_declared_speedtree_intent_alias(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "Full.json"
+            payload = self._sidecar_payload("SK_tree_01")
+            payload["materials"][0]["speedtree_intent"].update({
+                "material_instance_base": "Decal_Mossy_bark_01",
+                "production_group_base": "M_Decal_Mossy_bark_01",
+            })
+            payload["materials"][0]["name"] = "M_Decal_Mossy_bark_01"
+            payload["materials"][0]["slot_name"] = (
+                "M_Decal_Mossy_bark_01"
+            )
+            source.write_text(json.dumps(payload), encoding="utf-8")
+
+            result = _generated_material_sidecar(
+                {"_material_pipeline_json_path": str(source)},
+                "SK_tree_01_NA_Base",
+                root,
+                expected_material_slots=["Decal_Mossy_bark_01"],
+            )
+
+            generated = json.loads(
+                Path(result["generated"]["path"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(generated["materials"]), 1)
+            self.assertEqual(
+                generated["materials"][0]["slot_name"],
+                "M_Decal_Mossy_bark_01",
+            )
+            self.assertEqual(
+                generated["generated_material_slot_contract"]["slot_names"],
+                ["Decal_Mossy_bark_01"],
+            )
+
 class AssemblyBaseRoleExclusionTests(unittest.TestCase):
     def test_only_matched_role_polygons_are_removed(self):
         final_mesh = object()
@@ -474,54 +575,45 @@ class AssemblyBaseRoleExclusionTests(unittest.TestCase):
         )
 
 
-class GeneratedAssemblyReferencePoseSyncTests(unittest.TestCase):
-    def test_accepts_changed_pose_as_generated_output(self):
-        result = validate_generated_assembly_reference_pose_sync({
-            "success": True,
-            "changed": True,
-            "before_mismatch_index": 14,
-            "after_mismatch_index": -1,
-            "before_mesh_transform": {
-                "translation": [-206.443969727, -127.724121094, -81.055458069],
-            },
-            "target_skeleton_transform": {
-                "translation": [-206.444091797, -127.722900391, -81.055458069],
-            },
-        })
-
-        self.assertTrue(result["changed_pose_accepted"])
-        self.assertEqual(
-            result["synchronization_contract"],
-            "generated_assembly_pose_sync_attempted_v1",
+class ExactUnrealImportBoneNameMapTests(unittest.TestCase):
+    def test_maps_dropped_armature_wrapper_by_proven_index_offset(self):
+        mapping, report = derive_exact_unreal_import_bone_name_map(
+            ["Armature", "Root", "Bone_1_Start", "Bone_1_End"],
+            ["Root", "Bone_1_Start", "Bone_1_End"],
         )
+        self.assertIsNone(mapping["Armature"])
+        self.assertEqual(mapping["Root"], "Root")
+        self.assertEqual(report["index_offset"], -1)
+        self.assertFalse(report["approximation_used"])
 
-    def test_remaining_mismatch_is_diagnostic_not_a_gate(self):
-        result = validate_generated_assembly_reference_pose_sync({
-            "success": True,
-            "changed": True,
-            "before_mismatch_index": 14,
-            "after_mismatch_index": 14,
-        })
-        self.assertTrue(result["changed_pose_accepted"])
+    def test_maps_importer_root_collision_renames_by_exact_index(self):
+        mapping, report = derive_exact_unreal_import_bone_name_map(
+            ["Armature", "Root", "Bone_1_Start", "Bone_1_End", "Bone_2_End"],
+            ["root", "Root1", "Bone_1_Start", "Bone_1_End", "Bone_2_End"],
+        )
+        self.assertEqual(mapping["Armature"], "root")
+        self.assertEqual(mapping["Root"], "Root1")
+        self.assertEqual(report["index_offset"], 0)
+        self.assertEqual(len(report["renamed_by_unreal_import"]), 2)
+        self.assertFalse(report["approximation_used"])
 
-    def test_rejects_failed_sync(self):
+    def test_rejects_a_mid_hierarchy_deletion(self):
         with self.assertRaisesRegex(
             ClusterAssemblyBuildError,
-            "could not be synchronized",
+            "changed bone order",
         ):
-            validate_generated_assembly_reference_pose_sync({
-                "success": False,
-                "error": "provider failed",
-            })
+            derive_exact_unreal_import_bone_name_map(
+                ["Root", "A", "B", "C"],
+                ["Root", "B", "C"],
+            )
 
 
 class ExactNativeAttachmentInfluenceTests(unittest.TestCase):
     @staticmethod
     def _skeleton():
         return make_skeleton_snapshot([
-            {"index": 0, "name": "Armature", "parent_index": -1},
-            {"index": 1, "name": "NativeRoot", "parent_index": 0, "parent_name": "Armature"},
-            {"index": 2, "name": "CapturedChild", "parent_index": 1, "parent_name": "NativeRoot"},
+            {"index": 0, "name": "Root", "parent_index": -1},
+            {"index": 1, "name": "CapturedChild", "parent_index": 0, "parent_name": "Root"},
         ])
 
     @staticmethod
@@ -536,6 +628,7 @@ class ExactNativeAttachmentInfluenceTests(unittest.TestCase):
                 "parent_guid": "parent-guid",
                 "generator_guid": "generator-guid",
                 "authored_position_native": [1.0, 2.0, 3.0],
+                "authored_tangent_native_unit": [0.0, 1.0, 0.0],
                 "vertex_ranges": [(2, 7)],
                 "authored_position_influences": [
                     {
@@ -573,40 +666,45 @@ class ExactNativeAttachmentInfluenceTests(unittest.TestCase):
 
     def test_uses_native_runtime_owner_and_authored_weights(self):
         obj = self._object([4, 4, 4], [2, 3, 4])
+        receipt = self._receipt()
         influences, source = _exact_native_attachment_influences(
             obj,
             {"vertices": [0, 1, 2]},
             1,
-            self._receipt(),
+            receipt,
             self._skeleton(),
             "test native component",
+            native_receipt_index=build_exact_native_receipt_index(receipt),
         )
 
         self.assertEqual(influences, [
-            {"bone": "NativeRoot", "weight": 0.25},
+            {"bone": "Root", "weight": 0.25},
             {"bone": "CapturedChild", "weight": 0.75},
         ])
         self.assertEqual(
             source["policy"],
-            "native_modeler_authored_proxy_weights_v1",
+            "native_modeler_authored_proxy_weights_v2_"
+            "exact_skeleton_index_zero",
         )
         self.assertEqual(source["geometry_ordinal"], 4)
         self.assertEqual(source["native_vertex_indices"], [3])
         self.assertEqual(source["target_attachment_vertex_index"], 1)
         self.assertEqual(
             source["owner_selection_policy"],
-            "sole_exact_native_node_guid_range_intersection_v2",
+            "sole_exact_native_runtime_owner_range_intersection_v3",
         )
 
     def test_clipped_attachment_uses_sole_exact_component_intersection(self):
         obj = self._object([4, 4, 4], [0, 3, 11])
+        receipt = self._receipt()
         influences, source = _exact_native_attachment_influences(
             obj,
             {"vertices": [0, 1, 2]},
             None,
-            self._receipt(),
+            receipt,
             self._skeleton(),
             "test clipped native component",
+            native_receipt_index=build_exact_native_receipt_index(receipt),
         )
 
         self.assertEqual(influences[1]["bone"], "CapturedChild")
@@ -615,7 +713,7 @@ class ExactNativeAttachmentInfluenceTests(unittest.TestCase):
         self.assertEqual(source["unowned_native_vertex_count"], 2)
         self.assertIsNone(source["target_attachment_vertex_index"])
 
-    def test_multi_root_uses_exact_instance_source_bone(self):
+    def test_native_root_uses_exact_skeleton_index_zero_with_multiple_children(self):
         skeleton = make_skeleton_snapshot([
             {"index": 0, "name": "Root", "parent_index": -1},
             {
@@ -647,12 +745,12 @@ class ExactNativeAttachmentInfluenceTests(unittest.TestCase):
             "multi-root native component",
         )
 
-        self.assertEqual(influences[0]["bone"], "NativeRootB")
+        self.assertEqual(influences[0]["bone"], "Root")
         self.assertEqual(source["source_bone_id"], 7)
-        self.assertEqual(source["native_root_bone"], "NativeRootB")
+        self.assertEqual(source["native_root_bone"], "Root")
         self.assertEqual(
             source["native_root_resolution"],
-            "exact_instance_source_bone",
+            "exact_native_fbx_skeleton_index_zero",
         )
 
     def test_rejects_component_spanning_native_geometries(self):
@@ -958,7 +1056,10 @@ class ComponentTopologyTests(unittest.TestCase):
         self.assertEqual(len(partitioned), 2)
         self.assertEqual(
             [row["native_runtime_owner"] for row in partitioned],
-            [["node_guid", "node-a"], ["node_guid", "node-b"]],
+            [
+                ["node_guid", 3, "node-a"],
+                ["node_guid", 3, "node-b"],
+            ],
         )
         self.assertEqual(
             [len(row["polygons"]) for row in partitioned],
@@ -996,7 +1097,58 @@ class ComponentTopologyTests(unittest.TestCase):
             receipt,
         )
 
-        self.assertEqual(partitioned, components)
+        self.assertEqual(len(partitioned), 1)
+        self.assertEqual(partitioned[0]["vertices"], components[0]["vertices"])
+        self.assertEqual(partitioned[0]["polygons"], components[0]["polygons"])
+        self.assertEqual(
+            partitioned[0]["native_runtime_owner"],
+            ["node_guid", 3, "same-node"],
+        )
+        self.assertEqual(
+            partitioned[0]["native_runtime_owner_island_count"], 1
+        )
+
+    def test_same_native_owner_rejoins_disconnected_clipped_islands(self):
+        target = seam_split_test_mesh(False)
+        target.attributes = {
+            "speedtree_native_geometry_ordinal": SimpleNamespace(data=[
+                SimpleNamespace(value=3) for _vertex in target.vertices
+            ]),
+            "speedtree_native_vertex_index": SimpleNamespace(data=[
+                SimpleNamespace(value=index)
+                for index, _vertex in enumerate(target.vertices)
+            ]),
+        }
+        disconnected = [
+            {
+                "vertices": sorted({
+                    int(value) for value in target.polygons[index].vertices
+                }),
+                "polygons": [index],
+            }
+            for index in (0, 1)
+        ]
+        receipt = {"generated_instances": [{
+            "geometry_ordinal": 3,
+            "native_source_object_id": 9001,
+            "vertex_ranges": [(0, len(target.vertices) - 1)],
+        }]}
+
+        partitioned = _partition_components_by_native_runtime_owner(
+            SimpleNamespace(name="target", data=target),
+            disconnected,
+            receipt,
+        )
+
+        self.assertEqual(len(partitioned), 1)
+        self.assertEqual(partitioned[0]["polygons"], [0, 1])
+        self.assertEqual(
+            partitioned[0]["native_runtime_owner"],
+            ["native_source_object", 3, 9001],
+        )
+        self.assertEqual(
+            partitioned[0]["native_runtime_owner_island_count"], 2
+        )
 
     def test_unique_uv_face_subset_uses_the_normalized_prototype(self):
         source = seam_split_test_mesh(False)
@@ -1064,6 +1216,55 @@ class ComponentTopologyTests(unittest.TestCase):
                 {"source": prototype}, object(), target_component
             )
         self.assertIs(selected_after_larger_clip, prototype)
+
+    def test_speedtree_boundary_retriangulation_uses_unique_exact_face_identity(self):
+        source_component = object()
+        other_component = object()
+        target_component = object()
+        prototype = {
+            "object": SimpleNamespace(data=object()),
+            "component": source_component,
+        }
+        other = {
+            "object": SimpleNamespace(data=object()),
+            "component": other_component,
+        }
+        source_faces = Counter({
+            ("kept", index): 1 for index in range(44)
+        })
+        source_faces.update({
+            ("clipped_source", index): 1 for index in range(6)
+        })
+        target_faces = Counter({
+            ("kept", index): 1 for index in range(44)
+        })
+        target_faces.update({
+            ("new_boundary", index): 1 for index in range(6)
+        })
+        other_faces = Counter({
+            ("other", index): 1 for index in range(50)
+        })
+
+        def select_counter(_mesh, component):
+            if component is source_component:
+                return source_faces
+            if component is other_component:
+                return other_faces
+            return target_faces
+
+        with mock.patch(
+            "cluster_assembly_builder._component_signature",
+            return_value="target",
+        ), mock.patch(
+            "cluster_assembly_builder._component_uv_face_counter",
+            side_effect=select_counter,
+        ):
+            selected = _normalized_prototype_for_component(
+                {"source": prototype, "other": other},
+                object(),
+                target_component,
+            )
+        self.assertIs(selected, prototype)
 
     def test_speedtree_two_sided_render_matches_clipped_normalized_prototype(self):
         source_component = object()
@@ -1181,10 +1382,36 @@ class ComponentTopologyTests(unittest.TestCase):
             self.assertEqual(source_indices, [3, 5, 4])
             self.assertEqual(
                 evidence["policy"],
-                "all_candidates_topology_disambiguated_fail_closed_v1",
+                "exact_surviving_uv_identity_fail_closed_v2",
             )
             resolved.append(source_indices)
         self.assertEqual(resolved[0], resolved[1])
+
+    def test_new_clipped_boundary_uv_is_not_used_as_correspondence(self):
+        source = seam_split_test_mesh(False)
+        target = seam_split_test_mesh(False)
+        target.uv_layers.active.data[1].uv.x = 0.75
+        target.uv_layers.active.data[1].uv.y = 0.125
+        source_component = _component_groups(source, [0, 1])[0]
+        target_component = _component_groups(target, [0, 1])[0]
+
+        source_indices, target_indices, evidence = (
+            _ordered_cross_object_correspondence(
+                SimpleNamespace(data=source),
+                source_component,
+                SimpleNamespace(data=target),
+                target_component,
+                include_evidence=True,
+            )
+        )
+
+        self.assertEqual(len(source_indices), 3)
+        self.assertEqual(len(target_indices), 3)
+        self.assertEqual(evidence["target_only_uv_key_count"], 1)
+        self.assertEqual(
+            evidence["policy"],
+            "exact_surviving_uv_identity_fail_closed_v2",
+        )
 
     def test_distinct_duplicate_uv_without_unique_evidence_fails_closed(self):
         source = stacked_uv_test_mesh(identical_faces=True)
@@ -1611,6 +1838,244 @@ def fake_unreal_mesh_from_blender_bounds(
 
 
 class ContentDecisionTests(unittest.TestCase):
+    class CountingPolygons(list):
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.iteration_count = 0
+
+        def __iter__(self):
+            self.iteration_count += 1
+            return super().__iter__()
+
+    def test_role_materials_route_all_exact_slots_in_one_polygon_pass(self):
+        polygons = self.CountingPolygons([
+            SimpleNamespace(index=7, material_index=1),
+            SimpleNamespace(index=3, material_index=0),
+            SimpleNamespace(index=9, material_index=2),
+            SimpleNamespace(index=4, material_index=0),
+        ])
+        merged = SimpleNamespace(data=SimpleNamespace(
+            materials=[
+                SimpleNamespace(name="M_branch_tree_01"),
+                SimpleNamespace(name="M_leaf_tree_01"),
+                SimpleNamespace(name="M_Bark_tree_01"),
+            ],
+            polygons=polygons,
+        ))
+        normalized = {"status": "ready", "variants": [{"ordinal": 1}]}
+
+        rendered, unused = _role_material_polygons(merged, [
+            {
+                "role": "branch",
+                "role_identity": "M_branch_tree_01",
+                "normalized_variants": normalized,
+            },
+            {
+                "role": "leaf",
+                "role_identity": "M_leaf_tree_01",
+                "normalized_variants": normalized,
+            },
+            {
+                "role": "cluster",
+                "role_identity": "M_cluster_tree_01",
+                "assignments": [{"used_polygon_count": 1}],
+                "normalized_variants": normalized,
+            },
+        ])
+
+        self.assertEqual(polygons.iteration_count, 1)
+        self.assertEqual(rendered["branch"]["polygon_indices"], [3, 4])
+        self.assertEqual(rendered["leaf"]["polygon_indices"], [7])
+        self.assertEqual(rendered["cluster"]["polygon_indices"], [9])
+        self.assertEqual(unused, {})
+
+    def test_role_material_slot_conflict_fails_before_polygon_iteration(self):
+        polygons = self.CountingPolygons([
+            SimpleNamespace(index=0, material_index=0),
+        ])
+        merged = SimpleNamespace(data=SimpleNamespace(
+            materials=[SimpleNamespace(name="M_shared_cards_01")],
+            polygons=polygons,
+        ))
+
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "claimed by multiple roles",
+        ):
+            _role_material_polygons(merged, [
+                {"role": "branch", "role_identity": "M_shared_cards_01"},
+                {"role": "leaf", "role_identity": "M_shared_cards_01"},
+            ])
+
+        self.assertEqual(polygons.iteration_count, 0)
+
+    def test_source_roles_share_one_polygon_pass_per_source_object(self):
+        final_polygons = self.CountingPolygons()
+        final_mesh = SimpleNamespace(
+            data=SimpleNamespace(materials=[], polygons=final_polygons),
+            get=lambda name, default="": (
+                "C:/Trees/SK_tree_01.fbx"
+                if name == "codex_source_fbx"
+                else default
+            ),
+        )
+        source_polygons = self.CountingPolygons([
+            SimpleNamespace(index=0, material_index=0),
+            SimpleNamespace(index=1, material_index=1),
+        ])
+        source_mesh = SimpleNamespace(
+            name="SpeedTree_Source_Mesh",
+            type="MESH",
+            data=SimpleNamespace(
+                materials=[
+                    SimpleNamespace(name="M_branch_tree_01"),
+                    SimpleNamespace(name="M_leaf_tree_01"),
+                ],
+                polygons=source_polygons,
+            ),
+            users_collection=[SimpleNamespace(name="SpeedTree_Source")],
+            get=lambda name, default="": (
+                "C:/Trees/SK_tree_01.fbx"
+                if name == "codex_source_fbx"
+                else default
+            ),
+        )
+        roles, unused, targets = _role_geometry_sources(
+            SimpleNamespace(data=SimpleNamespace(
+                objects=[final_mesh, source_mesh]
+            )),
+            final_mesh,
+            [
+                {"role": "branch", "role_identity": "M_branch_tree_01"},
+                {"role": "leaf", "role_identity": "M_leaf_tree_01"},
+            ],
+        )
+
+        self.assertEqual(final_polygons.iteration_count, 1)
+        self.assertEqual(source_polygons.iteration_count, 1)
+        self.assertEqual(set(roles), {"branch", "leaf"})
+        self.assertEqual(unused, {})
+        self.assertIs(targets["branch"], source_mesh)
+        self.assertIs(targets["leaf"], source_mesh)
+
+    def test_duplicate_provider_keeps_frozen_last_row_fallback_candidates(self):
+        polygons = self.CountingPolygons([
+            SimpleNamespace(index=10, material_index=0),
+            SimpleNamespace(index=20, material_index=1),
+            SimpleNamespace(index=30, material_index=2),
+        ])
+        merged = SimpleNamespace(data=SimpleNamespace(
+            materials=[
+                SimpleNamespace(name="M_A"),
+                SimpleNamespace(name="M_B"),
+                SimpleNamespace(name="M_Bark"),
+            ],
+            polygons=polygons,
+        ))
+        normalized = {"status": "ready", "variants": [{"ordinal": 1}]}
+
+        rendered, unused = _role_material_polygons(merged, [
+            {
+                "role": "first",
+                "provider_key": "same",
+                "role_identity": "M_A",
+                "normalized_variants": normalized,
+            },
+            {
+                "role": "second",
+                "provider_key": "same",
+                "role_identity": "M_B",
+                "normalized_variants": normalized,
+            },
+            {
+                "role": "missing",
+                "provider_key": "missing",
+                "role_identity": "M_Missing",
+                "assignments": [{"used_polygon_count": 1}],
+                "normalized_variants": normalized,
+            },
+        ])
+
+        self.assertEqual(polygons.iteration_count, 1)
+        self.assertEqual(rendered["same"]["polygon_indices"], [20])
+        self.assertEqual(rendered["missing"]["polygon_indices"], [10, 30])
+        self.assertEqual(unused, {})
+
+    def test_source_shared_slot_keeps_frozen_role_local_conflict_scope(self):
+        final_polygons = self.CountingPolygons()
+        final_mesh = SimpleNamespace(
+            data=SimpleNamespace(materials=[], polygons=final_polygons),
+            get=lambda _name, default="": default,
+        )
+        source_polygons = self.CountingPolygons([
+            SimpleNamespace(index=0, material_index=0),
+        ])
+        source_mesh = SimpleNamespace(
+            name="Shared_Source",
+            type="MESH",
+            data=SimpleNamespace(
+                materials=[SimpleNamespace(name="M_shared")],
+                polygons=source_polygons,
+            ),
+            users_collection=[SimpleNamespace(name="SpeedTree_Source")],
+            get=lambda _name, default="": default,
+        )
+
+        roles, unused, targets = _role_geometry_sources(
+            SimpleNamespace(data=SimpleNamespace(
+                objects=[final_mesh, source_mesh]
+            )),
+            final_mesh,
+            [
+                {
+                    "role": "branch",
+                    "provider_key": "branch:a",
+                    "role_identity": "M_shared",
+                },
+                {
+                    "role": "leaf",
+                    "provider_key": "leaf:b",
+                    "role_identity": "M_shared",
+                },
+            ],
+        )
+
+        self.assertEqual(final_polygons.iteration_count, 1)
+        self.assertEqual(source_polygons.iteration_count, 1)
+        self.assertEqual(set(roles), {"branch:a", "leaf:b"})
+        self.assertEqual(unused, {})
+        self.assertIs(targets["branch:a"], source_mesh)
+        self.assertIs(targets["leaf:b"], source_mesh)
+
+    def test_final_fallback_reuses_initial_polygon_snapshot(self):
+        final_polygons = self.CountingPolygons([
+            SimpleNamespace(index=5, material_index=0),
+        ])
+        final_mesh = SimpleNamespace(
+            data=SimpleNamespace(
+                materials=[SimpleNamespace(name="M_Bark")],
+                polygons=final_polygons,
+            ),
+            get=lambda _name, default="": default,
+        )
+        normalized = {"status": "ready", "variants": [{"ordinal": 1}]}
+
+        roles, unused, targets = _role_geometry_sources(
+            SimpleNamespace(data=SimpleNamespace(objects=[final_mesh])),
+            final_mesh,
+            [{
+                "role": "leaf",
+                "role_identity": "M_missing",
+                "assignments": [{"used_polygon_count": 1}],
+                "normalized_variants": normalized,
+            }],
+        )
+
+        self.assertEqual(final_polygons.iteration_count, 1)
+        self.assertEqual(roles["leaf"]["polygon_indices"], [5])
+        self.assertEqual(unused, {})
+        self.assertIs(targets["leaf"], final_mesh)
+
     def test_missing_final_material_uses_normalized_topology_fallback(self):
         handoff = ready_handoff()
         role = handoff["assembly"]["part_builder_inputs"][0]
@@ -2067,7 +2532,7 @@ class PhysicalProductionContractTests(unittest.TestCase):
         transform["fit_mode"] = "uniform_similarity_3d"
         with self.assertRaisesRegex(
             ClusterAssemblyBuildError,
-            "uniform-similarity transforms",
+            "exact authored uniform-scale transforms",
         ):
             validate_normalized_prototype_unit_contract(manifest)
 
@@ -2087,7 +2552,7 @@ class PhysicalProductionContractTests(unittest.TestCase):
         ]
         with self.assertRaisesRegex(
             ClusterAssemblyBuildError,
-            "uniform-similarity transforms",
+            "exact authored uniform-scale transforms",
         ):
             validate_normalized_prototype_unit_contract(manifest)
 
@@ -2734,6 +3199,241 @@ class DynamicWindContractTests(unittest.TestCase):
 
 
 class TransformAndUnrealPlanTests(unittest.TestCase):
+    @staticmethod
+    def _exact_plan_line_fixture(target_mode="unique", unrelated_triangles=0):
+        class IdentityMatrix:
+            def __matmul__(self, value):
+                return value
+
+            def __getitem__(self, index):
+                return (
+                    (1.0, 0.0, 0.0, 0.0),
+                    (0.0, 1.0, 0.0, 0.0),
+                    (0.0, 0.0, 1.0, 0.0),
+                    (0.0, 0.0, 0.0, 1.0),
+                )[index]
+
+        class CountingTriangles:
+            def __init__(self, values):
+                self.values = list(values)
+                self.iteration_count = 0
+                self.yielded_count = 0
+
+            def __iter__(self):
+                self.iteration_count += 1
+                for value in self.values:
+                    self.yielded_count += 1
+                    yield value
+
+        class Mesh:
+            def __init__(self, vertices, uv_values, triangles):
+                self.vertices = [
+                    SimpleNamespace(co=tuple(value)) for value in vertices
+                ]
+                self.uv_layers = SimpleNamespace(
+                    active=SimpleNamespace(data=[
+                        SimpleNamespace(uv=tuple(value))
+                        for value in uv_values
+                    ])
+                )
+                self.loop_triangles = CountingTriangles(triangles)
+                self.calc_loop_triangles_calls = 0
+
+            def calc_loop_triangles(self):
+                self.calc_loop_triangles_calls += 1
+
+        coordinates = [
+            (0.0, 0.0, 0.0),
+            (1.0, 2.0, 0.0),
+            (-1.0, 2.0, 0.0),
+        ]
+        source_uv = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]
+        target_uv = list(source_uv)
+        if target_mode == "zero":
+            target_uv = [(value[0] + 2.0, value[1] + 2.0) for value in target_uv]
+        source_triangles = [SimpleNamespace(
+            polygon_index=0,
+            vertices=(0, 1, 2),
+            loops=(0, 1, 2),
+        )]
+        target_triangles = [
+            SimpleNamespace(
+                polygon_index=100 + index,
+                vertices=(0, 1, 2),
+                loops=(0, 1, 2),
+            )
+            for index in range(unrelated_triangles)
+        ]
+        target_triangles.append(SimpleNamespace(
+            polygon_index=7,
+            vertices=(0, 1, 2),
+            loops=(0, 1, 2),
+        ))
+        if target_mode == "ambiguous":
+            target_triangles.append(SimpleNamespace(
+                polygon_index=7,
+                vertices=(0, 1, 2),
+                loops=(0, 1, 2),
+            ))
+        source_mesh = Mesh(coordinates, source_uv, source_triangles)
+        target_mesh = Mesh(coordinates, target_uv, target_triangles)
+        return {
+            "source_obj": SimpleNamespace(
+                name="source",
+                data=source_mesh,
+                matrix_world=IdentityMatrix(),
+            ),
+            "target_obj": SimpleNamespace(
+                name="target",
+                data=target_mesh,
+                matrix_world=IdentityMatrix(),
+            ),
+            "source_component": {
+                "polygons": [0],
+                "vertices": [0, 1, 2],
+            },
+            "target_component": {
+                "polygons": [7],
+                "vertices": [0, 1, 2],
+            },
+        }
+
+    @staticmethod
+    def _run_exact_plan_line_fixture(fixture, indexed):
+        source_obj = fixture["source_obj"]
+        target_obj = fixture["target_obj"]
+        source_component = fixture["source_component"]
+        target_component = fixture["target_component"]
+        kwargs = {}
+        if indexed:
+            source_index = _build_loop_triangle_polygon_index(
+                source_obj.data,
+                source_component["polygons"],
+            )
+            target_index = _build_loop_triangle_polygon_index(
+                target_obj.data,
+                target_component["polygons"],
+            )
+            kwargs.update({
+                "target_triangle_index": target_index,
+                "prepared_source_line": _prepare_exact_source_plan_line(
+                    source_obj,
+                    source_component,
+                    (0.0, 0.0, 0.0),
+                    1.0,
+                    source_triangle_index=source_index,
+                ),
+            })
+        return _exact_plan_line_correspondence(
+            source_obj,
+            source_component,
+            [0, 1, 2],
+            target_obj,
+            target_component,
+            [0, 1, 2],
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+            1.0,
+            **kwargs,
+        )
+
+    def test_indexed_plan_line_is_canonical_equal_to_legacy_full_scan(self):
+        legacy = self._run_exact_plan_line_fixture(
+            self._exact_plan_line_fixture(unrelated_triangles=25),
+            indexed=False,
+        )
+        indexed = self._run_exact_plan_line_fixture(
+            self._exact_plan_line_fixture(unrelated_triangles=25),
+            indexed=True,
+        )
+        canonical = lambda value: json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        self.assertEqual(canonical(indexed), canonical(legacy))
+
+    def test_indexed_plan_line_preserves_zero_and_ambiguous_fail_closed_results(self):
+        for mode in ("zero", "ambiguous"):
+            failures = []
+            for indexed in (False, True):
+                with self.assertRaises(ClusterAssemblyBuildError) as raised:
+                    self._run_exact_plan_line_fixture(
+                        self._exact_plan_line_fixture(target_mode=mode),
+                        indexed=indexed,
+                    )
+                failures.append(str(raised.exception))
+            self.assertEqual(failures[1], failures[0], mode)
+
+    def test_indexed_bindings_do_not_revisit_unrelated_mesh_triangles(self):
+        fixture = self._exact_plan_line_fixture(unrelated_triangles=10000)
+        source_obj = fixture["source_obj"]
+        target_obj = fixture["target_obj"]
+        source_index = _build_loop_triangle_polygon_index(
+            source_obj.data,
+            fixture["source_component"]["polygons"],
+        )
+        target_index = _build_loop_triangle_polygon_index(
+            target_obj.data,
+            fixture["target_component"]["polygons"],
+        )
+        prepared_source = _prepare_exact_source_plan_line(
+            source_obj,
+            fixture["source_component"],
+            (0.0, 0.0, 0.0),
+            1.0,
+            source_triangle_index=source_index,
+        )
+        for _binding in range(3):
+            _exact_plan_line_correspondence(
+                source_obj,
+                fixture["source_component"],
+                [0, 1, 2],
+                target_obj,
+                fixture["target_component"],
+                [0, 1, 2],
+                (0.0, 0.0, 0.0),
+                (0.0, 0.0, 0.0),
+                1.0,
+                target_triangle_index=target_index,
+                prepared_source_line=prepared_source,
+            )
+        self.assertEqual(source_obj.data.calc_loop_triangles_calls, 1)
+        self.assertEqual(source_obj.data.loop_triangles.iteration_count, 1)
+        self.assertEqual(target_obj.data.calc_loop_triangles_calls, 1)
+        self.assertEqual(target_obj.data.loop_triangles.iteration_count, 1)
+        self.assertEqual(
+            target_obj.data.loop_triangles.yielded_count,
+            10001,
+        )
+        self.assertEqual(target_index["indexed_triangle_count"], 1)
+
+    def test_target_triangle_index_is_built_once_per_shared_target_mesh(self):
+        fixture = self._exact_plan_line_fixture(unrelated_triangles=1)
+        target_obj = fixture["target_obj"]
+        role_build_plans = {
+            "branch:a": {
+                "target_object": target_obj,
+                "matched": {
+                    "branch": {"instances": [{"polygons": [7]}]},
+                },
+            },
+            "leaf:b": {
+                "target_object": target_obj,
+                "matched": {
+                    "leaf": {"instances": [{"polygons": [100]}]},
+                },
+            },
+        }
+        indices = _build_target_loop_triangle_indices(role_build_plans)
+        self.assertEqual(set(indices), {id(target_obj.data)})
+        self.assertEqual(
+            indices[id(target_obj.data)]["polygon_indices"],
+            frozenset({7, 100}),
+        )
+        self.assertEqual(target_obj.data.calc_loop_triangles_calls, 1)
+        self.assertEqual(target_obj.data.loop_triangles.iteration_count, 1)
+
     def test_composite_transform_applies_relative_part_after_card_fit(self):
         half = math.sqrt(0.5)
         card = {
@@ -3243,87 +3943,57 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
             )
             self.assertNotIn("Plan", json.dumps(plan))
 
-    def test_uniform_similarity_fit_is_stable_for_planar_cards(self):
-        source = [
-            [-1.0, -1.0, 0.0],
-            [1.0, -1.0, 0.0],
-            [1.0, 1.0, 0.0],
-            [-1.0, 1.0, 0.0],
-        ]
-        target = [
-            [5.0 - point[1] * 2.5, -2.0 + point[0] * 2.5, 7.0]
-            for point in source
-        ]
-        transform = fit_uniform_similarity_transform(source, target)
-        self.assertEqual(transform["fit_mode"], "uniform_similarity_3d")
-        self.assertLess(transform["trs_relative_rms"], 1.0e-10)
-        self.assertEqual(transform["scale"], [2.5, 2.5, 2.5])
-        self.assertAlmostEqual(transform["translation"][0], 5.0, places=8)
-        self.assertAlmostEqual(transform["translation"][1], -2.0, places=8)
-        self.assertAlmostEqual(transform["translation"][2], 7.0, places=8)
-
-    def test_uniform_similarity_fit_locks_authored_root_on_deformed_plan(self):
-        source = [
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [1.0, 1.0, 0.0],
-            [0.0, 1.0, 0.0],
-        ]
-        target = [
-            [5.0, -2.0, 7.0],
-            [7.0, -2.0, 7.0],
-            [7.0, 1.0, 7.5],
-            [5.0, 1.0, 7.0],
-        ]
-        transform = fit_uniform_similarity_transform(
-            source,
-            target,
-            source_attachment=source[0],
-            target_attachment=target[0],
-        )
-        self.assertEqual(
-            transform["fit_mode"],
-            "uniform_similarity_3d_attachment_locked",
-        )
-        self.assertLess(transform["attachment_pivot_error"], 1.0e-12)
-        self.assertEqual(transform["translation"], target[0])
-        self.assertEqual(
-            transform["trs_relative_rms"],
-            transform["similarity_relative_rms"],
-        )
-        self.assertLess(
-            transform["affine_relative_rms"],
-            transform["similarity_relative_rms"],
-        )
-
-    def test_endpoint_frame_locks_exact_attachment_pivot_and_preserves_rigid_plan(self):
+    def test_exact_plan_line_uses_runtime_tangent_and_uv_length_separately(self):
         source = [
             [0.0, 0.0, 0.0],
             [2.0, 0.0, 0.0],
             [1.0, 0.5, 0.0],
             [1.0, -0.5, 0.0],
         ]
+        origin = [5.0, -2.0, 7.0]
+        axis_x = [1.0, 0.0, 0.0]
+        axis_y = [0.0, 0.0, 1.0]
+        scale = 3.0
         target = [
-            [5.0 - point[1] * 3.0, -2.0 + point[0] * 3.0, 7.0]
+            [
+                origin[axis]
+                + scale * (
+                    point[0] * axis_x[axis] + point[1] * axis_y[axis]
+                )
+                for axis in range(3)
+            ]
             for point in source
         ]
-        transform = derive_endpoint_uniform_similarity_transform(
+        transform = derive_exact_plan_line_transform(
             source,
             target,
-            source_attachment=[0.0, 0.0, 0.0],
-            target_attachment=[5.0, -2.0, 7.0],
+            source_attachment=source[0],
+            target_attachment=target[0],
+            source_line_length=0.5,
+            target_line_endpoint=[6.5, -2.0, 7.0],
+            target_tangent=axis_y,
         )
-        self.assertEqual(transform["translation"], [5.0, -2.0, 7.0])
-        self.assertEqual(transform["scale"], [3.0, 3.0, 3.0])
+        self.assertEqual(transform["translation"], origin)
+        self.assertEqual(transform["scale"], [scale, scale, scale])
         self.assertLess(transform["attachment_pivot_error"], 1.0e-12)
-        self.assertLess(transform["endpoint_error"], 1.0e-12)
         self.assertLess(transform["similarity_relative_rms"], 1.0e-12)
         self.assertEqual(
             transform["construction_mode"],
-            "exact_attachment_pivot_plus_surviving_root_tip_frame_v2",
+            "exact_attachment_runtime_tangent_and_uv_plan_length_v1",
+        )
+        self.assertEqual(
+            transform["frame_evidence"]["rotation_policy"],
+            "minimum_local_positive_y_to_exact_modeler_runtime_tangent_"
+            "preserve_normalized_plan_roll",
+        )
+        self.assertAlmostEqual(
+            transform["frame_evidence"][
+                "uv_scale_axis_to_runtime_tangent_degrees_diagnostic_only"
+            ],
+            90.0,
         )
 
-    def test_endpoint_frame_does_not_move_pivot_to_fit_nonrigid_curl(self):
+    def test_exact_plan_line_does_not_move_pivot_to_fit_other_vertices(self):
         source = [
             [0.0, 0.0, 0.0],
             [2.0, 0.0, 0.0],
@@ -3333,130 +4003,39 @@ class TransformAndUnrealPlanTests(unittest.TestCase):
         target = [
             [5.0, -2.0, 7.0],
             [11.0, -2.0, 7.0],
-            [8.0, -0.5, 7.2],
-            [8.0, -3.5, 6.8],
+            [8.0, -0.5, 7.0],
+            [8.0, -3.5, 8.0],
         ]
-        transform = derive_endpoint_uniform_similarity_transform(
+        transform = derive_exact_plan_line_transform(
             source,
             target,
-            source_attachment=[0.0, 0.0, 0.0],
-            target_attachment=[5.0, -2.0, 7.0],
+            source_attachment=source[0],
+            target_attachment=target[0],
+            source_line_length=0.5,
+            target_line_endpoint=[5.0, -0.5, 7.0],
+            target_tangent=[0.0, 1.0, 0.0],
         )
         self.assertEqual(transform["translation"], [5.0, -2.0, 7.0])
         self.assertLess(transform["attachment_pivot_error"], 1.0e-12)
         self.assertGreater(transform["similarity_relative_rms"], 0.0)
 
-    def test_safe_fallback_keeps_export_attached_with_uniform_scale(self):
-        transform = attachment_locked_safe_transform(
-            [1.0, 2.0, 3.0], "endpoint unavailable"
-        )
-        self.assertEqual(transform["translation"], [1.0, 2.0, 3.0])
-        self.assertEqual(transform["scale"], [1.0, 1.0, 1.0])
-        self.assertEqual(transform["rotation_xyzw"], [0.0, 0.0, 0.0, 1.0])
-        gate = gate_assembly_transform_residuals(
-            transform,
-            {"part_asset": "SK_part"},
-            block_geometry=False,
-        )
-        self.assertEqual(gate["status"], "warning")
-
-    def test_residual_ready_gate_checks_pivot_and_all_metrics(self):
+    def test_exact_plan_line_summary_has_no_acceptance_gate(self):
         transform = {
-            "attachment_pivot_error": 0.0,
-            "similarity_relative_rms": 0.009,
-            "trs_relative_rms": 0.009,
-            "affine_relative_rms": 0.001,
-            "placement_source": "test",
+            "similarity_relative_rms": 0.125,
+            "trs_relative_rms": 0.125,
+            "placement_source": (
+                "exact_fbx_attachment_vertex__runtime_tangent_uv_plan_length"
+            ),
         }
-        gate = gate_assembly_transform_residuals(
-            transform, {"full_asset": "SK_test", "part_asset": "SK_part"}
-        )
-        self.assertEqual(gate["status"], "pass")
-        self.assertEqual(gate["threshold"], 0.01)
-        self.assertEqual(
-            validate_persisted_residual_gate(transform)["status"], "pass"
-        )
-        exact_threshold = dict(transform)
-        exact_threshold.pop("residual_gate", None)
-        exact_threshold["similarity_relative_rms"] = 0.01
-        exact_threshold["trs_relative_rms"] = 0.01
-        self.assertEqual(
-            gate_assembly_transform_residuals(
-                exact_threshold,
-                {"full_asset": "SK_test", "part_asset": "SK_part"},
-            )["status"],
-            "pass",
-        )
         summary = _assembly_fit_summary(
             [{"transform": transform}], "uniform_similarity_3d"
         )
         self.assertEqual(summary["similarity_relative_rms_count"], 1)
-        self.assertEqual(summary["residual_ready_gate"]["status"], "pass")
-
-        authored_warning = dict(transform)
-        authored_warning.pop("residual_gate", None)
-        authored_warning["similarity_relative_rms"] = 0.05
-        authored_warning["trs_relative_rms"] = 0.05
-        warning_gate = gate_assembly_transform_residuals(
-            authored_warning,
-            {"full_asset": "SK_test", "part_asset": "SK_part"},
-            block_geometry=False,
-        )
-        self.assertEqual(warning_gate["status"], "warning")
         self.assertEqual(
-            validate_persisted_residual_gate(authored_warning)["status"],
-            "warning",
+            summary["residual_scope"],
+            "diagnostic_shape_difference_not_placement_fit",
         )
-
-        for field, value, message in (
-            ("similarity_relative_rms", 0.010001, "blocked placement"),
-            ("attachment_pivot_error", 1.0001e-8, "blocked placement"),
-            ("trs_relative_rms", float("nan"), "non-finite evidence"),
-        ):
-            blocked = dict(transform)
-            blocked.pop("residual_gate", None)
-            blocked[field] = value
-            with self.subTest(field=field), self.assertRaisesRegex(
-                ClusterAssemblyBuildError, message
-            ):
-                gate_assembly_transform_residuals(
-                    blocked,
-                    {"full_asset": "SK_test", "part_asset": "SK_part"},
-                )
-
-    def test_persisted_residual_gate_detects_receipt_drift(self):
-        transform = {
-            "attachment_pivot_error": 0.0,
-            "similarity_relative_rms": 0.001,
-            "trs_relative_rms": 0.001,
-            "affine_relative_rms": 0.0001,
-        }
-        gate_assembly_transform_residuals(transform, {"part_asset": "SK_part"})
-        transform["residual_gate"]["metrics"]["trs_relative_rms"] = 0.0
-        with self.assertRaisesRegex(
-            ClusterAssemblyBuildError, "evidence drifted"
-        ):
-            validate_persisted_residual_gate(transform)
-
-    def test_trs_fit_recovers_translation_rotation_and_scale(self):
-        source = [
-            [-1.0, -1.0, 0.0],
-            [1.0, -1.0, 0.0],
-            [1.0, 1.0, 0.0],
-            [-1.0, 1.0, 0.0],
-        ]
-        # Row-vector transform: rotate 90 degrees around Z, scale (2, 3, 1),
-        # then translate.
-        target = [
-            [5.0 + (-point[1]) * 2.0, -2.0 + point[0] * 3.0, 7.0]
-            for point in source
-        ]
-        transform = fit_trs_transform(source, target)
-        self.assertLess(transform["trs_relative_rms"], 1.0e-10)
-        self.assertTrue(all(math.isfinite(value) for value in transform["rotation_xyzw"]))
-        self.assertAlmostEqual(transform["translation"][0], 5.0, places=8)
-        self.assertAlmostEqual(transform["translation"][1], -2.0, places=8)
-        self.assertAlmostEqual(transform["translation"][2], 7.0, places=8)
+        self.assertNotIn("residual_ready_gate", summary)
 
     def test_bounds_gate_rejects_the_observed_unreal_yz_axis_swap(self):
         full = {

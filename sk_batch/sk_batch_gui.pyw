@@ -244,6 +244,7 @@ from sk_common import (
     PUSH_ABORT_KINDS,
     PUSH_MANIFEST_SCHEMA_VERSION,
     PUSH_SOURCE_FINGERPRINT_CACHE_VERSION,
+    UNREAL_COMMANDLET_BASE_ARGS,
     atomic_write_bytes,
     atomic_write_json,
     blend_path_for,
@@ -16741,7 +16742,9 @@ class App:
             else "unreal_crash"
         )
         message = (
-            f"Unreal commandlet crash retry limit exceeded ({max_item_crash_retries})"
+            "Unreal commandlet crash retry limit exceeded "
+            f"({max_item_crash_retries}); an operator stop counts as a crash, "
+            "so clear it with --reset-item-retries to requeue"
             if status == "manual_required"
             else "UnrealEditor-Cmd exited while this item was importing"
         )
@@ -17505,10 +17508,7 @@ class App:
             project,
             "-run=pythonscript",
             f"-script={runner}",
-            "-unattended",
-            "-NoSplash",
-            "-NoSound",
-            "-UTF8Output",
+            *UNREAL_COMMANDLET_BASE_ARGS,
         ]
         env = os.environ.copy()
         env.update(

@@ -207,6 +207,7 @@ class LaunchGuardTests(unittest.TestCase):
     def test_guard_exists_and_every_launcher_routes_through_it(self):
         self.assertTrue(GUARD.is_file(), f"missing launch guard: {GUARD}")
         headless_launchers = {
+            "SK_Affected_Headless_Refresh.bat",
             "SK_Cluster_Fleet_Push.bat",
             "SK_Exact_Push.bat",
         }

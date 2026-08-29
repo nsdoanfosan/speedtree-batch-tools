@@ -85,6 +85,26 @@ PRESET_DIR = ADDON_ENTRY_DIR / "presets" / "speedtree_10_1"
 CONFIG_PATH = TOOL_DIR / "sk_batch_config.json"
 STATE_PATH = TOOL_DIR / "sk_batch_state.json"
 UNREAL_WAIT_REFERENCE_FILENAME = "unreal_wait_references.json"
+
+# Switches shared by every headless ``unreal_ingest`` commandlet launch.
+#
+# ``-NoDDCCleanup`` is an engine switch consumed by
+# ``FileSystemCacheStore.cpp`` (``bDeleteUnused = bDeleteUnused &&
+# !FParse::Param(FCommandLine::Get(), TEXT("NoDDCCleanup"))``).  When it is
+# absent the local FileSystem DDC store spawns a background maintainer that
+# walks the whole cache on every process start.  On this workstation that is a
+# ~96 GiB / 89k file / 81k folder scan costing about three minutes per launch
+# while deleting nothing, because SK Batch runs are short lived and never age
+# entries out.  Batch ingest is throwaway work for the cache, so the scan is
+# pure overhead and is disabled for our commandlet only; interactive editor
+# sessions keep the engine default.
+UNREAL_COMMANDLET_BASE_ARGS = (
+    "-unattended",
+    "-NoSplash",
+    "-NoSound",
+    "-UTF8Output",
+    "-NoDDCCleanup",
+)
 LOG_DIR = TOOL_DIR / "logs"
 STATE_RECOVERY_LOG_PATH = LOG_DIR / "state_recovery.log"
 STATE_RECOVERY_LOG_MAX_BYTES = 64 * 1024
@@ -114,7 +134,7 @@ def send2ue_export_cache_root():
 
 DEFAULT_CONFIG = {
     "root": r"D:\OneDrive\Forestportfolio\02_nature\Tree",
-    "blender_exe": r"C:\Program Files\Blender Foundation\Blender 5.1\blender.exe",
+    "blender_exe": r"C:\Program Files\Blender Foundation\Blender 5.2\blender.exe",
     "speedtree_exe": r"C:\Program Files\SpeedTree\SpeedTree Modeler v10.1.0\win64\SpeedTree_Modeler.exe",
     "fbx_ini": str(PRESET_DIR / "Options_MA_Fbx.ini"),
     "xml_ini": str(PRESET_DIR / "Options_HI_Xml.ini"),
@@ -293,11 +313,14 @@ def load_config():
             cfg.update({k: v for k, v in data.items() if k in DEFAULT_CONFIG})
         except Exception:
             pass
+    cfg["blender_exe"] = DEFAULT_CONFIG["blender_exe"]
     return cfg
 
 
 def save_config(cfg):
-    _atomic_write_json(CONFIG_PATH, cfg)
+    normalized = dict(cfg)
+    normalized["blender_exe"] = DEFAULT_CONFIG["blender_exe"]
+    _atomic_write_json(CONFIG_PATH, normalized)
 
 
 def _append_bounded_state_recovery_log(message):

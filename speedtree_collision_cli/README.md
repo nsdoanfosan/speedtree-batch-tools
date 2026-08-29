@@ -18,8 +18,14 @@ SpeedTree Modeler 10.1.0의 공식 `-export` 경로가 Collision과 Shade Prunin
    FBX/XML serializer가 같은 정확한 계층을 사용하게 합니다.
 7. FBX serializer가 이미 계산한 ID 0/root influence와 단일 root의 Start
    cluster를 deform bone으로 보존합니다.
-8. 같은 serializer 호출에서 geometry/local vertex, runtime Node/Generator GUID,
-   authored position과 그 위치의 원본 bone influence를 native receipt로 기록합니다.
+8. SPM을 파싱한 export graph의 본 레코드가 0개이면 루트-절대 deform bone을
+   정확히 하나 생성하고 모든 ID 0 vertex를 weight 1로 연결합니다.
+9. 본이 이미 있는 지면형 `Leaf Mesh -> Zone -> Start` 배치와 유효한
+   `BaseRef -> target Branch`로 제작된 Branch Leaf에는 leaf별 export bone을
+   생성하고 해당 Leaf Mesh의 ID 0 vertex를 정확히 연결합니다.
+10. 같은 serializer 호출에서 geometry/local vertex, runtime Node/Generator GUID,
+   authored position, 런타임 pose의 단위 tangent와 그 위치의 원본 bone
+   influence를 native receipt로 기록합니다.
 
 Modeler 창, 파일 선택창, recovery Question, blank 문서, 마우스 포커스,
 Windows desktop 격리는 생산 경로에서 사용하지 않습니다.
@@ -80,6 +86,38 @@ child weight와 동일한 단정도 연산의 보수값을 Modeler 원본 ID 0 c
 - bone이 아닌 vertex group으로 향한 양수 weight 0개
 - BaseRef 305개 XML parent 불일치 0개, FBX orphan 0개
 
+## 지면형 Leaf Mesh bone 생성
+
+SpeedTree 10.1.0은 branch나 frond 없이 루트 `Zone`에 바로 배치된 Leaf Mesh에서
+geometry는 만들지만 export bone record는 만들지 않습니다. 이 경우 serializer의
+source bone ID가 모두 0이 되어 grass 한 패치가 `Root` 하나에 붙습니다.
+
+지면 배치는 런타임 부모 체인이 정확히
+`CLeafMeshNode -> CZoneNode -> CStartNode`인 경우에 적용됩니다. 또한 과거의
+"Branch/Base 조상 Leaf Mesh 제외" 정책은 제거되었습니다. 현재는
+`Leaf Mesh -> Branch ... -> Base` 체인의 Base가 유효한
+`CBaseRefNode -> target CBranchNode` 역참조를 가질 때도 leaf별 exact bone을
+생성합니다. 불완전한 BaseRef 체인을 이름이나 위치로 추정하지 않습니다.
+
+이 변경은 최종 Tree/Grass SPM에만 적용됩니다. 부모 폴더가 `Cluster`이거나
+stem이 `SK_cluster_`인 클러스터 소스는 leaf별 synthetic bone 대상에서 제외하며,
+기존의 축 변환·방향 판정용 단일 절대 기준 본 정책을 유지합니다.
+
+대상 Leaf Mesh가 실제 geometry를 생성했을 때만 authored position과 pose tangent로
+export bone을 하나 삽입합니다. 기존 ID 0 record는 그 exact bone ID로 바꾸고 모든
+vertex를 weight 1로 기록합니다. SPM/FBX 사후 repair, 파일명 분류, 최근접 bone 검색,
+외부 weight 정규화는 사용하지 않습니다.
+
+`SK_Weed_Common_grass_a_01.spm` 검증 결과는 다음과 같습니다.
+
+- 기존 velvet bone record 99개 유지
+- 실제 export된 dead/green Leaf Mesh용 bone record 82개 추가
+- dead 12,615 vertex를 62개 leaf bone에 연결, Root-only 0개
+- green 4,387 vertex를 20개 leaf bone에 연결, Root-only 0개
+- Blender 5.1에서 두 mesh의 모든 vertex weight 합 1
+- Unreal 5.8 임시 import에서 LOD0 32,012 vertex, 3 section, 363 skeleton bone 확인
+- `tree_densiflora_01` 회귀검사에서 synthetic bone 0개
+
 ## Native runtime receipt
 
 `--native-receipt`는 Modeler가 SPM을 이미 파싱한 뒤 FBX를 직렬화하는 바로 그
@@ -97,7 +135,7 @@ child weight와 동일한 단정도 연산의 보수값을 Modeler 원본 ID 0 c
 영수증에는 다음 exact identity만 들어갑니다.
 
 - serializer geometry ordinal과 정확한 local vertex 범위
-- 실제 runtime Node/parent/Generator GUID와 authored position
+- 실제 runtime Node/parent/Generator GUID와 authored position 및 pose tangent
 - Modeler 원본 weight solver가 authored position에 반환한 양수 influence
 - 실제 생성된 FBX cluster node 이름과 native bone ID/parent ID
 
@@ -107,6 +145,12 @@ Assembly는 보존된 geometry/local vertex ID와 이 범위가 교차하는 run
 local vertex가 단 하나의 runtime Node 범위를 증명하면 그 원본 authored position과
 weight를 그대로 사용합니다. 최근접 검색, 비율 투표, 이름 매칭, weight 재계산은
 없습니다.
+
+Assembly의 물리 스케일은 runtime Node의 `extent`를 사용하지 않습니다. 해당 값은
+물리 길이가 아닌 Modeler 내부 무차원 파라미터입니다. 정규화 플랜의 authored +Y
+선 끝점을 동일 UV로 원본 FBX 플랜 표면에 옮긴 실제 거리만 스케일에 사용하고,
+회전은 runtime pose tangent만 사용합니다. 피봇은 원본 attachment 위치 그대로이며
+face normal, outline extent, 최근접/최원점, 기하 fit은 사용하지 않습니다.
 
 ## 사용법
 

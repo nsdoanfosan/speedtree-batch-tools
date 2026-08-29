@@ -79,7 +79,10 @@ from cluster_assembly_handoff_contract import (
 )
 from cluster_assembly_builder import build_blender_assembly_inputs
 from job_report_contract import mark_job_failed
-from assembly_runtime_contract import ASSEMBLY_OUTPUT_CONTRACT_VERSION
+from assembly_runtime_contract import (
+    ASSEMBLY_OUTPUT_CONTRACT_VERSION,
+    assembly_runtime_code_state,
+)
 from cluster_export_handoff_contract import (
     capture_cluster_export_snapshot,
     cluster_export_contract_issues as inspect_cluster_export_contract,
@@ -121,8 +124,32 @@ def parse_args():
         help="Immutable response preset ID (legacy GRASS is accepted as WEED)",
     )
     parser.add_argument("--material-contract", required=True)
+    parser.add_argument(
+        "--cluster-assembly-contract",
+        default="",
+        help=(
+            "run-specific live Cluster Assembly audit report; kept separate "
+            "from the material preflight contract"
+        ),
+    )
     parser.add_argument("--bark-normalization-manifest", default="")
     parser.add_argument("--cluster-source-build-only", action="store_true")
+    parser.add_argument(
+        "--force-native-export",
+        action="store_true",
+        help=(
+            "bypass a reusable material-preflight FBX bundle and serialize "
+            "a fresh native SpeedTree FBX/XML/receipt with the installed hook"
+        ),
+    )
+    parser.add_argument(
+        "--force-cluster-assembly-rebuild",
+        action="store_true",
+        help=(
+            "bypass only the reusable Cluster Assembly manifest and execute "
+            "the complete current-run Assembly calculation again"
+        ),
+    )
     parser.add_argument("--report", required=True)
     return parser.parse_args(argv)
 
@@ -524,18 +551,98 @@ def export_collection_contract_issues(cluster_source_stem=""):
     )
 
 
-def inspect_cluster_assembly_fbx(receipt_path, spm_path, source_fbx_path):
+def same_resolved_fbx_source(first_path, second_path):
+    """Return true only when both inputs resolve to the same FBX path."""
+    if not first_path or not second_path:
+        return False
+    first_key = os.path.normcase(str(Path(first_path).resolve()))
+    second_key = os.path.normcase(str(Path(second_path).resolve()))
+    return first_key == second_key
+
+
+def build_cluster_assembly_handoff_from_imported(
+    receipt_path,
+    spm_path,
+    source_fbx_path,
+    imported_objects,
+    *,
+    receipt_payload=None,
+    selected_contract=None,
+):
+    """Build the existing exact inventory/handoff from one raw FBX import."""
+    if selected_contract is None:
+        _payload, contract = load_cluster_contract(receipt_path, spm_path)
+    else:
+        _payload = receipt_payload
+        contract = selected_contract
+    role_identities = role_identity_aliases_from_contract(
+        contract,
+        spm_path,
+    )
+    inventory = build_blender_fbx_inventory(
+        imported_objects,
+        source_fbx_path,
+        role_identities,
+    )
+    return build_assembly_handoff(
+        receipt_path,
+        spm_path,
+        inventory,
+        receipt_payload=_payload,
+        selected_contract=contract,
+    )
+
+
+def make_cluster_assembly_raw_import_observer(
+    receipt_path,
+    spm_path,
+    expected_source_fbx_path,
+    *,
+    receipt_payload=None,
+    selected_contract=None,
+):
+    """Create a fail-closed handoff observer plus its in-run result state."""
+    state = {}
+
+    def observer(imported_objects, imported_source_fbx_path):
+        if not same_resolved_fbx_source(
+            expected_source_fbx_path,
+            imported_source_fbx_path,
+        ):
+            raise RuntimeError(
+                "Cluster Assembly raw import observer received a different "
+                f"FBX: expected={Path(expected_source_fbx_path).resolve()} "
+                f"observed={Path(imported_source_fbx_path).resolve()}"
+            )
+        handoff = build_cluster_assembly_handoff_from_imported(
+            receipt_path,
+            spm_path,
+            expected_source_fbx_path,
+            imported_objects,
+            receipt_payload=receipt_payload,
+            selected_contract=selected_contract,
+        )
+        require_cluster_assembly_handoff_ready(handoff)
+        state["handoff"] = handoff
+        return handoff
+
+    return observer, state
+
+
+def inspect_cluster_assembly_fbx(
+    receipt_path,
+    spm_path,
+    source_fbx_path,
+    *,
+    receipt_payload=None,
+    selected_contract=None,
+):
     """Import the exact FBX in-memory and reconcile it before Assembly saves.
 
     The Assembly operator clears these tagged objects and performs its normal
     clean import.  If the contract blocks, this background Blender process exits
     without saving, so an existing user-managed Full SK blend stays untouched.
     """
-    _payload, contract = load_cluster_contract(receipt_path, spm_path)
-    role_identities = role_identity_aliases_from_contract(
-        contract,
-        spm_path,
-    )
     data_collections = ("meshes", "armatures", "materials", "images", "actions")
     before_objects = {obj.as_pointer() for obj in bpy.data.objects}
     before_data = {
@@ -555,12 +662,14 @@ def inspect_cluster_assembly_fbx(receipt_path, spm_path, source_fbx_path):
         ]
         for obj in imported:
             obj["codex_source_fbx"] = str(Path(source_fbx_path).resolve())
-        inventory = build_blender_fbx_inventory(
-            imported,
+        return build_cluster_assembly_handoff_from_imported(
+            receipt_path,
+            spm_path,
             source_fbx_path,
-            role_identities,
+            imported,
+            receipt_payload=receipt_payload,
+            selected_contract=selected_contract,
         )
-        return build_assembly_handoff(receipt_path, spm_path, inventory)
     finally:
         for obj in list(imported):
             if obj.name in bpy.data.objects:
@@ -634,6 +743,8 @@ def select_cluster_assembly_build_handoff(
     receipt_contract,
     inspected_handoff,
     current_manifest_handoff=None,
+    *,
+    explicit_live_authority=False,
 ):
     """Prefer every conclusive current-FBX result over persisted fallbacks.
 
@@ -653,15 +764,21 @@ def select_cluster_assembly_build_handoff(
         and inspected_handoff.get("status") == "pass_through"
     ):
         return "pass_through", inspected_handoff
+
+    receipt_handoff = {}
+    if isinstance(receipt_contract, dict):
+        receipt_handoff = receipt_contract.get("handoff") or {}
+    if (
+        explicit_live_authority
+        and receipt_handoff.get("status") == "pass_through"
+    ):
+        return "pass_through", receipt_handoff
     if (
         isinstance(current_manifest_handoff, dict)
         and current_manifest_handoff.get("status") == "ready"
     ):
         return "build", current_manifest_handoff
 
-    receipt_handoff = {}
-    if isinstance(receipt_contract, dict):
-        receipt_handoff = receipt_contract.get("handoff") or {}
     if receipt_handoff.get("status") == "pass_through":
         return "pass_through", receipt_handoff
     if isinstance(inspected_handoff, dict):
@@ -669,15 +786,49 @@ def select_cluster_assembly_build_handoff(
     return None, None
 
 
-def cluster_assembly_contract_from_material_contract(receipt_path, spm_path):
+def cluster_assembly_contract_from_material_contract(
+    receipt_path,
+    spm_path,
+    *,
+    require_exact=False,
+    require_live_audit=False,
+    include_payload=False,
+):
     """Find the additive PCG receipt inside the existing required contract."""
     try:
-        _payload, contract = load_cluster_contract(receipt_path, spm_path)
+        payload, contract = load_cluster_contract(
+            receipt_path,
+            spm_path,
+            require_exact=require_exact,
+        )
     except ValueError as exc:
         if str(exc) == "PCG receipt contains no cluster_assembly contract":
             return None
         raise
+    if require_live_audit:
+        persistence = (
+            payload.get("cluster_assembly_receipt_persistence") or {}
+        )
+        if persistence.get("live_audit_complete") is not True:
+            raise ValueError(
+                "explicit Cluster Assembly contract lost completed live "
+                "audit authority before handoff"
+            )
+    if include_payload:
+        return payload, contract
     return contract
+
+
+def validate_cluster_job_mode_arguments(
+    cluster_source_build_only,
+    cluster_assembly_contract,
+):
+    """Reject an explicit Assembly authority that source-only mode ignores."""
+    if cluster_source_build_only and cluster_assembly_contract:
+        raise RuntimeError(
+            "--cluster-source-build-only cannot be combined with "
+            "--cluster-assembly-contract"
+        )
 
 
 def main():
@@ -710,6 +861,10 @@ def main():
         "errors": [],
     }
     try:
+        validate_cluster_job_mode_arguments(
+            args.cluster_source_build_only,
+            args.cluster_assembly_contract,
+        )
         preflight_started = perf_counter()
         bark_normalization_manifest = None
         if args.bark_normalization_manifest:
@@ -767,6 +922,25 @@ def main():
             },
         )
         report["blender_addon_runtime"] = addon_runtime.receipt
+        addon_rows = list(addon_runtime.receipt.get("addons") or [])
+        speedtree_addon = next(
+            (
+                row
+                for row in addon_rows
+                if row.get("id") == "speedtree_bone_weight_repair"
+            ),
+            None,
+        )
+        if not speedtree_addon or not speedtree_addon.get("source_root"):
+            raise RuntimeError(
+                "SpeedTree add-on runtime receipt has no source root"
+            )
+        # This is deliberately an output reuse contract rather than merely
+        # diagnostic metadata.  A headless resume must not reuse FBX/Blend
+        # products made by older add-on or Assembly code after a logic fix.
+        report["assembly_producer_code_state"] = assembly_runtime_code_state(
+            speedtree_addon["source_root"]
+        )
         record_stage_duration(
             report,
             "addon_runtime_prepare",
@@ -798,6 +972,9 @@ def main():
 
         cluster_assembly_handoff = None
         cluster_assembly_handoff_summary = None
+        cluster_assembly_raw_import_observer = None
+        cluster_assembly_raw_import_state = None
+        cluster_assembly_receipt_payload = None
         cluster_assembly_source_resolution = None
         if args.cluster_source_build_only:
             # This SPM is a raw provider consumed by another owner's
@@ -814,22 +991,46 @@ def main():
                 "ignored_stale_candidates": [],
             }
         else:
+            embedded_cluster_contract = (
+                args.cluster_assembly_contract
+                or args.material_contract
+                or None
+            )
             cluster_receipt_path, cluster_receipt_resolution = (
                 resolve_cluster_receipt_path(
                     speedtree_spm,
-                    args.material_contract or None,
+                    embedded_cluster_contract,
                     include_resolution=True,
+                    require_embedded_live_audit=bool(
+                        args.cluster_assembly_contract
+                    ),
                 )
             )
         report["cluster_assembly_receipt_resolution"] = (
             cluster_receipt_resolution
         )
-        cluster_assembly_contract = (
+        cluster_assembly_contract_snapshot = (
             cluster_assembly_contract_from_material_contract(
-                cluster_receipt_path, speedtree_spm
+                cluster_receipt_path,
+                speedtree_spm,
+                require_exact=bool(args.cluster_assembly_contract),
+                require_live_audit=bool(args.cluster_assembly_contract),
+                include_payload=True,
             )
             if cluster_receipt_path
             else None
+        )
+        if cluster_assembly_contract_snapshot is None:
+            cluster_assembly_contract = None
+        else:
+            (
+                cluster_assembly_receipt_payload,
+                cluster_assembly_contract,
+            ) = cluster_assembly_contract_snapshot
+        explicit_live_assembly_authority = bool(
+            args.cluster_assembly_contract
+            and cluster_receipt_resolution.get("policy")
+            == "embedded_live_audit_authoritative"
         )
         if cluster_assembly_contract is not None:
             report["cluster_assembly_receipt"] = file_fingerprint(
@@ -900,12 +1101,14 @@ def main():
 
         export_settings = settings.as_dict()
         speedtree_export_started = perf_counter()
-        speedtree_export = reusable_preflight_export_bundle(
-            material_preflight,
-            speedtree_spm,
-            collision_cli,
-            collision_hook,
-        )
+        speedtree_export = None
+        if not args.force_native_export:
+            speedtree_export = reusable_preflight_export_bundle(
+                material_preflight,
+                speedtree_spm,
+                collision_cli,
+                collision_hook,
+            )
         if speedtree_export is None:
             speedtree_export = run_speedtree_cli_export(
                 str(speedtree_spm),
@@ -923,8 +1126,13 @@ def main():
                 name_stem=speedtree_spm.stem,
                 export_fbx=export_settings["speedtree_export_fbx"],
                 export_xml=export_settings["speedtree_export_xml"],
+                force_reexport=args.force_native_export,
             )
-            report["speedtree_export_source"] = "export_helper"
+            report["speedtree_export_source"] = (
+                "forced_export_helper"
+                if args.force_native_export
+                else "export_helper"
+            )
         else:
             report["speedtree_export_source"] = "validated_material_preflight"
         record_stage_duration(
@@ -1011,6 +1219,7 @@ def main():
                     name_stem=source_spm_path.stem,
                     export_fbx=export_settings["speedtree_export_fbx"],
                     export_xml=export_settings["speedtree_export_xml"],
+                    force_reexport=args.force_native_export,
                     # This secondary SPM contributes Assembly geometry through
                     # the same exact native FBX/XML serialization contract.
                 )
@@ -1110,21 +1319,42 @@ def main():
                 raise RuntimeError(
                     "Cluster Assembly ready source resolution has no FBX path"
                 )
-            cluster_assembly_handoff = inspect_cluster_assembly_fbx(
-                cluster_receipt_path,
-                speedtree_spm,
-                Path(source_fbx_value),
-            )
-            cluster_assembly_handoff_summary = (
-                compact_cluster_assembly_handoff(cluster_assembly_handoff)
-            )
-            report["cluster_assembly_handoff"] = (
-                cluster_assembly_handoff_summary
-            )
-            require_cluster_assembly_handoff_ready(
-                cluster_assembly_handoff
-            )
-            report["cluster_assembly_handoff_revalidated_after_export"] = True
+            if same_resolved_fbx_source(
+                source_fbx_value,
+                fbx_export["path"],
+            ):
+                (
+                    cluster_assembly_raw_import_observer,
+                    cluster_assembly_raw_import_state,
+                ) = make_cluster_assembly_raw_import_observer(
+                    cluster_receipt_path,
+                    speedtree_spm,
+                    Path(source_fbx_value),
+                    receipt_payload=cluster_assembly_receipt_payload,
+                    selected_contract=cluster_assembly_contract,
+                )
+            else:
+                cluster_assembly_handoff = inspect_cluster_assembly_fbx(
+                    cluster_receipt_path,
+                    speedtree_spm,
+                    Path(source_fbx_value),
+                    receipt_payload=cluster_assembly_receipt_payload,
+                    selected_contract=cluster_assembly_contract,
+                )
+                cluster_assembly_handoff_summary = (
+                    compact_cluster_assembly_handoff(
+                        cluster_assembly_handoff
+                    )
+                )
+                report["cluster_assembly_handoff"] = (
+                    cluster_assembly_handoff_summary
+                )
+                require_cluster_assembly_handoff_ready(
+                    cluster_assembly_handoff
+                )
+                report[
+                    "cluster_assembly_handoff_revalidated_after_export"
+                ] = True
 
         settings.source_fbx_path = fbx_export["path"]
         if xml_export.get("exists"):
@@ -1160,12 +1390,36 @@ def main():
                 canonical_spm.stem,
             )
         blender_assembly_started = perf_counter()
-        result = run_import_and_assemble(assembly_settings)
+        result = run_import_and_assemble(
+            assembly_settings,
+            raw_import_observer=cluster_assembly_raw_import_observer,
+        )
         record_stage_duration(
             report,
             "blender_import_and_assemble",
             blender_assembly_started,
         )
+        if cluster_assembly_raw_import_state is not None:
+            cluster_assembly_handoff = (
+                cluster_assembly_raw_import_state.get("handoff")
+            )
+            if not isinstance(cluster_assembly_handoff, dict):
+                raise RuntimeError(
+                    "Cluster Assembly raw import observer did not produce "
+                    "an exact handoff"
+                )
+            cluster_assembly_handoff_summary = (
+                compact_cluster_assembly_handoff(
+                    cluster_assembly_handoff
+                )
+            )
+            report["cluster_assembly_handoff"] = (
+                cluster_assembly_handoff_summary
+            )
+            report[
+                "cluster_assembly_handoff_revalidated_after_export"
+            ] = True
+            report["cluster_assembly_handoff_raw_import_reused"] = True
         if not isinstance(result, dict):
             raise RuntimeError(
                 "SpeedTree Assembly did not return a pipeline report"
@@ -1550,6 +1804,9 @@ def main():
                 cluster_assembly_contract,
                 cluster_assembly_handoff,
                 current_handoff,
+                explicit_live_authority=(
+                    explicit_live_assembly_authority
+                ),
             )
         )
         if preflight["status"] == "ok" and assembly_mode == "pass_through":
@@ -1568,6 +1825,7 @@ def main():
                 pass_through_receipt_path=cluster_receipt_path,
                 pass_through_target_contract=cluster_assembly_contract,
                 pass_through_target_spm=speedtree_spm,
+                force_rebuild=args.force_cluster_assembly_rebuild,
             )
             record_stage_duration(
                 report, "cluster_assembly_build", assembly_started
@@ -1606,6 +1864,7 @@ def main():
                     speedtree_export.get("native_receipt")
                     or fbx_export.get("native_receipt")
                 ),
+                force_rebuild=args.force_cluster_assembly_rebuild,
             )
             record_stage_duration(
                 report, "cluster_assembly_build", assembly_started

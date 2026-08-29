@@ -36,15 +36,35 @@ def exact_identity_contract(binding_count):
     }
     return {
         "placement_contract": {
-            "version": 2,
-            "identity_policy": "native_modeler_authored_position_receipt_v1",
-            "translation_source": "native_modeler_runtime_receipt",
-            "exact_render_attachment_binding_count": binding_count,
+            "version": 9,
+            "identity_policy": "exact_fbx_vertex_or_native_clipped_origin_v1",
+            "translation_source": (
+                "exact_fbx_attachment_vertex_else_native_receipt"
+            ),
+            "rotation_uniform_scale_source": (
+                "exact_modeler_runtime_tangent_and_uv_plan_line_length_v1"
+            ),
+            "exact_plan_line": {
+                "selection_policy": (
+                    "unique_source_and_target_uv_triangles_containing_exact_"
+                    "authored_line_endpoint_v1"
+                ),
+                "frame_policy": (
+                    "runtime_pose_tangent_preserve_plan_roll_and_exact_uv_length"
+                ),
+                "nearest_or_farthest_search": False,
+            },
+            "exact_attachment_binding_count": binding_count,
+            "exact_fbx_attachment_binding_count": binding_count,
+            "native_clipped_origin_attachment_binding_count": 0,
             "source_spm": source_spm,
         },
         "attachment_bone_contract": {
             "status": "ready",
-            "policy": "native_modeler_runtime_receipt_v1",
+            "policy": (
+                "native_modeler_runtime_receipt_v5_exact_pose_"
+                "skeleton_index_zero"
+            ),
             "source_spm": source_spm,
             "receipt": {
                 "path": "C:/target.speedtree_native_receipt.json",
@@ -184,6 +204,76 @@ class ClusterFleetPushTests(unittest.TestCase):
             result["material_consolidation"]["status"], "applied"
         )
 
+    def test_provider_resume_requires_current_producer_code_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pipeline = root / "pipeline.json"
+            report = root / "assembly_report.json"
+            blend = root / "provider.blend"
+            blend.write_bytes(b"blend")
+            payload = {
+                "status": "done",
+                "cluster_source_build_contract": {},
+                "assembly_export_postcondition": {
+                    "objects": [{"name": "SK_leaf_sample_01"}],
+                },
+            }
+            pipeline.write_text(json.dumps(payload), encoding="utf-8")
+            report_payload = {
+                "status": "ok",
+                "unreal_push_ready": True,
+                "blend": str(blend),
+                "pipeline_report": str(pipeline),
+                "blender_addon_runtime": {
+                    "addons": [{
+                        "id": "speedtree_bone_weight_repair",
+                        "source_root": str(root / "addon"),
+                    }],
+                },
+            }
+            report.write_text(
+                json.dumps(report_payload), encoding="utf-8"
+            )
+
+            missing = validate_provider_assembly_result(
+                report,
+                require_current_producer=True,
+            )
+            self.assertIn(
+                "provider_producer_code_state_missing",
+                missing["problems"],
+            )
+
+            report_payload["assembly_producer_code_state"] = {
+                "addon/core.py": "a" * 64,
+            }
+            report.write_text(
+                json.dumps(report_payload), encoding="utf-8"
+            )
+            with patch(
+                "cluster_fleet_push.assembly_runtime_code_state",
+                return_value=report_payload["assembly_producer_code_state"],
+            ):
+                current = validate_provider_assembly_result(
+                    report,
+                    require_current_producer=True,
+                )
+            self.assertTrue(current["ok"])
+            self.assertEqual(current["producer_code_state"], "current")
+
+            with patch(
+                "cluster_fleet_push.assembly_runtime_code_state",
+                return_value={"addon/core.py": "b" * 64},
+            ):
+                stale = validate_provider_assembly_result(
+                    report,
+                    require_current_producer=True,
+                )
+            self.assertIn(
+                "provider_producer_code_state_stale",
+                stale["problems"],
+            )
+
     def test_provider_live_result_requires_actual_unreal_import(self):
         self.assertTrue(validate_provider_live_result({
             "status": "ok",
@@ -297,12 +387,17 @@ class ClusterFleetPushTests(unittest.TestCase):
             blend = spm.with_suffix(".blend")
             blender = root / "blender.exe"
             contract = root / "material.json"
+            cluster_contract = root / "cluster_assembly_live.json"
             report = root / "assembly_report.json"
-            for path in (spm, blend, blender, contract):
+            for path in (spm, blend, blender, contract, cluster_contract):
                 path.write_bytes(b"current")
 
             command = build_assembly_command(
-                {"spm": spm}, blender, contract, report
+                {"spm": spm},
+                blender,
+                contract,
+                report,
+                cluster_assembly_contract=cluster_contract,
             )
 
             self.assertIn("assembly_headless_job.py", " ".join(command))
@@ -310,6 +405,10 @@ class ClusterFleetPushTests(unittest.TestCase):
             self.assertEqual(
                 command[command.index("--material-contract") + 1],
                 str(contract),
+            )
+            self.assertEqual(
+                command[command.index("--cluster-assembly-contract") + 1],
+                str(cluster_contract),
             )
 
     def test_assembly_result_requires_exact_attachment_bindings(self):
@@ -381,6 +480,36 @@ class ClusterFleetPushTests(unittest.TestCase):
             self.assertTrue(result["ok"])
             self.assertTrue(result["pass_through"])
             self.assertEqual(result["parts"], 0)
+
+    def test_saved_pass_through_without_current_summary_fails_closed_once(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report = root / "assembly_report.json"
+            manifest = root / "assembly.json"
+            report.write_text(
+                json.dumps({"status": "ok"}),
+                encoding="utf-8",
+            )
+            manifest.write_text(json.dumps({
+                "status": "pass_through",
+                "content_decision": "pass_through",
+                "parts": [],
+            }), encoding="utf-8")
+
+            result = validate_assembly_result(
+                report,
+                {"manifest": manifest},
+            )
+
+            self.assertFalse(result["ok"])
+            self.assertFalse(result["pass_through"])
+            self.assertEqual(result["problems"], [
+                "current_pass_through_decision_missing_from_assembly_report"
+            ])
+            self.assertEqual(
+                result["policy"],
+                "saved_pass_through_not_current_run_authority",
+            )
 
     def test_pass_through_with_preserved_build_is_actionable(self):
         with tempfile.TemporaryDirectory() as temporary:
