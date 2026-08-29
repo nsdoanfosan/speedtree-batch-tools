@@ -633,6 +633,7 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                     spm,
                     embedded,
                     include_resolution=True,
+                    require_embedded_live_audit=True,
                 )
 
             self.assertEqual(resolved, embedded.resolve())
@@ -641,6 +642,68 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                 "embedded_live_audit_authoritative",
             )
             persisted_resolution.assert_not_called()
+
+    def test_explicit_live_audit_requires_completed_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_Tree_elm_01.spm"
+            embedded = root / "cluster_assembly_live.json"
+            fbx = root / "Tree_elm_01.fbx"
+            spm.write_bytes(b"spm")
+            fbx.write_bytes(b"fbx")
+            write_receipt(
+                embedded,
+                spm,
+                fbx,
+                [("branch", "branch_elm_01", "pass_through")],
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "live_audit_complete=true required",
+            ):
+                resolve_cluster_receipt_path(
+                    spm,
+                    embedded,
+                    require_embedded_live_audit=True,
+                )
+
+    def test_explicit_live_audit_requires_exact_requested_spm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            requested_spm = root / "SK_Tree_requested_01.spm"
+            other_spm = root / "SK_Tree_other_01.spm"
+            embedded = root / "cluster_assembly_live.json"
+            fbx = root / "Tree_other_01.fbx"
+            requested_spm.write_bytes(b"requested")
+            other_spm.write_bytes(b"other")
+            fbx.write_bytes(b"fbx")
+            write_receipt(
+                embedded,
+                other_spm,
+                fbx,
+                [("branch", "branch_other_01", "pass_through")],
+                # The requested SPM appears only as a source/provider.  The
+                # explicit live contract must require the exact target owner.
+                assembly_spm=requested_spm,
+            )
+            payload = json.loads(embedded.read_text(encoding="utf-8"))
+            payload["cluster_assembly_receipt_persistence"] = {
+                "status": "ok",
+                "stage": "receipt_persistence",
+                "live_audit_complete": True,
+            }
+            embedded.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "does not exactly identify the requested SPM",
+            ):
+                resolve_cluster_receipt_path(
+                    requested_spm,
+                    embedded,
+                    require_embedded_live_audit=True,
+                )
 
     def test_divergent_persisted_receipts_fail_closed_without_live_audit(self):
         spm = Path("C:/Trees/SK_Tree_elm_01.spm")

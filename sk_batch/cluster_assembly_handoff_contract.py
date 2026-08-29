@@ -628,28 +628,47 @@ def _contract_spm_paths(contract):
     return paths
 
 
-def select_cluster_contract(payload, spm_path):
+def _contract_target_spm_paths(contract):
+    """Return only owner target identities, excluding sources/providers."""
+    paths = set()
+    for row in contract.get("tree_source_identities") or []:
+        fingerprint = row.get("target_spm") or {}
+        if fingerprint.get("path"):
+            paths.add(_normalized_path(fingerprint["path"]))
+    return paths
+
+
+def select_cluster_contract(payload, spm_path, *, require_exact=False):
     candidates = _contract_candidates(payload)
     if not candidates:
         raise ValueError("PCG receipt contains no cluster_assembly contract")
     spm_key = _normalized_path(spm_path)
+    contract_paths = (
+        _contract_target_spm_paths
+        if require_exact
+        else _contract_spm_paths
+    )
     matching = [
         candidate for candidate in candidates
-        if spm_key in _contract_spm_paths(candidate)
+        if spm_key in contract_paths(candidate)
     ]
     if len(matching) == 1:
         return matching[0]
-    if not matching and len(candidates) == 1:
+    if not matching and len(candidates) == 1 and not require_exact:
         return candidates[0]
     if not matching:
         raise ValueError("PCG receipt does not identify the requested SPM")
     raise ValueError("PCG receipt has multiple Cluster contracts for the requested SPM")
 
 
-def load_cluster_contract(receipt_path, spm_path):
+def load_cluster_contract(receipt_path, spm_path, *, require_exact=False):
     receipt = Path(receipt_path)
     payload = json.loads(receipt.read_text(encoding="utf-8"))
-    return payload, select_cluster_contract(payload, spm_path)
+    return payload, select_cluster_contract(
+        payload,
+        spm_path,
+        require_exact=require_exact,
+    )
 
 
 def resolve_cluster_receipt_path(
@@ -657,14 +676,17 @@ def resolve_cluster_receipt_path(
     embedded_contract_path=None,
     *,
     include_resolution=False,
+    require_embedded_live_audit=False,
 ):
-    """Resolve the additive PCG receipt without adding a new batch argument.
+    """Resolve an additive PCG receipt or an explicit live audit contract.
 
     PCG persists the Cluster contract independently from the existing SK
     material preflight report.  A current, hash-validated persisted receipt is
     usable cache evidence.  Only a run-specific embedded contract explicitly
     marked ``live_audit_complete`` can supersede that cache; an older material
-    report is never a fallback authority.
+    report is never a fallback authority.  A caller that supplies the explicit
+    run-specific contract can require both exact target identity and the
+    completed-live-audit marker instead of falling back to persisted evidence.
     """
     from pcg_st9_texture_batch.pcg_cluster_assembly_contract import (
         ClusterAssemblyReceiptStaleError,
@@ -674,6 +696,7 @@ def resolve_cluster_receipt_path(
 
     embedded_resolved = None
     embedded_live_audit = False
+    embedded_error = None
     if embedded_contract_path:
         embedded = Path(embedded_contract_path)
         if embedded.is_file():
@@ -681,9 +704,13 @@ def resolve_cluster_receipt_path(
                 embedded_payload = json.loads(
                     embedded.read_text(encoding="utf-8")
                 )
-                select_cluster_contract(embedded_payload, spm_path)
-            except (OSError, json.JSONDecodeError, ValueError):
-                pass
+                select_cluster_contract(
+                    embedded_payload,
+                    spm_path,
+                    require_exact=True,
+                )
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                embedded_error = str(exc)
             else:
                 embedded_resolved = embedded.resolve()
                 persistence = (
@@ -695,6 +722,20 @@ def resolve_cluster_receipt_path(
                 embedded_live_audit = (
                     persistence.get("live_audit_complete") is True
                 )
+        else:
+            embedded_error = "contract path does not exist"
+
+    if require_embedded_live_audit:
+        if embedded_resolved is None:
+            raise ValueError(
+                "explicit Cluster Assembly contract does not exactly identify "
+                f"the requested SPM: {embedded_error or embedded_contract_path}"
+            )
+        if not embedded_live_audit:
+            raise ValueError(
+                "explicit Cluster Assembly contract is not an authoritative "
+                "completed live audit (live_audit_complete=true required)"
+            )
 
     # The caller writes this marker only after the run-specific PCG audit has
     # completed and the exact selected contract has been embedded.  A persisted

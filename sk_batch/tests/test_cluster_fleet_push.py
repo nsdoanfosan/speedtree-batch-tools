@@ -387,12 +387,17 @@ class ClusterFleetPushTests(unittest.TestCase):
             blend = spm.with_suffix(".blend")
             blender = root / "blender.exe"
             contract = root / "material.json"
+            cluster_contract = root / "cluster_assembly_live.json"
             report = root / "assembly_report.json"
-            for path in (spm, blend, blender, contract):
+            for path in (spm, blend, blender, contract, cluster_contract):
                 path.write_bytes(b"current")
 
             command = build_assembly_command(
-                {"spm": spm}, blender, contract, report
+                {"spm": spm},
+                blender,
+                contract,
+                report,
+                cluster_assembly_contract=cluster_contract,
             )
 
             self.assertIn("assembly_headless_job.py", " ".join(command))
@@ -400,6 +405,10 @@ class ClusterFleetPushTests(unittest.TestCase):
             self.assertEqual(
                 command[command.index("--material-contract") + 1],
                 str(contract),
+            )
+            self.assertEqual(
+                command[command.index("--cluster-assembly-contract") + 1],
+                str(cluster_contract),
             )
 
     def test_assembly_result_requires_exact_attachment_bindings(self):
@@ -471,6 +480,36 @@ class ClusterFleetPushTests(unittest.TestCase):
             self.assertTrue(result["ok"])
             self.assertTrue(result["pass_through"])
             self.assertEqual(result["parts"], 0)
+
+    def test_saved_pass_through_without_current_summary_fails_closed_once(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report = root / "assembly_report.json"
+            manifest = root / "assembly.json"
+            report.write_text(
+                json.dumps({"status": "ok"}),
+                encoding="utf-8",
+            )
+            manifest.write_text(json.dumps({
+                "status": "pass_through",
+                "content_decision": "pass_through",
+                "parts": [],
+            }), encoding="utf-8")
+
+            result = validate_assembly_result(
+                report,
+                {"manifest": manifest},
+            )
+
+            self.assertFalse(result["ok"])
+            self.assertFalse(result["pass_through"])
+            self.assertEqual(result["problems"], [
+                "current_pass_through_decision_missing_from_assembly_report"
+            ])
+            self.assertEqual(
+                result["policy"],
+                "saved_pass_through_not_current_run_authority",
+            )
 
     def test_pass_through_with_preserved_build_is_actionable(self):
         with tempfile.TemporaryDirectory() as temporary:

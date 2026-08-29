@@ -181,6 +181,17 @@ class SourceReviewPolicyTests(unittest.TestCase):
         for call in calls:
             keywords = {item.arg: item.value for item in call.keywords}
             self.assertNotIn("allow_boneless", keywords)
+            self.assertIn("force_reexport", keywords)
+            self.assertEqual(
+                ast.dump(keywords["force_reexport"]),
+                ast.dump(
+                    ast.Attribute(
+                        value=ast.Name(id="args", ctx=ast.Load()),
+                        attr="force_native_export",
+                        ctx=ast.Load(),
+                    )
+                ),
+            )
 
 
 if __name__ == "__main__":

@@ -151,6 +151,7 @@ def build_assembly_command(
     material_contract,
     report_path,
     *,
+    cluster_assembly_contract=None,
     force_native_export=False,
 ):
     spm = Path(target["spm"]).resolve()
@@ -171,9 +172,16 @@ def build_assembly_command(
         wind_preset_for_spm(spm),
         "--material-contract",
         str(Path(material_contract).resolve()),
+    ]
+    if cluster_assembly_contract:
+        command.extend([
+            "--cluster-assembly-contract",
+            str(Path(cluster_assembly_contract).resolve()),
+        ])
+    command.extend([
         "--report",
         str(Path(report_path).resolve()),
-    ]
+    ])
     if force_native_export:
         command.insert(-2, "--force-native-export")
     return command
@@ -210,6 +218,33 @@ def validate_assembly_result(report_path, target):
         }
     manifest_path = Path(target["manifest"])
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if (
+        manifest.get("status") == "pass_through"
+        and manifest.get("content_decision") == "pass_through"
+    ):
+        # A saved pass-through manifest is historical production state, not
+        # proof of the current live audit decision.  Fail closed with the real
+        # orchestration error instead of applying build-only placement,
+        # attachment, and binding requirements to a zero-part contract.
+        return {
+            "ok": False,
+            "pass_through": False,
+            "problems": [
+                "current_pass_through_decision_missing_from_assembly_report"
+            ],
+            "policy": "saved_pass_through_not_current_run_authority",
+            "parts": 0,
+            "bindings": 0,
+            "assigned": 0,
+            "unmatched": 0,
+            "preserved_role_polygons_removed": 0,
+            "preserved_role_polygons_kept": 0,
+            "role_demotions": role_demotions,
+            "existing_assembly_assets_orphaned": manifest.get(
+                "existing_assembly_assets_orphaned"
+            ),
+            "report": str(Path(report_path).resolve()),
+        }
     placement = manifest.get("placement_contract") or {}
     placement_frame = placement.get("exact_plan_line") or {}
     attachment_bones = manifest.get("attachment_bone_contract") or {}
@@ -1189,6 +1224,7 @@ def main(argv=None):
                 args.blender,
                 outputs["material_contract"],
                 assembly_report,
+                cluster_assembly_contract=receipt_refresh_report,
                 force_native_export=args.force_native_export,
             )
             result["assembly_report"] = str(assembly_report)

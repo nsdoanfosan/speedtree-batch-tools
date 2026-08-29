@@ -124,6 +124,14 @@ def parse_args():
         help="Immutable response preset ID (legacy GRASS is accepted as WEED)",
     )
     parser.add_argument("--material-contract", required=True)
+    parser.add_argument(
+        "--cluster-assembly-contract",
+        default="",
+        help=(
+            "run-specific live Cluster Assembly audit report; kept separate "
+            "from the material preflight contract"
+        ),
+    )
     parser.add_argument("--bark-normalization-manifest", default="")
     parser.add_argument("--cluster-source-build-only", action="store_true")
     parser.add_argument(
@@ -688,10 +696,19 @@ def select_cluster_assembly_build_handoff(
     return None, None
 
 
-def cluster_assembly_contract_from_material_contract(receipt_path, spm_path):
+def cluster_assembly_contract_from_material_contract(
+    receipt_path,
+    spm_path,
+    *,
+    require_exact=False,
+):
     """Find the additive PCG receipt inside the existing required contract."""
     try:
-        _payload, contract = load_cluster_contract(receipt_path, spm_path)
+        _payload, contract = load_cluster_contract(
+            receipt_path,
+            spm_path,
+            require_exact=require_exact,
+        )
     except ValueError as exc:
         if str(exc) == "PCG receipt contains no cluster_assembly contract":
             return None
@@ -852,11 +869,19 @@ def main():
                 "ignored_stale_candidates": [],
             }
         else:
+            embedded_cluster_contract = (
+                args.cluster_assembly_contract
+                or args.material_contract
+                or None
+            )
             cluster_receipt_path, cluster_receipt_resolution = (
                 resolve_cluster_receipt_path(
                     speedtree_spm,
-                    args.material_contract or None,
+                    embedded_cluster_contract,
                     include_resolution=True,
+                    require_embedded_live_audit=bool(
+                        args.cluster_assembly_contract
+                    ),
                 )
             )
         report["cluster_assembly_receipt_resolution"] = (
@@ -864,7 +889,9 @@ def main():
         )
         cluster_assembly_contract = (
             cluster_assembly_contract_from_material_contract(
-                cluster_receipt_path, speedtree_spm
+                cluster_receipt_path,
+                speedtree_spm,
+                require_exact=bool(args.cluster_assembly_contract),
             )
             if cluster_receipt_path
             else None
@@ -963,6 +990,7 @@ def main():
                 name_stem=speedtree_spm.stem,
                 export_fbx=export_settings["speedtree_export_fbx"],
                 export_xml=export_settings["speedtree_export_xml"],
+                force_reexport=args.force_native_export,
             )
             report["speedtree_export_source"] = (
                 "forced_export_helper"
@@ -1055,6 +1083,7 @@ def main():
                     name_stem=source_spm_path.stem,
                     export_fbx=export_settings["speedtree_export_fbx"],
                     export_xml=export_settings["speedtree_export_xml"],
+                    force_reexport=args.force_native_export,
                     # This secondary SPM contributes Assembly geometry through
                     # the same exact native FBX/XML serialization contract.
                 )
