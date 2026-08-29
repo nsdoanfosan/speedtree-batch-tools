@@ -1549,6 +1549,7 @@ def validate_normalized_prototype_unit_contract(manifest):
                     not in {
                         "sole_exact_native_range_intersection_v1",
                         "sole_exact_native_node_guid_range_intersection_v2",
+                        "sole_exact_native_runtime_owner_range_intersection_v3",
                     }
                     or not influence_source.get("native_vertex_indices")
                     or not influence_source.get("node_guid")
