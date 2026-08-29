@@ -57,6 +57,7 @@ from cluster_assembly_builder import (  # noqa: E402
     _partition_components_by_native_runtime_owner,
     _partition_normalized_render_components,
     _prepare_exact_source_plan_line,
+    _role_geometry_sources,
     _role_material_polygons,
     _strip_fbx_scene_textures,
     _validate_capture_receipt,
@@ -1837,6 +1838,244 @@ def fake_unreal_mesh_from_blender_bounds(
 
 
 class ContentDecisionTests(unittest.TestCase):
+    class CountingPolygons(list):
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.iteration_count = 0
+
+        def __iter__(self):
+            self.iteration_count += 1
+            return super().__iter__()
+
+    def test_role_materials_route_all_exact_slots_in_one_polygon_pass(self):
+        polygons = self.CountingPolygons([
+            SimpleNamespace(index=7, material_index=1),
+            SimpleNamespace(index=3, material_index=0),
+            SimpleNamespace(index=9, material_index=2),
+            SimpleNamespace(index=4, material_index=0),
+        ])
+        merged = SimpleNamespace(data=SimpleNamespace(
+            materials=[
+                SimpleNamespace(name="M_branch_tree_01"),
+                SimpleNamespace(name="M_leaf_tree_01"),
+                SimpleNamespace(name="M_Bark_tree_01"),
+            ],
+            polygons=polygons,
+        ))
+        normalized = {"status": "ready", "variants": [{"ordinal": 1}]}
+
+        rendered, unused = _role_material_polygons(merged, [
+            {
+                "role": "branch",
+                "role_identity": "M_branch_tree_01",
+                "normalized_variants": normalized,
+            },
+            {
+                "role": "leaf",
+                "role_identity": "M_leaf_tree_01",
+                "normalized_variants": normalized,
+            },
+            {
+                "role": "cluster",
+                "role_identity": "M_cluster_tree_01",
+                "assignments": [{"used_polygon_count": 1}],
+                "normalized_variants": normalized,
+            },
+        ])
+
+        self.assertEqual(polygons.iteration_count, 1)
+        self.assertEqual(rendered["branch"]["polygon_indices"], [3, 4])
+        self.assertEqual(rendered["leaf"]["polygon_indices"], [7])
+        self.assertEqual(rendered["cluster"]["polygon_indices"], [9])
+        self.assertEqual(unused, {})
+
+    def test_role_material_slot_conflict_fails_before_polygon_iteration(self):
+        polygons = self.CountingPolygons([
+            SimpleNamespace(index=0, material_index=0),
+        ])
+        merged = SimpleNamespace(data=SimpleNamespace(
+            materials=[SimpleNamespace(name="M_shared_cards_01")],
+            polygons=polygons,
+        ))
+
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "claimed by multiple roles",
+        ):
+            _role_material_polygons(merged, [
+                {"role": "branch", "role_identity": "M_shared_cards_01"},
+                {"role": "leaf", "role_identity": "M_shared_cards_01"},
+            ])
+
+        self.assertEqual(polygons.iteration_count, 0)
+
+    def test_source_roles_share_one_polygon_pass_per_source_object(self):
+        final_polygons = self.CountingPolygons()
+        final_mesh = SimpleNamespace(
+            data=SimpleNamespace(materials=[], polygons=final_polygons),
+            get=lambda name, default="": (
+                "C:/Trees/SK_tree_01.fbx"
+                if name == "codex_source_fbx"
+                else default
+            ),
+        )
+        source_polygons = self.CountingPolygons([
+            SimpleNamespace(index=0, material_index=0),
+            SimpleNamespace(index=1, material_index=1),
+        ])
+        source_mesh = SimpleNamespace(
+            name="SpeedTree_Source_Mesh",
+            type="MESH",
+            data=SimpleNamespace(
+                materials=[
+                    SimpleNamespace(name="M_branch_tree_01"),
+                    SimpleNamespace(name="M_leaf_tree_01"),
+                ],
+                polygons=source_polygons,
+            ),
+            users_collection=[SimpleNamespace(name="SpeedTree_Source")],
+            get=lambda name, default="": (
+                "C:/Trees/SK_tree_01.fbx"
+                if name == "codex_source_fbx"
+                else default
+            ),
+        )
+        roles, unused, targets = _role_geometry_sources(
+            SimpleNamespace(data=SimpleNamespace(
+                objects=[final_mesh, source_mesh]
+            )),
+            final_mesh,
+            [
+                {"role": "branch", "role_identity": "M_branch_tree_01"},
+                {"role": "leaf", "role_identity": "M_leaf_tree_01"},
+            ],
+        )
+
+        self.assertEqual(final_polygons.iteration_count, 1)
+        self.assertEqual(source_polygons.iteration_count, 1)
+        self.assertEqual(set(roles), {"branch", "leaf"})
+        self.assertEqual(unused, {})
+        self.assertIs(targets["branch"], source_mesh)
+        self.assertIs(targets["leaf"], source_mesh)
+
+    def test_duplicate_provider_keeps_frozen_last_row_fallback_candidates(self):
+        polygons = self.CountingPolygons([
+            SimpleNamespace(index=10, material_index=0),
+            SimpleNamespace(index=20, material_index=1),
+            SimpleNamespace(index=30, material_index=2),
+        ])
+        merged = SimpleNamespace(data=SimpleNamespace(
+            materials=[
+                SimpleNamespace(name="M_A"),
+                SimpleNamespace(name="M_B"),
+                SimpleNamespace(name="M_Bark"),
+            ],
+            polygons=polygons,
+        ))
+        normalized = {"status": "ready", "variants": [{"ordinal": 1}]}
+
+        rendered, unused = _role_material_polygons(merged, [
+            {
+                "role": "first",
+                "provider_key": "same",
+                "role_identity": "M_A",
+                "normalized_variants": normalized,
+            },
+            {
+                "role": "second",
+                "provider_key": "same",
+                "role_identity": "M_B",
+                "normalized_variants": normalized,
+            },
+            {
+                "role": "missing",
+                "provider_key": "missing",
+                "role_identity": "M_Missing",
+                "assignments": [{"used_polygon_count": 1}],
+                "normalized_variants": normalized,
+            },
+        ])
+
+        self.assertEqual(polygons.iteration_count, 1)
+        self.assertEqual(rendered["same"]["polygon_indices"], [20])
+        self.assertEqual(rendered["missing"]["polygon_indices"], [10, 30])
+        self.assertEqual(unused, {})
+
+    def test_source_shared_slot_keeps_frozen_role_local_conflict_scope(self):
+        final_polygons = self.CountingPolygons()
+        final_mesh = SimpleNamespace(
+            data=SimpleNamespace(materials=[], polygons=final_polygons),
+            get=lambda _name, default="": default,
+        )
+        source_polygons = self.CountingPolygons([
+            SimpleNamespace(index=0, material_index=0),
+        ])
+        source_mesh = SimpleNamespace(
+            name="Shared_Source",
+            type="MESH",
+            data=SimpleNamespace(
+                materials=[SimpleNamespace(name="M_shared")],
+                polygons=source_polygons,
+            ),
+            users_collection=[SimpleNamespace(name="SpeedTree_Source")],
+            get=lambda _name, default="": default,
+        )
+
+        roles, unused, targets = _role_geometry_sources(
+            SimpleNamespace(data=SimpleNamespace(
+                objects=[final_mesh, source_mesh]
+            )),
+            final_mesh,
+            [
+                {
+                    "role": "branch",
+                    "provider_key": "branch:a",
+                    "role_identity": "M_shared",
+                },
+                {
+                    "role": "leaf",
+                    "provider_key": "leaf:b",
+                    "role_identity": "M_shared",
+                },
+            ],
+        )
+
+        self.assertEqual(final_polygons.iteration_count, 1)
+        self.assertEqual(source_polygons.iteration_count, 1)
+        self.assertEqual(set(roles), {"branch:a", "leaf:b"})
+        self.assertEqual(unused, {})
+        self.assertIs(targets["branch:a"], source_mesh)
+        self.assertIs(targets["leaf:b"], source_mesh)
+
+    def test_final_fallback_reuses_initial_polygon_snapshot(self):
+        final_polygons = self.CountingPolygons([
+            SimpleNamespace(index=5, material_index=0),
+        ])
+        final_mesh = SimpleNamespace(
+            data=SimpleNamespace(
+                materials=[SimpleNamespace(name="M_Bark")],
+                polygons=final_polygons,
+            ),
+            get=lambda _name, default="": default,
+        )
+        normalized = {"status": "ready", "variants": [{"ordinal": 1}]}
+
+        roles, unused, targets = _role_geometry_sources(
+            SimpleNamespace(data=SimpleNamespace(objects=[final_mesh])),
+            final_mesh,
+            [{
+                "role": "leaf",
+                "role_identity": "M_missing",
+                "assignments": [{"used_polygon_count": 1}],
+                "normalized_variants": normalized,
+            }],
+        )
+
+        self.assertEqual(final_polygons.iteration_count, 1)
+        self.assertEqual(roles["leaf"]["polygon_indices"], [5])
+        self.assertEqual(unused, {})
+        self.assertIs(targets["leaf"], final_mesh)
+
     def test_missing_final_material_uses_normalized_topology_fallback(self):
         handoff = ready_handoff()
         role = handoff["assembly"]["part_builder_inputs"][0]

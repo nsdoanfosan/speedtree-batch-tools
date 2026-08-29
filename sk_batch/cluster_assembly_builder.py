@@ -5431,6 +5431,7 @@ def _role_material_polygons(
     role_inputs,
     *,
     allow_topology_fallback=True,
+    polygon_snapshot_cache=None,
 ):
     materials = list(merged_mesh.data.materials)
     slots_by_identity = defaultdict(set)
@@ -5440,8 +5441,11 @@ def _role_material_polygons(
     result = {}
     prepared_unused = {}
     claimed_slots = {}
+    row_slots_by_index = []
+    row_indices_by_slot = defaultdict(list)
+    prepared_rows = []
     missing_slot_rows = []
-    for row in role_inputs:
+    for row_index, row in enumerate(role_inputs):
         role = str(row["role"]).casefold()
         provider_key = _role_builder_key(row)
         identity_values = [
@@ -5471,11 +5475,44 @@ def _role_material_polygons(
                     f"slot={slot}, roles={owner},{provider_key}"
                 )
             claimed_slots[slot] = provider_key
-        polygons = [
-            int(polygon.index)
+            row_indices_by_slot[slot].append(row_index)
+        row_slots_by_index.append(slots)
+        prepared_rows.append((provider_key, role, row, identities))
+
+    # Resolve all exact role slots before touching polygon RNA, then route the
+    # mesh in one global-order pass.  The slot-to-row list deliberately keeps
+    # duplicate rows for one provider separate, matching the former per-row
+    # scans and their last-row-wins result semantics.  A slot claimed by two
+    # different providers has already failed above, before any mesh traversal.
+    snapshot_key = "polygon_material_rows_v1"
+    snapshot_mesh_key = "polygon_material_rows_mesh_identity"
+    if polygon_snapshot_cache is not None and snapshot_key in polygon_snapshot_cache:
+        if polygon_snapshot_cache.get(snapshot_mesh_key) != id(merged_mesh):
+            raise ClusterAssemblyBuildError(
+                "Assembly polygon snapshot was reused for a different mesh"
+            )
+        polygon_rows = polygon_snapshot_cache[snapshot_key]
+    else:
+        polygon_rows = tuple(
+            (int(polygon.index), int(polygon.material_index))
             for polygon in merged_mesh.data.polygons
-            if int(polygon.material_index) in slots
-        ]
+        )
+        if polygon_snapshot_cache is not None:
+            polygon_snapshot_cache[snapshot_mesh_key] = id(merged_mesh)
+            polygon_snapshot_cache[snapshot_key] = polygon_rows
+
+    polygons_by_row = [[] for _row in prepared_rows]
+    for polygon_index, material_index in polygon_rows:
+        row_indices = row_indices_by_slot.get(material_index)
+        if row_indices:
+            for row_index in row_indices:
+                polygons_by_row[row_index].append(polygon_index)
+
+    for row_index, (provider_key, role, row, identities) in enumerate(
+        prepared_rows
+    ):
+        slots = row_slots_by_index[row_index]
+        polygons = polygons_by_row[row_index]
         if not slots:
             missing_slot_rows.append((provider_key, role, row, identities))
             continue
@@ -5527,15 +5564,19 @@ def _role_material_polygons(
     # matcher inspect only polygons not already claimed by an exact material
     # role.  It will still fail closed later when no normalized prototype
     # actually matches.
+    # Build this from the final result, rather than from every claimed slot.
+    # Duplicate rows for one provider intentionally retain the historical
+    # last-row-wins behavior, including which polygons remain eligible for a
+    # later missing-slot topology fallback.
     claimed_polygons = {
         polygon
         for role_row in result.values()
         for polygon in role_row["polygon_indices"]
     }
     topology_candidates = [
-        int(polygon.index)
-        for polygon in merged_mesh.data.polygons
-        if int(polygon.index) not in claimed_polygons
+        polygon_index
+        for polygon_index, _material_index in polygon_rows
+        if polygon_index not in claimed_polygons
     ]
     for provider_key, role, row, identities in missing_slot_rows:
         normalized = deepcopy(row.get("normalized_variants"))
@@ -5605,10 +5646,12 @@ def _role_geometry_sources(bpy_module, final_merged_mesh, role_inputs):
     placement geometry. Prefer those exact source objects before falling back
     to topology search on the final merged base.
     """
+    final_polygon_snapshot = {}
     exact_final, _unused = _role_material_polygons(
         final_merged_mesh,
         role_inputs,
         allow_topology_fallback=False,
+        polygon_snapshot_cache=final_polygon_snapshot,
     )
     roles = dict(exact_final)
     targets = {
@@ -5645,6 +5688,7 @@ def _role_geometry_sources(bpy_module, final_merged_mesh, role_inputs):
             continue
         source_objects.append(obj)
 
+    source_polygon_snapshots = {id(obj): {} for obj in source_objects}
     still_unresolved = []
     for row in unresolved:
         provider_key = _role_builder_key(row)
@@ -5654,6 +5698,7 @@ def _role_geometry_sources(bpy_module, final_merged_mesh, role_inputs):
                 obj,
                 [row],
                 allow_topology_fallback=False,
+                polygon_snapshot_cache=source_polygon_snapshots[id(obj)],
             )
             if provider_key in rendered:
                 matches.append((obj, rendered[provider_key]))
@@ -5679,6 +5724,7 @@ def _role_geometry_sources(bpy_module, final_merged_mesh, role_inputs):
             final_merged_mesh,
             still_unresolved,
             allow_topology_fallback=True,
+            polygon_snapshot_cache=final_polygon_snapshot,
         )
         roles.update(fallback)
         targets.update({
