@@ -44,6 +44,9 @@ from cluster_assembly_builder import (  # noqa: E402
     _component_signature,
     _current_unreal_skeleton_diagnostic,
     _expected_normalized_bounds_for_variant,
+    _build_loop_triangle_polygon_index,
+    _build_target_loop_triangle_indices,
+    _exact_plan_line_correspondence,
     _exact_native_attachment_influences,
     _export_selected_fbx,
     _configure_final_assembly_preserve_area,
@@ -53,6 +56,7 @@ from cluster_assembly_builder import (  # noqa: E402
     _ordered_cross_object_correspondence,
     _partition_components_by_native_runtime_owner,
     _partition_normalized_render_components,
+    _prepare_exact_source_plan_line,
     _role_material_polygons,
     _strip_fbx_scene_textures,
     _validate_capture_receipt,
@@ -2949,6 +2953,241 @@ class DynamicWindContractTests(unittest.TestCase):
 
 
 class TransformAndUnrealPlanTests(unittest.TestCase):
+    @staticmethod
+    def _exact_plan_line_fixture(target_mode="unique", unrelated_triangles=0):
+        class IdentityMatrix:
+            def __matmul__(self, value):
+                return value
+
+            def __getitem__(self, index):
+                return (
+                    (1.0, 0.0, 0.0, 0.0),
+                    (0.0, 1.0, 0.0, 0.0),
+                    (0.0, 0.0, 1.0, 0.0),
+                    (0.0, 0.0, 0.0, 1.0),
+                )[index]
+
+        class CountingTriangles:
+            def __init__(self, values):
+                self.values = list(values)
+                self.iteration_count = 0
+                self.yielded_count = 0
+
+            def __iter__(self):
+                self.iteration_count += 1
+                for value in self.values:
+                    self.yielded_count += 1
+                    yield value
+
+        class Mesh:
+            def __init__(self, vertices, uv_values, triangles):
+                self.vertices = [
+                    SimpleNamespace(co=tuple(value)) for value in vertices
+                ]
+                self.uv_layers = SimpleNamespace(
+                    active=SimpleNamespace(data=[
+                        SimpleNamespace(uv=tuple(value))
+                        for value in uv_values
+                    ])
+                )
+                self.loop_triangles = CountingTriangles(triangles)
+                self.calc_loop_triangles_calls = 0
+
+            def calc_loop_triangles(self):
+                self.calc_loop_triangles_calls += 1
+
+        coordinates = [
+            (0.0, 0.0, 0.0),
+            (1.0, 2.0, 0.0),
+            (-1.0, 2.0, 0.0),
+        ]
+        source_uv = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]
+        target_uv = list(source_uv)
+        if target_mode == "zero":
+            target_uv = [(value[0] + 2.0, value[1] + 2.0) for value in target_uv]
+        source_triangles = [SimpleNamespace(
+            polygon_index=0,
+            vertices=(0, 1, 2),
+            loops=(0, 1, 2),
+        )]
+        target_triangles = [
+            SimpleNamespace(
+                polygon_index=100 + index,
+                vertices=(0, 1, 2),
+                loops=(0, 1, 2),
+            )
+            for index in range(unrelated_triangles)
+        ]
+        target_triangles.append(SimpleNamespace(
+            polygon_index=7,
+            vertices=(0, 1, 2),
+            loops=(0, 1, 2),
+        ))
+        if target_mode == "ambiguous":
+            target_triangles.append(SimpleNamespace(
+                polygon_index=7,
+                vertices=(0, 1, 2),
+                loops=(0, 1, 2),
+            ))
+        source_mesh = Mesh(coordinates, source_uv, source_triangles)
+        target_mesh = Mesh(coordinates, target_uv, target_triangles)
+        return {
+            "source_obj": SimpleNamespace(
+                name="source",
+                data=source_mesh,
+                matrix_world=IdentityMatrix(),
+            ),
+            "target_obj": SimpleNamespace(
+                name="target",
+                data=target_mesh,
+                matrix_world=IdentityMatrix(),
+            ),
+            "source_component": {
+                "polygons": [0],
+                "vertices": [0, 1, 2],
+            },
+            "target_component": {
+                "polygons": [7],
+                "vertices": [0, 1, 2],
+            },
+        }
+
+    @staticmethod
+    def _run_exact_plan_line_fixture(fixture, indexed):
+        source_obj = fixture["source_obj"]
+        target_obj = fixture["target_obj"]
+        source_component = fixture["source_component"]
+        target_component = fixture["target_component"]
+        kwargs = {}
+        if indexed:
+            source_index = _build_loop_triangle_polygon_index(
+                source_obj.data,
+                source_component["polygons"],
+            )
+            target_index = _build_loop_triangle_polygon_index(
+                target_obj.data,
+                target_component["polygons"],
+            )
+            kwargs.update({
+                "target_triangle_index": target_index,
+                "prepared_source_line": _prepare_exact_source_plan_line(
+                    source_obj,
+                    source_component,
+                    (0.0, 0.0, 0.0),
+                    1.0,
+                    source_triangle_index=source_index,
+                ),
+            })
+        return _exact_plan_line_correspondence(
+            source_obj,
+            source_component,
+            [0, 1, 2],
+            target_obj,
+            target_component,
+            [0, 1, 2],
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+            1.0,
+            **kwargs,
+        )
+
+    def test_indexed_plan_line_is_canonical_equal_to_legacy_full_scan(self):
+        legacy = self._run_exact_plan_line_fixture(
+            self._exact_plan_line_fixture(unrelated_triangles=25),
+            indexed=False,
+        )
+        indexed = self._run_exact_plan_line_fixture(
+            self._exact_plan_line_fixture(unrelated_triangles=25),
+            indexed=True,
+        )
+        canonical = lambda value: json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        self.assertEqual(canonical(indexed), canonical(legacy))
+
+    def test_indexed_plan_line_preserves_zero_and_ambiguous_fail_closed_results(self):
+        for mode in ("zero", "ambiguous"):
+            failures = []
+            for indexed in (False, True):
+                with self.assertRaises(ClusterAssemblyBuildError) as raised:
+                    self._run_exact_plan_line_fixture(
+                        self._exact_plan_line_fixture(target_mode=mode),
+                        indexed=indexed,
+                    )
+                failures.append(str(raised.exception))
+            self.assertEqual(failures[1], failures[0], mode)
+
+    def test_indexed_bindings_do_not_revisit_unrelated_mesh_triangles(self):
+        fixture = self._exact_plan_line_fixture(unrelated_triangles=10000)
+        source_obj = fixture["source_obj"]
+        target_obj = fixture["target_obj"]
+        source_index = _build_loop_triangle_polygon_index(
+            source_obj.data,
+            fixture["source_component"]["polygons"],
+        )
+        target_index = _build_loop_triangle_polygon_index(
+            target_obj.data,
+            fixture["target_component"]["polygons"],
+        )
+        prepared_source = _prepare_exact_source_plan_line(
+            source_obj,
+            fixture["source_component"],
+            (0.0, 0.0, 0.0),
+            1.0,
+            source_triangle_index=source_index,
+        )
+        for _binding in range(3):
+            _exact_plan_line_correspondence(
+                source_obj,
+                fixture["source_component"],
+                [0, 1, 2],
+                target_obj,
+                fixture["target_component"],
+                [0, 1, 2],
+                (0.0, 0.0, 0.0),
+                (0.0, 0.0, 0.0),
+                1.0,
+                target_triangle_index=target_index,
+                prepared_source_line=prepared_source,
+            )
+        self.assertEqual(source_obj.data.calc_loop_triangles_calls, 1)
+        self.assertEqual(source_obj.data.loop_triangles.iteration_count, 1)
+        self.assertEqual(target_obj.data.calc_loop_triangles_calls, 1)
+        self.assertEqual(target_obj.data.loop_triangles.iteration_count, 1)
+        self.assertEqual(
+            target_obj.data.loop_triangles.yielded_count,
+            10001,
+        )
+        self.assertEqual(target_index["indexed_triangle_count"], 1)
+
+    def test_target_triangle_index_is_built_once_per_shared_target_mesh(self):
+        fixture = self._exact_plan_line_fixture(unrelated_triangles=1)
+        target_obj = fixture["target_obj"]
+        role_build_plans = {
+            "branch:a": {
+                "target_object": target_obj,
+                "matched": {
+                    "branch": {"instances": [{"polygons": [7]}]},
+                },
+            },
+            "leaf:b": {
+                "target_object": target_obj,
+                "matched": {
+                    "leaf": {"instances": [{"polygons": [100]}]},
+                },
+            },
+        }
+        indices = _build_target_loop_triangle_indices(role_build_plans)
+        self.assertEqual(set(indices), {id(target_obj.data)})
+        self.assertEqual(
+            indices[id(target_obj.data)]["polygon_indices"],
+            frozenset({7, 100}),
+        )
+        self.assertEqual(target_obj.data.calc_loop_triangles_calls, 1)
+        self.assertEqual(target_obj.data.loop_triangles.iteration_count, 1)
+
     def test_composite_transform_applies_relative_part_after_card_fit(self):
         half = math.sqrt(0.5)
         card = {

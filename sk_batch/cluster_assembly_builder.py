@@ -67,7 +67,7 @@ MAX_SPEEDTREE_RENDER_FACE_MULTIPLICITY = 2
 # and ambiguous in the next.
 MIN_FBX_COORDINATE_TOLERANCE_METERS = 1.0e-6
 PASS_THROUGH_PROVENANCE_SCHEMA_VERSION = 1
-ASSEMBLY_BUILD_CACHE_VERSION = 19
+ASSEMBLY_BUILD_CACHE_VERSION = 20
 FINAL_ASSEMBLY_NANITE_SHAPE_PRESERVATION = "preserve_area"
 PASS_THROUGH_PROVENANCE_REASON = (
     "selected_target_contract_handoff_pass_through"
@@ -4062,6 +4062,223 @@ def _barycentric_xy(point, triangle):
     return (first, second, 1.0 - first - second)
 
 
+def _mesh_runtime_identity(mesh):
+    as_pointer = getattr(mesh, "as_pointer", None)
+    return int(as_pointer()) if callable(as_pointer) else id(mesh)
+
+
+def _build_loop_triangle_polygon_index(mesh, polygon_indices):
+    """Index selected mesh loop triangles once without changing their order.
+
+    ``Mesh.loop_triangles`` belongs to the whole merged SpeedTree mesh.  An
+    Assembly binding, however, needs only the triangles of its small rendered
+    component.  Store the original global triangle ordinal so reconstructing a
+    component view remains byte-for-byte ordered like the former full scan.
+    """
+
+    requested = frozenset(int(value) for value in polygon_indices)
+    mesh.calc_loop_triangles()
+    by_polygon = {polygon_index: [] for polygon_index in requested}
+    total_triangle_count = 0
+    indexed_triangle_count = 0
+    for ordinal, triangle in enumerate(mesh.loop_triangles):
+        total_triangle_count += 1
+        polygon_index = int(triangle.polygon_index)
+        records = by_polygon.get(polygon_index)
+        if records is None:
+            continue
+        records.append({
+            "ordinal": ordinal,
+            "polygon_index": polygon_index,
+            "vertices": tuple(int(value) for value in triangle.vertices),
+            "loops": tuple(int(value) for value in triangle.loops),
+        })
+        indexed_triangle_count += 1
+    return {
+        "mesh_identity": _mesh_runtime_identity(mesh),
+        "polygon_indices": requested,
+        "by_polygon": {
+            polygon_index: tuple(records)
+            for polygon_index, records in by_polygon.items()
+        },
+        "total_triangle_count": total_triangle_count,
+        "indexed_triangle_count": indexed_triangle_count,
+    }
+
+
+def _component_loop_triangle_records(mesh, polygon_indices, triangle_index=None):
+    """Return one component's triangles in original global mesh order."""
+
+    requested = frozenset(int(value) for value in polygon_indices)
+    if triangle_index is None:
+        # Compatibility path for focused callers and tests. Production builds
+        # supply the per-mesh index prepared after all role matches are known.
+        return [
+            {
+                "ordinal": ordinal,
+                "polygon_index": int(triangle.polygon_index),
+                "vertices": tuple(int(value) for value in triangle.vertices),
+                "loops": tuple(int(value) for value in triangle.loops),
+            }
+            for ordinal, triangle in enumerate(
+                _calculated_loop_triangles(mesh)
+            )
+            if int(triangle.polygon_index) in requested
+        ]
+    if int(triangle_index.get("mesh_identity", -1)) != _mesh_runtime_identity(
+        mesh
+    ):
+        raise ClusterAssemblyBuildError(
+            "exact Assembly loop-triangle index belongs to another mesh"
+        )
+    indexed_polygons = frozenset(triangle_index.get("polygon_indices") or ())
+    missing = requested - indexed_polygons
+    if missing:
+        raise ClusterAssemblyBuildError(
+            "exact Assembly loop-triangle index does not cover component "
+            "polygons: " + ", ".join(str(value) for value in sorted(missing))
+        )
+    records = [
+        record
+        for polygon_index in requested
+        for record in (
+            (triangle_index.get("by_polygon") or {}).get(polygon_index) or ()
+        )
+    ]
+    records.sort(key=lambda row: int(row["ordinal"]))
+    return records
+
+
+def _calculated_loop_triangles(mesh):
+    """Calculate and return the mesh-wide loop-triangle collection once."""
+
+    mesh.calc_loop_triangles()
+    return mesh.loop_triangles
+
+
+def _build_target_loop_triangle_indices(role_build_plans):
+    """Build exactly one selected-polygon triangle index per target mesh."""
+
+    meshes = {}
+    polygons_by_mesh = defaultdict(set)
+    for plan in (role_build_plans or {}).values():
+        target_object = plan.get("target_object")
+        mesh = getattr(target_object, "data", None)
+        if mesh is None:
+            continue
+        mesh_identity = _mesh_runtime_identity(mesh)
+        meshes[mesh_identity] = mesh
+        for matched in (plan.get("matched") or {}).values():
+            for component in matched.get("instances") or ():
+                polygons_by_mesh[mesh_identity].update(
+                    int(value) for value in component.get("polygons") or ()
+                )
+    return {
+        mesh_identity: _build_loop_triangle_polygon_index(
+            meshes[mesh_identity],
+            polygons,
+        )
+        for mesh_identity, polygons in polygons_by_mesh.items()
+        if polygons
+    }
+
+
+def _prepare_exact_source_plan_line(
+    source_obj,
+    source_component,
+    source_attachment,
+    source_line_length,
+    *,
+    source_triangle_index=None,
+):
+    """Resolve the source-side authored line triangle once per prototype."""
+
+    source_origin = tuple(float(value) for value in source_attachment)
+    try:
+        normalized_line_length = float(source_line_length)
+    except (TypeError, ValueError) as exc:
+        raise ClusterAssemblyBuildError(
+            "exact Assembly plan-line length is invalid"
+        ) from exc
+    if (
+        not math.isfinite(normalized_line_length)
+        or normalized_line_length <= 1.0e-12
+    ):
+        raise ClusterAssemblyBuildError(
+            "exact Assembly plan-line length is degenerate"
+        )
+    source_endpoint_xy = (
+        source_origin[0],
+        source_origin[1] + normalized_line_length,
+    )
+    source_uv_layer = source_obj.data.uv_layers.active
+    if source_uv_layer is None:
+        raise ClusterAssemblyBuildError(
+            "exact Assembly authored-line mapping requires source and target UVs"
+        )
+    source_candidates = []
+    for triangle in _component_loop_triangle_records(
+        source_obj.data,
+        source_component["polygons"],
+        source_triangle_index,
+    ):
+        source_triangle_indices = list(triangle["vertices"])
+        source_points = _local_points(source_obj, source_triangle_indices)
+        weights = _barycentric_xy(source_endpoint_xy, source_points)
+        if (
+            weights is None
+            or min(weights) < -1.0e-12
+            or max(weights) > 1.0 + 1.0e-12
+        ):
+            continue
+        reconstructed_source = tuple(
+            sum(
+                weights[index] * source_points[index][axis]
+                for index in range(3)
+            )
+            for axis in range(3)
+        )
+        source_endpoint_error = math.dist(
+            source_endpoint_xy,
+            reconstructed_source[:2],
+        )
+        if source_endpoint_error > 1.0e-12:
+            continue
+        source_uv_points = [
+            tuple(float(value) for value in source_uv_layer.data[loop].uv)
+            for loop in triangle["loops"]
+        ]
+        source_endpoint_uv = tuple(
+            sum(
+                weights[index] * source_uv_points[index][axis]
+                for index in range(3)
+            )
+            for axis in range(2)
+        )
+        source_candidates.append({
+            "polygon_index": int(triangle["polygon_index"]),
+            "source_indices": source_triangle_indices,
+            "source_points": source_points,
+            "source_line_endpoint": list(reconstructed_source),
+            "source_geometry_barycentric_weights": [
+                float(value) for value in weights
+            ],
+            "source_line_endpoint_xy_error": source_endpoint_error,
+            "source_uv_points": source_uv_points,
+            "source_line_endpoint_uv": list(source_endpoint_uv),
+        })
+    if len(source_candidates) != 1:
+        raise ClusterAssemblyBuildError(
+            "exact Assembly authored line endpoint must belong to one exact "
+            f"source geometry triangle, got {len(source_candidates)}"
+        )
+    return {
+        "source_origin": source_origin,
+        "source_line_length": normalized_line_length,
+        "candidate": source_candidates[0],
+    }
+
+
 def _exact_plan_line_correspondence(
     source_obj,
     source_component,
@@ -4072,6 +4289,10 @@ def _exact_plan_line_correspondence(
     source_attachment,
     target_attachment,
     source_line_length,
+    *,
+    source_triangle_index=None,
+    target_triangle_index=None,
+    prepared_source_line=None,
 ):
     """Map the authored line endpoint through its exact UV/topology triangle."""
     if len(source_indices) != len(target_indices):
@@ -4090,82 +4311,45 @@ def _exact_plan_line_correspondence(
         raise ClusterAssemblyBuildError(
             "exact Assembly plan-line length is degenerate"
         )
-    source_endpoint_xy = (
-        source_origin[0],
-        source_origin[1] + source_line_length,
-    )
-    source_polygon_indices = {
-        int(value) for value in source_component["polygons"]
-    }
-    target_polygon_indices = {
-        int(value) for value in target_component["polygons"]
-    }
-    source_obj.data.calc_loop_triangles()
-    target_obj.data.calc_loop_triangles()
     source_uv_layer = source_obj.data.uv_layers.active
     target_uv_layer = target_obj.data.uv_layers.active
     if source_uv_layer is None or target_uv_layer is None:
         raise ClusterAssemblyBuildError(
             "exact Assembly authored-line mapping requires source and target UVs"
         )
-    source_candidates = []
-    for triangle in source_obj.data.loop_triangles:
-        polygon_index = int(triangle.polygon_index)
-        if polygon_index not in source_polygon_indices:
-            continue
-        source_triangle_indices = [int(value) for value in triangle.vertices]
-        source_points = _local_points(source_obj, source_triangle_indices)
-        weights = _barycentric_xy(source_endpoint_xy, source_points)
-        if weights is None or min(weights) < -1.0e-12 or max(weights) > 1.0 + 1.0e-12:
-            continue
-        reconstructed_source = tuple(
-            sum(weights[index] * source_points[index][axis] for index in range(3))
-            for axis in range(3)
+    if prepared_source_line is None:
+        prepared_source_line = _prepare_exact_source_plan_line(
+            source_obj,
+            source_component,
+            source_origin,
+            source_line_length,
+            source_triangle_index=source_triangle_index,
         )
-        source_endpoint_error = math.dist(
-            source_endpoint_xy,
-            reconstructed_source[:2],
-        )
-        if source_endpoint_error > 1.0e-12:
-            continue
-        source_uv_points = [
-            tuple(float(value) for value in source_uv_layer.data[loop].uv)
-            for loop in triangle.loops
-        ]
-        source_endpoint_uv = tuple(
-            sum(
-                weights[index] * source_uv_points[index][axis]
-                for index in range(3)
-            )
-            for axis in range(2)
-        )
-        source_candidates.append({
-            "polygon_index": polygon_index,
-            "source_indices": source_triangle_indices,
-            "source_points": source_points,
-            "source_line_endpoint": list(reconstructed_source),
-            "source_geometry_barycentric_weights": [
-                float(value) for value in weights
-            ],
-            "source_line_endpoint_xy_error": source_endpoint_error,
-            "source_uv_points": source_uv_points,
-            "source_line_endpoint_uv": list(source_endpoint_uv),
-        })
-    if len(source_candidates) != 1:
+    if (
+        tuple(prepared_source_line.get("source_origin") or ()) != source_origin
+        or float(prepared_source_line.get("source_line_length", -1.0))
+        != source_line_length
+    ):
         raise ClusterAssemblyBuildError(
-            "exact Assembly authored line endpoint must belong to one exact "
-            f"source geometry triangle, got {len(source_candidates)}"
+            "prepared exact Assembly source line does not match this prototype"
         )
-    source_candidate = source_candidates[0]
+    source_candidate = prepared_source_line.get("candidate")
+    if not isinstance(source_candidate, dict):
+        raise ClusterAssemblyBuildError(
+            "prepared exact Assembly source line has no candidate"
+        )
     target_candidates = []
     source_endpoint_uv = source_candidate["source_line_endpoint_uv"]
-    for triangle in target_obj.data.loop_triangles:
-        target_polygon_index = int(triangle.polygon_index)
-        if target_polygon_index not in target_polygon_indices:
-            continue
+    target_triangles = _component_loop_triangle_records(
+        target_obj.data,
+        target_component["polygons"],
+        target_triangle_index,
+    )
+    for triangle in target_triangles:
+        target_polygon_index = int(triangle["polygon_index"])
         target_uv_points = [
             tuple(float(value) for value in target_uv_layer.data[loop].uv)
-            for loop in triangle.loops
+            for loop in triangle["loops"]
         ]
         weights = _barycentric_xy(source_endpoint_uv, target_uv_points)
         if weights is None or min(weights) < -1.0e-12 or max(weights) > 1.0 + 1.0e-12:
@@ -4180,7 +4364,7 @@ def _exact_plan_line_correspondence(
         target_uv_error = math.dist(source_endpoint_uv, reconstructed_uv)
         if target_uv_error > 1.0e-12:
             continue
-        target_triangle_indices = [int(value) for value in triangle.vertices]
+        target_triangle_indices = list(triangle["vertices"])
         target_points = _world_points(target_obj, target_triangle_indices)
         target_endpoint = tuple(
             sum(
@@ -4210,13 +4394,11 @@ def _exact_plan_line_correspondence(
             for row in target_candidates[:8]
         ]
         nearest_uv_triangles = []
-        for triangle in target_obj.data.loop_triangles:
-            target_polygon_index = int(triangle.polygon_index)
-            if target_polygon_index not in target_polygon_indices:
-                continue
+        for triangle in target_triangles:
+            target_polygon_index = int(triangle["polygon_index"])
             target_uv_points = [
                 tuple(float(value) for value in target_uv_layer.data[loop].uv)
-                for loop in triangle.loops
+                for loop in triangle["loops"]
             ]
             weights = _barycentric_xy(source_endpoint_uv, target_uv_points)
             if weights is None:
@@ -4267,7 +4449,7 @@ def _exact_plan_line_correspondence(
             f"source_line_endpoint_uv={source_endpoint_uv}, "
             f"target_matches={len(target_candidates)}, candidates={diagnostics}, "
             f"target_component_owner={target_component.get('native_runtime_owner')}, "
-            f"target_component_polygons={len(target_polygon_indices)}, "
+            f"target_component_polygons={len(set(target_component['polygons']))}, "
             f"nearest_uv_triangles={nearest_uv_triangles[:4]}, "
             f"correspondence_scale_ratio={scale_summary}"
         )
@@ -5559,6 +5741,7 @@ def build_blender_assembly_inputs(
     pass_through_receipt_path=None,
     pass_through_target_contract=None,
     pass_through_target_spm=None,
+    force_rebuild=False,
 ):
     """Generate base/part FBXs and a strict builder manifest inside BWR.
 
@@ -5660,11 +5843,13 @@ def build_blender_assembly_inputs(
             else None
         ),
     )
-    reusable_manifest = _load_reusable_assembly_manifest(
-        manifest_path,
-        build_input_signature,
-        full_fingerprint_before,
-    )
+    reusable_manifest = None
+    if not force_rebuild:
+        reusable_manifest = _load_reusable_assembly_manifest(
+            manifest_path,
+            build_input_signature,
+            full_fingerprint_before,
+        )
     if reusable_manifest is not None:
         return reusable_manifest
     snapshot = snapshot_blender_armature(final_armature)
@@ -5808,6 +5993,9 @@ def build_blender_assembly_inputs(
                     **row,
                 })
         _validate_role_component_claims(role_build_plans)
+        target_loop_triangle_indices = _build_target_loop_triangle_indices(
+            role_build_plans
+        )
         # No public Assembly artifact may exist until every requested rendered
         # role has proven at least one normalized prototype/component match.
         output.mkdir(parents=True, exist_ok=True)
@@ -5934,9 +6122,18 @@ def build_blender_assembly_inputs(
                         variant,
                         part_asset_name,
                     )
-                    bindings = []
-                    for instance_index, component in enumerate(instances):
-                        source_attachment_index = attachment_vertex_index
+                    target_triangle_index = target_loop_triangle_indices.get(
+                        _mesh_runtime_identity(target_object.data)
+                    )
+                    if instances and target_triangle_index is None:
+                        raise ClusterAssemblyBuildError(
+                            "normalized Assembly target mesh has no prepared "
+                            "loop-triangle index"
+                        )
+                    source_attachment_index = attachment_vertex_index
+                    source_attachment_coordinate = None
+                    prepared_source_line = None
+                    if instances:
                         if (
                             0 <= source_attachment_index
                             < len(source_obj.data.vertices)
@@ -5964,6 +6161,21 @@ def build_blender_assembly_inputs(
                                 f"component_vertex_count="
                                 f"{len(source_component['vertices'])}"
                             )
+                        source_triangle_index = (
+                            _build_loop_triangle_polygon_index(
+                                source_obj.data,
+                                source_component["polygons"],
+                            )
+                        )
+                        prepared_source_line = _prepare_exact_source_plan_line(
+                            source_obj,
+                            source_component,
+                            source_attachment_coordinate,
+                            authored_line["length"],
+                            source_triangle_index=source_triangle_index,
+                        )
+                    bindings = []
+                    for instance_index, component in enumerate(instances):
                         try:
                             (
                                 resolved_source_attachment_index,
@@ -6116,6 +6328,8 @@ def build_blender_assembly_inputs(
                             fit_source_attachment,
                             fit_target_attachment,
                             authored_line["length"],
+                            target_triangle_index=target_triangle_index,
+                            prepared_source_line=prepared_source_line,
                         )
                         placement_source = (
                             attachment_position_source
@@ -6564,6 +6778,8 @@ def build_blender_assembly_inputs(
             "kind": MANIFEST_KIND,
             "status": "ready",
             "content_decision": "build",
+            "cache_reused": False,
+            "force_rebuild_requested": bool(force_rebuild),
             "full_skeletal_mesh_preserved": True,
             "full_asset_stem": stem,
             "full_fbx": full_fingerprint_before,

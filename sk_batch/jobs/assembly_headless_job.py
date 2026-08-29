@@ -134,6 +134,14 @@ def parse_args():
             "a fresh native SpeedTree FBX/XML/receipt with the installed hook"
         ),
     )
+    parser.add_argument(
+        "--force-cluster-assembly-rebuild",
+        action="store_true",
+        help=(
+            "bypass only the reusable Cluster Assembly manifest and execute "
+            "the complete current-run Assembly calculation again"
+        ),
+    )
     parser.add_argument("--report", required=True)
     return parser.parse_args(argv)
 
@@ -1604,6 +1612,7 @@ def main():
                 pass_through_receipt_path=cluster_receipt_path,
                 pass_through_target_contract=cluster_assembly_contract,
                 pass_through_target_spm=speedtree_spm,
+                force_rebuild=args.force_cluster_assembly_rebuild,
             )
             record_stage_duration(
                 report, "cluster_assembly_build", assembly_started
@@ -1642,6 +1651,7 @@ def main():
                     speedtree_export.get("native_receipt")
                     or fbx_export.get("native_receipt")
                 ),
+                force_rebuild=args.force_cluster_assembly_rebuild,
             )
             record_stage_duration(
                 report, "cluster_assembly_build", assembly_started
