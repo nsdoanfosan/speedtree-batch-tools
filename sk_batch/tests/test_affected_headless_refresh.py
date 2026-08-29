@@ -82,7 +82,7 @@ def test_audit_selects_zero_bone_baseref_branch_leaf(tmp_path):
     assert "baseref_branch_leaf_mesh_refresh_scope" in audit["reasons"]
 
 
-def test_main_exact_pushes_every_selected_target_headlessly(tmp_path, monkeypatch):
+def test_main_uses_dependency_fleet_for_every_selected_target(tmp_path, monkeypatch):
     selected = [
         {"stem": "SK_tree_a", "spm": str(tmp_path / "SK_tree_a.spm"), "selected": True},
         {"stem": "SK_weed_grass_b", "spm": str(tmp_path / "SK_weed_grass_b.spm"), "selected": True},
@@ -94,22 +94,28 @@ def test_main_exact_pushes_every_selected_target_headlessly(tmp_path, monkeypatc
     )
     captured = {}
 
-    def fake_exact_push(argv):
-        captured.setdefault("calls", []).append(argv)
+    def fake_fleet(argv):
+        captured["call"] = argv
+        run_id = argv[argv.index("--run-id") + 1]
+        (tmp_path / f"cluster_fleet_push_{run_id}.json").write_text(
+            json.dumps({"status": "dry_run", "provider_dependencies": []}),
+            encoding="utf-8",
+        )
         return 0
 
-    monkeypatch.setattr(refresh.exact_push, "main", fake_exact_push)
+    monkeypatch.setattr(refresh.cluster_fleet_push, "main", fake_fleet)
     result = refresh.main([
         "--root", str(tmp_path), "--log-dir", str(tmp_path), "--dry-run"
     ])
 
     assert result == 0
-    assert len(captured["calls"]) == 2
-    assert all("--transport" in call for call in captured["calls"])
-    assert all("headless" in call for call in captured["calls"])
-    assert all("--dry-run" in call for call in captured["calls"])
-    assert any("SK_tree_a" in " ".join(call) for call in captured["calls"])
-    assert any("SK_weed_grass_b" in " ".join(call) for call in captured["calls"])
+    call = captured["call"]
+    assert "--force-native-export" in call
+    assert "--push-pass-through-roots" in call
+    assert "--dry-run" in call
+    assert call.count("--target-spm") == 2
+    assert "SK_tree_a" in " ".join(call)
+    assert "SK_weed_grass_b" in " ".join(call)
 
 
 def test_main_resumes_prepared_run_without_reexport(tmp_path, monkeypatch):
@@ -140,21 +146,21 @@ def test_main_resumes_prepared_run_without_reexport(tmp_path, monkeypatch):
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(
-        refresh.exact_push,
-        "main",
-        lambda _argv: (_ for _ in ()).throw(AssertionError("must not reexport")),
-    )
-    monkeypatch.setattr(
-        refresh.exact_push,
-        "run_headless_manifest",
-        lambda *_args, **_kwargs: {"status": "ok", "items": {}},
-    )
+    def fake_fleet(argv):
+        assert "--run-id" in argv
+        assert run_id in argv
+        (tmp_path / f"cluster_fleet_push_{run_id}.json").write_text(
+            json.dumps({
+                "status": "ok",
+                "verified_count": 1,
+                "failed_count": 0,
+                "provider_failed_count": 0,
+            }),
+            encoding="utf-8",
+        )
+        return 0
 
-    def fake_merge(_outputs, _batch_result):
-        return {"status": "ok"}
-
-    monkeypatch.setattr(refresh.exact_push, "merge_unreal_result", fake_merge)
+    monkeypatch.setattr(refresh.cluster_fleet_push, "main", fake_fleet)
     assert refresh.main([
         "--log-dir", str(tmp_path), "--resume-run-id", run_id
     ]) == 0
@@ -298,6 +304,14 @@ def _write_manifest(target, *, placement_version, status=None):
             "status": "ready",
         }
     manifest.write_text(json.dumps(payload), encoding="utf-8")
+    native = refresh.native_receipt_path(target)
+    if native.is_file():
+        deployment = refresh.deployment_receipt_path(target)
+        deployment.write_text(json.dumps({
+            "status": "imported_ok",
+            "native_receipt_sha256": refresh._sha256(native),
+            "assembly_manifest_sha256": refresh._sha256(manifest),
+        }), encoding="utf-8")
 
 
 def _write_pass_through_manifest(target):
@@ -314,6 +328,14 @@ def _write_pass_through_manifest(target):
         }),
         encoding="utf-8",
     )
+    native = refresh.native_receipt_path(target)
+    if native.is_file():
+        deployment = refresh.deployment_receipt_path(target)
+        deployment.write_text(json.dumps({
+            "status": "imported_ok",
+            "native_receipt_sha256": refresh._sha256(native),
+            "assembly_manifest_sha256": refresh._sha256(manifest),
+        }), encoding="utf-8")
 
 
 def _current_target(tmp_path, stem):
@@ -361,6 +383,29 @@ def test_fully_current_asset_is_not_reselected(tmp_path):
     audit = refresh.audit_target(_current_target(tmp_path, "SK_tree_current_02"))
     assert audit["reasons"] == []
     assert audit["selected"] is False
+
+
+def test_locally_current_asset_without_unreal_deployment_is_selected(tmp_path):
+    target = _current_target(tmp_path, "SK_tree_not_deployed_01")
+    refresh.deployment_receipt_path(target).unlink()
+
+    audit = refresh.audit_target(target)
+
+    assert "unreal_deployment_receipt_missing_or_stale" in audit["reasons"]
+    assert audit["selected"] is True
+
+
+def test_native_change_after_unreal_deployment_is_selected(tmp_path):
+    target = _current_target(tmp_path, "SK_tree_changed_after_deploy_01")
+    receipt = refresh.native_receipt_path(target)
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    payload["post_deployment_change"] = True
+    receipt.write_text(json.dumps(payload), encoding="utf-8")
+
+    audit = refresh.audit_target(target)
+
+    assert "unreal_deployment_receipt_missing_or_stale" in audit["reasons"]
+    assert "native receipt hash changed" in audit["deployment_receipt_error"]
 
 
 def test_stale_placement_contract_is_selected(tmp_path):

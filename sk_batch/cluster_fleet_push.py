@@ -28,6 +28,7 @@ from exact_push import (
     ExactPushError,
     build_exact_push_command,
     merge_unreal_result,
+    reset_checkpoint_item_retries,
     run_headless_manifest,
 )
 from process_lifecycle import owned_run
@@ -687,6 +688,15 @@ def parse_args(argv=None):
         default=DEFAULT_UNREAL_EDITOR_CMD,
     )
     parser.add_argument("--only", action="append", default=[])
+    parser.add_argument(
+        "--target-spm",
+        action="append",
+        default=[],
+        help=(
+            "process only these exact SPM paths; unlike --only this never "
+            "selects a sibling by a partial stem match"
+        ),
+    )
     parser.add_argument("--exclude", action="append", default=[])
     parser.add_argument("--skip-birch", action="store_true")
     parser.add_argument(
@@ -697,14 +707,41 @@ def parse_args(argv=None):
             "SpeedTree FBX/XML/bone receipt instead of reusing preflight output"
         ),
     )
+    parser.add_argument(
+        "--push-pass-through-roots",
+        action="store_true",
+        help=(
+            "also export/import roots whose current cluster manifest is "
+            "pass-through; required when native full-mesh bone data changed"
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--run-id")
+    parser.add_argument("--reset-item-retries", action="store_true")
     return parser.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(argv)
+    exact_target_keys = {
+        normalized_path_key(Path(value).expanduser().resolve())
+        for value in args.target_spm
+    }
+    discovery_filters = list(args.only)
+    discovery_filters.extend(Path(value).stem for value in args.target_spm)
     targets, missing = discover_current_cluster_targets(
-        args.root, only=args.only
+        args.root, only=discovery_filters
+    )
+    if exact_target_keys:
+        targets = [
+            row for row in targets
+            if normalized_path_key(row["spm"]) in exact_target_keys
+        ]
+    found_exact_target_keys = {
+        normalized_path_key(row["spm"]) for row in targets
+    }
+    missing_requested_target_spms = sorted(
+        exact_target_keys - found_exact_target_keys
     )
     filters = [value.casefold() for value in args.only]
     if filters:
@@ -735,7 +772,7 @@ def main(argv=None):
         dependency_resolution,
     ) = discover_provider_dependencies(targets)
 
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
     fleet_report_path = args.log_dir / f"cluster_fleet_push_{run_id}.json"
     fleet = {
         "status": "running",
@@ -747,6 +784,10 @@ def main(argv=None):
         ),
         "birch_paper_order": "last",
         "targets": [str(row["spm"]) for row in targets],
+        "requested_target_spms": [
+            str(Path(value).expanduser().resolve()) for value in args.target_spm
+        ],
+        "missing_requested_target_spms": missing_requested_target_spms,
         "excluded_targets": [str(row["spm"]) for row in excluded_targets],
         "provider_dependencies": [str(path) for path in provider_spms],
         "dependencies_by_root": dependencies_by_root,
@@ -768,9 +809,11 @@ def main(argv=None):
     print(f"SK_CLUSTER_FLEET_PROVIDERS={len(provider_spms)}")
     print(f"SK_CLUSTER_FLEET_REPORT={fleet_report_path}")
     if args.dry_run:
-        fleet["status"] = "dry_run"
+        fleet["status"] = (
+            "failed" if missing_requested_target_spms else "dry_run"
+        )
         save_fleet()
-        return 0
+        return 1 if missing_requested_target_spms else 0
 
     pending = []
     processed_providers = {}
@@ -820,6 +863,7 @@ def main(argv=None):
                 args.blender,
                 outputs["material_contract"],
                 assembly_report,
+                force_native_export=args.force_native_export,
             )
             result["assembly_report"] = str(assembly_report)
             assembly_completed = owned_run(
@@ -1034,16 +1078,21 @@ def main(argv=None):
                     break
                 result["assembly_repeated_after_new_provider"] = True
             if assembly_verification.get("pass_through"):
-                result["status"] = "skipped_no_current_assembly"
-                result["diagnostic"] = (
-                    "current receipt declares Assembly pass-through; it was "
-                    "recorded separately when a production build manifest "
-                    "already existed, and no Assembly was exported"
-                )
-                save_fleet()
-                continue
-            target["expected_parts"] = assembly_verification["parts"]
-            target["expected_bindings"] = assembly_verification["bindings"]
+                if not args.push_pass_through_roots:
+                    result["status"] = "skipped_no_current_assembly"
+                    result["diagnostic"] = (
+                        "current receipt declares Assembly pass-through; it was "
+                        "recorded separately when a production build manifest "
+                        "already existed, and no Assembly was exported"
+                    )
+                    save_fleet()
+                    continue
+                target["pass_through"] = True
+                target["expected_parts"] = 0
+                target["expected_bindings"] = 0
+            else:
+                target["expected_parts"] = assembly_verification["parts"]
+                target["expected_bindings"] = assembly_verification["bindings"]
             completed = owned_run(
                 command,
                 source="sk_batch.cluster_fleet_push.blender_export",
@@ -1101,6 +1150,10 @@ def main(argv=None):
         fleet["unreal_manifest"] = str(manifest_path)
         fleet["unreal_checkpoint"] = str(checkpoint_path)
         fleet["unreal_report"] = str(batch_report_path)
+        if args.reset_item_retries and checkpoint_path.is_file():
+            fleet["unreal_batch_retry_reset"] = (
+                reset_checkpoint_item_retries(checkpoint_path)
+            )
         save_fleet()
         try:
             fleet["pre_unreal_checkout"] = checkout_headless_manifest_assets(
@@ -1122,6 +1175,7 @@ def main(argv=None):
                 verification = (
                     validate_provider_live_result(report)
                     if entry["kind"] == "provider"
+                    or entry.get("target", {}).get("pass_through")
                     else validate_live_result(report, entry["target"])
                 )
                 result["verification"] = verification
@@ -1155,7 +1209,9 @@ def main(argv=None):
         if row["status"] != "verified_dependency_in_unreal"
     ]
     fleet["status"] = (
-        "ok" if not failed and not failed_providers else "failed"
+        "ok"
+        if not failed and not failed_providers and not missing_requested_target_spms
+        else "failed"
     )
     fleet["verified_count"] = len([
         row for row in fleet["results"]
@@ -1186,7 +1242,11 @@ def main(argv=None):
         "SK_CLUSTER_FLEET_PROVIDER_FAILED="
         f"{fleet['provider_failed_count']}"
     )
-    return 0 if not failed and not failed_providers else 1
+    return (
+        0
+        if not failed and not failed_providers and not missing_requested_target_spms
+        else 1
+    )
 
 
 if __name__ == "__main__":

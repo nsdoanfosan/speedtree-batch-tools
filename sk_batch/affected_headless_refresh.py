@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
 
 import cluster_assembly_builder
 import cluster_fleet_push
-import exact_push
 
 
 DEFAULT_ROOT = cluster_fleet_push.DEFAULT_ROOT
@@ -41,6 +41,19 @@ PASS_THROUGH_MANIFEST_STATUS = "pass_through"
 def native_receipt_path(target):
     spm = Path(target["spm"])
     return spm.parent / "fbx" / f"{target['stem']}.speedtree_native_receipt.json"
+
+
+def deployment_receipt_path(target):
+    spm = Path(target["spm"])
+    return spm.parent / "fbx" / f"{target['stem']}.unreal_deployment_receipt.json"
+
+
+def _sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _vertex_ranges_are_exact_and_ordered(row):
@@ -157,6 +170,7 @@ def audit_target(target):
     # Selection is structural only, matching the permanent SPM-parsed rules.
 
     manifest_path = Path(target["manifest"])
+    manifest_payload = None
     manifest_placement_version = None
     manifest_status = None
     manifest_error = ""
@@ -184,6 +198,21 @@ def audit_target(target):
                 # material table are all described by the older contract.
                 reasons.append("assembly_placement_contract_stale")
 
+    deployment_path = deployment_receipt_path(target)
+    deployment_error = ""
+    if receipt is not None and manifest_payload is not None:
+        try:
+            deployment = json.loads(deployment_path.read_text(encoding="utf-8"))
+            if deployment.get("status") != "imported_ok":
+                raise ValueError("deployment status is not imported_ok")
+            if deployment.get("native_receipt_sha256") != _sha256(receipt_path):
+                raise ValueError("native receipt hash changed after Unreal import")
+            if deployment.get("assembly_manifest_sha256") != _sha256(manifest_path):
+                raise ValueError("Assembly manifest hash changed after Unreal import")
+        except (OSError, ValueError, TypeError) as exc:
+            deployment_error = str(exc)
+            reasons.append("unreal_deployment_receipt_missing_or_stale")
+
     return {
         "stem": target["stem"],
         "spm": str(Path(target["spm"]).resolve()),
@@ -194,6 +223,8 @@ def audit_target(target):
         ),
         "receipt_error": error,
         "manifest_error": manifest_error,
+        "deployment_receipt": str(deployment_path.resolve()),
+        "deployment_receipt_error": deployment_error,
         "manifest_status": manifest_status,
         "manifest_placement_contract_version": manifest_placement_version,
         "expected_placement_contract_version": PLACEMENT_CONTRACT_VERSION,
@@ -287,6 +318,7 @@ def main(argv=None):
                 "assembly_placement_contract_stale",
                 "parsed_native_bone_count_zero",
                 "baseref_branch_leaf_mesh_refresh_scope",
+                "unreal_deployment_receipt_missing_or_stale",
             ],
             "selection_is_converging": True,
             "force_native_export": True,
@@ -305,140 +337,84 @@ def main(argv=None):
         print("No stale or explicit verification targets were found.")
         return 0
 
-    results = []
-    failed = 0
-    prepared = []
-    if args.resume_run_id:
-        for target in selected:
-            prepared_report = (
-                args.log_dir
-                / f"{target['stem']}_affected_prepared_{run_id}.json"
-            )
-            ok = prepared_report.is_file()
-            results.append({
-                "stem": target["stem"],
-                "spm": target["spm"],
-                "returncode": 0 if ok else 1,
-                "status": "prepared" if ok else "failed",
-            })
-            if ok:
-                prepared.append(json.loads(
-                    prepared_report.read_text(encoding="utf-8")
-                ))
-            else:
-                failed += 1
-        print(
-            f"SK_AFFECTED_HEADLESS_RESUMED_PREPARED={len(prepared)}",
-            flush=True,
+    # Use the dependency-aware fleet for the actual work.  It prepares every
+    # distinct Cluster provider first, then every consuming root, and finally
+    # submits one ordered Unreal manifest.  The former direct exact-push loop
+    # skipped providers, leaving a stale provider FBX/receipt behind a newly
+    # exported root and causing the Assembly validator to reject authored bone
+    # weights.  Cluster providers retain their established single-axis-bone
+    # policy; force-native-export only refreshes that policy's receipt/artifact.
+    fleet_args = [
+        "--root", str(args.root.expanduser().resolve()),
+        "--log-dir", str(args.log_dir.expanduser().resolve()),
+        "--p4-client", args.p4_client,
+        "--run-id", run_id,
+        "--force-native-export",
+        "--push-pass-through-roots",
+    ]
+    for target in selected:
+        fleet_args.extend(["--target-spm", target["spm"]])
+    if args.dry_run:
+        fleet_args.append("--dry-run")
+    if args.reset_item_retries:
+        fleet_args.append("--reset-item-retries")
+    returncode = cluster_fleet_push.main(fleet_args)
+    fleet_report_path = args.log_dir / f"cluster_fleet_push_{run_id}.json"
+    fleet = json.loads(fleet_report_path.read_text(encoding="utf-8"))
+    selected_by_spm = {
+        str(Path(row["spm"]).resolve()).casefold(): row for row in selected
+    }
+    for result in fleet.get("results") or []:
+        if result.get("status") != "verified_in_unreal":
+            continue
+        target = selected_by_spm.get(
+            str(Path(result["spm"]).resolve()).casefold()
         )
-    for index, target in enumerate(selected, 1):
-        if args.resume_run_id:
-            break
-        print(f"[{index}/{len(selected)}] EXACT_PUSH {target['stem']}", flush=True)
-        push_args = [
-            "--spm",
-            target["spm"],
-            "--log-dir",
-            str(args.log_dir.expanduser().resolve()),
-            "--transport",
-            "headless",
-        ]
-        prepared_report = (
-            args.log_dir / f"{target['stem']}_affected_prepared_{run_id}.json"
-        )
-        if args.dry_run:
-            push_args.append("--dry-run")
-        else:
-            push_args.extend([
-                "--defer-unreal",
-                "--prepared-report",
-                str(prepared_report.resolve()),
-            ])
-        returncode = exact_push.main(push_args)
-        results.append({
-            "stem": target["stem"],
-            "spm": target["spm"],
-            "returncode": returncode,
-            "status": "ok" if returncode == 0 else "failed",
-        })
-        failed += int(returncode != 0)
-        if returncode == 0 and not args.dry_run:
-            prepared.append(json.loads(
-                prepared_report.read_text(encoding="utf-8")
-            ))
-
-    if prepared and not args.dry_run:
-        batch_manifest_path = args.log_dir / (
-            f"affected_exact_push_batch_{run_id}_manifest.json"
-        )
-        batch_checkpoint_path = args.log_dir / (
-            f"affected_exact_push_batch_{run_id}_checkpoint.json"
-        )
-        batch_report_path = args.log_dir / (
-            f"affected_exact_push_batch_{run_id}.json"
-        )
-        items = []
-        for row in prepared:
-            source_manifest = Path(row["outputs"]["manifest"])
-            payload = json.loads(source_manifest.read_text(encoding="utf-8"))
-            items.extend(payload.get("items") or [])
-        batch_manifest_path.write_text(
-            json.dumps({
-                "schema_version": 1,
-                "created_at": datetime.now().isoformat(timespec="seconds"),
-                "checkpoint_path": str(batch_checkpoint_path.resolve()),
-                "report_path": str(batch_report_path.resolve()),
-                "max_item_crash_retries": 2,
-                "items": items,
-            }, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        print(
-            f"SK_AFFECTED_HEADLESS_UNREAL_BATCH_ITEMS={len(items)}",
-            flush=True,
-        )
-        if args.reset_item_retries and batch_checkpoint_path.is_file():
-            retry_reset = exact_push.reset_checkpoint_item_retries(
-                batch_checkpoint_path
-            )
-            inventory["unreal_batch_retry_reset"] = retry_reset
-            print(
-                "SK_AFFECTED_HEADLESS_RETRY_RESET="
-                f"{len(retry_reset['reset'])}",
-                flush=True,
-            )
-        batch_result = exact_push.run_headless_manifest(
-            batch_manifest_path,
-            batch_checkpoint_path,
-            batch_report_path,
-        )
-        by_stem = {row["stem"]: row for row in results}
-        for row in prepared:
-            outputs = row["outputs"]
-            merged = exact_push.merge_unreal_result(outputs, batch_result)
-            stem = Path(outputs["queue_id"]).stem
-            ok = merged.get("status") == "ok"
-            by_stem[stem]["status"] = "ok" if ok else "failed"
-            by_stem[stem]["returncode"] = 0 if ok else 1
-            failed += int(not ok)
-        inventory["unreal_batch"] = {
-            "manifest": str(batch_manifest_path.resolve()),
-            "checkpoint": str(batch_checkpoint_path.resolve()),
-            "report": str(batch_report_path.resolve()),
-            "item_count": len(items),
+        if target is None:
+            continue
+        native_path = native_receipt_path(target)
+        manifest_path = Path(target["manifest"])
+        marker_path = deployment_receipt_path(target)
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker = {
+            "schema_version": 1,
+            "status": "imported_ok",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "spm": str(Path(target["spm"]).resolve()),
+            "native_receipt": str(native_path.resolve()),
+            "native_receipt_sha256": _sha256(native_path),
+            "assembly_manifest": str(manifest_path.resolve()),
+            "assembly_manifest_sha256": _sha256(manifest_path),
+            "cluster_fleet_report": str(fleet_report_path.resolve()),
+            "exact_push_report": result.get("report"),
         }
-
-    inventory["status"] = (
-        "dry_run" if args.dry_run else ("ok" if failed == 0 else "failed")
+        temporary = marker_path.with_suffix(marker_path.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps(marker, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        temporary.replace(marker_path)
+    inventory["execution_policy"] = (
+        "dependency_aware_cluster_providers_then_roots_single_unreal_batch"
     )
-    inventory["results"] = results
-    inventory["failed_count"] = failed
+    inventory["cluster_fleet_report"] = str(fleet_report_path.resolve())
+    inventory["provider_dependencies"] = fleet.get("provider_dependencies") or []
+    inventory["provider_results"] = fleet.get("provider_results") or []
+    inventory["results"] = fleet.get("results") or []
+    inventory["failed_count"] = int(fleet.get("failed_count") or 0)
+    inventory["provider_failed_count"] = int(
+        fleet.get("provider_failed_count") or 0
+    )
+    inventory["status"] = "dry_run" if args.dry_run else fleet.get("status")
     inventory_path.write_text(
         json.dumps(inventory, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    print(f"SK_AFFECTED_HEADLESS_VERIFIED={len(results) - failed}")
-    print(f"SK_AFFECTED_HEADLESS_FAILED={failed}")
-    return 0 if failed == 0 else 1
+    print(f"SK_AFFECTED_HEADLESS_VERIFIED={fleet.get('verified_count', 0)}")
+    print(f"SK_AFFECTED_HEADLESS_FAILED={inventory['failed_count']}")
+    print(
+        "SK_AFFECTED_HEADLESS_PROVIDER_FAILED="
+        f"{inventory['provider_failed_count']}"
+    )
+    return returncode
 
 
 if __name__ == "__main__":
