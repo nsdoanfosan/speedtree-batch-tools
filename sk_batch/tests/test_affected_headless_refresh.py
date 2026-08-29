@@ -112,6 +112,7 @@ def test_main_uses_dependency_fleet_for_every_selected_target(tmp_path, monkeypa
     call = captured["call"]
     assert "--force-native-export" in call
     assert "--push-pass-through-roots" in call
+    assert "--fail-fast" in call
     assert "--dry-run" in call
     assert call.count("--target-spm") == 2
     assert "SK_tree_a" in " ".join(call)

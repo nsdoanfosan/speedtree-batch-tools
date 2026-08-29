@@ -718,6 +718,11 @@ def parse_args(argv=None):
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--run-id")
     parser.add_argument("--reset-item-retries", action="store_true")
+    parser.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="stop preparation at the first provider or root data failure",
+    )
     return parser.parse_args(argv)
 
 
@@ -944,7 +949,30 @@ def main(argv=None):
         for root_spm in roots[1:]:
             if root_spm not in provider_result["dependency_of"]:
                 provider_result["dependency_of"].append(root_spm)
+        if args.fail_fast and provider_result.get("status") == "failed":
+            break
     save_fleet()
+
+    if args.fail_fast and any(
+        row.get("status") == "failed" for row in fleet["provider_results"]
+    ):
+        fleet["status"] = "failed"
+        fleet["verified_count"] = 0
+        fleet["skipped_no_current_assembly_count"] = 0
+        fleet["failed_count"] = 0
+        fleet["provider_verified_count"] = 0
+        fleet["provider_failed_count"] = len([
+            row for row in fleet["provider_results"]
+            if row.get("status") == "failed"
+        ])
+        save_fleet()
+        print("SK_CLUSTER_FLEET_VERIFIED=0")
+        print("SK_CLUSTER_FLEET_FAILED=0")
+        print(
+            "SK_CLUSTER_FLEET_PROVIDER_FAILED="
+            f"{fleet['provider_failed_count']}"
+        )
+        return 1
 
     for index, target in enumerate(targets, 1):
         print(f"[{index}/{len(targets)}] EXPORT {target['stem']}", flush=True)
@@ -1130,6 +1158,8 @@ def main(argv=None):
             result["status"] = "failed"
             result["error"] = str(exc)
         save_fleet()
+        if args.fail_fast and result.get("status") == "failed":
+            break
 
     if pending:
         manifest_path = args.log_dir / f"cluster_fleet_push_{run_id}_unreal_manifest.json"

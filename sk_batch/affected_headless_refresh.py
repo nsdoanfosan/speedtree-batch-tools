@@ -351,6 +351,7 @@ def main(argv=None):
         "--run-id", run_id,
         "--force-native-export",
         "--push-pass-through-roots",
+        "--fail-fast",
     ]
     for target in selected:
         fleet_args.extend(["--target-spm", target["spm"]])
