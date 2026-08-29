@@ -59,6 +59,19 @@ def _is_headless_manifest_runtime():
     return bool(os.environ.get("SK_BATCH_MANIFEST_PATH"))
 
 
+def _is_null_rhi_runtime():
+    """Return whether Unreal was intentionally started without a renderer."""
+    system_library = getattr(unreal, "SystemLibrary", None)
+    get_command_line = getattr(system_library, "get_command_line", None)
+    parse_param = getattr(system_library, "parse_param", None)
+    if not callable(get_command_line) or not callable(parse_param):
+        return False
+    try:
+        return bool(parse_param(str(get_command_line()), "nullrhi"))
+    except Exception:
+        return False
+
+
 def _defer_headless_runtime_validation(assembly, recovered_from_pending=False):
     """Record that GPU frame validation must run later in a live editor/RPC."""
     previous = assembly.get("runtime") if recovered_from_pending else None
@@ -78,11 +91,200 @@ def _defer_headless_runtime_validation(assembly, recovered_from_pending=False):
     return assembly
 
 
+def _validate_null_rhi_dynamic_wind_runtime(mesh_path):
+    """Fail closed on CPU/runtime setup while deferring renderer-only residency."""
+    begin = _begin_instanced_dynamic_wind_runtime(mesh_path)
+    token = begin.get("probe_token")
+    checks = {}
+    validation_error = None
+    try:
+        validation = begin.get("validation")
+        if not isinstance(validation, dict):
+            raise RuntimeError("NullRHI DynamicWind validation payload is not an object")
+        checks = {
+            "begin_success": begin.get("success") is True,
+            "begin_pending": begin.get("status") == "pending",
+            "probe_token_present": bool(token),
+            "begin_cpu_runtime_contract": begin.get("begin_cpu_runtime_contract") is True,
+            "crud_add": begin.get("crud_add") is True,
+            "crud_update": begin.get("crud_update") is True,
+            "crud_read_back": begin.get("crud_read_back") is True,
+            "crud_remove": begin.get("crud_remove") is True,
+            "crud_readd": begin.get("crud_readd") is True,
+            "owner_actor_is_transient": begin.get("owner_actor_is_transient") is True,
+            "persistent_level_dirty_state_preserved": (
+                begin.get("persistent_level_dirty_state_preserved") is True
+            ),
+            "subsystem_exists": validation.get("subsystem_exists") is True,
+            "subsystem_provider_ready": validation.get("subsystem_provider_ready") is True,
+            "mesh_skeleton_identity_matches": (
+                validation.get("mesh_skeleton_identity_matches") is True
+            ),
+            "reference_bone_counts_match": (
+                isinstance(validation.get("ref_bones"), int)
+                and validation.get("ref_bones") > 0
+                and validation.get("ref_bones") == validation.get("skeleton_ref_bones")
+            ),
+            "skeleton_bind_pose_matches": (
+                validation.get("skeleton_bind_pose_mismatch") is False
+            ),
+            "wind_bones_valid": (
+                isinstance(validation.get("wind_bones"), int)
+                and validation.get("wind_bones") > 0
+                and validation.get("invalid_wind_bones") == 0
+            ),
+            "skeletal_data_ready": validation.get("skeletal_data_ready") is True,
+            "component_mesh_matches": validation.get("component_mesh_matches") is True,
+            "component_instance_created": validation.get("component_instances") == 1,
+            "component_registered": validation.get("component_registered") is True,
+            "component_visible": validation.get("component_visible") is True,
+            "component_enabled": validation.get("component_enabled") is True,
+            "mesh_not_compiling": validation.get("mesh_compiling") is False,
+            "provider_not_compiling": validation.get("provider_compiling") is False,
+            "provider_is_dynamic_wind_data": (
+                validation.get("provider_is_dynamic_wind_data") is True
+            ),
+        }
+        failed = sorted(name for name, passed in checks.items() if not passed)
+        if failed:
+            raise RuntimeError(
+                "NullRHI DynamicWind CPU/static contract failed: "
+                + ", ".join(failed)
+            )
+    except Exception as exc:
+        validation_error = exc
+    cleanup = _best_effort_cancel_instanced_dynamic_wind_runtime(token)
+    if validation_error is not None:
+        if not cleanup.get("cleanup_confirmed"):
+            raise RuntimeError(
+                f"{validation_error}; NullRHI DynamicWind probe cleanup also failed"
+            ) from validation_error
+        raise validation_error
+    if not cleanup.get("cleanup_confirmed"):
+        raise RuntimeError("NullRHI DynamicWind CPU/static probe cleanup failed")
+    return {
+        "success": True,
+        "status": "null_rhi_cpu_static_passed_render_deferred",
+        "render_frame_validation_performed": False,
+        "render_frame_validation_deferred": True,
+        "reason": (
+            "Unreal was intentionally started with -NullRHI, so no scene proxy "
+            "or render-thread frame can exist"
+        ),
+        "cpu_static_checks": checks,
+        "begin": begin,
+        "cleanup": cleanup,
+    }
+
+
+def _validate_null_rhi_assembly_static_contract(assembly):
+    """Re-assert every non-render Assembly contract before accepting NullRHI."""
+    build = assembly.get("build") or {}
+    skeleton = build.get("manifest_skeleton_diagnostic") or {}
+    bone_map = build.get("unreal_bone_name_map") or {}
+    binding = build.get("native_binding_contract") or {}
+    preserve = build.get("final_nanite_shape_preservation") or {}
+    completion = build.get("bounds_completion") or {}
+    wind = build.get("dynamic_wind") or {}
+    provenance = build.get("provenance") or {}
+    material_normalization = build.get("material_normalization") or {}
+    materials = assembly.get("materials") or {}
+    parts = build.get("parts") or []
+    assembly_path = str(build.get("assembly") or "").split(".")[0]
+    save_writability = assembly.get("save_writability") or []
+    checks = {
+        "build_status": build.get("status") == "ok",
+        "full_skeletal_mesh_preserved": build.get("full_skeletal_mesh_preserved") is True,
+        "skeleton_current_authority": (
+            skeleton.get("current_unreal_skeleton_is_authoritative") is True
+            and isinstance(skeleton.get("actual_bone_count"), int)
+            and skeleton.get("actual_bone_count") > 0
+        ),
+        "bone_map_exact_without_approximation": (
+            str(bone_map.get("status") or "").startswith("exact")
+            and bone_map.get("approximation_used") is False
+        ),
+        "native_binding_exact": (
+            binding.get("construction") == "direct_exact_reference_skeleton_indices"
+            and binding.get("all_authored_influences_preserved") is True
+            and binding.get("weights_sum_to_one") is True
+            and isinstance(build.get("binding_count"), int)
+            and build.get("binding_count") > 0
+        ),
+        "base_weights_in_final_wind": (
+            build.get("base_weights_in_final_wind") is True
+        ),
+        "final_preserve_area": (
+            preserve.get("policy") == "preserve_area"
+            and preserve.get("applied_before_finish") is True
+            and preserve.get("base_and_parts_unchanged") is True
+            and preserve.get("preserved_through_finish") is True
+        ),
+        "assembly_bounds_complete": completion.get("status") == "complete",
+        "dynamic_wind_exact": (
+            wind.get("success") is True
+            and isinstance(build.get("final_skeleton_bones"), int)
+            and build.get("final_skeleton_bones") > 0
+            and skeleton.get("actual_bone_count") == build.get("final_skeleton_bones")
+            and wind.get("declared_bones") == build.get("final_skeleton_bones")
+            and wind.get("final_bones") == build.get("final_skeleton_bones")
+            and wind.get("skeleton_asset_ref_bones") == build.get("final_skeleton_bones")
+            and wind.get("skeleton_asset_matches_final_mesh") is True
+            and wind.get("skeleton_bind_pose_matches") is True
+            and wind.get("missing_current_joints") == 0
+            and wind.get("remapped_joint_records") == 0
+            and wind.get("bone_group_mapping_matches_json") is True
+        ),
+        "provenance_counts_exact": (
+            provenance.get("success") is True
+            and provenance.get("part_count") == len(parts)
+            and provenance.get("instance_count") == build.get("binding_count")
+        ),
+        "material_normalization_exact": (
+            (material_normalization.get("assembly_section_audit") or {}).get("status")
+            == "ok"
+            and len(material_normalization.get("part_section_audits") or [])
+            == len(parts)
+            and all(
+                audit.get("status") == "ok"
+                for audit in material_normalization.get("part_section_audits") or []
+            )
+        ),
+        "final_material_sections_exact": (
+            (materials.get("section_material_validation") or {}).get("status") == "ok"
+            and bool(materials.get("slots"))
+            and all(slot.get("material") for slot in materials.get("slots") or [])
+        ),
+        "assembly_writable": any(
+            str(row.get("asset") or "").split(".")[0] == assembly_path
+            and row.get("status") in {"writable", "new_package"}
+            for row in save_writability
+        ),
+        "thumbnail_free_save_completed": (
+            (assembly.get("thumbnail_free_save") or {}).get("status") == "ok"
+            and (assembly.get("thumbnail_free_save") or {}).get("asset") == assembly_path
+        ),
+    }
+    failed = sorted(name for name, passed in checks.items() if not passed)
+    if failed:
+        raise RuntimeError(
+            "NullRHI Assembly static contract failed: " + ", ".join(failed)
+        )
+    return checks
+
+
 def _prepare_assembly_runtime_validation(assembly):
     if assembly.get("status") != "ready_for_runtime":
         return "imported_ok"
     if _is_headless_manifest_runtime():
         _defer_headless_runtime_validation(assembly)
+        return "imported_ok"
+    if _is_null_rhi_runtime():
+        assembly_path = (assembly.get("build") or {}).get("assembly")
+        assembly_static_checks = _validate_null_rhi_assembly_static_contract(assembly)
+        assembly["runtime"] = _validate_null_rhi_dynamic_wind_runtime(assembly_path)
+        assembly["runtime"]["assembly_static_checks"] = assembly_static_checks
+        assembly["status"] = "ok"
         return "imported_ok"
     assembly_path = (assembly.get("build") or {}).get("assembly")
     runtime = _begin_instanced_dynamic_wind_runtime(assembly_path)
@@ -2320,8 +2522,11 @@ def _ingest_cluster_assembly(send2ue_unreal, item, full_wind):
         if assembly_path
         else None
     )
-    if assembly_path:
+    thumbnail_free_saved = (
         _save_large_assembly_without_thumbnail(assembly_path)
+        if assembly_path
+        else None
+    )
     return {
         "status": "ready_for_runtime",
         "assets": generated_assets,
@@ -2331,6 +2536,10 @@ def _ingest_cluster_assembly(send2ue_unreal, item, full_wind):
         "skeleton_reimports": skeleton_reimports,
         "build": result,
         "materials": materials,
+        "thumbnail_free_save": {
+            "status": "ok",
+            "asset": thumbnail_free_saved,
+        } if thumbnail_free_saved else None,
         "full_final_skeleton": full_skeleton_path,
         "persisted_final_contract": persisted_final_contract,
         "wind_contract_comparison": wind_contract_comparison,
@@ -2699,13 +2908,38 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
         if (
             previous.get("fingerprint") == fingerprint
             and previous.get("status") == "runtime_pending"
-            and _is_headless_manifest_runtime()
+            and (_is_headless_manifest_runtime() or _is_null_rhi_runtime())
         ):
             assembly = previous.get("cluster_assembly") or {}
-            _defer_headless_runtime_validation(
-                assembly,
-                recovered_from_pending=True,
-            )
+            if _is_headless_manifest_runtime():
+                _defer_headless_runtime_validation(
+                    assembly,
+                    recovered_from_pending=True,
+                )
+            else:
+                previous_begin = assembly.get("runtime")
+                assembly_path = (assembly.get("build") or {}).get("assembly")
+                previous_token = (
+                    previous_begin.get("probe_token")
+                    if isinstance(previous_begin, dict)
+                    else None
+                )
+                previous_cleanup = (
+                    _best_effort_cancel_instanced_dynamic_wind_runtime(previous_token)
+                    if previous_token
+                    else None
+                )
+                assembly_static_checks = _validate_null_rhi_assembly_static_contract(
+                    assembly
+                )
+                assembly["runtime"] = _validate_null_rhi_dynamic_wind_runtime(
+                    assembly_path
+                )
+                assembly["runtime"]["assembly_static_checks"] = assembly_static_checks
+                assembly["runtime"]["recovered_from_pending"] = True
+                assembly["runtime"]["previous_begin"] = previous_begin
+                assembly["runtime"]["previous_cleanup"] = previous_cleanup
+                assembly["status"] = "ok"
             previous["cluster_assembly"] = assembly
             previous["status"] = "imported_ok"
             previous["completed_at"] = _now()

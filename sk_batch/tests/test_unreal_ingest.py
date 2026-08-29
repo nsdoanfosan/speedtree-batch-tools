@@ -5,6 +5,7 @@ import tempfile
 import types
 import unittest
 import stat
+from copy import deepcopy
 from pathlib import Path
 
 
@@ -983,6 +984,289 @@ def test_headless_runtime_validation_is_deferred_without_starting_probe(monkeypa
     assert assembly["status"] == "ok"
     assert assembly["runtime"]["status"] == "headless_deferred"
     assert assembly["runtime"]["render_frame_validation_performed"] is False
+
+
+def test_null_rhi_runtime_validation_runs_cpu_checks_without_finish_frame_polling(
+    monkeypatch,
+):
+    runner = load_runner(monkeypatch)
+    runner.unreal.SystemLibrary = types.SimpleNamespace(
+        get_command_line=lambda: (
+            'UnrealEditor.exe "C:/Project/MyProject.uproject" -NullRHI -Unattended'
+        ),
+        parse_param=lambda command_line, name: (
+            name.casefold() == "nullrhi" and "-NullRHI" in command_line
+        ),
+    )
+    seen = []
+    monkeypatch.setattr(
+        runner,
+        "_validate_null_rhi_assembly_static_contract",
+        lambda assembly: {"build_status": assembly["status"] == "ready_for_runtime"},
+    )
+    monkeypatch.setattr(
+        runner,
+        "_validate_null_rhi_dynamic_wind_runtime",
+        lambda path: seen.append(path) or {
+            "success": True,
+            "status": "null_rhi_cpu_static_passed_render_deferred",
+            "render_frame_validation_performed": False,
+        },
+    )
+    assembly = {
+        "status": "ready_for_runtime",
+        "build": {"assembly": "/Game/Meshes/Tree/Assembly"},
+    }
+
+    status = runner._prepare_assembly_runtime_validation(assembly)
+
+    assert status == "imported_ok"
+    assert assembly["status"] == "ok"
+    assert assembly["runtime"]["status"] == (
+        "null_rhi_cpu_static_passed_render_deferred"
+    )
+    assert assembly["runtime"]["render_frame_validation_performed"] is False
+    assert assembly["runtime"]["assembly_static_checks"] == {"build_status": True}
+    assert seen == ["/Game/Meshes/Tree/Assembly"]
+
+
+def test_null_rhi_cpu_static_probe_validates_and_cleans_up(monkeypatch):
+    runner = load_runner(monkeypatch)
+    begin = {
+        "success": True,
+        "status": "pending",
+        "probe_token": "probe-null-rhi",
+        "begin_cpu_runtime_contract": True,
+        "crud_add": True,
+        "crud_update": True,
+        "crud_read_back": True,
+        "crud_remove": True,
+        "crud_readd": True,
+        "owner_actor_is_transient": True,
+        "persistent_level_dirty_state_preserved": True,
+        "validation": {
+            "subsystem_exists": True,
+            "subsystem_provider_ready": True,
+            "ref_bones": 42,
+            "skeleton_ref_bones": 42,
+            "mesh_skeleton_identity_matches": True,
+            "skeleton_bind_pose_mismatch": False,
+            "wind_bones": 42,
+            "invalid_wind_bones": 0,
+            "skeletal_data_ready": True,
+            "component_mesh_matches": True,
+            "component_instances": 1,
+            "component_registered": True,
+            "component_visible": True,
+            "component_enabled": True,
+            "mesh_compiling": False,
+            "provider_compiling": False,
+            "provider_is_dynamic_wind_data": True,
+        },
+    }
+    monkeypatch.setattr(
+        runner,
+        "_begin_instanced_dynamic_wind_runtime",
+        lambda path: begin if path == "/Game/Meshes/Tree/Assembly" else None,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_best_effort_cancel_instanced_dynamic_wind_runtime",
+        lambda token: {
+            "success": token == "probe-null-rhi",
+            "cleanup_confirmed": token == "probe-null-rhi",
+            "result": {"success": True, "cancelled": True},
+        },
+    )
+
+    result = runner._validate_null_rhi_dynamic_wind_runtime(
+        "/Game/Meshes/Tree/Assembly"
+    )
+
+    assert result["success"] is True
+    assert result["status"] == "null_rhi_cpu_static_passed_render_deferred"
+    assert all(result["cpu_static_checks"].values())
+    assert result["cleanup"]["cleanup_confirmed"] is True
+
+
+def test_null_rhi_cpu_static_probe_fails_closed_on_skeleton_mismatch(monkeypatch):
+    runner = load_runner(monkeypatch)
+    begin = {
+        "probe_token": "probe-null-rhi",
+        "begin_cpu_runtime_contract": True,
+        "crud_add": True,
+        "crud_update": True,
+        "crud_read_back": True,
+        "crud_remove": True,
+        "crud_readd": True,
+        "owner_actor_is_transient": True,
+        "persistent_level_dirty_state_preserved": True,
+        "validation": {
+            "subsystem_exists": True,
+            "subsystem_provider_ready": True,
+            "ref_bones": 42,
+            "skeleton_ref_bones": 42,
+            "mesh_skeleton_identity_matches": False,
+            "skeleton_bind_pose_mismatch": False,
+            "wind_bones": 42,
+            "invalid_wind_bones": 0,
+            "skeletal_data_ready": True,
+            "component_mesh_matches": True,
+            "component_instances": 1,
+            "component_registered": True,
+            "component_visible": True,
+            "component_enabled": True,
+            "mesh_compiling": False,
+            "provider_compiling": False,
+            "provider_is_dynamic_wind_data": True,
+        },
+    }
+    monkeypatch.setattr(runner, "_begin_instanced_dynamic_wind_runtime", lambda _p: begin)
+    monkeypatch.setattr(
+        runner,
+        "_best_effort_cancel_instanced_dynamic_wind_runtime",
+        lambda _token: {"cleanup_confirmed": True},
+    )
+
+    with unittest.TestCase().assertRaisesRegex(
+        RuntimeError,
+        "mesh_skeleton_identity_matches",
+    ):
+        runner._validate_null_rhi_dynamic_wind_runtime("/Game/Meshes/Tree/Assembly")
+
+
+def test_null_rhi_cpu_static_probe_cleans_up_malformed_validation(monkeypatch):
+    runner = load_runner(monkeypatch)
+    monkeypatch.setattr(
+        runner,
+        "_begin_instanced_dynamic_wind_runtime",
+        lambda _path: {
+            "success": True,
+            "status": "pending",
+            "probe_token": "probe-malformed",
+            "validation": ["malformed"],
+        },
+    )
+    cancelled = []
+    monkeypatch.setattr(
+        runner,
+        "_best_effort_cancel_instanced_dynamic_wind_runtime",
+        lambda token: cancelled.append(token) or {"cleanup_confirmed": True},
+    )
+
+    with unittest.TestCase().assertRaisesRegex(RuntimeError, "not an object"):
+        runner._validate_null_rhi_dynamic_wind_runtime("/Game/Meshes/Tree/Assembly")
+
+    assert cancelled == ["probe-malformed"]
+
+
+def _null_rhi_static_assembly_fixture(bone_count=9789):
+    assembly_path = "/Game/Meshes/Tree/Assembly/SK_Tree_NaniteAssembly"
+    return {
+        "status": "ready_for_runtime",
+        "save_writability": [
+            {"asset": assembly_path, "status": "writable"},
+        ],
+        "thumbnail_free_save": {"status": "ok", "asset": assembly_path},
+        "materials": {
+            "slots": [{"material": "/Game/Material/MI_Tree.MI_Tree"}],
+            "section_material_validation": {"status": "ok"},
+        },
+        "build": {
+            "status": "ok",
+            "full_skeletal_mesh_preserved": True,
+            "assembly": assembly_path + ".SK_Tree_NaniteAssembly",
+            "final_skeleton_bones": bone_count,
+            "manifest_skeleton_diagnostic": {
+                "current_unreal_skeleton_is_authoritative": True,
+                "actual_bone_count": bone_count,
+            },
+            "unreal_bone_name_map": {
+                "status": "exact_constant_index_offset",
+                "approximation_used": False,
+            },
+            "native_binding_contract": {
+                "construction": "direct_exact_reference_skeleton_indices",
+                "all_authored_influences_preserved": True,
+                "weights_sum_to_one": True,
+            },
+            "binding_count": 4,
+            "base_weights_in_final_wind": True,
+            "final_nanite_shape_preservation": {
+                "policy": "preserve_area",
+                "applied_before_finish": True,
+                "base_and_parts_unchanged": True,
+                "preserved_through_finish": True,
+            },
+            "bounds_completion": {"status": "complete"},
+            "dynamic_wind": {
+                "success": True,
+                "declared_bones": bone_count,
+                "final_bones": bone_count,
+                "skeleton_asset_ref_bones": bone_count,
+                "skeleton_asset_matches_final_mesh": True,
+                "skeleton_bind_pose_matches": True,
+                "missing_current_joints": 0,
+                "remapped_joint_records": 0,
+                "bone_group_mapping_matches_json": True,
+            },
+            "parts": [{"bindings": 4}],
+            "provenance": {
+                "success": True,
+                "part_count": 1,
+                "instance_count": 4,
+            },
+            "material_normalization": {
+                "part_section_audits": [{"status": "ok"}],
+                "assembly_section_audit": {"status": "ok"},
+            },
+        },
+    }
+
+
+def test_null_rhi_assembly_static_contract_accepts_exact_9789_bones():
+    runner = load_runner()
+    checks = runner._validate_null_rhi_assembly_static_contract(
+        _null_rhi_static_assembly_fixture()
+    )
+
+    assert all(checks.values())
+
+
+def test_null_rhi_assembly_static_contract_fails_closed_on_exactness_regressions():
+    runner = load_runner()
+    for case in (
+        "bind_pose",
+        "bone_count",
+        "approximation",
+        "material_audit",
+        "preserve_area",
+    ):
+        payload = deepcopy(_null_rhi_static_assembly_fixture())
+        if case == "bind_pose":
+            payload["build"]["dynamic_wind"]["skeleton_bind_pose_matches"] = False
+        elif case == "bone_count":
+            payload["build"]["dynamic_wind"]["final_bones"] = 9788
+        elif case == "approximation":
+            payload["build"]["unreal_bone_name_map"]["approximation_used"] = True
+        elif case == "material_audit":
+            payload["materials"]["section_material_validation"]["status"] = (
+                "unavailable"
+            )
+        elif case == "preserve_area":
+            payload["build"]["final_nanite_shape_preservation"][
+                "preserved_through_finish"
+            ] = False
+
+        with unittest.TestCase().subTest(case=case):
+            with unittest.TestCase().assertRaises(RuntimeError):
+                runner._validate_null_rhi_assembly_static_contract(payload)
+
+
+def test_null_rhi_detection_fails_closed_without_unreal_command_line_api():
+    runner = load_runner()
+
+    assert runner._is_null_rhi_runtime() is False
 
 
 def test_headless_restart_recovers_pending_without_reimport(tmp_path, monkeypatch):
