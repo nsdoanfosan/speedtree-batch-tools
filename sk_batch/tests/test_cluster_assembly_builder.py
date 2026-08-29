@@ -499,6 +499,41 @@ class GeneratedMaterialSlotContractTests(unittest.TestCase):
                 ["M_leaf_tree_01.001", "M_bark_tree_01"],
             )
 
+    def test_generated_sidecar_uses_declared_speedtree_intent_alias(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "Full.json"
+            payload = self._sidecar_payload("SK_tree_01")
+            payload["materials"][0]["speedtree_intent"].update({
+                "material_instance_base": "Decal_Mossy_bark_01",
+                "production_group_base": "M_Decal_Mossy_bark_01",
+            })
+            payload["materials"][0]["name"] = "M_Decal_Mossy_bark_01"
+            payload["materials"][0]["slot_name"] = (
+                "M_Decal_Mossy_bark_01"
+            )
+            source.write_text(json.dumps(payload), encoding="utf-8")
+
+            result = _generated_material_sidecar(
+                {"_material_pipeline_json_path": str(source)},
+                "SK_tree_01_NA_Base",
+                root,
+                expected_material_slots=["Decal_Mossy_bark_01"],
+            )
+
+            generated = json.loads(
+                Path(result["generated"]["path"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(generated["materials"]), 1)
+            self.assertEqual(
+                generated["materials"][0]["slot_name"],
+                "M_Decal_Mossy_bark_01",
+            )
+            self.assertEqual(
+                generated["generated_material_slot_contract"]["slot_names"],
+                ["Decal_Mossy_bark_01"],
+            )
+
 class AssemblyBaseRoleExclusionTests(unittest.TestCase):
     def test_only_matched_role_polygons_are_removed(self):
         final_mesh = object()

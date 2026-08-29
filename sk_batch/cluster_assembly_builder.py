@@ -6861,10 +6861,22 @@ def _generated_material_sidecar(
         materials = list(payload.get("materials") or [])
         by_key = defaultdict(list)
         for entry in materials:
-            slot_name = str(
-                entry.get("slot_name") or entry.get("name") or ""
-            ).strip()
-            by_key[_material_slot_key(slot_name)].append(entry)
+            intent = entry.get("speedtree_intent") or {}
+            # Full sidecars intentionally distinguish the production group
+            # slot (often ``M_*``) from SpeedTree's authored material-instance
+            # base (often the same name without ``M_``).  Both are explicit,
+            # authoritative identities for this one row; use those declared
+            # aliases instead of guessing by stripping prefixes.
+            aliases = {
+                str(entry.get("slot_name") or "").strip(),
+                str(entry.get("name") or "").strip(),
+                str(intent.get("material_instance_base") or "").strip(),
+                str(intent.get("production_group_base") or "").strip(),
+            }
+            for alias in aliases:
+                key = _material_slot_key(alias)
+                if key and entry not in by_key[key]:
+                    by_key[key].append(entry)
         selected = []
         seen_expected = set()
         for slot_index, slot_name in enumerate(expected_material_slots):
