@@ -232,6 +232,33 @@ def load_native_export_receipt(path, *, source_spm=None):
             ),
         })
 
+    parent_by_bone_id = {
+        row["id"]: row["parent_id"] for row in checked_bones
+    }
+    for row in checked_bones:
+        bone_id = row["id"]
+        parent_id = row["parent_id"]
+        if bone_id != 0 and parent_id == bone_id:
+            raise NativeReceiptError(
+                "native SpeedTree bone cannot parent itself"
+            )
+        if parent_id != 0 and parent_id not in bone_ids:
+            raise NativeReceiptError(
+                "native SpeedTree bone parent ID is missing"
+            )
+    for row in checked_bones:
+        bone_id = row["id"]
+        parent_id = row["parent_id"]
+        visited = {bone_id}
+        current = parent_id
+        while current != 0:
+            if current in visited:
+                raise NativeReceiptError(
+                    "native SpeedTree bone parent graph contains a cycle"
+                )
+            visited.add(current)
+            current = parent_by_bone_id[current]
+
     checked_instances = []
     for row in payload.get("generated_instances") or []:
         try:

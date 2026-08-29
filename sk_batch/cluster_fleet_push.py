@@ -153,6 +153,7 @@ def build_assembly_command(
     *,
     cluster_assembly_contract=None,
     force_native_export=False,
+    force_cluster_assembly_rebuild=False,
 ):
     spm = Path(target["spm"]).resolve()
     command = [
@@ -184,6 +185,8 @@ def build_assembly_command(
     ])
     if force_native_export:
         command.insert(-2, "--force-native-export")
+    if force_cluster_assembly_rebuild:
+        command.insert(-2, "--force-cluster-assembly-rebuild")
     return command
 
 
@@ -784,11 +787,36 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--force-cluster-assembly-rebuild",
+        action="store_true",
+        help=(
+            "rebuild current Cluster Assembly output instead of reusing an "
+            "existing Assembly computation"
+        ),
+    )
+    parser.add_argument(
+        "--transport",
+        choices=("headless", "rpc"),
+        default="headless",
+        help=(
+            "use a new Unreal commandlet batch or the currently open Unreal "
+            "Editor's Send2UE RPC endpoint"
+        ),
+    )
+    parser.add_argument(
         "--push-pass-through-roots",
         action="store_true",
         help=(
             "also export/import roots whose current cluster manifest is "
             "pass-through; required when native full-mesh bone data changed"
+        ),
+    )
+    parser.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help=(
+            "prepare and validate native/Assembly FBX outputs without "
+            "checking out Unreal packages or launching an Unreal commandlet"
         ),
     )
     parser.add_argument("--dry-run", action="store_true")
@@ -812,6 +840,8 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.prepare_only and args.transport == "rpc":
+        raise SystemExit("--prepare-only cannot be combined with --transport rpc")
     exact_target_keys = {
         normalized_path_key(Path(value).expanduser().resolve())
         for value in args.target_spm
@@ -866,7 +896,11 @@ def main(argv=None):
     fleet = {
         "status": "running",
         "root": str(args.root.expanduser().resolve()),
-        "transport": "headless_commandlet",
+        "transport": (
+            "fbx_only"
+            if args.prepare_only
+            else ("open_editor_rpc" if args.transport == "rpc" else "headless_commandlet")
+        ),
         "assembly_policy": (
             "provider_assembly_push_then_refresh_exact_target_"
             "assembly_export_and_push"
@@ -994,6 +1028,7 @@ def main(argv=None):
                 log_dir=args.log_dir,
                 run_id=f"fleet_{run_id}_provider_{ordinal:03d}",
                 unreal_project=args.unreal_project,
+                transport=args.transport,
             )
             assembly_report = (
                 args.log_dir
@@ -1008,6 +1043,9 @@ def main(argv=None):
                 outputs["material_contract"],
                 assembly_report,
                 force_native_export=args.force_native_export,
+                force_cluster_assembly_rebuild=(
+                    args.force_cluster_assembly_rebuild
+                ),
             )
             result["assembly_report"] = str(assembly_report)
             if (
@@ -1089,6 +1127,17 @@ def main(argv=None):
             export_report = json.loads(
                 outputs["report"].read_text(encoding="utf-8")
             )
+            if args.transport == "rpc":
+                verification = validate_provider_live_result(export_report)
+                result["verification"] = verification
+                if not verification["ok"]:
+                    raise RuntimeError(
+                        "provider RPC Push postcondition failed: "
+                        + "; ".join(verification["problems"])
+                    )
+                result["status"] = "verified_dependency_in_unreal"
+                save_fleet()
+                return result
             if export_report.get("status") != "exported_pending_unreal":
                 raise RuntimeError(
                     "provider export did not reach exported_pending_unreal"
@@ -1214,6 +1263,7 @@ def main(argv=None):
                 log_dir=args.log_dir,
                 run_id=f"fleet_{run_id}_{index:03d}",
                 unreal_project=args.unreal_project,
+                transport=args.transport,
             )
             assembly_report = (
                 args.log_dir
@@ -1226,6 +1276,9 @@ def main(argv=None):
                 assembly_report,
                 cluster_assembly_contract=receipt_refresh_report,
                 force_native_export=args.force_native_export,
+                force_cluster_assembly_rebuild=(
+                    args.force_cluster_assembly_rebuild
+                ),
             )
             result["assembly_report"] = str(assembly_report)
             while True:
@@ -1314,6 +1367,17 @@ def main(argv=None):
             export_report = json.loads(
                 outputs["report"].read_text(encoding="utf-8")
             )
+            if args.transport == "rpc":
+                verification = validate_live_result(export_report, target)
+                result["verification"] = verification
+                if not verification["ok"]:
+                    raise RuntimeError(
+                        "production RPC Push postcondition failed: "
+                        + "; ".join(verification["problems"])
+                    )
+                result["status"] = "verified_in_unreal"
+                save_fleet()
+                continue
             if export_report.get("status") != "exported_pending_unreal":
                 raise RuntimeError(
                     "production export did not reach exported_pending_unreal"
@@ -1340,6 +1404,18 @@ def main(argv=None):
         save_fleet()
         if args.fail_fast and result.get("status") == "failed":
             break
+
+    if pending and args.prepare_only:
+        for entry in pending:
+            entry["result"]["status"] = (
+                "prepared_dependency_fbx"
+                if entry["kind"] == "provider"
+                else "prepared_fbx"
+            )
+        fleet["prepare_only"] = True
+        fleet["prepared_manifest_item_count"] = len(pending)
+        pending.clear()
+        save_fleet()
 
     if pending:
         manifest_path = args.log_dir / f"cluster_fleet_push_{run_id}_unreal_manifest.json"
@@ -1416,13 +1492,18 @@ def main(argv=None):
         "verified_in_unreal",
         "skipped_no_current_assembly",
     }
+    if args.prepare_only:
+        successful_statuses.add("prepared_fbx")
     failed = [
         row for row in fleet["results"]
         if row["status"] not in successful_statuses
     ]
+    successful_provider_statuses = {"verified_dependency_in_unreal"}
+    if args.prepare_only:
+        successful_provider_statuses.add("prepared_dependency_fbx")
     failed_providers = [
         row for row in fleet["provider_results"]
-        if row["status"] != "verified_dependency_in_unreal"
+        if row["status"] not in successful_provider_statuses
     ]
     fleet["status"] = (
         "ok"
@@ -1442,9 +1523,18 @@ def main(argv=None):
         row for row in fleet["provider_results"]
         if row["status"] == "verified_dependency_in_unreal"
     ])
+    fleet["prepared_count"] = len([
+        row for row in fleet["results"]
+        if row["status"] == "prepared_fbx"
+    ])
+    fleet["provider_prepared_count"] = len([
+        row for row in fleet["provider_results"]
+        if row["status"] == "prepared_dependency_fbx"
+    ])
     fleet["provider_failed_count"] = len(failed_providers)
     save_fleet()
     print(f"SK_CLUSTER_FLEET_VERIFIED={fleet['verified_count']}")
+    print(f"SK_CLUSTER_FLEET_PREPARED={fleet['prepared_count']}")
     print(
         "SK_CLUSTER_FLEET_SKIPPED_NO_CURRENT_ASSEMBLY="
         f"{fleet['skipped_no_current_assembly_count']}"
@@ -1457,6 +1547,10 @@ def main(argv=None):
     print(
         "SK_CLUSTER_FLEET_PROVIDER_FAILED="
         f"{fleet['provider_failed_count']}"
+    )
+    print(
+        "SK_CLUSTER_FLEET_PROVIDER_PREPARED="
+        f"{fleet['provider_prepared_count']}"
     )
     return (
         0

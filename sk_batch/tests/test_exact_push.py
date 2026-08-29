@@ -136,6 +136,18 @@ class ExactPushCommandTests(unittest.TestCase):
             )
             self.assertNotIn("backup", str(outputs["export_root"]).casefold())
 
+            generated_config = (
+                root / "Saved" / "Config" / "WindowsEditor" / "Engine.ini"
+            )
+            generated_config.parent.mkdir(parents=True)
+            generated_config.write_text(
+                "\n".join([
+                    "[/Script/PythonScriptPlugin.PythonScriptPluginSettings]",
+                    "bRemoteExecution=True",
+                    "RemoteExecutionMulticastBindAddress=127.0.0.1",
+                ]),
+                encoding="utf-8",
+            )
             with mock.patch.object(
                 exact_push,
                 "send2ue_export_cache_root",
@@ -159,7 +171,7 @@ class ExactPushCommandTests(unittest.TestCase):
                 rpc_command[
                     rpc_command.index("--rpc-multicast-bind-address") + 1
                 ],
-                "192.168.0.4",
+                "127.0.0.1",
             )
             self.assertEqual(
                 rpc_command[

@@ -22,6 +22,7 @@ from cluster_fleet_push import (  # noqa: E402
     checkout_headless_manifest_assets,
     discover_provider_dependencies,
     discover_current_cluster_targets,
+    parse_args,
     validate_provider_live_result,
     validate_provider_assembly_result,
     validate_assembly_result,
@@ -77,6 +78,11 @@ def exact_identity_contract(binding_count):
 
 
 class ClusterFleetPushTests(unittest.TestCase):
+    def test_prepare_only_flag_parses(self):
+        args = parse_args(["--prepare-only"])
+
+        self.assertTrue(args.prepare_only)
+
     def test_provider_dependencies_are_ordered_before_roots_and_deduplicated(self):
         root_a = Path("D:/trees/tree_a/SK_tree_a_01.spm")
         root_b = Path("D:/trees/tree_b/SK_tree_b_01.spm")
@@ -398,6 +404,8 @@ class ClusterFleetPushTests(unittest.TestCase):
                 contract,
                 report,
                 cluster_assembly_contract=cluster_contract,
+                force_native_export=True,
+                force_cluster_assembly_rebuild=True,
             )
 
             self.assertIn("assembly_headless_job.py", " ".join(command))
@@ -410,6 +418,8 @@ class ClusterFleetPushTests(unittest.TestCase):
                 command[command.index("--cluster-assembly-contract") + 1],
                 str(cluster_contract),
             )
+            self.assertIn("--force-native-export", command)
+            self.assertIn("--force-cluster-assembly-rebuild", command)
 
     def test_assembly_result_requires_exact_attachment_bindings(self):
         with tempfile.TemporaryDirectory() as temporary:

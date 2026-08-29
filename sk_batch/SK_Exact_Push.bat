@@ -8,7 +8,7 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%COLLISION_DIR%
 if errorlevel 1 goto collision_build_failed
 
 :collision_ready
-"%COLLISION_CLI%" --diagnose 2>nul | %SystemRoot%\System32\findstr.exe /x /c:"SPEEDTREE_COLLISION_CLI_CONTRACT=native-runtime-receipt-v15"
+"%COLLISION_CLI%" --diagnose 2>nul | %SystemRoot%\System32\findstr.exe /x /c:"SPEEDTREE_COLLISION_CLI_CONTRACT=native-runtime-receipt-v16"
 if errorlevel 1 goto collision_diagnose_failed
 set "SPEEDTREE_COLLISION_CLI_EXE=%COLLISION_CLI%"
 set "SPEEDTREE_COLLISION_NATIVE_CLI=1"

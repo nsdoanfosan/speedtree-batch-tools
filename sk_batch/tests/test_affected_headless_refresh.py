@@ -90,7 +90,7 @@ def test_main_uses_dependency_fleet_for_every_selected_target(tmp_path, monkeypa
     monkeypatch.setattr(
         refresh,
         "discover_affected_targets",
-        lambda _root: (selected, selected, []),
+        lambda _root: (selected[:1], selected, []),
     )
     captured = {}
 
@@ -105,7 +105,9 @@ def test_main_uses_dependency_fleet_for_every_selected_target(tmp_path, monkeypa
 
     monkeypatch.setattr(refresh.cluster_fleet_push, "main", fake_fleet)
     result = refresh.main([
-        "--root", str(tmp_path), "--log-dir", str(tmp_path), "--dry-run"
+        "--root", str(tmp_path), "--log-dir", str(tmp_path), "--dry-run",
+        "--all-current-targets", "--force-cluster-assembly-rebuild",
+        "--transport", "rpc",
     ])
 
     assert result == 0
@@ -114,9 +116,21 @@ def test_main_uses_dependency_fleet_for_every_selected_target(tmp_path, monkeypa
     assert "--push-pass-through-roots" in call
     assert "--fail-fast" in call
     assert "--dry-run" in call
+    assert "--force-cluster-assembly-rebuild" in call
+    assert call[call.index("--transport") + 1] == "rpc"
     assert call.count("--target-spm") == 2
     assert "SK_tree_a" in " ".join(call)
     assert "SK_weed_grass_b" in " ".join(call)
+
+
+def test_prepare_only_rejects_rpc_transport(tmp_path):
+    import pytest
+
+    with pytest.raises(SystemExit):
+        refresh.main([
+            "--log-dir", str(tmp_path), "--prepare-only",
+            "--transport", "rpc",
+        ])
 
 
 def test_main_resumes_prepared_run_without_reexport(tmp_path, monkeypatch):
@@ -485,6 +499,37 @@ def test_surviving_zero_bone_leaf_mesh_is_selected(tmp_path):
     assert "zero_bone_leaf_mesh_present" in audit["reasons"]
     assert audit["zero_bone_leaf_mesh_instance_count"] == 1
     assert audit["selected"] is True
+
+
+def test_intentional_direct_base_native_root_leaf_is_not_zero_bone_defect(tmp_path):
+    target = _current_target(tmp_path, "SK_tree_direct_base_root_01")
+    _write_receipt(
+        target,
+        schema_version=refresh.NATIVE_RECEIPT_SCHEMA_VERSION,
+        bones=[{"id": 1}],
+        instances=[{
+            "source_rtti": refresh.LEAF_MESH_RTTI,
+            "source_bone_id": 0,
+            "parent_rtti": refresh.BASE_RTTI,
+            "ancestor_chain": [
+                {"source_rtti": refresh.BASE_RTTI},
+                {"source_rtti": refresh.START_RTTI},
+            ],
+            "authored_position_influences": [{
+                "bone_id": 0,
+                "native_root": True,
+                "weight": 1.0,
+            }],
+        }],
+    )
+    _write_manifest(target, placement_version=refresh.PLACEMENT_CONTRACT_VERSION)
+
+    audit = refresh.audit_target(target)
+
+    assert "zero_bone_leaf_mesh_present" not in audit["reasons"]
+    assert audit["zero_bone_leaf_mesh_instance_count"] == 0
+    assert audit["intentional_direct_base_root_leaf_mesh_instance_count"] == 1
+    assert audit["selected"] is False
 
 
 def test_missing_assembly_manifest_is_selected(tmp_path):
