@@ -169,7 +169,13 @@ def audit_target(target):
     # redundant and non-converging: it reselected correct grass on every run.
     # Selection is structural only, matching the permanent SPM-parsed rules.
 
-    manifest_path = Path(target["manifest"])
+    spm_path = Path(target["spm"])
+    manifest_path = Path(
+        target.get("manifest")
+        or spm_path.parent
+        / "assembly"
+        / f"{target['stem']}_cluster_assembly_bindings.json"
+    )
     manifest_payload = None
     manifest_placement_version = None
     manifest_status = None
@@ -216,7 +222,7 @@ def audit_target(target):
     return {
         "stem": target["stem"],
         "spm": str(Path(target["spm"]).resolve()),
-        "manifest": str(Path(target["manifest"]).resolve()),
+        "manifest": str(manifest_path.resolve()),
         "receipt": str(receipt_path.resolve()),
         "receipt_schema_version": (
             receipt.get("schema_version") if receipt is not None else None
