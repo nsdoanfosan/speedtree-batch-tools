@@ -150,6 +150,7 @@ def test_main_resumes_prepared_run_without_reexport(tmp_path, monkeypatch):
     def fake_fleet(argv):
         assert "--run-id" in argv
         assert run_id in argv
+        assert "--resume-prepared" in argv
         (tmp_path / f"cluster_fleet_push_{run_id}.json").write_text(
             json.dumps({
                 "status": "ok",

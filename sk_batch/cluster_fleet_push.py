@@ -723,6 +723,14 @@ def parse_args(argv=None):
         action="store_true",
         help="stop preparation at the first provider or root data failure",
     )
+    parser.add_argument(
+        "--resume-prepared",
+        action="store_true",
+        help=(
+            "reuse same-run provider exports only after their Assembly report "
+            "and exact manifest are revalidated"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -871,6 +879,42 @@ def main(argv=None):
                 force_native_export=args.force_native_export,
             )
             result["assembly_report"] = str(assembly_report)
+            if (
+                args.resume_prepared
+                and assembly_report.is_file()
+                and outputs["report"].is_file()
+                and outputs["manifest"].is_file()
+            ):
+                prior_assembly = validate_provider_assembly_result(
+                    assembly_report
+                )
+                prior_export = json.loads(
+                    outputs["report"].read_text(encoding="utf-8")
+                )
+                prior_manifest = json.loads(
+                    outputs["manifest"].read_text(encoding="utf-8")
+                )
+                prior_items = list(prior_manifest.get("items") or [])
+                if (
+                    prior_assembly["ok"]
+                    and prior_export.get("status")
+                    == "exported_pending_unreal"
+                    and len(prior_items) == 1
+                ):
+                    result["assembly_verification"] = prior_assembly
+                    result["report"] = str(outputs["report"])
+                    result["status"] = "reused_exported_pending_unreal"
+                    result["resume_policy"] = (
+                        "same_run_revalidated_assembly_and_exact_manifest"
+                    )
+                    pending.append({
+                        "kind": "provider",
+                        "outputs": outputs,
+                        "item": prior_items[0],
+                        "result": result,
+                    })
+                    save_fleet()
+                    return result
             assembly_completed = owned_run(
                 assembly_command,
                 source=(

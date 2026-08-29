@@ -359,6 +359,8 @@ def main(argv=None):
         fleet_args.append("--dry-run")
     if args.reset_item_retries:
         fleet_args.append("--reset-item-retries")
+    if args.resume_run_id:
+        fleet_args.append("--resume-prepared")
     returncode = cluster_fleet_push.main(fleet_args)
     fleet_report_path = args.log_dir / f"cluster_fleet_push_{run_id}.json"
     fleet = json.loads(fleet_report_path.read_text(encoding="utf-8"))
