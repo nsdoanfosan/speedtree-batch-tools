@@ -213,24 +213,27 @@ class ClusterFleetPushTests(unittest.TestCase):
             blend.write_bytes(b"blend")
             payload = {
                 "status": "done",
-                "blender_addon_runtime": {
-                    "addons": [{
-                        "id": "speedtree_bone_weight_repair",
-                        "source_root": str(root / "addon"),
-                    }],
-                },
                 "cluster_source_build_contract": {},
                 "assembly_export_postcondition": {
                     "objects": [{"name": "SK_leaf_sample_01"}],
                 },
             }
             pipeline.write_text(json.dumps(payload), encoding="utf-8")
-            report.write_text(json.dumps({
+            report_payload = {
                 "status": "ok",
                 "unreal_push_ready": True,
                 "blend": str(blend),
                 "pipeline_report": str(pipeline),
-            }), encoding="utf-8")
+                "blender_addon_runtime": {
+                    "addons": [{
+                        "id": "speedtree_bone_weight_repair",
+                        "source_root": str(root / "addon"),
+                    }],
+                },
+            }
+            report.write_text(
+                json.dumps(report_payload), encoding="utf-8"
+            )
 
             missing = validate_provider_assembly_result(
                 report,
@@ -241,13 +244,15 @@ class ClusterFleetPushTests(unittest.TestCase):
                 missing["problems"],
             )
 
-            payload["assembly_producer_code_state"] = {
+            report_payload["assembly_producer_code_state"] = {
                 "addon/core.py": "a" * 64,
             }
-            pipeline.write_text(json.dumps(payload), encoding="utf-8")
+            report.write_text(
+                json.dumps(report_payload), encoding="utf-8"
+            )
             with patch(
                 "cluster_fleet_push.assembly_runtime_code_state",
-                return_value=payload["assembly_producer_code_state"],
+                return_value=report_payload["assembly_producer_code_state"],
             ):
                 current = validate_provider_assembly_result(
                     report,

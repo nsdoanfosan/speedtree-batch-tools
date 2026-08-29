@@ -352,8 +352,11 @@ def validate_provider_assembly_result(
     producer_state_status = "not_checked"
     if require_current_producer:
         producer_state_status = "invalid"
-        recorded_state = pipeline.get("assembly_producer_code_state")
-        runtime = pipeline.get("blender_addon_runtime") or {}
+        # The headless job owns producer identity.  The nested add-on pipeline
+        # report is intentionally about scene/output evidence and does not own
+        # the launcher/runtime implementation fingerprint.
+        recorded_state = report.get("assembly_producer_code_state")
+        runtime = report.get("blender_addon_runtime") or {}
         addon_row = next(
             (
                 row
