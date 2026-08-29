@@ -22,5 +22,5 @@ echo [ERROR] Failed to build the SpeedTree native export CLI.
 exit /b 10
 
 :collision_diagnose_failed
-echo [ERROR] The installed SpeedTree/native hook contract is not v13.
+echo [ERROR] The installed SpeedTree/native hook contract is not v15.
 exit /b 11
