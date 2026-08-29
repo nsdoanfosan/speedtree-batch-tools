@@ -912,7 +912,7 @@ def augment_texture_readiness_contract(
     return readiness
 
 
-def run_export(args, speedtree_cli):
+def run_export(args, speedtree_cli, policy_report=None):
     spm = Path(args.spm)
     fbx_target = spm.parent / "fbx" / f"{spm.stem}.fbx"
     xml_target = spm.parent / "xml" / f"{spm.stem}.xml"
@@ -927,11 +927,16 @@ def run_export(args, speedtree_cli):
         args.xml_ini,
         purpose=f"{spm.name} material-preflight XML export",
     )
-    export_bundle = getattr(speedtree_cli, "export_bundle", None)
-    if not callable(export_bundle):
+    export_transaction = getattr(
+        speedtree_cli,
+        "export_bundle_with_minimum_bone_policy",
+        None,
+    )
+    if not callable(export_transaction):
         raise RuntimeError(
-            "Installed SpeedTree export helper does not support one-process "
-            "FBX/XML export_bundle; update the junction-installed add-on."
+            "Installed SpeedTree export helper does not support the sealed "
+            "minimum-bone FBX/XML transaction; update the junction-installed "
+            "add-on."
         )
     original_gate = getattr(speedtree_cli, "speedtree_export_gate", None)
     if not callable(original_gate):
@@ -939,9 +944,18 @@ def run_export(args, speedtree_cli):
             "Installed SpeedTree export helper does not expose the shared "
             "SpeedTree export gate."
         )
+    reported_gate_depth = 0
 
     @contextmanager
     def reported_gate():
+        nonlocal reported_gate_depth
+        if reported_gate_depth > 0:
+            reported_gate_depth += 1
+            try:
+                yield
+            finally:
+                reported_gate_depth -= 1
+            return
         emit_progress_marker(
             SPEEDTREE_SLOT_WAIT_MARKER,
             spm=spm.name,
@@ -951,7 +965,11 @@ def run_export(args, speedtree_cli):
                 SPEEDTREE_SLOT_ACQUIRED_MARKER,
                 spm=spm.name,
             )
-            yield
+            reported_gate_depth = 1
+            try:
+                yield
+            finally:
+                reported_gate_depth = 0
 
     # The helper still owns the one machine-wide mutex. This process-local
     # wrapper only exposes the exact wait/acquire boundary to the parent GUI.
@@ -964,7 +982,7 @@ def run_export(args, speedtree_cli):
         max(1, int(getattr(args, "native_process_timeout", 180))) * 1000
     )
     try:
-        return export_bundle(
+        return export_transaction(
             exe=Path(args.speedtree_exe),
             spm=spm,
             targets=(
@@ -973,6 +991,7 @@ def run_export(args, speedtree_cli):
             ),
             timeout_seconds=max(1, int(args.timeout)),
             native_receipt=native_receipt_target,
+            policy_report=policy_report,
         )
     finally:
         if previous_timeout is None:
@@ -1478,7 +1497,13 @@ def main():
                 status="ok",
             )
             progress_stage = "speedtree_export"
-            export_bundle = run_export(args, speedtree_cli)
+            export_policy_report = {}
+            export_bundle = run_export(
+                args,
+                speedtree_cli,
+                policy_report=export_policy_report,
+            )
+            report.update(export_policy_report)
             if (
                 isinstance(export_bundle, dict)
                 and isinstance(export_bundle.get("fbx"), dict)

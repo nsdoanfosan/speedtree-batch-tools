@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -17,12 +18,14 @@ if str(SK_BATCH) not in sys.path:
 from cluster_fleet_push import (  # noqa: E402
     ExactPushError,
     PushDependencyError,
+    build_spm_bone_policy_command,
     build_receipt_refresh_command,
     build_assembly_command,
     checkout_headless_manifest_assets,
     discover_provider_dependencies,
     discover_current_cluster_targets,
     parse_args,
+    validate_spm_bone_policy_report,
     validate_provider_live_result,
     validate_provider_assembly_result,
     validate_assembly_result,
@@ -78,6 +81,133 @@ def exact_identity_contract(binding_count):
 
 
 class ClusterFleetPushTests(unittest.TestCase):
+    def test_policy_batch_command_uses_factory_startup_and_exact_targets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            blender = root / "blender.exe"
+            spm = root / "SK_tree_01.spm"
+            request = root / "request.json"
+            report = root / "report.json"
+            blender.write_bytes(b"exe")
+            spm.write_bytes(b"spm")
+
+            command = build_spm_bone_policy_command(
+                [{"spm": spm}], blender, request, report
+            )
+            payload = json.loads(request.read_text(encoding="utf-8"))
+
+        self.assertIn("--factory-startup", command)
+        self.assertIn("--background", command)
+        self.assertEqual(payload["targets"], [str(spm.resolve())])
+
+    def test_policy_batch_report_requires_exact_ordered_identities(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = root / "SK_tree_01.spm"
+            second = root / "SK_tree_02.spm"
+            report = root / "report.json"
+            first.write_bytes(b"one")
+            second.write_bytes(b"two")
+            def sealed(path):
+                stat_result = path.stat()
+                return {
+                    "path": str(path.resolve()),
+                    "size": stat_result.st_size,
+                    "mtime_ns": stat_result.st_mtime_ns,
+                    "sha256": __import__("hashlib").sha256(
+                        path.read_bytes()
+                    ).hexdigest(),
+                }
+            report.write_text(json.dumps({
+                "status": "ok",
+                "results": [
+                    {
+                        "spm": str(first),
+                        "status": "already_compliant",
+                        "sealed_source_identity": sealed(first),
+                    },
+                    {
+                        "spm": str(second),
+                        "status": "updated",
+                        "sealed_source_identity": sealed(second),
+                    },
+                ],
+            }), encoding="utf-8")
+            payload = validate_spm_bone_policy_report(
+                report,
+                [{"spm": first}, {"spm": second}],
+            )
+            self.assertEqual(len(payload["results"]), 2)
+
+            report.write_text(json.dumps({
+                "status": "ok",
+                "results": [
+                    {
+                        "spm": str(second),
+                        "status": "updated",
+                        "sealed_source_identity": sealed(second),
+                    },
+                    {
+                        "spm": str(first),
+                        "status": "already_compliant",
+                        "sealed_source_identity": sealed(first),
+                    },
+                ],
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "identity mismatch"):
+                validate_spm_bone_policy_report(
+                    report,
+                    [{"spm": first}, {"spm": second}],
+                )
+
+    def test_fleet_policy_failure_aborts_before_provider_or_root_processes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            blender = root / "blender.exe"
+            spm = root / "tree" / "SK_tree_01.spm"
+            manifest = spm.parent / "assembly" / "current.json"
+            logs = root / "logs"
+            blender.write_bytes(b"exe")
+            spm.parent.mkdir()
+            spm.write_bytes(b"spm")
+            manifest.parent.mkdir()
+            manifest.write_text("{}", encoding="utf-8")
+            calls = []
+
+            def fake_owned_run(_command, **kwargs):
+                calls.append(kwargs.get("source"))
+                return SimpleNamespace(returncode=1)
+
+            with patch(
+                "cluster_fleet_push.discover_current_cluster_targets",
+                return_value=([{
+                    "spm": spm,
+                    "stem": spm.stem,
+                    "manifest": manifest,
+                    "birch_paper": False,
+                }], []),
+            ), patch(
+                "cluster_fleet_push.discover_provider_dependencies",
+                return_value=([], {}, {}, {}),
+            ), patch(
+                "cluster_fleet_push.owned_run",
+                side_effect=fake_owned_run,
+            ):
+                from cluster_fleet_push import main
+
+                result = main([
+                    "--root", str(root),
+                    "--blender", str(blender),
+                    "--log-dir", str(logs),
+                    "--run-id", "policy_failure",
+                ])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(
+            calls,
+            ["sk_batch.cluster_fleet_push.spm_bone_policy"],
+        )
+
     def test_prepare_only_flag_parses(self):
         args = parse_args(["--prepare-only"])
 

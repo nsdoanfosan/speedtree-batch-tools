@@ -13,6 +13,7 @@ Birch Paper is sorted last by default.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import stat
 import subprocess
@@ -44,6 +45,11 @@ from assembly_runtime_contract import assembly_runtime_code_state
 
 DEFAULT_ROOT = Path(r"D:\OneDrive\Forestportfolio\02_nature\Tree")
 ASSEMBLY_JOB = Path(__file__).resolve().parent / "jobs" / "assembly_headless_job.py"
+SPM_BONE_POLICY_JOB = (
+    Path(__file__).resolve().parent
+    / "jobs"
+    / "spm_bone_policy_headless_job.py"
+)
 PCG_AUDIT = (
     Path(__file__).resolve().parents[1]
     / "pcg_st9_texture_batch"
@@ -188,6 +194,99 @@ def build_assembly_command(
     if force_cluster_assembly_rebuild:
         command.insert(-2, "--force-cluster-assembly-rebuild")
     return command
+
+
+def build_spm_bone_policy_command(targets, blender, request_path, report_path):
+    """Build one headless add-on transaction for every selected root SPM."""
+    targets = [Path(row["spm"]).resolve() for row in targets]
+    if not targets:
+        raise ExactPushError("SPM bone-policy batch has no selected targets")
+    if not SPM_BONE_POLICY_JOB.is_file():
+        raise ExactPushError(
+            "SPM bone-policy headless job is missing: "
+            + str(SPM_BONE_POLICY_JOB)
+        )
+    blender = Path(blender).resolve()
+    if not blender.is_file():
+        raise ExactPushError("Blender executable is missing: " + str(blender))
+    request_path = Path(request_path).resolve()
+    report_path = Path(report_path).resolve()
+    request_path.parent.mkdir(parents=True, exist_ok=True)
+    request_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "speedtree_spm_minimum_bone_policy_batch_request",
+                "targets": [str(path) for path in targets],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return [
+        str(blender),
+        "--factory-startup",
+        "--background",
+        "--python",
+        str(SPM_BONE_POLICY_JOB),
+        "--",
+        "--request",
+        str(request_path),
+        "--report",
+        str(report_path),
+    ]
+
+
+def validate_spm_bone_policy_report(report_path, targets):
+    """Fail closed unless every exact root produced one validated receipt."""
+    report_path = Path(report_path).resolve()
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    if payload.get("status") != "ok":
+        raise RuntimeError(
+            "SPM bone-policy batch failed: " + str(payload.get("error") or "")
+        )
+    expected = [
+        normalized_path_key(Path(row["spm"]).resolve()) for row in targets
+    ]
+    results = list(payload.get("results") or [])
+    actual = [normalized_path_key(row.get("spm") or "") for row in results]
+    if actual != expected:
+        raise RuntimeError(
+            "SPM bone-policy batch receipt order/identity mismatch"
+        )
+    allowed = {
+        "updated",
+        "already_compliant",
+        "excluded_cluster_source",
+    }
+    if any(row.get("status") not in allowed for row in results):
+        raise RuntimeError("SPM bone-policy batch contains an invalid status")
+    for target, row in zip(targets, results):
+        spm = Path(target["spm"]).resolve()
+        sealed = row.get("sealed_source_identity") or {}
+        stat_result = spm.stat()
+        digest_builder = hashlib.sha256()
+        with spm.open("rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest_builder.update(chunk)
+        digest = digest_builder.hexdigest()
+        if (
+            normalized_path_key(sealed.get("path") or "")
+            != normalized_path_key(spm)
+            or int(sealed.get("size", -1)) != stat_result.st_size
+            or int(sealed.get("mtime_ns", -1)) != stat_result.st_mtime_ns
+            or str(sealed.get("sha256") or "").casefold()
+            != digest.casefold()
+        ):
+            raise RuntimeError(
+                "SPM bone-policy sealed source changed before fleet execution: "
+                + str(spm)
+            )
+    return payload
 
 
 def validate_assembly_result(report_path, target):
@@ -937,6 +1036,49 @@ def main(argv=None):
         )
         save_fleet()
         return 1 if missing_requested_target_spms else 0
+
+    policy_request_path = (
+        args.log_dir / f"cluster_fleet_push_{run_id}_spm_bone_policy_request.json"
+    )
+    policy_report_path = (
+        args.log_dir / f"cluster_fleet_push_{run_id}_spm_bone_policy.json"
+    )
+    fleet["spm_bone_policy_request"] = str(policy_request_path)
+    fleet["spm_bone_policy_report"] = str(policy_report_path)
+    try:
+        policy_command = build_spm_bone_policy_command(
+            targets,
+            args.blender,
+            policy_request_path,
+            policy_report_path,
+        )
+        policy_completed = owned_run(
+            policy_command,
+            source="sk_batch.cluster_fleet_push.spm_bone_policy",
+            run_factory=subprocess.run,
+            check=False,
+        )
+        fleet["spm_bone_policy_returncode"] = policy_completed.returncode
+        if policy_completed.returncode:
+            raise RuntimeError(
+                "SPM bone-policy headless batch exited "
+                f"{policy_completed.returncode}"
+            )
+        fleet["spm_bone_policy"] = validate_spm_bone_policy_report(
+            policy_report_path,
+            targets,
+        )
+    except (ExactPushError, OSError, ValueError, RuntimeError) as exc:
+        fleet["status"] = "failed"
+        fleet["spm_bone_policy_error"] = str(exc)
+        fleet["provider_verified_count"] = 0
+        fleet["provider_failed_count"] = 0
+        fleet["verified_count"] = 0
+        fleet["failed_count"] = 0
+        save_fleet()
+        print("SK_CLUSTER_FLEET_SPM_BONE_POLICY_FAILED=1")
+        return 1
+    save_fleet()
 
     pending = []
     processed_providers = {}

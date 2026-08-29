@@ -76,7 +76,10 @@ ADDONS = {
         "source_environment": "SPEEDTREE_BWR_ADDON_DIR",
         "capabilities": {
             "speedtree_export_v1": {
-                "operations": ["run_speedtree_cli_export"],
+                "operations": [
+                    "ensure_minimum_absolute_branch_bones",
+                    "run_speedtree_cli_export",
+                ],
             },
             "assembly_pipeline_v1": {
                 "operations": ["run_import_and_assemble"],
@@ -93,6 +96,10 @@ ADDONS = {
             },
         },
         "operations": {
+            "ensure_minimum_absolute_branch_bones": (
+                "speedtree_bone_weight_repair.core:"
+                "ensure_minimum_absolute_branch_bones"
+            ),
             "run_speedtree_cli_export": (
                 "speedtree_bone_weight_repair.core:run_speedtree_cli_export"
             ),

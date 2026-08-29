@@ -896,20 +896,6 @@ def main():
                 "production_source_mutated": False,
             }
         material_preflight = None
-        if args.material_contract:
-            # Validate the exact SPM/STMAT hashes before Blender or the add-on
-            # can mutate a scene.  The add-on still receives the same report
-            # path for its existing texture-binding loader.
-            material_preflight = validate_preflight_report(
-                args.material_contract,
-                speedtree_spm,
-                require_ok=True,
-            )
-            report["speedtree_pipeline_contract"] = material_preflight[
-                "speedtree_pipeline_contract"
-            ]
-            report["speedtree_pipeline_contract_required"] = True
-        record_stage_duration(report, "input_preflight", preflight_started)
         addon_runtime_started = perf_counter()
         addon_runtime = prepare_runtime(
             "sk_batch.jobs.assembly_headless_job",
@@ -954,6 +940,33 @@ def main():
             "speedtree_bone_weight_repair",
             "run_import_and_assemble",
         )
+        ensure_minimum_branch_bones = addon_runtime.operation(
+            "speedtree_bone_weight_repair",
+            "ensure_minimum_absolute_branch_bones",
+        )
+        source_policy_started = perf_counter()
+        report["spm_bone_policy_preflight"] = (
+            ensure_minimum_branch_bones(str(speedtree_spm))
+        )
+        record_stage_duration(
+            report,
+            "spm_bone_policy_preflight",
+            source_policy_started,
+        )
+        if args.material_contract:
+            # Historical wrappers are rebound only after the persistent source
+            # policy is complete. The resulting contract therefore seals the
+            # post-policy SPM, while export-time drift remains fail-closed.
+            material_preflight = validate_preflight_report(
+                args.material_contract,
+                speedtree_spm,
+                require_ok=True,
+            )
+            report["speedtree_pipeline_contract"] = material_preflight[
+                "speedtree_pipeline_contract"
+            ]
+            report["speedtree_pipeline_contract_required"] = True
+        record_stage_duration(report, "input_preflight", preflight_started)
 
         blend_path = os.path.abspath(args.blend)
         blend_exists = os.path.exists(blend_path)
