@@ -5272,6 +5272,8 @@ bool WriteNativeReceipt() {
         const auto& proxy = gNativeReceiptProxies[index];
         stream << "    {\"geometry_ordinal\": " << proxy.key.geometryOrdinal
                << ", \"native_instance_id\": " << proxy.key.instanceId
+               << ", \"native_source_object_id\": "
+               << static_cast<unsigned long long>(proxy.key.sourceObject)
                << ", \"record_type\": " << proxy.key.recordType
                << ", \"source_bone_id\": " << proxy.key.sourceBoneId
                << ", \"source_rtti\": \""

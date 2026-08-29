@@ -245,7 +245,7 @@ class NativeSpeedTreeReceiptTests(unittest.TestCase):
         self.assertEqual(instance["unowned_native_vertex_count"], 2)
         self.assertEqual(
             instance["owner_selection_policy"],
-            "sole_exact_native_node_guid_range_intersection_v2",
+            "sole_exact_native_runtime_owner_range_intersection_v3",
         )
 
     def test_same_runtime_node_guid_coalesces_split_serializer_records(self):
@@ -270,6 +270,84 @@ class NativeSpeedTreeReceiptTests(unittest.TestCase):
         self.assertEqual(instance["matched_native_vertex_indices"], [2, 3, 4, 5])
         self.assertEqual(instance["native_instance_ids"], [2305, 3585])
         self.assertEqual(instance["native_serializer_record_count"], 2)
+
+    def test_zero_guid_and_reused_instance_id_do_not_merge_distinct_nodes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spm, receipt_path = self._write(Path(temporary))
+            receipt = load_native_export_receipt(
+                receipt_path,
+                source_spm=spm,
+            )
+        first = receipt["generated_instances"][0]
+        first.update({
+            "node_guid": "AAAAAAAAAAAAAAAAAAAAAA==",
+            "native_instance_id": 311040,
+            "parent_guid": "parent-a",
+            "generator_guid": "generator-a",
+            "source_rtti": "branch",
+            "vertex_ranges": [(2, 2)],
+        })
+        receipt["generated_instances"].append({
+            **first,
+            "parent_guid": "parent-b",
+            "generator_guid": "generator-b",
+            "authored_position_native": (9.0, 8.0, 7.0),
+            "vertex_ranges": [(7, 7)],
+        })
+
+        with self.assertRaisesRegex(NativeReceiptError, "sole intersecting"):
+            exact_generated_instance(receipt, 0, [2, 7])
+
+    def test_runtime_source_object_id_separates_identical_fallback_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spm, receipt_path = self._write(Path(temporary))
+            receipt = load_native_export_receipt(
+                receipt_path,
+                source_spm=spm,
+            )
+        first = receipt["generated_instances"][0]
+        first.update({
+            "node_guid": "AAAAAAAAAAAAAAAAAAAAAA==",
+            "native_instance_id": 311040,
+            "native_source_object_id": 1001,
+            "vertex_ranges": [(2, 2)],
+        })
+        receipt["generated_instances"].append({
+            **first,
+            "native_source_object_id": 1002,
+            "vertex_ranges": [(7, 7)],
+        })
+
+        with self.assertRaisesRegex(NativeReceiptError, "sole intersecting"):
+            exact_generated_instance(receipt, 0, [2, 7])
+
+    def test_owner_never_collapses_ambiguous_attachment_influences(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spm, receipt_path = self._write(Path(temporary))
+            receipt = load_native_export_receipt(
+                receipt_path,
+                source_spm=spm,
+            )
+        first = receipt["generated_instances"][0]
+        first["vertex_ranges"] = [(2, 2)]
+        receipt["generated_instances"].append({
+            **first,
+            "source_bone_id": 8,
+            "vertex_ranges": [(2, 2)],
+            "authored_position_influences": [{
+                "bone_id": 8,
+                "mapping_node": "start",
+                "exported_cluster_name": "DifferentBone",
+                "native_root": False,
+                "weight": 1.0,
+            }],
+        })
+
+        with self.assertRaisesRegex(
+            NativeReceiptError,
+            "ambiguous authored attachment influences",
+        ):
+            exact_generated_instance(receipt, 0, [2])
 
     def test_clipped_subset_never_ranks_multiple_intersecting_owners(self):
         with tempfile.TemporaryDirectory() as temporary:

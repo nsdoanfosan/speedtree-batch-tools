@@ -646,7 +646,7 @@ class ExactNativeAttachmentInfluenceTests(unittest.TestCase):
         self.assertEqual(source["target_attachment_vertex_index"], 1)
         self.assertEqual(
             source["owner_selection_policy"],
-            "sole_exact_native_node_guid_range_intersection_v2",
+            "sole_exact_native_runtime_owner_range_intersection_v3",
         )
 
     def test_clipped_attachment_uses_sole_exact_component_intersection(self):
@@ -1009,7 +1009,10 @@ class ComponentTopologyTests(unittest.TestCase):
         self.assertEqual(len(partitioned), 2)
         self.assertEqual(
             [row["native_runtime_owner"] for row in partitioned],
-            [["node_guid", "node-a"], ["node_guid", "node-b"]],
+            [
+                ["node_guid", 3, "node-a"],
+                ["node_guid", 3, "node-b"],
+            ],
         )
         self.assertEqual(
             [len(row["polygons"]) for row in partitioned],

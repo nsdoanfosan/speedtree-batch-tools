@@ -333,26 +333,53 @@ def exact_geometry_ordinal(receipt, vertex_count):
     return matches[0]
 
 
+ZERO_NATIVE_NODE_GUIDS = {
+    "00000000-0000-0000-0000-000000000000",
+    "AAAAAAAAAAAAAAAAAAAAAA==",
+}
+
+
+def _valid_native_node_guid(row):
+    """Return a real runtime GUID, excluding SpeedTree's zero sentinel."""
+    value = str(row.get("node_guid") or "").strip()
+    return "" if not value or value in ZERO_NATIVE_NODE_GUIDS else value
+
+
 def _native_runtime_owner_key(row, row_index, geometry_ordinal):
     """Identity of the native runtime Node that owns a serializer record.
 
-    ``node_guid`` is authoritative when present.  Otherwise fall back to the
-    native instance id, scoped by geometry because the id is only unique within
-    one geometry.  The record's position in the file is the last resort: it is
-    an output order, not an identity, and keying on it split a single surface
-    into several owners whenever SpeedTree serialized one branch strip as
-    several records, which it does whenever the strip's vertices alternate
-    between bones.
+    A non-zero ``node_guid`` is authoritative within one geometry.  SpeedTree's
+    zero GUID is a missing value, not an owner: production receipts contain
+    thousands of unrelated records with that sentinel.  ``native_instance_id``
+    also repeats across unrelated nodes, so the no-GUID fallback includes the
+    authored frame and lineage fields that stay constant across the per-bone
+    serializer records of one actual node.
     """
-    node_guid = str(row.get("node_guid") or "")
+    source_object_id = row.get("native_source_object_id")
+    if source_object_id is not None and int(source_object_id) != 0:
+        return (
+            "native_source_object",
+            int(geometry_ordinal),
+            int(source_object_id),
+        )
+    node_guid = _valid_native_node_guid(row)
     if node_guid:
-        return ("node_guid", node_guid)
+        return ("node_guid", int(geometry_ordinal), node_guid)
     native_instance_id = row.get("native_instance_id")
     if native_instance_id is not None:
         return (
-            "native_instance",
+            "native_instance_frame",
             int(geometry_ordinal),
             int(native_instance_id),
+            str(row.get("parent_guid") or ""),
+            str(row.get("generator_guid") or ""),
+            str(row.get("source_rtti") or ""),
+            tuple(float(value) for value in (
+                row.get("authored_position_native") or []
+            )),
+            tuple(float(value) for value in (
+                row.get("authored_tangent_native_unit") or []
+            )),
         )
     return ("serializer_record", int(row_index))
 
@@ -380,7 +407,6 @@ def exact_generated_instance(receipt, geometry_ordinal, vertex_indices):
             if any(first <= vertex <= last for first, last in ranges)
         ]
         if matched:
-            node_guid = str(row.get("node_guid") or "")
             owner_key = _native_runtime_owner_key(
                 row, row_index, geometry_ordinal
             )
@@ -391,15 +417,12 @@ def exact_generated_instance(receipt, geometry_ordinal, vertex_indices):
                     "matched": set(),
                     "record_indices": [],
                     "native_instance_ids": set(),
+                    "matched_rows": [],
                 }
                 matches_by_owner[owner_key] = owner
-            # Records of one owner legitimately disagree on source_bone_id: a
-            # runtime Node is serialized once per bone its vertices are weighted
-            # to.  Measured across production receipts, 20888 node_guid groups
-            # and 471 native-instance groups span several bones.  That is what
-            # skinning looks like, so nothing is compared or rejected here.
             owner["matched"].update(matched)
             owner["record_indices"].append(row_index)
+            owner["matched_rows"].append(row)
             if row.get("native_instance_id") is not None:
                 owner["native_instance_ids"].add(
                     int(row["native_instance_id"])
@@ -411,7 +434,41 @@ def exact_generated_instance(receipt, geometry_ordinal, vertex_indices):
             f"geometry={geometry_ordinal}, matches={len(matches)}"
         )
     owner = matches[0]
-    row = owner["row"]
+    matched_rows = owner["matched_rows"]
+    stable_fields = (
+        "geometry_ordinal",
+        "parent_guid",
+        "generator_guid",
+        "source_rtti",
+        "authored_position_native",
+        "authored_tangent_native_unit",
+    )
+    for field in stable_fields:
+        values = {
+            json.dumps(row.get(field), sort_keys=True, ensure_ascii=False)
+            for row in matched_rows
+        }
+        if len(values) > 1:
+            raise NativeReceiptError(
+                "one native runtime owner has inconsistent attachment "
+                f"metadata: field={field}"
+            )
+    influence_values = {
+        json.dumps(
+            row.get("authored_position_influences") or [],
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        for row in matched_rows
+    }
+    if len(influence_values) > 1:
+        raise NativeReceiptError(
+            "one native runtime owner has ambiguous authored attachment "
+            "influences for the queried vertices"
+        )
+    # The selected row is now safe: every serializer record intersecting the
+    # queried attachment agrees on its authored frame and full influence set.
+    row = matched_rows[0]
     matched = sorted(owner["matched"])
     matched_set = set(matched)
     return {
@@ -425,6 +482,6 @@ def exact_generated_instance(receipt, geometry_ordinal, vertex_indices):
         "native_serializer_record_indices": list(owner["record_indices"]),
         "native_serializer_record_count": len(owner["record_indices"]),
         "owner_selection_policy": (
-            "sole_exact_native_node_guid_range_intersection_v2"
+            "sole_exact_native_runtime_owner_range_intersection_v3"
         ),
     }
