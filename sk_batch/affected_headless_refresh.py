@@ -80,11 +80,13 @@ def audit_target(target):
     base_ref_branch_leaf_instances = []
     base_ref_branch_zero_bone_leaf_instances = []
     native_bone_count = None
+    missing_source_object_identity_count = 0
     if receipt is not None:
+        generated_instances = receipt.get("generated_instances") or []
         native_bone_count = len(receipt.get("bones") or [])
         leaf_instances = [
             row
-            for row in receipt.get("generated_instances") or []
+            for row in generated_instances
             if row.get("source_rtti") == LEAF_MESH_RTTI
         ]
         zero_bone_leaf_instances = [
@@ -109,6 +111,16 @@ def audit_target(target):
         ]
         if receipt.get("schema_version") != NATIVE_RECEIPT_SCHEMA_VERSION:
             reasons.append("native_receipt_schema_stale")
+        missing_source_object_identity_count = sum(
+            "native_source_object_id" not in row
+            for row in generated_instances
+        )
+        if missing_source_object_identity_count:
+            # v15 records the serializer's actual runtime source-object
+            # identity.  node_guid and native_instance_id both collide in real
+            # receipts, so an older row cannot safely prove which per-bone
+            # records belong to one node.
+            reasons.append("native_source_object_identity_missing")
         if zero_bone_leaf_instances:
             # The permanent rule is that no exported Leaf Mesh keeps bone id 0.
             # A receipt that still carries them was written before the rule
@@ -116,7 +128,7 @@ def audit_target(target):
             reasons.append("zero_bone_leaf_mesh_present")
         invalid_range_instances = [
             row
-            for row in receipt.get("generated_instances") or []
+            for row in generated_instances
             if not _vertex_ranges_are_exact_and_ordered(row)
         ]
         if invalid_range_instances:
@@ -187,6 +199,9 @@ def audit_target(target):
         "expected_placement_contract_version": PLACEMENT_CONTRACT_VERSION,
         "expected_native_receipt_schema_version": NATIVE_RECEIPT_SCHEMA_VERSION,
         "native_bone_count": native_bone_count,
+        "missing_native_source_object_identity_count": (
+            missing_source_object_identity_count
+        ),
         "leaf_mesh_instance_count": len(leaf_instances),
         "zero_bone_leaf_mesh_instance_count": len(zero_bone_leaf_instances),
         "baseref_branch_zero_bone_leaf_mesh_instance_count": len(
@@ -265,6 +280,7 @@ def main(argv=None):
             "selection_policy": [
                 "native_receipt_missing_or_unreadable",
                 "native_receipt_schema_stale",
+                "native_source_object_identity_missing",
                 "zero_bone_leaf_mesh_present",
                 "native_vertex_ranges_not_exact_and_ordered",
                 "assembly_manifest_missing_or_unreadable",

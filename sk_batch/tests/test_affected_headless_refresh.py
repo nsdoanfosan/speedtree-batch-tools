@@ -65,6 +65,7 @@ def test_audit_selects_zero_bone_baseref_branch_leaf(tmp_path):
             "generated_instances": [{
                 "source_rtti": refresh.LEAF_MESH_RTTI,
                 "source_bone_id": 0,
+                "native_source_object_id": 1001,
                 "vertex_ranges": [[0, 2]],
                 "ancestor_chain": [
                     {"source_rtti": refresh.BRANCH_RTTI},
@@ -239,6 +240,7 @@ def _write_receipt(target, *, schema_version, bones, instances):
     rows = []
     for offset, instance in enumerate(instances):
         row = dict(instance)
+        row.setdefault("native_source_object_id", 1000 + offset)
         # Every real instance carries ranges; default to a valid one so a case
         # that is not about ranges does not trip the range reason.
         row.setdefault("vertex_ranges", [[offset * 4, offset * 4 + 2]])
@@ -251,6 +253,29 @@ def _write_receipt(target, *, schema_version, bones, instances):
         }),
         encoding="utf-8",
     )
+
+
+def test_missing_native_source_object_identity_is_selected(tmp_path):
+    target = _target(tmp_path, "SK_tree_old_runtime_identity_01")
+    receipt = refresh.native_receipt_path(target)
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    receipt.write_text(
+        json.dumps({
+            "schema_version": refresh.NATIVE_RECEIPT_SCHEMA_VERSION,
+            "bones": [{"id": 42}],
+            "generated_instances": [{
+                "source_rtti": ".?AVCBranchNode@@",
+                "source_bone_id": 42,
+                "vertex_ranges": [[0, 2]],
+            }],
+        }),
+        encoding="utf-8",
+    )
+    _write_manifest(target, placement_version=refresh.PLACEMENT_CONTRACT_VERSION)
+
+    audit = refresh.audit_target(target)
+    assert "native_source_object_identity_missing" in audit["reasons"]
+    assert audit["missing_native_source_object_identity_count"] == 1
 
 
 def _write_manifest(target, *, placement_version, status=None):
