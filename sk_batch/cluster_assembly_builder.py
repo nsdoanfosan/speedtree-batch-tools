@@ -3016,7 +3016,12 @@ def _partition_components_by_native_runtime_owner(obj, components, receipt):
             if owner is not None:
                 component_owners.add(owner)
         if len(component_owners) <= 1:
-            partitioned.append(component)
+            row = dict(component)
+            if component_owners:
+                row["native_runtime_owner"] = list(
+                    next(iter(component_owners))
+                )
+            partitioned.append(row)
             continue
         if any(owner is None for owner in polygon_owners.values()):
             raise ClusterAssemblyBuildError(
@@ -3038,7 +3043,40 @@ def _partition_components_by_native_runtime_owner(obj, components, receipt):
                 "polygons": polygons,
                 "native_runtime_owner": list(owner),
             })
-    return sorted(partitioned, key=lambda row: row["polygons"][0])
+    # One native runtime object can be clipped into disconnected render
+    # islands.  Connectivity alone must not publish one full replacement part
+    # per island: that duplicates the authored object and can leave a tiny
+    # island without the normalized plan's scale-line face.  Rejoin only the
+    # islands carrying the exact same runtime-owner key. Different source
+    # objects, Nodes, or fallback frames remain separate regardless of spatial
+    # proximity or shared bones.
+    unowned = []
+    by_owner = defaultdict(list)
+    for row in partitioned:
+        owner = row.get("native_runtime_owner")
+        if owner is None:
+            unowned.append(row)
+        else:
+            by_owner[tuple(owner)].append(row)
+    rejoined = list(unowned)
+    for owner, rows in by_owner.items():
+        polygons = sorted({
+            int(polygon)
+            for row in rows
+            for polygon in row["polygons"]
+        })
+        vertices = sorted({
+            int(vertex)
+            for row in rows
+            for vertex in row["vertices"]
+        })
+        rejoined.append({
+            "vertices": vertices,
+            "polygons": polygons,
+            "native_runtime_owner": list(owner),
+            "native_runtime_owner_island_count": len(rows),
+        })
+    return sorted(rejoined, key=lambda row: row["polygons"][0])
 
 
 def _component_signature(mesh, component):
@@ -4170,13 +4208,67 @@ def _exact_plan_line_correspondence(
             }
             for row in target_candidates[:8]
         ]
+        nearest_uv_triangles = []
+        for triangle in target_obj.data.loop_triangles:
+            target_polygon_index = int(triangle.polygon_index)
+            if target_polygon_index not in target_polygon_indices:
+                continue
+            target_uv_points = [
+                tuple(float(value) for value in target_uv_layer.data[loop].uv)
+                for loop in triangle.loops
+            ]
+            weights = _barycentric_xy(source_endpoint_uv, target_uv_points)
+            if weights is None:
+                continue
+            violation = max(
+                0.0,
+                -min(weights),
+                max(weights) - 1.0,
+            )
+            nearest_uv_triangles.append({
+                "target_polygon_index": target_polygon_index,
+                "containment_violation": float(violation),
+                "weights": [float(value) for value in weights],
+                "target_uv_points": [list(point) for point in target_uv_points],
+            })
+        nearest_uv_triangles.sort(key=lambda row: (
+            row["containment_violation"],
+            row["target_polygon_index"],
+        ))
+        correspondence_scale_ratios = []
+        for source_index, target_index in zip(source_indices, target_indices):
+            source_point = tuple(
+                float(value) for value in source_obj.data.vertices[source_index].co
+            )
+            target_point = _world_coordinate(
+                target_obj,
+                target_obj.data.vertices[target_index].co,
+            )
+            source_distance = math.dist(source_origin, source_point)
+            if source_distance <= 1.0e-12:
+                continue
+            correspondence_scale_ratios.append(
+                math.dist(target_origin, target_point) / source_distance
+            )
+        scale_summary = None
+        if correspondence_scale_ratios:
+            scale_summary = {
+                "count": len(correspondence_scale_ratios),
+                "minimum": min(correspondence_scale_ratios),
+                "median": statistics.median(correspondence_scale_ratios),
+                "maximum": max(correspondence_scale_ratios),
+            }
         raise ClusterAssemblyBuildError(
             "exact Assembly authored line UV must belong to one target render "
             "triangle: "
             f"source_object={source_obj.name!r}, target_object={target_obj.name!r}, "
             f"source_polygon={source_candidate['polygon_index']}, "
             f"source_line_endpoint_uv={source_endpoint_uv}, "
-            f"target_matches={len(target_candidates)}, candidates={diagnostics}"
+            f"target_matches={len(target_candidates)}, candidates={diagnostics}, "
+            f"target_component_owner={target_component.get('native_runtime_owner')}, "
+            f"target_component_polygons={len(target_polygon_indices)}, "
+            f"nearest_uv_triangles={nearest_uv_triangles[:4]}, "
+            f"correspondence_scale_ratio={scale_summary}"
         )
     selected = {**source_candidate, **target_candidates[0]}
     selected["selection_policy"] = (

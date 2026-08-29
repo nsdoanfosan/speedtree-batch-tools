@@ -1050,7 +1050,58 @@ class ComponentTopologyTests(unittest.TestCase):
             receipt,
         )
 
-        self.assertEqual(partitioned, components)
+        self.assertEqual(len(partitioned), 1)
+        self.assertEqual(partitioned[0]["vertices"], components[0]["vertices"])
+        self.assertEqual(partitioned[0]["polygons"], components[0]["polygons"])
+        self.assertEqual(
+            partitioned[0]["native_runtime_owner"],
+            ["node_guid", 3, "same-node"],
+        )
+        self.assertEqual(
+            partitioned[0]["native_runtime_owner_island_count"], 1
+        )
+
+    def test_same_native_owner_rejoins_disconnected_clipped_islands(self):
+        target = seam_split_test_mesh(False)
+        target.attributes = {
+            "speedtree_native_geometry_ordinal": SimpleNamespace(data=[
+                SimpleNamespace(value=3) for _vertex in target.vertices
+            ]),
+            "speedtree_native_vertex_index": SimpleNamespace(data=[
+                SimpleNamespace(value=index)
+                for index, _vertex in enumerate(target.vertices)
+            ]),
+        }
+        disconnected = [
+            {
+                "vertices": sorted({
+                    int(value) for value in target.polygons[index].vertices
+                }),
+                "polygons": [index],
+            }
+            for index in (0, 1)
+        ]
+        receipt = {"generated_instances": [{
+            "geometry_ordinal": 3,
+            "native_source_object_id": 9001,
+            "vertex_ranges": [(0, len(target.vertices) - 1)],
+        }]}
+
+        partitioned = _partition_components_by_native_runtime_owner(
+            SimpleNamespace(name="target", data=target),
+            disconnected,
+            receipt,
+        )
+
+        self.assertEqual(len(partitioned), 1)
+        self.assertEqual(partitioned[0]["polygons"], [0, 1])
+        self.assertEqual(
+            partitioned[0]["native_runtime_owner"],
+            ["native_source_object", 3, 9001],
+        )
+        self.assertEqual(
+            partitioned[0]["native_runtime_owner_island_count"], 2
+        )
 
     def test_unique_uv_face_subset_uses_the_normalized_prototype(self):
         source = seam_split_test_mesh(False)
