@@ -671,6 +671,8 @@ def assembly_runtime_code_paths(addon_dir):
     addon_dir = Path(addon_dir)
     paths = list(addon_dir.rglob("*.py"))
     paths.extend([
+        REPO_DIR / "blender_addon_gateway.py",
+        REPO_DIR / "blender_addon_contract.py",
         REPO_DIR / "speedtree_pipeline_contract.py",
         REPO_DIR / "cluster_spm_pair_contract.py",
         REPO_DIR / "cluster_blend_sync.py",

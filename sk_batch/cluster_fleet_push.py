@@ -39,6 +39,7 @@ from push_dependency_schedule import (
     normalized_path_key,
 )
 from sk_common import wind_preset_for_spm
+from assembly_runtime_contract import assembly_runtime_code_state
 
 
 DEFAULT_ROOT = Path(r"D:\OneDrive\Forestportfolio\02_nature\Tree")
@@ -326,7 +327,11 @@ def validate_assembly_result(report_path, target):
     }
 
 
-def validate_provider_assembly_result(report_path):
+def validate_provider_assembly_result(
+    report_path,
+    *,
+    require_current_producer=False,
+):
     """Validate the normalized provider artifact produced by Assembly."""
     report_path = Path(report_path).resolve()
     report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -344,6 +349,38 @@ def validate_provider_assembly_result(report_path):
     objects = list(postcondition.get("objects") or [])
     if pipeline and pipeline.get("status") != "done":
         problems.append("provider_pipeline_not_done")
+    producer_state_status = "not_checked"
+    if require_current_producer:
+        producer_state_status = "invalid"
+        recorded_state = pipeline.get("assembly_producer_code_state")
+        runtime = pipeline.get("blender_addon_runtime") or {}
+        addon_row = next(
+            (
+                row
+                for row in (runtime.get("addons") or [])
+                if row.get("id") == "speedtree_bone_weight_repair"
+            ),
+            None,
+        )
+        source_root = (
+            addon_row.get("source_root") if isinstance(addon_row, dict) else None
+        )
+        if not isinstance(recorded_state, dict) or not recorded_state:
+            problems.append("provider_producer_code_state_missing")
+        elif not source_root:
+            problems.append("provider_addon_source_root_missing")
+        else:
+            try:
+                current_state = assembly_runtime_code_state(source_root)
+            except (OSError, ValueError) as exc:
+                problems.append(
+                    f"provider_producer_code_state_unreadable:{exc}"
+                )
+            else:
+                if recorded_state != current_state:
+                    problems.append("provider_producer_code_state_stale")
+                else:
+                    producer_state_status = "current"
     assembled_blend = Path(str(report.get("blend") or ""))
     if report.get("unreal_push_ready") is not True:
         problems.append("provider_unreal_push_not_ready")
@@ -377,6 +414,7 @@ def validate_provider_assembly_result(report_path):
         "source_object": source.get("source_object"),
         "export_objects": [str(row.get("name") or "") for row in objects],
         "material_consolidation": material_consolidation,
+        "producer_code_state": producer_state_status,
     }
 
 
@@ -898,7 +936,8 @@ def main(argv=None):
                     if not prior_assembly_path.is_file():
                         continue
                     prior_assembly = validate_provider_assembly_result(
-                        prior_assembly_path
+                        prior_assembly_path,
+                        require_current_producer=True,
                     )
                     if not prior_assembly["ok"]:
                         continue
@@ -940,7 +979,8 @@ def main(argv=None):
                 and outputs["manifest"].is_file()
             ):
                 prior_assembly = validate_provider_assembly_result(
-                    assembly_report
+                    assembly_report,
+                    require_current_producer=True,
                 )
                 prior_export = json.loads(
                     outputs["report"].read_text(encoding="utf-8")
@@ -983,7 +1023,10 @@ def main(argv=None):
                     "provider Assembly exited "
                     f"{assembly_completed.returncode}"
                 )
-            verification = validate_provider_assembly_result(assembly_report)
+            verification = validate_provider_assembly_result(
+                assembly_report,
+                require_current_producer=True,
+            )
             result["assembly_verification"] = verification
             if not verification["ok"]:
                 raise RuntimeError(

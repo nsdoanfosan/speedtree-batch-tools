@@ -204,6 +204,71 @@ class ClusterFleetPushTests(unittest.TestCase):
             result["material_consolidation"]["status"], "applied"
         )
 
+    def test_provider_resume_requires_current_producer_code_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pipeline = root / "pipeline.json"
+            report = root / "assembly_report.json"
+            blend = root / "provider.blend"
+            blend.write_bytes(b"blend")
+            payload = {
+                "status": "done",
+                "blender_addon_runtime": {
+                    "addons": [{
+                        "id": "speedtree_bone_weight_repair",
+                        "source_root": str(root / "addon"),
+                    }],
+                },
+                "cluster_source_build_contract": {},
+                "assembly_export_postcondition": {
+                    "objects": [{"name": "SK_leaf_sample_01"}],
+                },
+            }
+            pipeline.write_text(json.dumps(payload), encoding="utf-8")
+            report.write_text(json.dumps({
+                "status": "ok",
+                "unreal_push_ready": True,
+                "blend": str(blend),
+                "pipeline_report": str(pipeline),
+            }), encoding="utf-8")
+
+            missing = validate_provider_assembly_result(
+                report,
+                require_current_producer=True,
+            )
+            self.assertIn(
+                "provider_producer_code_state_missing",
+                missing["problems"],
+            )
+
+            payload["assembly_producer_code_state"] = {
+                "addon/core.py": "a" * 64,
+            }
+            pipeline.write_text(json.dumps(payload), encoding="utf-8")
+            with patch(
+                "cluster_fleet_push.assembly_runtime_code_state",
+                return_value=payload["assembly_producer_code_state"],
+            ):
+                current = validate_provider_assembly_result(
+                    report,
+                    require_current_producer=True,
+                )
+            self.assertTrue(current["ok"])
+            self.assertEqual(current["producer_code_state"], "current")
+
+            with patch(
+                "cluster_fleet_push.assembly_runtime_code_state",
+                return_value={"addon/core.py": "b" * 64},
+            ):
+                stale = validate_provider_assembly_result(
+                    report,
+                    require_current_producer=True,
+                )
+            self.assertIn(
+                "provider_producer_code_state_stale",
+                stale["problems"],
+            )
+
     def test_provider_live_result_requires_actual_unreal_import(self):
         self.assertTrue(validate_provider_live_result({
             "status": "ok",

@@ -79,7 +79,10 @@ from cluster_assembly_handoff_contract import (
 )
 from cluster_assembly_builder import build_blender_assembly_inputs
 from job_report_contract import mark_job_failed
-from assembly_runtime_contract import ASSEMBLY_OUTPUT_CONTRACT_VERSION
+from assembly_runtime_contract import (
+    ASSEMBLY_OUTPUT_CONTRACT_VERSION,
+    assembly_runtime_code_state,
+)
 from cluster_export_handoff_contract import (
     capture_cluster_export_snapshot,
     cluster_export_contract_issues as inspect_cluster_export_contract,
@@ -775,6 +778,25 @@ def main():
             },
         )
         report["blender_addon_runtime"] = addon_runtime.receipt
+        addon_rows = list(addon_runtime.receipt.get("addons") or [])
+        speedtree_addon = next(
+            (
+                row
+                for row in addon_rows
+                if row.get("id") == "speedtree_bone_weight_repair"
+            ),
+            None,
+        )
+        if not speedtree_addon or not speedtree_addon.get("source_root"):
+            raise RuntimeError(
+                "SpeedTree add-on runtime receipt has no source root"
+            )
+        # This is deliberately an output reuse contract rather than merely
+        # diagnostic metadata.  A headless resume must not reuse FBX/Blend
+        # products made by older add-on or Assembly code after a logic fix.
+        report["assembly_producer_code_state"] = assembly_runtime_code_state(
+            speedtree_addon["source_root"]
+        )
         record_stage_duration(
             report,
             "addon_runtime_prepare",
