@@ -297,7 +297,13 @@ def main(argv=None):
         if not inventory_path.is_file():
             raise SystemExit(f"resume inventory does not exist: {inventory_path}")
         inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
-        selected = inventory.get("selected") or []
+        originally_selected = inventory.get("selected") or []
+        resume_audits = [audit_target(target) for target in originally_selected]
+        selected = [row for row in resume_audits if row["selected"]]
+        inventory["resume_skipped_current"] = [
+            row["spm"] for row in resume_audits if not row["selected"]
+        ]
+        inventory["selected"] = selected
         audited = inventory.get("audited") or []
         missing = inventory.get("discovery_missing") or []
         inventory["status"] = "resuming"
