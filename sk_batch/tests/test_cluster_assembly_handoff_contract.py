@@ -27,6 +27,7 @@ from cluster_assembly_handoff_contract import (  # noqa: E402
     _normalized_variants_ready,
     resolve_cluster_receipt_path,
     role_identity_aliases_from_contract,
+    select_cluster_contract,
 )
 
 
@@ -704,6 +705,92 @@ class ClusterAssemblyHandoffTests(unittest.TestCase):
                     embedded,
                     require_embedded_live_audit=True,
                 )
+
+    def test_exact_target_fingerprint_allows_mtime_only_drift(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_Tree_exact_01.spm"
+            receipt = root / "cluster_assembly_live.json"
+            fbx = root / "Tree_exact_01.fbx"
+            spm.write_bytes(b"same-content")
+            fbx.write_bytes(b"fbx")
+            write_receipt(receipt, spm, fbx, [])
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+            fingerprint = payload["items"][0]["cluster_assembly"][
+                "tree_source_identities"
+            ][0]["target_spm"]
+            fingerprint["mtime_ns"] = int(fingerprint["mtime_ns"]) - 1
+
+            selected = select_cluster_contract(
+                payload,
+                spm,
+                require_exact=True,
+            )
+
+            self.assertIs(
+                selected,
+                payload["items"][0]["cluster_assembly"],
+            )
+
+    def test_roleless_live_pass_through_rejects_stale_target_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spm = root / "SK_Grass_roleless_01.spm"
+            receipt = root / "cluster_assembly_live.json"
+            fbx = root / "Grass_roleless_01.fbx"
+            spm.write_bytes(b"AAAA")
+            fbx.write_bytes(b"fbx")
+            write_receipt(receipt, spm, fbx, [])
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+            contract = payload["items"][0]["cluster_assembly"]
+            contract["handoff"] = {
+                "status": "pass_through",
+                "roles": [],
+            }
+            payload["cluster_assembly_receipt_persistence"] = {
+                "status": "ok",
+                "stage": "receipt_persistence",
+                "live_audit_complete": True,
+            }
+            receipt.write_text(json.dumps(payload), encoding="utf-8")
+            spm.write_bytes(b"BBBB")
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "does not exactly identify the requested SPM",
+            ):
+                resolve_cluster_receipt_path(
+                    spm,
+                    receipt,
+                    require_embedded_live_audit=True,
+                )
+
+    def test_selected_contract_snapshot_avoids_receipt_reload(self):
+        contract = {
+            "handoff": {"status": "pass_through", "roles": []},
+            "dependencies": [],
+            "tree_source_identities": [],
+        }
+        payload = {"cluster_assembly": contract}
+        inventory = {
+            "source_fbx": {},
+            "objects": [],
+            "materials": [],
+        }
+
+        with mock.patch(
+            "cluster_assembly_handoff_contract.load_cluster_contract",
+            side_effect=AssertionError("receipt reloaded"),
+        ):
+            handoff = build_assembly_handoff(
+                "validated-live.json",
+                "SK_Grass_roleless_01.spm",
+                inventory,
+                receipt_payload=payload,
+                selected_contract=contract,
+            )
+
+        self.assertEqual(handoff["status"], "pass_through")
 
     def test_divergent_persisted_receipts_fail_closed_without_live_audit(self):
         spm = Path("C:/Trees/SK_Tree_elm_01.spm")

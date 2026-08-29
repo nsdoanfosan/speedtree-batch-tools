@@ -638,6 +638,37 @@ def _contract_target_spm_paths(contract):
     return paths
 
 
+def _require_exact_target_spm_fingerprint(contract, spm_path):
+    """Bind explicit target authority to current path, size, and content."""
+    spm_key = _normalized_path(spm_path)
+    expected_rows = [
+        row.get("target_spm") or {}
+        for row in contract.get("tree_source_identities") or []
+        if _normalized_path((row.get("target_spm") or {}).get("path"))
+        == spm_key
+    ]
+    if not expected_rows:
+        raise ValueError(
+            "PCG receipt does not exactly identify the requested SPM"
+        )
+    actual = file_fingerprint(spm_path)
+    for expected in expected_rows:
+        problems = []
+        if expected.get("exists") is not True or actual.get("exists") is not True:
+            problems.append("exists")
+        if expected.get("size") != actual.get("size"):
+            problems.append("size")
+        expected_sha256 = str(expected.get("sha256") or "").casefold()
+        actual_sha256 = str(actual.get("sha256") or "").casefold()
+        if not expected_sha256 or expected_sha256 != actual_sha256:
+            problems.append("sha256")
+        if problems:
+            raise ValueError(
+                "PCG exact target SPM fingerprint mismatch: "
+                + ", ".join(problems)
+            )
+
+
 def select_cluster_contract(payload, spm_path, *, require_exact=False):
     candidates = _contract_candidates(payload)
     if not candidates:
@@ -653,6 +684,11 @@ def select_cluster_contract(payload, spm_path, *, require_exact=False):
         if spm_key in contract_paths(candidate)
     ]
     if len(matching) == 1:
+        if require_exact:
+            _require_exact_target_spm_fingerprint(
+                matching[0],
+                spm_path,
+            )
         return matching[0]
     if not matching and len(candidates) == 1 and not require_exact:
         return candidates[0]
@@ -1498,9 +1534,31 @@ def _recover_full_fbx_normalized_variants(contract, receipt_row, spm_path):
         return None, f"provider_normalization_recovery_failed: {exc}"
 
 
-def build_assembly_handoff(receipt_path, spm_path, inventory):
+def build_assembly_handoff(
+    receipt_path,
+    spm_path,
+    inventory,
+    *,
+    receipt_payload=None,
+    selected_contract=None,
+):
     """Reconcile one PCG receipt with the exact imported FBX inventory."""
-    _payload, contract = load_cluster_contract(receipt_path, spm_path)
+    if selected_contract is None:
+        _payload, contract = load_cluster_contract(receipt_path, spm_path)
+    else:
+        if not isinstance(receipt_payload, dict):
+            raise ValueError(
+                "selected Cluster contract requires its validated receipt payload"
+            )
+        if not any(
+            candidate is selected_contract
+            for candidate in _contract_candidates(receipt_payload)
+        ):
+            raise ValueError(
+                "selected Cluster contract is not owned by the validated payload"
+            )
+        _payload = receipt_payload
+        contract = selected_contract
     role_rows = _role_receipt_entries(contract)
     roles = []
     issues = []
