@@ -377,10 +377,18 @@ def main(argv=None):
         inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
         originally_selected = inventory.get("selected") or []
         resume_audits = [audit_target(target) for target in originally_selected]
-        selected = [row for row in resume_audits if row["selected"]]
-        inventory["resume_skipped_current"] = [
-            row["spm"] for row in resume_audits if not row["selected"]
-        ]
+        if inventory.get("all_current_targets"):
+            # An explicit full-fleet run remains a full-fleet run on resume.
+            # Re-filtering it through the converging stale audit silently drops
+            # targets that have not yet run merely because an older receipt is
+            # currently readable.
+            selected = resume_audits
+            inventory["resume_skipped_current"] = []
+        else:
+            selected = [row for row in resume_audits if row["selected"]]
+            inventory["resume_skipped_current"] = [
+                row["spm"] for row in resume_audits if not row["selected"]
+            ]
         inventory["selected"] = selected
         audited = inventory.get("audited") or []
         missing = inventory.get("discovery_missing") or []

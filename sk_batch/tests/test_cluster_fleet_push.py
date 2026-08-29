@@ -837,6 +837,44 @@ class ClusterFleetPushTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
 
+    def test_live_result_accepts_current_pass_through_without_assembly_build(self):
+        target = {
+            "pass_through": True,
+            "expected_parts": 0,
+            "expected_bindings": 0,
+        }
+        report = {
+            "status": "ok",
+            "unreal_result": {
+                "status": "imported_ok",
+                "cluster_assembly": {
+                    "status": "skipped",
+                    "reason": "no content-driven Assembly manifest",
+                },
+            },
+        }
+
+        result = validate_live_result(report, target)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["pass_through"])
+        self.assertEqual(result["assembly_status"], "skipped")
+
+    def test_live_result_rejects_pass_through_that_built_an_assembly(self):
+        target = {"pass_through": True}
+        report = {
+            "status": "ok",
+            "unreal_result": {
+                "status": "imported_ok",
+                "cluster_assembly": {"status": "ok", "build": {}},
+            },
+        }
+
+        result = validate_live_result(report, target)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("pass_through_assembly_not_skipped", result["problems"])
+
     def test_incomplete_current_manifest_is_reported_as_diagnostic(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

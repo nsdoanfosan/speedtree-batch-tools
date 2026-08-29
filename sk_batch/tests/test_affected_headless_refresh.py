@@ -189,6 +189,51 @@ def test_main_resumes_prepared_run_without_reexport(tmp_path, monkeypatch):
     assert inventory["failed_count"] == 0
 
 
+def test_full_fleet_resume_keeps_targets_that_are_current(tmp_path, monkeypatch):
+    run_id = "20260830_022824"
+    spm = tmp_path / "SK_tree_current_but_not_run.spm"
+    inventory_path = tmp_path / f"affected_headless_refresh_{run_id}.json"
+    inventory_path.write_text(
+        json.dumps({
+            "all_current_targets": True,
+            "selected": [{"stem": spm.stem, "spm": str(spm)}],
+            "audited": [],
+            "discovery_missing": [],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        refresh,
+        "audit_target",
+        lambda target: {**target, "selected": False, "reasons": []},
+    )
+
+    def fake_fleet(argv):
+        assert "--target-spm" in argv
+        assert str(spm) in argv
+        assert "--resume-prepared" in argv
+        (tmp_path / f"cluster_fleet_push_{run_id}.json").write_text(
+            json.dumps({
+                "status": "ok",
+                "verified_count": 1,
+                "failed_count": 0,
+                "provider_failed_count": 0,
+                "results": [],
+            }),
+            encoding="utf-8",
+        )
+        return 0
+
+    monkeypatch.setattr(refresh.cluster_fleet_push, "main", fake_fleet)
+
+    assert refresh.main([
+        "--log-dir", str(tmp_path), "--resume-run-id", run_id,
+    ]) == 0
+    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+    assert len(inventory["selected"]) == 1
+    assert inventory["resume_skipped_current"] == []
+
+
 def test_reset_item_retries_requires_resume_run_id():
     import pytest
 

@@ -817,6 +817,27 @@ def discover_current_cluster_targets(
 def validate_live_result(report: dict, target: dict) -> dict:
     unreal_result = report.get("unreal_result") or {}
     assembly = unreal_result.get("cluster_assembly") or {}
+    if target.get("pass_through"):
+        problems = []
+        if (
+            report.get("status") != "ok"
+            or unreal_result.get("status") != "imported_ok"
+        ):
+            problems.append("unreal_import_not_ok")
+        if assembly.get("status") != "skipped":
+            problems.append("pass_through_assembly_not_skipped")
+        return {
+            "ok": not problems,
+            "pass_through": True,
+            "problems": problems,
+            "assembly": None,
+            "built_parts": 0,
+            "binding_count": 0,
+            "wind_success": None,
+            "provenance_success": None,
+            "assembly_status": assembly.get("status"),
+            "assembly_reason": assembly.get("reason"),
+        }
     build = assembly.get("build") or {}
     built_parts = list(build.get("parts") or [])
     wind = build.get("dynamic_wind") or {}
