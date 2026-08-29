@@ -134,7 +134,7 @@ def send2ue_export_cache_root():
 
 DEFAULT_CONFIG = {
     "root": r"D:\OneDrive\Forestportfolio\02_nature\Tree",
-    "blender_exe": r"C:\Program Files\Blender Foundation\Blender 5.1\blender.exe",
+    "blender_exe": r"C:\Program Files\Blender Foundation\Blender 5.2\blender.exe",
     "speedtree_exe": r"C:\Program Files\SpeedTree\SpeedTree Modeler v10.1.0\win64\SpeedTree_Modeler.exe",
     "fbx_ini": str(PRESET_DIR / "Options_MA_Fbx.ini"),
     "xml_ini": str(PRESET_DIR / "Options_HI_Xml.ini"),
@@ -313,11 +313,14 @@ def load_config():
             cfg.update({k: v for k, v in data.items() if k in DEFAULT_CONFIG})
         except Exception:
             pass
+    cfg["blender_exe"] = DEFAULT_CONFIG["blender_exe"]
     return cfg
 
 
 def save_config(cfg):
-    _atomic_write_json(CONFIG_PATH, cfg)
+    normalized = dict(cfg)
+    normalized["blender_exe"] = DEFAULT_CONFIG["blender_exe"]
+    _atomic_write_json(CONFIG_PATH, normalized)
 
 
 def _append_bounded_state_recovery_log(message):

@@ -74,7 +74,7 @@ class BlenderAddonContractTests(unittest.TestCase):
             )
         )
 
-    def test_installed_source_prefers_newest_blender_and_resolves_junction(self):
+    def test_installed_source_uses_blender_52_and_resolves_junction(self):
         with tempfile.TemporaryDirectory() as temporary:
             appdata = Path(temporary)
             older = (
@@ -86,7 +86,29 @@ class BlenderAddonContractTests(unittest.TestCase):
                 / "addons"
                 / "speedtree_bone_weight_repair"
             )
-            newer = (
+            selected = (
+                appdata
+                / "Blender Foundation"
+                / "Blender"
+                / "5.2"
+                / "scripts"
+                / "addons"
+                / "speedtree_bone_weight_repair"
+            )
+            older.mkdir(parents=True)
+            selected.mkdir(parents=True)
+            self.assertEqual(
+                contract.discover_installed_addon_source(
+                    "speedtree_bone_weight_repair",
+                    appdata=appdata,
+                ),
+                selected.resolve(),
+            )
+
+    def test_installed_source_does_not_fallback_to_blender_51(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            appdata = Path(temporary)
+            legacy = (
                 appdata
                 / "Blender Foundation"
                 / "Blender"
@@ -95,14 +117,12 @@ class BlenderAddonContractTests(unittest.TestCase):
                 / "addons"
                 / "speedtree_bone_weight_repair"
             )
-            older.mkdir(parents=True)
-            newer.mkdir(parents=True)
-            self.assertEqual(
+            legacy.mkdir(parents=True)
+            self.assertIsNone(
                 contract.discover_installed_addon_source(
                     "speedtree_bone_weight_repair",
                     appdata=appdata,
-                ),
-                newer.resolve(),
+                )
             )
 
     def test_receipt_is_bound_to_exact_request(self):

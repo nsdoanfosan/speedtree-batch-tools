@@ -40,7 +40,7 @@ ASSEMBLY_JOB = SK_BATCH_DIR / "jobs" / "assembly_headless_job.py"
 UNREAL_INGEST = SK_BATCH_DIR / "unreal_ingest.py"
 GUI_ENTRY = SK_BATCH_DIR / "sk_batch_gui.pyw"
 DEFAULT_BLENDER = Path(
-    r"C:\Program Files\Blender Foundation\Blender 5.1\blender.exe"
+    r"C:\Program Files\Blender Foundation\Blender 5.2\blender.exe"
 )
 DEFAULT_UNREAL_PROJECT = Path(
     r"C:\UnrealProjects\MyProject2\MyProject2.uproject"

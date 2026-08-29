@@ -231,7 +231,7 @@ Base에서 자식에만 있는 구조는 적용 시 삭제합니다. 자식 구�
   감사되며 다음 ON/OFF 적용으로 한 상태로 정규화한다.
 - 관계 `ON`은 blend 옆 `<blend stem>.atlas_leaf_targets.json`에 기록된다.
   적용 시 부모 식생 폴더 직하의 모든 `SK_*.spm`을 한 번에 등록한다. 현재 SK Batch
-  BWR 보고서와 canonical Cluster SPM 해시를 먼저 확인하고, Blender 5.1에서
+  BWR 보고서와 canonical Cluster SPM 해시를 먼저 확인하고, Blender 5.2에서
   `PHYSICAL_DIRECT_CAPTURE` 8맵 촬영 → 연결 성분별 `part_root` Prototype →
   Plan Mesh → Atlas handoff를 자동 실행한다. Blender에서 Cluster Normalizer를
   따로 누를 필요가 없다.

@@ -85,8 +85,9 @@ failure로 보고된다.
 그 source 밖에 있을 때 mutation 전에 실패한다.
 
 BWR preset의 기본 위치도 더 이상 `Documents/GitHub` checkout을 추측하지
-않는다. 최신 Blender `scripts/addons`에 설치된 junction을 resolve해 Blender가
-실제로 실행하는 BWR source와 같은 checkout을 사용한다.
+않는다. Blender 5.2 `scripts/addons`에 설치된 junction만 resolve해 Blender가
+실제로 실행하는 BWR source와 같은 checkout을 사용한다. 5.1 설치본으로는
+fallback하지 않는다.
 
 ## 새 연동을 추가하는 방법
 

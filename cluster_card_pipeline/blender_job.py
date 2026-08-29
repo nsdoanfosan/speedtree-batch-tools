@@ -1,4 +1,4 @@
-"""Blender 5.1 background job for normalized cluster-card outputs."""
+"""Blender 5.2 background job for normalized cluster-card outputs."""
 
 from __future__ import annotations
 

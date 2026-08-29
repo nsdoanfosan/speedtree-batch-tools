@@ -18,7 +18,7 @@ python -m cluster_card_pipeline.cli `
   --mesh-ids 1 2 9 `
   --output-prefix 'branch_elm_01' `
   --output-dir 'D:\path\card_pipeline_outputs\branch_elm_01' `
-  --blender-exe 'C:\Program Files\Blender Foundation\Blender 5.1\blender.exe' `
+  --blender-exe 'C:\Program Files\Blender Foundation\Blender 5.2\blender.exe' `
   --speedtree-exe 'C:\Program Files\SpeedTree\SpeedTree Modeler v10.1.0\win64\SpeedTree_Modeler.exe' `
   --speedtree-fbx-options 'D:\path\Options_Fbx.ini' `
   --speedtree-xml-options 'D:\path\Options_HI_Xml.ini'
