@@ -539,6 +539,7 @@ std::mutex gNativeReceiptMutex;
 std::vector<NativeReceiptGeometry> gNativeReceiptGeometries;
 std::unordered_map<void*, std::string> gNativeReceiptFbxNodeNames;
 std::vector<NativeReceiptBone> gNativeReceiptBones;
+std::unordered_map<int, std::size_t> gNativeReceiptBoneIndexes;
 std::vector<NativeReceiptProxy> gNativeReceiptProxies;
 std::unordered_map<
     NativeReceiptProxyKey,
@@ -648,6 +649,140 @@ void Log(const char* message) {
     static constexpr char newline[] = "\r\n";
     WriteFile(file, newline, 2, &written, nullptr);
     CloseHandle(file);
+}
+
+std::atomic<unsigned int> gNativeQpcExportSequence{0};
+std::atomic<unsigned int> gNativeQpcActiveExport{0};
+std::atomic<LONGLONG> gNativeQpcExportStartTicks{0};
+
+LONGLONG NativeQpcFrequency() {
+    static const LONGLONG frequency = []() {
+        LARGE_INTEGER value{};
+        return QueryPerformanceFrequency(&value) && value.QuadPart > 0
+            ? value.QuadPart
+            : 0;
+    }();
+    return frequency;
+}
+
+LONGLONG NativeQpcNow() {
+    LARGE_INTEGER value{};
+    return QueryPerformanceCounter(&value) ? value.QuadPart : 0;
+}
+
+void LogNativeQpcPhase(
+    const char* phase,
+    unsigned int exportSequence,
+    unsigned int collisionPass,
+    LONGLONG exportStartTicks,
+    LONGLONG phaseStartTicks,
+    LONGLONG phaseEndTicks) {
+    const LONGLONG frequency = NativeQpcFrequency();
+    if (phase == nullptr || phase[0] == '\0' || exportSequence == 0 ||
+        frequency <= 0 || exportStartTicks <= 0 ||
+        phaseStartTicks < exportStartTicks || phaseEndTicks < phaseStartTicks) {
+        return;
+    }
+    char message[512]{};
+    _snprintf_s(
+        message,
+        sizeof(message),
+        _TRUNCATE,
+        "QPC1 phase=%s export=%u collision_pass=%u start_ticks=%lld "
+        "duration_ticks=%lld frequency_hz=%lld thread_id=%lu",
+        phase,
+        exportSequence,
+        collisionPass,
+        phaseStartTicks - exportStartTicks,
+        phaseEndTicks - phaseStartTicks,
+        frequency,
+        static_cast<unsigned long>(GetCurrentThreadId()));
+    Log(message);
+}
+
+struct NativeQpcPhaseToken {
+    const char* phase = nullptr;
+    unsigned int collisionPass = 0;
+    unsigned int exportSequence = 0;
+    LONGLONG exportStartTicks = 0;
+    LONGLONG phaseStartTicks = 0;
+};
+
+NativeQpcPhaseToken BeginNativeQpcPhase(
+    const char* phase,
+    unsigned int collisionPass = 0) noexcept {
+    return {
+        phase,
+        collisionPass,
+        gNativeQpcActiveExport.load(std::memory_order_acquire),
+        gNativeQpcExportStartTicks.load(std::memory_order_acquire),
+        NativeQpcNow(),
+    };
+}
+
+void EndNativeQpcPhase(const NativeQpcPhaseToken& token) noexcept {
+    LogNativeQpcPhase(
+        token.phase,
+        token.exportSequence,
+        token.collisionPass,
+        token.exportStartTicks,
+        token.phaseStartTicks,
+        NativeQpcNow());
+}
+
+class NativeQpcPhase final {
+public:
+    explicit NativeQpcPhase(
+        const char* phase,
+        unsigned int collisionPass = 0) noexcept
+        : token_(BeginNativeQpcPhase(phase, collisionPass)) {}
+
+    ~NativeQpcPhase() noexcept {
+        EndNativeQpcPhase(token_);
+    }
+
+    NativeQpcPhase(const NativeQpcPhase&) = delete;
+    NativeQpcPhase& operator=(const NativeQpcPhase&) = delete;
+
+private:
+    NativeQpcPhaseToken token_{};
+};
+
+struct NativeQpcExportToken {
+    unsigned int exportSequence = 0;
+    LONGLONG exportStartTicks = 0;
+};
+
+NativeQpcExportToken BeginNativeQpcExport() noexcept {
+    NativeQpcExportToken token{};
+    token.exportSequence =
+        gNativeQpcExportSequence.fetch_add(1, std::memory_order_acq_rel) + 1;
+    token.exportStartTicks = NativeQpcNow();
+    gNativeQpcExportStartTicks.store(
+        token.exportStartTicks,
+        std::memory_order_release);
+    gNativeQpcActiveExport.store(
+        token.exportSequence,
+        std::memory_order_release);
+    return token;
+}
+
+void EndNativeQpcExport(const NativeQpcExportToken& token) noexcept {
+    const LONGLONG endTicks = NativeQpcNow();
+    LogNativeQpcPhase(
+        "native_export_total",
+        token.exportSequence,
+        0,
+        token.exportStartTicks,
+        token.exportStartTicks,
+        endTicks);
+    unsigned int expected = token.exportSequence;
+    if (gNativeQpcActiveExport.compare_exchange_strong(
+            expected,
+            0,
+            std::memory_order_acq_rel)) {
+        gNativeQpcExportStartTicks.store(0, std::memory_order_release);
+    }
 }
 
 void LogPointer(const char* prefix, const void* pointer) {
@@ -976,7 +1111,9 @@ void ResetNativeReceiptCapture() {
     std::lock_guard<std::mutex> lock(gNativeReceiptMutex);
     gMissingIdZeroBoneRecordLogged.store(false, std::memory_order_release);
     gNativeReceiptGeometries.clear();
+    gNativeReceiptFbxNodeNames.clear();
     gNativeReceiptBones.clear();
+    gNativeReceiptBoneIndexes.clear();
     gNativeReceiptProxies.clear();
     gNativeReceiptProxyIndexes.clear();
     gSyntheticLeafBoneIds.clear();
@@ -1324,14 +1461,23 @@ void CaptureNativeReceiptBone(const void* sourceBoneRecord, const void* sourceBr
         row.sourceType = sourceType;
     }
     std::lock_guard<std::mutex> lock(gNativeReceiptMutex);
-    const auto duplicate = std::find_if(
-        gNativeReceiptBones.begin(),
-        gNativeReceiptBones.end(),
-        [&row](const NativeReceiptBone& existing) {
-            return existing.boneId == row.boneId;
-        });
-    if (duplicate == gNativeReceiptBones.end()) {
+    const auto duplicate = gNativeReceiptBoneIndexes.find(row.boneId);
+    if (duplicate == gNativeReceiptBoneIndexes.end()) {
+        const std::size_t ordinal = gNativeReceiptBones.size();
         gNativeReceiptBones.push_back(std::move(row));
+        gNativeReceiptBoneIndexes.emplace(
+            gNativeReceiptBones[ordinal].boneId,
+            ordinal);
+        return;
+    }
+    const NativeReceiptBone& existing =
+        gNativeReceiptBones.at(duplicate->second);
+    if (existing.parentId != row.parentId ||
+        std::memcmp(existing.start, row.start, sizeof(row.start)) != 0 ||
+        std::memcmp(existing.end, row.end, sizeof(row.end)) != 0) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "Native receipt observed conflicting parent or coordinates for one exact bone ID");
     }
 }
 
@@ -2437,8 +2583,16 @@ void __fastcall HookedQThreadStart(void* thread, int priority) {
             LogCollisionResultState(
                 "native CLI export collision refresh started",
                 collisionModel);
+            const NativeQpcPhaseToken collisionCompute = BeginNativeQpcPhase(
+                "collision_post_regeneration_compute",
+                2);
             gCollisionCompute(collisionModel);
+            EndNativeQpcPhase(collisionCompute);
+            const NativeQpcPhaseToken collisionDone = BeginNativeQpcPhase(
+                "collision_post_regeneration_done",
+                2);
             gCollisionDone(collisionModel);
+            EndNativeQpcPhase(collisionDone);
             gSynchronousCollisionCompleted.store(true, std::memory_order_release);
             LogCollisionResultState(
                 "native CLI export collision refresh completed",
@@ -2996,14 +3150,25 @@ bool __fastcall HookedNativeModelUpdate(void* model, int variation) {
         LogCollisionResultState(phase, model);
         return guiResult;
     }
-    if (!EnsureHeadlessOpenGlContext()) {
+    const NativeQpcPhaseToken modelUpdateTotal = BeginNativeQpcPhase(
+        "native_model_update_total");
+    bool hasHeadlessContext = false;
+    const NativeQpcPhaseToken headlessContext = BeginNativeQpcPhase(
+        "headless_opengl_context");
+    hasHeadlessContext = EnsureHeadlessOpenGlContext();
+    EndNativeQpcPhase(headlessContext);
+    if (!hasHeadlessContext) {
         AbortExport(
             kHookRuntimeFailureExitCode,
             "native CLI model update could not create its headless render context");
     }
     auto* modelBytes = static_cast<unsigned char*>(model);
     modelBytes[0x9BDC] = 1;
-    const bool result = gOriginalNativeModelUpdate(model, variation);
+    bool result = false;
+    const NativeQpcPhaseToken rawModelUpdate = BeginNativeQpcPhase(
+        "native_raw_model_update");
+    result = gOriginalNativeModelUpdate(model, variation);
+    EndNativeQpcPhase(rawModelUpdate);
     LogCollisionResultState(
         "native CLI raw model update with headless render context",
         model);
@@ -3016,8 +3181,14 @@ bool __fastcall HookedNativeModelUpdate(void* model, int variation) {
         reinterpret_cast<bool(__fastcall*)(void*)>(gSpeedTreeBase + 0x3DA640);
     const auto rebuildInteractiveGenerators =
         reinterpret_cast<void(__fastcall*)(void*, bool)>(gSpeedTreeBase + 0x3E9490);
+    const NativeQpcPhaseToken generatorPrepare = BeginNativeQpcPhase(
+        "interactive_generator_prepare");
     prepareInteractiveGenerators(model);
+    EndNativeQpcPhase(generatorPrepare);
+    const NativeQpcPhaseToken generatorRebuild = BeginNativeQpcPhase(
+        "interactive_generator_rebuild");
     rebuildInteractiveGenerators(model, true);
+    EndNativeQpcPhase(generatorRebuild);
     auto* generatorState = *reinterpret_cast<unsigned char**>(modelBytes + 0x7B0);
     auto* generatorStateEnd = *reinterpret_cast<unsigned char**>(modelBytes + 0x7B8);
     for (; generatorState < generatorStateEnd; generatorState += 0x2420) {
@@ -3037,6 +3208,8 @@ bool __fastcall HookedNativeModelUpdate(void* model, int variation) {
         gSpeedTreeBase + kTreeDocumentPrepareRva);
     const auto stageTreeDocumentModel = reinterpret_cast<TreeDocumentModelStageFn>(
         gSpeedTreeBase + kTreeDocumentModelStageRva);
+    const NativeQpcPhaseToken documentStage = BeginNativeQpcPhase(
+        "native_full_document_stage");
     prepareTreeDocument(treeDocument);
     void* modelInterface = static_cast<unsigned char*>(treeDocument) + 0x18;
     stageTreeDocumentModel(modelInterface);
@@ -3044,12 +3217,16 @@ bool __fastcall HookedNativeModelUpdate(void* model, int variation) {
     auto finishModelStage = reinterpret_cast<bool(__fastcall*)(void*)>(
         modelInterfaceVtable[0xD8 / sizeof(void*)]);
     finishModelStage(modelInterface);
+    EndNativeQpcPhase(documentStage);
     LogCollisionResultState(
         "native CLI full document stage after raw generation",
         model);
     const auto generateShadeVolume = reinterpret_cast<void(__fastcall*)(void*, int)>(
         gSpeedTreeBase + kGenerateShadeVolumeRva);
+    const NativeQpcPhaseToken shadeVolume = BeginNativeQpcPhase(
+        "shade_pruning_volume_generation");
     generateShadeVolume(model, 5);
+    EndNativeQpcPhase(shadeVolume);
     Log("native CLI shade-pruning volume generation completed");
     gMarkCollisionDirty(model);
     modelBytes[0x9C68] = 1;
@@ -3059,8 +3236,16 @@ bool __fastcall HookedNativeModelUpdate(void* model, int variation) {
     LogCollisionResultState(
         "native CLI model marked dirty after full input generation",
         model);
+    const NativeQpcPhaseToken collisionCompute = BeginNativeQpcPhase(
+        "collision_post_input_compute",
+        1);
     gCollisionCompute(model);
+    EndNativeQpcPhase(collisionCompute);
+    const NativeQpcPhaseToken collisionDone = BeginNativeQpcPhase(
+        "collision_post_input_done",
+        1);
     gCollisionDone(model);
+    EndNativeQpcPhase(collisionDone);
     gSynchronousCollisionCompleted.store(true, std::memory_order_release);
     LogCollisionResultState(
         "native CLI full post-input collision computation completed",
@@ -3155,7 +3340,11 @@ bool __fastcall HookedNativeModelUpdate(void* model, int variation) {
     void* const originalIdleViewState =
         *reinterpret_cast<void**>(nativeMainWindow + 0x4B0);
     nativeMainWindow[0x615] = 0;
-    const bool postCollisionResult = gOriginalNativeModelUpdate(model, variation);
+    bool postCollisionResult = false;
+    const NativeQpcPhaseToken postCollisionUpdate = BeginNativeQpcPhase(
+        "native_post_collision_model_update");
+    postCollisionResult = gOriginalNativeModelUpdate(model, variation);
+    EndNativeQpcPhase(postCollisionUpdate);
     // Restore UI-only idle state changed by the scoped interactive rebuild.
     // The model itself remains regenerated, while the native exporter's
     // original non-interactive window state is preserved.
@@ -3168,11 +3357,23 @@ bool __fastcall HookedNativeModelUpdate(void* model, int variation) {
     gSynchronousCollisionCompleted.store(false, std::memory_order_release);
     const auto scheduleCollision =
         reinterpret_cast<void(__fastcall*)(void*, bool)>(gSpeedTreeBase + 0x3BF790);
+    const NativeQpcPhaseToken collisionSchedule = BeginNativeQpcPhase(
+        "collision_post_regeneration_schedule",
+        2);
     scheduleCollision(model, false);
+    EndNativeQpcPhase(collisionSchedule);
     if (!gSynchronousCollisionCompleted.load(std::memory_order_acquire)) {
         Log("native CLI collision scheduler did not start a worker; using direct fallback");
+        const NativeQpcPhaseToken fallbackCompute = BeginNativeQpcPhase(
+            "collision_post_regeneration_direct_fallback_compute",
+            2);
         gCollisionCompute(model);
+        EndNativeQpcPhase(fallbackCompute);
+        const NativeQpcPhaseToken fallbackDone = BeginNativeQpcPhase(
+            "collision_post_regeneration_direct_fallback_done",
+            2);
         gCollisionDone(model);
+        EndNativeQpcPhase(fallbackDone);
         gSynchronousCollisionCompleted.store(true, std::memory_order_release);
     }
     LogCollisionScheduleState(
@@ -3180,7 +3381,11 @@ bool __fastcall HookedNativeModelUpdate(void* model, int variation) {
         model);
     const auto commitCollisionGeneratorChanges =
         reinterpret_cast<void(__fastcall*)(void*, bool)>(gSpeedTreeBase + 0x3DDD30);
+    const NativeQpcPhaseToken collisionCommit = BeginNativeQpcPhase(
+        "collision_generator_commit",
+        2);
     commitCollisionGeneratorChanges(model, true);
+    EndNativeQpcPhase(collisionCommit);
     LogCollisionResultState(
         "native CLI collision-complete generator commit finished",
         model);
@@ -3271,6 +3476,7 @@ bool __fastcall HookedNativeModelUpdate(void* model, int variation) {
     LogCollisionResultState(
         "native CLI post-prune model regeneration completed",
         model);
+    EndNativeQpcPhase(modelUpdateTotal);
     return result && postCollisionResult;
 }
 
@@ -3280,7 +3486,10 @@ void __fastcall HookedNativeExportFinalizeGeometry(void* exportBuilder, bool sep
             "native CLI finalize geometry entry",
             gCollisionModel.load(std::memory_order_acquire));
     }
-    gOriginalNativeExportFinalizeGeometry(exportBuilder, separate);
+    {
+        NativeQpcPhase finalizeGeometry("native_export_finalize_geometry");
+        gOriginalNativeExportFinalizeGeometry(exportBuilder, separate);
+    }
     if (gNativeCliExportActive.load(std::memory_order_acquire)) {
         LogCollisionResultState(
             "native CLI finalize geometry exit",
@@ -3294,7 +3503,10 @@ void __fastcall HookedNativeExportFinalizeDocument(void* exportBuilder) {
             "native CLI finalize document entry",
             gCollisionModel.load(std::memory_order_acquire));
     }
-    gOriginalNativeExportFinalizeDocument(exportBuilder);
+    {
+        NativeQpcPhase finalizeDocument("native_export_finalize_document");
+        gOriginalNativeExportFinalizeDocument(exportBuilder);
+    }
     if (gNativeCliExportActive.load(std::memory_order_acquire)) {
         LogCollisionResultState(
             "native CLI finalize document exit",
@@ -3322,14 +3534,27 @@ void __fastcall HookedNativeExportBuild(void* exportBuilder) {
             "native CLI collision state normalized for full pruning",
             collisionModel);
         Log("executing collision core before native CLI geometry build");
-        gCollisionCompute(collisionModel);
-        gCollisionDone(collisionModel);
+        {
+            NativeQpcPhase fallbackCompute(
+                "collision_prebuild_safety_fallback_compute",
+                2);
+            gCollisionCompute(collisionModel);
+        }
+        {
+            NativeQpcPhase fallbackDone(
+                "collision_prebuild_safety_fallback_done",
+                2);
+            gCollisionDone(collisionModel);
+        }
         gSynchronousCollisionCompleted.store(true, std::memory_order_release);
         LogCollisionResultState(
             "native CLI pre-build collision computation completed",
             collisionModel);
     }
-    gOriginalNativeExportBuild(exportBuilder);
+    {
+        NativeQpcPhase exportBuild("native_export_geometry_build");
+        gOriginalNativeExportBuild(exportBuilder);
+    }
 }
 
 [[noreturn]] void AbortExport(DWORD exitCode, const char* reason) {
@@ -5169,13 +5394,25 @@ bool WriteNativeReceipt() {
         return true;
     }
 
+    NativeQpcPhase receiptTotal("native_receipt_total");
     std::lock_guard<std::mutex> lock(gNativeReceiptMutex);
-    std::sort(
-        gNativeReceiptBones.begin(),
-        gNativeReceiptBones.end(),
-        [](const NativeReceiptBone& left, const NativeReceiptBone& right) {
-            return left.boneId < right.boneId;
-        });
+    {
+        NativeQpcPhase boneSort("native_receipt_bone_sort");
+        std::sort(
+            gNativeReceiptBones.begin(),
+            gNativeReceiptBones.end(),
+            [](const NativeReceiptBone& left, const NativeReceiptBone& right) {
+                return left.boneId < right.boneId;
+            });
+        gNativeReceiptBoneIndexes.clear();
+        for (std::size_t index = 0;
+             index < gNativeReceiptBones.size();
+             ++index) {
+            gNativeReceiptBoneIndexes.emplace(
+                gNativeReceiptBones[index].boneId,
+                index);
+        }
+    }
 
     const std::filesystem::path destination(gNativeReceiptPath);
     std::error_code directoryError;
@@ -5206,8 +5443,11 @@ bool WriteNativeReceipt() {
             sourceAttributes.ftLastWriteTime.dwLowDateTime
         : 0;
 
+    const NativeQpcPhaseToken receiptSerialization = BeginNativeQpcPhase(
+        "native_receipt_json_serialization");
     std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
     if (!stream) {
+        EndNativeQpcPhase(receiptSerialization);
         Log("native receipt temporary file could not be opened");
         return false;
     }
@@ -5361,14 +5601,20 @@ bool WriteNativeReceipt() {
     stream << "  ]\n}\n";
     stream.close();
     if (!stream) {
+        EndNativeQpcPhase(receiptSerialization);
         DeleteFileW(temporary.c_str());
         Log("native receipt write did not complete");
         return false;
     }
-    if (!MoveFileExW(
-            temporary.c_str(),
-            destination.c_str(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    EndNativeQpcPhase(receiptSerialization);
+    const NativeQpcPhaseToken receiptPromotion = BeginNativeQpcPhase(
+        "native_receipt_atomic_promotion");
+    const bool promoted = MoveFileExW(
+        temporary.c_str(),
+        destination.c_str(),
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+    EndNativeQpcPhase(receiptPromotion);
+    if (!promoted) {
         DeleteFileW(temporary.c_str());
         Log("native receipt atomic promotion failed");
         return false;
@@ -5398,11 +5644,14 @@ void RunSecondaryNativeExport(void* mainWindow, bool gameExport) {
     }
     Log("native CLI starting bundled secondary export in the loaded process");
     gSecondaryNativeSerializationActive.store(true, std::memory_order_release);
-    gOriginalSpeedTreeExport(
-        mainWindow,
-        &secondaryOutput,
-        &secondaryOptions,
-        gameExport);
+    {
+        NativeQpcPhase secondaryExport("native_secondary_export_total");
+        gOriginalSpeedTreeExport(
+            mainWindow,
+            &secondaryOutput,
+            &secondaryOptions,
+            gameExport);
+    }
     gSecondaryNativeSerializationActive.store(false, std::memory_order_release);
     if (!gVerificationOnly &&
         !gSynchronousCollisionCompleted.load(std::memory_order_acquire)) {
@@ -5414,6 +5663,7 @@ void RunSecondaryNativeExport(void* mainWindow, bool gameExport) {
 }
 
 void __fastcall HookedSpeedTreeExport(void* arg1, void* arg2, void* arg3, bool gameExport) {
+    const NativeQpcExportToken exportTelemetry = BeginNativeQpcExport();
     Log("SpeedTree native CLI export intercepted");
     ResetNativeReceiptCapture();
     __try {
@@ -5435,10 +5685,14 @@ void __fastcall HookedSpeedTreeExport(void* arg1, void* arg2, void* arg3, bool g
 
     if (gVerificationOnly) {
         Log("native CLI verification-only export skips Collision/Prune bake");
+        const NativeQpcPhaseToken primaryExport = BeginNativeQpcPhase(
+            "native_primary_export_total");
         gOriginalSpeedTreeExport(arg1, arg2, arg3, gameExport);
+        EndNativeQpcPhase(primaryExport);
         WriteNativeReceipt();
         RunSecondaryNativeExport(arg1, gameExport);
         Log("native CLI bundled verification export completed");
+        EndNativeQpcExport(exportTelemetry);
         return;
     }
 
@@ -5470,6 +5724,8 @@ void __fastcall HookedSpeedTreeExport(void* arg1, void* arg2, void* arg3, bool g
             kHookRuntimeFailureExitCode,
             "native CLI could not disable deferred UI updates during export");
     }
+    const NativeQpcPhaseToken modelFinalization = BeginNativeQpcPhase(
+        "native_cli_model_finalization");
     __try {
         auto* mainWindow = static_cast<unsigned char*>(arg1);
         if (mainWindow[0x615] == 0) {
@@ -5521,7 +5777,11 @@ void __fastcall HookedSpeedTreeExport(void* arg1, void* arg2, void* arg3, bool g
             kHookRuntimeFailureExitCode,
             "native CLI model finalization raised an internal exception");
     }
+    EndNativeQpcPhase(modelFinalization);
+    const NativeQpcPhaseToken primaryExport = BeginNativeQpcPhase(
+        "native_primary_export_total");
     gOriginalSpeedTreeExport(arg1, arg2, arg3, gameExport);
+    EndNativeQpcPhase(primaryExport);
     WriteNativeReceipt();
     RunSecondaryNativeExport(arg1, gameExport);
     if (!SetNativeDeferredUiUpdateNoop(false)) {
@@ -5541,6 +5801,7 @@ void __fastcall HookedSpeedTreeExport(void* arg1, void* arg2, void* arg3, bool g
             "native CLI exporter never produced collision inputs before serialization");
     }
     Log("native CLI post-collision export completed");
+    EndNativeQpcExport(exportTelemetry);
 }
 
 template <typename FunctionType>

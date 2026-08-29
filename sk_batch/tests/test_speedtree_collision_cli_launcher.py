@@ -353,6 +353,77 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
             hook,
         )
 
+    def test_native_cli_logs_large_native_phases_with_qpc(self):
+        hook = HOOK_SOURCE.read_text(encoding="utf-8")
+        receipt_capture = hook[
+            hook.index("void CaptureNativeReceiptProxy"):
+            hook.index("void CaptureNativeReceiptBone")
+        ]
+        vertex_weights = hook[
+            hook.index("void __fastcall HookedExportVertexWeights"):
+            hook.index("int __fastcall CaptureNativeReceiptIdZero")
+        ]
+
+        self.assertIn("QueryPerformanceCounter", hook)
+        self.assertIn("QueryPerformanceFrequency", hook)
+        self.assertIn(
+            '"QPC1 phase=%s export=%u collision_pass=%u start_ticks=%lld "',
+            hook,
+        )
+        for phase in (
+            "native_raw_model_update",
+            "interactive_generator_prepare",
+            "interactive_generator_rebuild",
+            "native_full_document_stage",
+            "shade_pruning_volume_generation",
+            "native_export_geometry_build",
+            "native_receipt_json_serialization",
+            "native_secondary_export_total",
+        ):
+            self.assertIn(f'"{phase}"', hook)
+        self.assertIn('"collision_post_input_compute",\n        1', hook)
+        self.assertIn('"collision_post_regeneration_compute",\n                2', hook)
+        self.assertIn(
+            '"collision_post_regeneration_direct_fallback_compute",',
+            hook,
+        )
+        self.assertIn('"collision_prebuild_safety_fallback_compute"', hook)
+        self.assertNotIn("QueryPerformanceCounter", receipt_capture)
+        self.assertNotIn("BeginNativeQpcPhase", receipt_capture)
+        self.assertNotIn("QueryPerformanceCounter", vertex_weights)
+        self.assertNotIn("BeginNativeQpcPhase", vertex_weights)
+
+    def test_native_receipt_bone_identity_lookup_is_exact_and_reset(self):
+        hook = HOOK_SOURCE.read_text(encoding="utf-8")
+        capture = hook[
+            hook.index("void CaptureNativeReceiptBone"):
+            hook.index("void __fastcall HookedExportVertexWeights")
+        ]
+        reset = hook[
+            hook.index("void ResetNativeReceiptCapture"):
+            hook.index("int NativeReceiptGeometryOrdinal")
+        ]
+
+        self.assertIn(
+            "std::unordered_map<int, std::size_t> "
+            "gNativeReceiptBoneIndexes;",
+            hook,
+        )
+        self.assertIn("gNativeReceiptBoneIndexes.find(row.boneId)", capture)
+        self.assertNotIn("std::find_if", capture)
+        self.assertIn("existing.parentId != row.parentId", capture)
+        self.assertIn(
+            "std::memcmp(existing.start, row.start, sizeof(row.start)) != 0",
+            capture,
+        )
+        self.assertIn(
+            "std::memcmp(existing.end, row.end, sizeof(row.end)) != 0",
+            capture,
+        )
+        self.assertIn("conflicting parent or coordinates", capture)
+        self.assertIn("gNativeReceiptFbxNodeNames.clear();", reset)
+        self.assertIn("gNativeReceiptBoneIndexes.clear();", reset)
+
     def test_verification_exports_skip_only_the_expensive_post_bake(self):
         launcher = LAUNCHER_SOURCE.read_text(encoding="utf-8")
         hook = HOOK_SOURCE.read_text(encoding="utf-8")
