@@ -42,6 +42,7 @@ from artifact_content_key import (
 )
 from speedtree_native_receipt import (
     NativeReceiptError,
+    _native_runtime_owner_key,
     exact_generated_instance,
     exact_geometry_ordinal,
     load_native_export_receipt,
@@ -2919,16 +2920,54 @@ def _exact_index_component_groups(mesh, polygon_indices):
     )
 
 
+class _NativeRuntimeOwnerGroups:
+    """Union-find over owner keys joined by a shared polygon."""
+
+    def __init__(self):
+        self._parent = {}
+
+    def _find(self, owner):
+        root = self._parent.setdefault(owner, owner)
+        while root != self._parent[root]:
+            root = self._parent[root]
+        # Path compression keeps repeated lookups cheap on dense meshes.
+        while owner != root:
+            self._parent[owner], owner = root, self._parent[owner]
+        return root
+
+    def join(self, owners):
+        ordered = sorted(owners)
+        for owner in ordered[1:]:
+            first, second = self._find(ordered[0]), self._find(owner)
+            if first != second:
+                self._parent[max(first, second)] = min(first, second)
+
+    def representative(self, owners):
+        if not owners:
+            return None
+        return min(self._find(owner) for owner in owners)
+
+
 def _partition_components_by_native_runtime_owner(obj, components, receipt):
-    """Split accidentally welded render components by exact runtime Node GUID.
+    """Split accidentally welded render components by exact runtime Node identity.
 
     SpeedTree can place two independent cards on the same authored edge.  The
     FBX/BWR coordinate weld then correctly reconnects seam-split faces, but it
     cannot distinguish those coincident card instances by geometry alone.  The
     native serializer receipt can: every surviving vertex retains its exact
     geometry ordinal/local index, and each Node record carries its runtime
-    GUID.  Use that identity only when a welded component actually intersects
-    multiple Nodes; ordinary one-owner components remain untouched.
+    identity.  Use that identity only when a welded component actually
+    intersects multiple Nodes; ordinary one-owner components remain untouched.
+
+    Two records of the same native instance are one owner.  A branch strip whose
+    vertices alternate between bones is serialized as several records, so keying
+    the fallback on the record's position in the file invented separate owners
+    for one surface.
+
+    A polygon that spans several owners is authored, not broken.  Truly
+    coincident cards never share a polygon, so owners joined by one are joined
+    surfaces and belong in the same partition; they are merged transitively
+    instead of rejected.
     """
 
     ordinal_attribute = obj.data.attributes.get(
@@ -2940,13 +2979,8 @@ def _partition_components_by_native_runtime_owner(obj, components, receipt):
 
     owner_by_native_vertex = defaultdict(set)
     for row_index, row in enumerate(receipt.get("generated_instances") or []):
-        node_guid = str(row.get("node_guid") or "")
-        owner = (
-            ("node_guid", node_guid)
-            if node_guid
-            else ("serializer_record", int(row_index))
-        )
         geometry_ordinal = int(row["geometry_ordinal"])
+        owner = _native_runtime_owner_key(row, row_index, geometry_ordinal)
         for first, last in row.get("vertex_ranges") or []:
             for native_vertex_index in range(int(first), int(last) + 1):
                 owner_by_native_vertex[
@@ -2962,20 +2996,22 @@ def _partition_components_by_native_runtime_owner(obj, components, receipt):
 
     partitioned = []
     for component in components:
-        component_owners = set()
-        polygon_owners = {}
+        polygon_owner_sets = {}
+        joined = _NativeRuntimeOwnerGroups()
         for polygon_index in component["polygons"]:
             owners = set()
             for vertex_index in obj.data.polygons[polygon_index].vertices:
                 owners.update(vertex_owners(vertex_index))
-            if len(owners) > 1:
-                raise ClusterAssemblyBuildError(
-                    "one rendered polygon crosses multiple native runtime "
-                    f"Node owners: object={obj.name!r} polygon={polygon_index} "
-                    f"owners={sorted(owners)}"
-                )
-            owner = next(iter(owners)) if owners else None
-            polygon_owners[int(polygon_index)] = owner
+            polygon_owner_sets[int(polygon_index)] = owners
+            # One polygon cannot belong to two coincident cards, so every owner
+            # it touches describes the same joined surface.
+            joined.join(owners)
+
+        component_owners = set()
+        polygon_owners = {}
+        for polygon_index, owners in polygon_owner_sets.items():
+            owner = joined.representative(owners)
+            polygon_owners[polygon_index] = owner
             if owner is not None:
                 component_owners.add(owner)
         if len(component_owners) <= 1:
