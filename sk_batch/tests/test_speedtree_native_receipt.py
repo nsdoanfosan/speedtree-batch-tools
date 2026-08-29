@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import random
 import sys
 import tempfile
 import unittest
@@ -14,11 +15,123 @@ if str(SK_BATCH) not in sys.path:
 
 from speedtree_native_receipt import (  # noqa: E402
     NativeReceiptError,
+    _native_runtime_owner_key,
+    build_exact_native_receipt_index,
     exact_generated_instance,
     load_native_export_receipt,
     native_position_to_blender_world,
     native_tangent_to_blender_world,
 )
+
+
+def _linear_exact_generated_instance(receipt, geometry_ordinal, vertex_indices):
+    """Frozen pre-index oracle used to prove exact behavioral parity."""
+    vertices = sorted({int(value) for value in vertex_indices})
+    if not vertices:
+        raise NativeReceiptError("target component has no vertices")
+    matches_by_owner = {}
+    for row_index, row in enumerate(receipt.get("generated_instances") or []):
+        if int(row["geometry_ordinal"]) != int(geometry_ordinal):
+            continue
+        matched = [
+            vertex
+            for vertex in vertices
+            if any(
+                first <= vertex <= last
+                for first, last in row["vertex_ranges"]
+            )
+        ]
+        if not matched:
+            continue
+        owner_key = _native_runtime_owner_key(
+            row,
+            row_index,
+            geometry_ordinal,
+        )
+        owner = matches_by_owner.setdefault(owner_key, {
+            "row": row,
+            "matched": set(),
+            "record_indices": [],
+            "native_instance_ids": set(),
+            "matched_rows": [],
+        })
+        owner["matched"].update(matched)
+        owner["record_indices"].append(row_index)
+        owner["matched_rows"].append(row)
+        if row.get("native_instance_id") is not None:
+            owner["native_instance_ids"].add(
+                int(row["native_instance_id"])
+            )
+    matches = list(matches_by_owner.values())
+    if len(matches) != 1:
+        raise NativeReceiptError(
+            "target component has no sole intersecting native runtime owner: "
+            f"geometry={geometry_ordinal}, matches={len(matches)}"
+        )
+    owner = matches[0]
+    matched_rows = owner["matched_rows"]
+    stable_fields = (
+        "geometry_ordinal",
+        "parent_guid",
+        "generator_guid",
+        "source_rtti",
+        "authored_position_native",
+        "authored_tangent_native_unit",
+    )
+    for field in stable_fields:
+        values = {
+            json.dumps(row.get(field), sort_keys=True, ensure_ascii=False)
+            for row in matched_rows
+        }
+        if len(values) > 1:
+            raise NativeReceiptError(
+                "one native runtime owner has inconsistent attachment "
+                f"metadata: field={field}"
+            )
+    influence_values = {
+        json.dumps(
+            row.get("authored_position_influences") or [],
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        for row in matched_rows
+    }
+    if len(influence_values) > 1:
+        raise NativeReceiptError(
+            "one native runtime owner has ambiguous authored attachment "
+            "influences for the queried vertices"
+        )
+    row = matched_rows[0]
+    matched = sorted(owner["matched"])
+    matched_set = set(matched)
+    return {
+        **row,
+        "matched_native_vertex_indices": matched,
+        "queried_native_vertex_count": len(vertices),
+        "unowned_native_vertex_count": sum(
+            vertex not in matched_set for vertex in vertices
+        ),
+        "native_instance_ids": sorted(owner["native_instance_ids"]),
+        "native_serializer_record_indices": list(owner["record_indices"]),
+        "native_serializer_record_count": len(owner["record_indices"]),
+        "owner_selection_policy": (
+            "sole_exact_native_runtime_owner_range_intersection_v3"
+        ),
+    }
+
+
+def _exact_outcome(function):
+    try:
+        return (
+            "ok",
+            json.dumps(
+                function(),
+                sort_keys=True,
+                ensure_ascii=False,
+            ),
+        )
+    except NativeReceiptError as exc:
+        return "error", str(exc)
 
 
 class NativeSpeedTreeReceiptTests(unittest.TestCase):
@@ -269,7 +382,167 @@ class NativeSpeedTreeReceiptTests(unittest.TestCase):
 
         self.assertEqual(instance["matched_native_vertex_indices"], [2, 3, 4, 5])
         self.assertEqual(instance["native_instance_ids"], [2305, 3585])
+        self.assertEqual(instance["native_serializer_record_indices"], [0, 1])
         self.assertEqual(instance["native_serializer_record_count"], 2)
+
+    @staticmethod
+    def _overlapping_exact_receipt():
+        def row(owner, ranges, native_instance_id):
+            return {
+                "geometry_ordinal": 0,
+                "native_instance_id": native_instance_id,
+                "node_guid": owner,
+                "parent_guid": f"{owner}-parent",
+                "generator_guid": f"{owner}-generator",
+                "source_rtti": "leaf",
+                "source_bone_id": native_instance_id,
+                "authored_position_native": [1.0, 2.0, 3.0],
+                "authored_tangent_native_unit": [0.0, 1.0, 0.0],
+                "vertex_ranges": ranges,
+                "authored_position_influences": [{
+                    "bone_id": 7,
+                    "mapping_node": "start",
+                    "exported_cluster_name": "CapturedNode",
+                    "native_root": False,
+                    "weight": 1.0,
+                }],
+            }
+
+        return {
+            "geometries": [{"ordinal": 0, "vertex_count": 40}],
+            "generated_instances": [
+                row("owner-a", [(0, 5), (15, 18)], 100),
+                row("owner-a", [(4, 9), (30, 31)], 101),
+                row("owner-b", [(8, 14)], 200),
+                row("owner-b", [(18, 22)], 201),
+                row("owner-c", [(25, 27)], 300),
+            ],
+        }
+
+    def test_overlapping_rows_use_csr_without_losing_record_order(self):
+        receipt = self._overlapping_exact_receipt()
+        index = build_exact_native_receipt_index(receipt)
+
+        self.assertEqual(index.storage_modes, {0: "csr_multiple_rows"})
+        instance = exact_generated_instance(
+            receipt,
+            0,
+            [4, 5],
+            receipt_index=index,
+        )
+
+        self.assertEqual(instance["matched_native_vertex_indices"], [4, 5])
+        self.assertEqual(instance["native_serializer_record_indices"], [0, 1])
+        self.assertEqual(instance["native_instance_ids"], [100, 101])
+        with self.assertRaisesRegex(NativeReceiptError, "sole intersecting"):
+            exact_generated_instance(
+                receipt,
+                0,
+                [8],
+                receipt_index=index,
+            )
+
+    def test_same_owner_stable_metadata_conflict_remains_fail_closed(self):
+        receipt = self._overlapping_exact_receipt()
+        receipt["generated_instances"][1][
+            "authored_tangent_native_unit"
+        ] = [1.0, 0.0, 0.0]
+        index = build_exact_native_receipt_index(receipt)
+        expected = _exact_outcome(
+            lambda: _linear_exact_generated_instance(receipt, 0, [4])
+        )
+
+        self.assertEqual(
+            _exact_outcome(
+                lambda: exact_generated_instance(
+                    receipt,
+                    0,
+                    [4],
+                    receipt_index=index,
+                )
+            ),
+            expected,
+        )
+        self.assertEqual(
+            expected,
+            (
+                "error",
+                "one native runtime owner has inconsistent attachment "
+                "metadata: field=authored_tangent_native_unit",
+            ),
+        )
+
+    def test_disjoint_ranges_use_one_packed_row_id_per_native_vertex(self):
+        receipt = self._overlapping_exact_receipt()
+        receipt["generated_instances"] = [
+            receipt["generated_instances"][0],
+            receipt["generated_instances"][4],
+        ]
+        receipt["generated_instances"][0]["vertex_ranges"] = [(0, 18)]
+        receipt["generated_instances"][1]["vertex_ranges"] = [(25, 27)]
+        index = build_exact_native_receipt_index(receipt)
+
+        self.assertEqual(index.storage_modes, {0: "dense_single_row"})
+        self.assertEqual(index.persistent_storage_bytes, 40 * 4)
+        self.assertEqual(index.records_at(0, 0), (0,))
+        self.assertEqual(index.records_at(0, 23), ())
+        self.assertEqual(index.records_at(0, 26), (1,))
+
+    def test_index_and_memory_bounded_interval_match_frozen_linear_oracle(self):
+        receipt = self._overlapping_exact_receipt()
+        csr_index = build_exact_native_receipt_index(receipt)
+        interval_index = build_exact_native_receipt_index(
+            receipt,
+            storage_budget_bytes=0,
+        )
+        self.assertEqual(csr_index.storage_modes, {0: "csr_multiple_rows"})
+        self.assertEqual(interval_index.storage_modes, {0: "interval"})
+        randomizer = random.Random(739)
+        queries = [
+            [randomizer.randrange(-3, 44) for _value in range(
+                randomizer.randrange(0, 8)
+            )]
+            for _query in range(500)
+        ]
+        queries.extend((
+            [4, 5],
+            [8],
+            [18],
+            [23, 24],
+            [27, 25, 27],
+            [],
+        ))
+
+        for vertices in queries:
+            expected = _exact_outcome(
+                lambda vertices=vertices: _linear_exact_generated_instance(
+                    receipt,
+                    0,
+                    vertices,
+                )
+            )
+            self.assertEqual(
+                _exact_outcome(
+                    lambda vertices=vertices: exact_generated_instance(
+                        receipt,
+                        0,
+                        vertices,
+                        receipt_index=csr_index,
+                    )
+                ),
+                expected,
+            )
+            self.assertEqual(
+                _exact_outcome(
+                    lambda vertices=vertices: exact_generated_instance(
+                        receipt,
+                        0,
+                        vertices,
+                        receipt_index=interval_index,
+                    )
+                ),
+                expected,
+            )
 
     def test_zero_guid_and_reused_instance_id_do_not_merge_distinct_nodes(self):
         with tempfile.TemporaryDirectory() as temporary:

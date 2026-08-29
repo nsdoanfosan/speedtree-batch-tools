@@ -71,6 +71,9 @@ from cluster_assembly_builder import (  # noqa: E402
     validate_wind_json_against_skeleton,
     validate_file_fingerprint,
 )
+from speedtree_native_receipt import (  # noqa: E402
+    build_exact_native_receipt_index,
+)
 
 
 class FakeEditorProperties:
@@ -662,13 +665,15 @@ class ExactNativeAttachmentInfluenceTests(unittest.TestCase):
 
     def test_uses_native_runtime_owner_and_authored_weights(self):
         obj = self._object([4, 4, 4], [2, 3, 4])
+        receipt = self._receipt()
         influences, source = _exact_native_attachment_influences(
             obj,
             {"vertices": [0, 1, 2]},
             1,
-            self._receipt(),
+            receipt,
             self._skeleton(),
             "test native component",
+            native_receipt_index=build_exact_native_receipt_index(receipt),
         )
 
         self.assertEqual(influences, [
@@ -690,13 +695,15 @@ class ExactNativeAttachmentInfluenceTests(unittest.TestCase):
 
     def test_clipped_attachment_uses_sole_exact_component_intersection(self):
         obj = self._object([4, 4, 4], [0, 3, 11])
+        receipt = self._receipt()
         influences, source = _exact_native_attachment_influences(
             obj,
             {"vertices": [0, 1, 2]},
             None,
-            self._receipt(),
+            receipt,
             self._skeleton(),
             "test clipped native component",
+            native_receipt_index=build_exact_native_receipt_index(receipt),
         )
 
         self.assertEqual(influences[1]["bone"], "CapturedChild")

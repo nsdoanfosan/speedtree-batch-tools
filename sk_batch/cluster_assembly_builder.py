@@ -43,7 +43,7 @@ from artifact_content_key import (
 )
 from speedtree_native_receipt import (
     NativeReceiptError,
-    _native_runtime_owner_key,
+    build_exact_native_receipt_index,
     exact_generated_instance,
     exact_geometry_ordinal,
     load_native_export_receipt,
@@ -2950,7 +2950,13 @@ class _NativeRuntimeOwnerGroups:
         return min(self._find(owner) for owner in owners)
 
 
-def _partition_components_by_native_runtime_owner(obj, components, receipt):
+def _partition_components_by_native_runtime_owner(
+    obj,
+    components,
+    receipt,
+    *,
+    receipt_index=None,
+):
     """Split accidentally welded render components by exact runtime Node identity.
 
     SpeedTree can place two independent cards on the same authored edge.  The
@@ -2978,23 +2984,18 @@ def _partition_components_by_native_runtime_owner(obj, components, receipt):
     vertex_attribute = obj.data.attributes.get("speedtree_native_vertex_index")
     if ordinal_attribute is None or vertex_attribute is None:
         return list(components)
-
-    owner_by_native_vertex = defaultdict(set)
-    for row_index, row in enumerate(receipt.get("generated_instances") or []):
-        geometry_ordinal = int(row["geometry_ordinal"])
-        owner = _native_runtime_owner_key(row, row_index, geometry_ordinal)
-        for first, last in row.get("vertex_ranges") or []:
-            for native_vertex_index in range(int(first), int(last) + 1):
-                owner_by_native_vertex[
-                    (geometry_ordinal, native_vertex_index)
-                ].add(owner)
+    if receipt_index is None:
+        receipt_index = build_exact_native_receipt_index(receipt)
+    if not receipt_index.belongs_to(receipt):
+        raise ClusterAssemblyBuildError(
+            "native runtime owner index belongs to a different receipt"
+        )
 
     def vertex_owners(vertex_index):
-        key = (
+        return receipt_index.owner_keys_at(
             int(ordinal_attribute.data[int(vertex_index)].value),
             int(vertex_attribute.data[int(vertex_index)].value),
         )
-        return owner_by_native_vertex.get(key, set())
 
     partitioned = []
     for component in components:
@@ -4488,6 +4489,7 @@ def _exact_native_attachment_influences(
     skeleton_snapshot,
     context,
     skeleton_identity=None,
+    native_receipt_index=None,
 ):
     """Read authored proxy weights captured inside Modeler's FBX serializer."""
 
@@ -4542,6 +4544,7 @@ def _exact_native_attachment_influences(
             native_receipt,
             geometry_ordinal,
             native_vertices,
+            receipt_index=native_receipt_index,
         )
     except NativeReceiptError as exc:
         raise ClusterAssemblyBuildError(f"{context}: {exc}") from exc
@@ -5881,6 +5884,7 @@ def build_blender_assembly_inputs(
     preserved_render_components = []
     authored_spm_fingerprint = None
     native_receipt = None
+    native_receipt_index = None
     native_receipt_fingerprint = None
     exact_attachment_binding_count = 0
     exact_fbx_attachment_binding_count = 0
@@ -5912,6 +5916,9 @@ def build_blender_assembly_inputs(
             native_receipt = load_native_export_receipt(
                 target_native_receipt_path,
                 source_spm=authored_spm_fingerprint["path"],
+            )
+            native_receipt_index = build_exact_native_receipt_index(
+                native_receipt
             )
         except NativeReceiptError as exc:
             raise ClusterAssemblyBuildError(str(exc)) from exc
@@ -5963,6 +5970,7 @@ def build_blender_assembly_inputs(
                 target_object,
                 components,
                 native_receipt,
+                receipt_index=native_receipt_index,
             )
             matched, preserved = _partition_normalized_render_components(
                 prototypes,
@@ -6229,6 +6237,7 @@ def build_blender_assembly_inputs(
                                     f"{part_asset_name}"
                                 ),
                                 skeleton_identity=native_skeleton_identity,
+                                native_receipt_index=native_receipt_index,
                             )
                         )
                         source_attachment = tuple(
