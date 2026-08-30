@@ -26,6 +26,7 @@ import re
 import statistics
 import subprocess
 import sys
+from array import array
 from contextlib import contextmanager
 from copy import deepcopy
 from collections import Counter, defaultdict
@@ -2950,12 +2951,56 @@ class _NativeRuntimeOwnerGroups:
         return min(self._find(owner) for owner in owners)
 
 
+def _dense_int_attribute_values(attribute, count):
+    """Read one dense Blender integer attribute with an exact scalar fallback."""
+
+    values = array("i", [0]) * int(count)
+    foreach_get = getattr(getattr(attribute, "data", None), "foreach_get", None)
+    if callable(foreach_get):
+        try:
+            foreach_get("value", values)
+            return values
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            # Ordinary unit fakes and older Blender collection shims may expose
+            # an incomplete foreach_get.  Scalar access below is the existing
+            # exact behavior, not an alternate identity policy.
+            pass
+    return array(
+        "i",
+        (
+            int(attribute.data[index].value)
+            for index in range(int(count))
+        ),
+    )
+
+
+def _native_point_identity_arrays(obj):
+    ordinal_attribute = obj.data.attributes.get(
+        "speedtree_native_geometry_ordinal"
+    )
+    vertex_attribute = obj.data.attributes.get("speedtree_native_vertex_index")
+    if ordinal_attribute is None or vertex_attribute is None:
+        return None
+    vertex_count = len(obj.data.vertices)
+    return {
+        "geometry_ordinals": _dense_int_attribute_values(
+            ordinal_attribute,
+            vertex_count,
+        ),
+        "native_vertex_indices": _dense_int_attribute_values(
+            vertex_attribute,
+            vertex_count,
+        ),
+    }
+
+
 def _partition_components_by_native_runtime_owner(
     obj,
     components,
     receipt,
     *,
     receipt_index=None,
+    native_point_identity=None,
 ):
     """Split accidentally welded render components by exact runtime Node identity.
 
@@ -2978,11 +3023,9 @@ def _partition_components_by_native_runtime_owner(
     instead of rejected.
     """
 
-    ordinal_attribute = obj.data.attributes.get(
-        "speedtree_native_geometry_ordinal"
-    )
-    vertex_attribute = obj.data.attributes.get("speedtree_native_vertex_index")
-    if ordinal_attribute is None or vertex_attribute is None:
+    if native_point_identity is None:
+        native_point_identity = _native_point_identity_arrays(obj)
+    if native_point_identity is None:
         return list(components)
     if receipt_index is None:
         receipt_index = build_exact_native_receipt_index(receipt)
@@ -2991,11 +3034,20 @@ def _partition_components_by_native_runtime_owner(
             "native runtime owner index belongs to a different receipt"
         )
 
+    geometry_ordinals = native_point_identity["geometry_ordinals"]
+    native_vertex_indices = native_point_identity["native_vertex_indices"]
+    owner_lookup = {}
+
     def vertex_owners(vertex_index):
-        return receipt_index.owner_keys_at(
-            int(ordinal_attribute.data[int(vertex_index)].value),
-            int(vertex_attribute.data[int(vertex_index)].value),
-        )
+        vertex_index = int(vertex_index)
+        owners = owner_lookup.get(vertex_index)
+        if owners is None:
+            owners = receipt_index.owner_keys_at(
+                int(geometry_ordinals[vertex_index]),
+                int(native_vertex_indices[vertex_index]),
+            )
+            owner_lookup[vertex_index] = owners
+        return owners
 
     partitioned = []
     for component in components:
@@ -4490,6 +4542,7 @@ def _exact_native_attachment_influences(
     context,
     skeleton_identity=None,
     native_receipt_index=None,
+    native_point_identity=None,
 ):
     """Read authored proxy weights captured inside Modeler's FBX serializer."""
 
@@ -4502,13 +4555,13 @@ def _exact_native_attachment_influences(
             raise ClusterAssemblyBuildError(
                 f"{context} attachment vertex is outside its target component"
             )
-    ordinal_attribute = obj.data.attributes.get(
-        "speedtree_native_geometry_ordinal"
-    )
-    vertex_attribute = obj.data.attributes.get("speedtree_native_vertex_index")
-    if ordinal_attribute is not None and vertex_attribute is not None:
+    if native_point_identity is None:
+        native_point_identity = _native_point_identity_arrays(obj)
+    if native_point_identity is not None:
+        geometry_ordinals = native_point_identity["geometry_ordinals"]
+        native_vertex_indices = native_point_identity["native_vertex_indices"]
         ordinals = {
-            int(ordinal_attribute.data[index].value)
+            int(geometry_ordinals[index])
             for index in vertices
         }
         if len(ordinals) != 1:
@@ -4517,7 +4570,7 @@ def _exact_native_attachment_influences(
             )
         geometry_ordinal = ordinals.pop()
         native_vertices = [
-            int(vertex_attribute.data[index].value)
+            int(native_vertex_indices[index])
             for index in (
                 [target_attachment_vertex]
                 if target_attachment_vertex is not None
@@ -5936,6 +5989,7 @@ def build_blender_assembly_inputs(
     exact_fbx_attachment_binding_count = 0
     native_clipped_origin_attachment_binding_count = 0
     source_correspondence_cache = {}
+    native_point_identity_cache = {}
     base_obj = None
     base_armature = None
     scene_units = bpy.context.scene.unit_settings
@@ -5987,6 +6041,14 @@ def build_blender_assembly_inputs(
             role_row = roles[provider_key]
             role = role_row["role"]
             target_object = role_targets[provider_key]
+            target_mesh_identity = _mesh_runtime_identity(target_object.data)
+            if target_mesh_identity not in native_point_identity_cache:
+                native_point_identity_cache[
+                    target_mesh_identity
+                ] = _native_point_identity_arrays(target_object)
+            native_point_identity = native_point_identity_cache[
+                target_mesh_identity
+            ]
             normalized_contract = role_row.get("normalized_variants")
             if not normalized_contract:
                 raise ClusterAssemblyBuildError(
@@ -6017,6 +6079,7 @@ def build_blender_assembly_inputs(
                 components,
                 native_receipt,
                 receipt_index=native_receipt_index,
+                native_point_identity=native_point_identity,
             )
             matched, preserved = _partition_normalized_render_components(
                 prototypes,
@@ -6035,6 +6098,7 @@ def build_blender_assembly_inputs(
                 "target_object": target_object,
                 "matched": matched,
                 "preserved": preserved,
+                "native_point_identity": native_point_identity,
                 "speculative_provider_expansion": (
                     role_row.get("speculative_provider_expansion") is True
                 ),
@@ -6284,6 +6348,9 @@ def build_blender_assembly_inputs(
                                 ),
                                 skeleton_identity=native_skeleton_identity,
                                 native_receipt_index=native_receipt_index,
+                                native_point_identity=role_build_plans[
+                                    provider_key
+                                ]["native_point_identity"],
                             )
                         )
                         source_attachment = tuple(

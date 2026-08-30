@@ -5,6 +5,7 @@ import math
 import sys
 import tempfile
 import unittest
+from array import array
 from collections import Counter, namedtuple
 from pathlib import Path
 from types import SimpleNamespace
@@ -86,6 +87,26 @@ class FakeEditorProperties:
 
     def set_editor_property(self, name, value):
         self.values[name] = value
+
+
+class DenseIntAttributeData:
+    def __init__(self, values):
+        self.values = [int(value) for value in values]
+        self.foreach_get_calls = []
+        self.scalar_reads = 0
+
+    def foreach_get(self, name, destination):
+        self.foreach_get_calls.append(name)
+        if name != "value":
+            raise ValueError(name)
+        if not isinstance(destination, array):
+            raise TypeError(type(destination))
+        for index, value in enumerate(self.values):
+            destination[index] = value
+
+    def __getitem__(self, index):
+        self.scalar_reads += 1
+        raise AssertionError(f"unexpected scalar read at {index}")
 
 
 class UnrealNaniteAssemblyCompilationTests(unittest.TestCase):
@@ -647,13 +668,18 @@ class ExactNativeAttachmentInfluenceTests(unittest.TestCase):
         }
 
     @staticmethod
-    def _object(ordinals, native_indices):
+    def _object(ordinals, native_indices, *, dense=False):
+        def attribute_data(values):
+            if dense:
+                return DenseIntAttributeData(values)
+            return [SimpleNamespace(value=value) for value in values]
+
         attributes = {
             "speedtree_native_geometry_ordinal": SimpleNamespace(
-                data=[SimpleNamespace(value=value) for value in ordinals]
+                data=attribute_data(ordinals)
             ),
             "speedtree_native_vertex_index": SimpleNamespace(
-                data=[SimpleNamespace(value=value) for value in native_indices]
+                data=attribute_data(native_indices)
             ),
         }
         return SimpleNamespace(
@@ -692,6 +718,34 @@ class ExactNativeAttachmentInfluenceTests(unittest.TestCase):
             source["owner_selection_policy"],
             "sole_exact_native_runtime_owner_range_intersection_v3",
         )
+
+    def test_dense_native_attributes_use_foreach_get_with_exact_result(self):
+        receipt = self._receipt()
+        receipt_index = build_exact_native_receipt_index(receipt)
+        scalar = _exact_native_attachment_influences(
+            self._object([4, 4, 4], [2, 3, 4]),
+            {"vertices": [0, 1, 2]},
+            1,
+            receipt,
+            self._skeleton(),
+            "scalar native component",
+            native_receipt_index=receipt_index,
+        )
+        dense_obj = self._object([4, 4, 4], [2, 3, 4], dense=True)
+        dense = _exact_native_attachment_influences(
+            dense_obj,
+            {"vertices": [0, 1, 2]},
+            1,
+            receipt,
+            self._skeleton(),
+            "dense native component",
+            native_receipt_index=receipt_index,
+        )
+
+        self.assertEqual(dense, scalar)
+        for attribute in dense_obj.data.attributes.values():
+            self.assertEqual(attribute.data.foreach_get_calls, ["value"])
+            self.assertEqual(attribute.data.scalar_reads, 0)
 
     def test_clipped_attachment_uses_sole_exact_component_intersection(self):
         obj = self._object([4, 4, 4], [0, 3, 11])
@@ -1106,6 +1160,46 @@ class ComponentTopologyTests(unittest.TestCase):
         self.assertEqual(
             partitioned[0]["native_runtime_owner_island_count"], 1
         )
+
+    def test_native_owner_lookup_is_memoized_per_dense_vertex(self):
+        target = seam_split_test_mesh(False)
+        target.attributes = {
+            "speedtree_native_geometry_ordinal": SimpleNamespace(
+                data=DenseIntAttributeData([3] * len(target.vertices))
+            ),
+            "speedtree_native_vertex_index": SimpleNamespace(
+                data=DenseIntAttributeData(range(len(target.vertices)))
+            ),
+        }
+        components = _component_groups(target, [0, 1])
+        receipt = {"generated_instances": [{
+            "geometry_ordinal": 3,
+            "node_guid": "same-node",
+            "vertex_ranges": [(0, len(target.vertices) - 1)],
+        }]}
+        actual_index = build_exact_native_receipt_index(receipt)
+        owner_keys_at = mock.Mock(side_effect=actual_index.owner_keys_at)
+        counting_index = SimpleNamespace(
+            belongs_to=actual_index.belongs_to,
+            owner_keys_at=owner_keys_at,
+        )
+
+        partitioned = _partition_components_by_native_runtime_owner(
+            SimpleNamespace(name="target", data=target),
+            components,
+            receipt,
+            receipt_index=counting_index,
+        )
+
+        self.assertEqual(len(partitioned), 1)
+        self.assertEqual(owner_keys_at.call_count, len(target.vertices))
+        self.assertEqual(
+            sorted(call.args[1] for call in owner_keys_at.call_args_list),
+            list(range(len(target.vertices))),
+        )
+        for attribute in target.attributes.values():
+            self.assertEqual(attribute.data.foreach_get_calls, ["value"])
+            self.assertEqual(attribute.data.scalar_reads, 0)
 
     def test_same_native_owner_rejoins_disconnected_clipped_islands(self):
         target = seam_split_test_mesh(False)
