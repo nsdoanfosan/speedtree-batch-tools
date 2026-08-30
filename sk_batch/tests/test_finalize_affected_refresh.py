@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -215,6 +216,55 @@ def _target_from_inventory(inventory, index=0):
     return inventory.targets[index]
 
 
+def _bind_handoff_artifact(bundle, artifact: Path):
+    payload = artifact.read_bytes()
+    record = {
+        "path": str(artifact.resolve()),
+        "size": len(payload),
+        "mtime_ns": artifact.stat().st_mtime_ns,
+        "fingerprint": hashlib.blake2b(payload, digest_size=16).hexdigest(),
+    }
+    manifest = json.loads(bundle.manifest.read_text(encoding="utf-8"))
+    item = manifest["items"][0]
+    item["handoff_files"] = [record]
+    contract = {
+        key: item.get(key) for key in finalizer.FRESH_PUSH_CONTRACT_KEYS
+    }
+    fingerprint = finalizer.stable_fingerprint(contract)
+    item["fingerprint"] = fingerprint
+    _write_json(bundle.manifest, manifest)
+    for path in (bundle.checkpoint, bundle.batch, bundle.item_report):
+        if not path.is_file():
+            continue
+        evidence = json.loads(path.read_text(encoding="utf-8"))
+        if path == bundle.item_report:
+            evidence["fingerprint"] = fingerprint
+        else:
+            states = evidence.get("items") or {}
+            for state in states.values():
+                state["fingerprint"] = fingerprint
+        _write_json(path, evidence)
+    if bundle.exact_report.is_file():
+        report = json.loads(bundle.exact_report.read_text(encoding="utf-8"))
+        if report.get("status") == "ok":
+            report["manifest_fingerprint"] = fingerprint
+            if isinstance(report.get("unreal_result"), dict):
+                report["unreal_result"]["fingerprint"] = fingerprint
+        _write_json(bundle.exact_report, report)
+    return fingerprint
+
+
+def _validate_fixture_artifacts(item):
+    for record in item.get("handoff_files") or []:
+        path = Path(record["path"])
+        payload = path.read_bytes()
+        if len(payload) != record["size"]:
+            raise finalizer.PushUnrealRecoveryError("handoff file size changed")
+        actual = hashlib.blake2b(payload, digest_size=16).hexdigest()
+        if actual != record["fingerprint"]:
+            raise finalizer.PushUnrealRecoveryError("handoff file content changed")
+
+
 def test_inventory_uses_selected_array_order_not_mutated_flags(tmp_path):
     path, rows = _write_inventory(tmp_path, count=3)
     inventory = finalizer.load_ordered_inventory(path, expected_count=3)
@@ -408,6 +458,99 @@ def test_later_validated_success_seals_earlier_failure_with_new_fingerprint(
     assert old_fingerprint != new_fingerprint
     assert winner.candidate.bundle.run_id == "tail054"
     assert winner.sealed_attempts == (failed_bundle.bundle_id,)
+
+
+def test_later_success_seals_failed_attempt_after_shared_handoff_was_rewritten(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(
+        finalizer, "validate_item_artifacts", _validate_fixture_artifacts
+    )
+    inventory_path, rows = _write_inventory(tmp_path / "inventory", count=1)
+    inventory = finalizer.load_ordered_inventory(inventory_path, expected_count=1)
+    target = _target_from_inventory(inventory)
+    first = datetime(2026, 8, 30, 12, 30, tzinfo=timezone.utc)
+    handoff = tmp_path / "shared" / "megaplant_tree_groups.json"
+    handoff.parent.mkdir(parents=True)
+    handoff.write_text("failed-attempt-bytes", encoding="utf-8")
+    failed_bundle = _write_bundle(
+        tmp_path / "logs",
+        "tail036",
+        19,
+        rows[0],
+        success=False,
+        started_at=first,
+    )
+    _bind_handoff_artifact(failed_bundle, handoff)
+
+    # A later forced-fresh run rewrites the same mutable handoff path before
+    # producing its own exact success evidence.
+    handoff.write_text("later-success-bytes", encoding="utf-8")
+    success_bundle = _write_bundle(
+        tmp_path / "logs",
+        "tail054",
+        1,
+        rows[0],
+        success=True,
+        started_at=first + timedelta(minutes=12),
+    )
+    _bind_handoff_artifact(success_bundle, handoff)
+    failed_fleet = {
+        "spm": str(target.spm),
+        "stem": target.stem,
+        "status": "failed",
+        "report": str(failed_bundle.exact_report),
+    }
+    success_fleet = {
+        "spm": str(target.spm),
+        "stem": target.stem,
+        "status": "verified_in_unreal",
+        "report": str(success_bundle.exact_report),
+    }
+
+    failed = finalizer.validate_exact_bundle(
+        failed_bundle, target, fleet_result=failed_fleet, verify_artifacts=True
+    )
+    success = finalizer.validate_exact_bundle(
+        success_bundle, target, fleet_result=success_fleet, verify_artifacts=True
+    )
+    winner = finalizer.reduce_attempt_history(target, [failed, success])
+
+    assert failed.classification == finalizer.AMBIGUOUS_FAILURE
+    assert failed.event_at < success.started_at
+    assert success.classification == finalizer.SUCCESS
+    assert winner.candidate.bundle.run_id == "tail054"
+    assert winner.sealed_attempts == (failed_bundle.bundle_id,)
+
+
+def test_successful_fleet_attempt_with_handoff_drift_remains_invalid(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(
+        finalizer, "validate_item_artifacts", _validate_fixture_artifacts
+    )
+    inventory_path, rows = _write_inventory(tmp_path / "inventory", count=1)
+    inventory = finalizer.load_ordered_inventory(inventory_path, expected_count=1)
+    target = _target_from_inventory(inventory)
+    handoff = tmp_path / "shared" / "megaplant_tree_groups.json"
+    handoff.parent.mkdir(parents=True)
+    handoff.write_text("success-bytes", encoding="utf-8")
+    bundle = _write_bundle(tmp_path / "logs", "success", 1, rows[0])
+    _bind_handoff_artifact(bundle, handoff)
+    handoff.write_text("drifted-after-success", encoding="utf-8")
+    fleet_result = {
+        "spm": str(target.spm),
+        "stem": target.stem,
+        "status": "verified_in_unreal",
+        "report": str(bundle.exact_report),
+    }
+
+    verdict = finalizer.validate_exact_bundle(
+        bundle, target, fleet_result=fleet_result, verify_artifacts=True
+    )
+
+    assert verdict.classification == finalizer.INVALID
+    assert "content changed" in verdict.errors[0] or "size changed" in verdict.errors[0]
 
 
 def test_later_ambiguous_rpc_invalidates_earlier_success(tmp_path):

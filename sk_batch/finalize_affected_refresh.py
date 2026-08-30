@@ -453,11 +453,6 @@ def validate_exact_bundle(
         fingerprint = str(item.get("fingerprint") or "")
         if not fingerprint or fingerprint != expected_fingerprint:
             raise FinalizationError("manifest item fingerprint is invalid")
-        if verify_artifacts:
-            try:
-                validate_item_artifacts(item)
-            except PushUnrealRecoveryError as exc:
-                raise FinalizationError(str(exc)) from exc
 
         if fleet_result is not None:
             if canonical_path(fleet_result.get("spm") or "") != target.canonical_spm:
@@ -487,9 +482,19 @@ def validate_exact_bundle(
         # A failed/ambiguous attempt is still structurally useful history.  It
         # may be sealed only by a strictly later fully validated success.
         checkpoint_status = str(checkpoint_state.get("status") or "")
-        if checkpoint_status != "imported_ok" or checkpoint.get("complete") is not True:
+        fleet_declared_failure = bool(
+            fleet_result is not None
+            and fleet_result.get("status") == "failed"
+        )
+        if (
+            fleet_declared_failure
+            or checkpoint_status != "imported_ok"
+            or checkpoint.get("complete") is not True
+        ):
             event_at = _parse_time(
-                checkpoint_state.get("updated_at"), "checkpoint updated_at"
+                checkpoint_state.get("completed_at")
+                or checkpoint_state.get("updated_at"),
+                "failed attempt event timestamp",
             )
             return CandidateVerdict(
                 target=target,
@@ -498,11 +503,26 @@ def validate_exact_bundle(
                 fingerprint=fingerprint,
                 started_at=started_at,
                 event_at=event_at,
-                verification_basis="incomplete_or_failed_rpc_attempt",
+                verification_basis=(
+                    "fleet_declared_failed_attempt"
+                    if fleet_declared_failure
+                    else "incomplete_or_failed_rpc_attempt"
+                ),
                 snapshots=tuple(snapshots),
             )
         if checkpoint.get("current_item") not in (None, ""):
             raise FinalizationError("complete checkpoint still has current_item")
+
+        # Only a candidate that claims success may seal the mutable handoff
+        # artifacts against their current bytes.  A terminal failed/incomplete
+        # attempt above is ordered history, not a success claim; a strictly
+        # later fully validated success may seal it even when that later fresh
+        # run necessarily rewrote the same handoff path.
+        if verify_artifacts:
+            try:
+                validate_item_artifacts(item)
+            except PushUnrealRecoveryError as exc:
+                raise FinalizationError(str(exc)) from exc
 
         batch_snapshot = read_stable_json(bundle.batch)
         item_snapshot = read_stable_json(bundle.item_report)
