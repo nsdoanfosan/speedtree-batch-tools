@@ -297,12 +297,16 @@ def _prepare_assembly_runtime_validation(assembly):
     return "runtime_pending"
 
 
-def _atomic_write_json(path, data):
+def _atomic_write_json(path, data, *, compact=False):
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
     temporary.write_text(
-        json.dumps(data, indent=2, ensure_ascii=False),
+        json.dumps(
+            data,
+            ensure_ascii=False,
+            **({"separators": (",", ":")} if compact else {"indent": 2}),
+        ),
         encoding="utf-8",
     )
     os.replace(temporary, target)
@@ -3689,7 +3693,7 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
         checkpoint["stale_runtime_probe_cleanup"] = (
             _best_effort_cancel_instanced_dynamic_wind_runtime("")
         )
-    _atomic_write_json(checkpoint_path, checkpoint)
+    _atomic_write_json(checkpoint_path, checkpoint, compact=True)
 
     for item_ref in manifest_items:
         queue_id = str(item_ref["queue_id"])
@@ -3736,7 +3740,7 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
             previous["updated_at"] = _now()
             checkpoint["current_item"] = None
             checkpoint["updated_at"] = _now()
-            _atomic_write_json(checkpoint_path, checkpoint)
+            _atomic_write_json(checkpoint_path, checkpoint, compact=True)
             if previous.get("report"):
                 item_report = dict(previous)
                 item_report["queue_id"] = queue_id
@@ -3758,7 +3762,7 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
             checkpoint["items"][queue_id] = state
             checkpoint["current_item"] = None
             checkpoint["updated_at"] = _now()
-            _atomic_write_json(checkpoint_path, checkpoint)
+            _atomic_write_json(checkpoint_path, checkpoint, compact=True)
             if item_ref.get("report_path"):
                 item_report = dict(state)
                 item_report["queue_id"] = queue_id
@@ -3796,7 +3800,7 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
         checkpoint["items"][queue_id] = state
         checkpoint["current_item"] = queue_id
         checkpoint["updated_at"] = _now()
-        _atomic_write_json(checkpoint_path, checkpoint)
+        _atomic_write_json(checkpoint_path, checkpoint, compact=True)
 
         result = None
         item = None
@@ -3857,7 +3861,7 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
             state["resource_release"] = _release_item_unreal_resources()
             checkpoint["current_item"] = None
             checkpoint["updated_at"] = _now()
-            _atomic_write_json(checkpoint_path, checkpoint)
+            _atomic_write_json(checkpoint_path, checkpoint, compact=True)
             item_report = dict(state)
             item_report["queue_id"] = queue_id
             item_report["checkpoint"] = checkpoint_path
@@ -3898,7 +3902,7 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
         metadata = manifest.get(metadata_key)
         if isinstance(metadata, dict):
             report[metadata_key] = metadata
-    _atomic_write_json(checkpoint_path, checkpoint)
+    _atomic_write_json(checkpoint_path, checkpoint, compact=True)
     _atomic_write_json(report_path, report)
     return report
 
@@ -3973,7 +3977,7 @@ def finish_runtime_probe(checkpoint_path, report_path, queue_id):
     )
     if checkpoint["complete"]:
         checkpoint["completed_at"] = _now()
-    _atomic_write_json(checkpoint_path, checkpoint)
+    _atomic_write_json(checkpoint_path, checkpoint, compact=True)
 
     if state.get("report"):
         item_report = dict(state)
@@ -4044,7 +4048,7 @@ def cancel_runtime_probe(checkpoint_path, report_path, queue_id, reason):
     )
     if checkpoint["complete"]:
         checkpoint["completed_at"] = _now()
-    _atomic_write_json(checkpoint_path, checkpoint)
+    _atomic_write_json(checkpoint_path, checkpoint, compact=True)
 
     if state.get("report"):
         item_report = dict(state)

@@ -6,6 +6,7 @@ import os
 import stat
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,7 +28,10 @@ from cluster_fleet_push import (  # noqa: E402
     discover_provider_dependencies,
     discover_current_cluster_targets,
     main,
+    normalized_path_key,
     parse_args,
+    root_dependency_round_plan,
+    seal_root_material_contract,
     validate_spm_bone_policy_report,
     validate_provider_live_result,
     validate_provider_assembly_result,
@@ -35,6 +39,7 @@ from cluster_fleet_push import (  # noqa: E402
     validate_live_result,
     write_combined_lazy_manifest,
 )
+from stage_batch_policy import run_memory_bounded_stage  # noqa: E402
 
 
 def exact_identity_contract(binding_count):
@@ -102,23 +107,194 @@ class ClusterFleetPushTests(unittest.TestCase):
         source = (SK_BATCH / "cluster_fleet_push.py").read_text(
             encoding="utf-8"
         )
-        assembly_loop = source.index(
+        root_preparation = source.index(
             "    for index, target in enumerate(targets, 1):"
         )
-        prepared_append = source.index(
-            "            prepared_roots.append({",
-            assembly_loop,
+        assembly_round = source.index(
+            "        round_outcomes, dynamic_root_policy = "
+            "run_memory_bounded_stage(",
+            root_preparation,
         )
-        export_loop = source.index(
-            "    for export_index, prepared in enumerate(prepared_roots, 1):",
-            prepared_append,
+        prepared_barrier = source.index(
+            "    prepared_roots = [",
+            assembly_round,
+        )
+        export_function = source.index(
+            "    def export_prepared_root(",
+            prepared_barrier,
         )
 
-        self.assertLess(assembly_loop, prepared_append)
-        self.assertLess(prepared_append, export_loop)
+        self.assertLess(root_preparation, assembly_round)
+        self.assertLess(assembly_round, prepared_barrier)
+        self.assertLess(prepared_barrier, export_function)
         self.assertIn(
-            "all_root_assembly_then_all_root_blender_export_then_combined_unreal",
+            "provider_barrier_then_memory_bounded_root_assembly_rounds_then_",
             source,
+        )
+
+    def test_dependency_round_rebuilds_every_root_sharing_new_provider(self):
+        provider = Path("D:/trees/shared/SK_branch_provider.spm")
+        plan = root_dependency_round_plan(
+            [
+                {"job_key": 1, "dependencies": [provider]},
+                {"job_key": 2, "dependencies": [provider]},
+                {"job_key": 3, "dependencies": []},
+            ],
+            processed_provider_keys=set(),
+        )
+
+        self.assertEqual(plan["new_providers"], [provider.resolve()])
+        self.assertEqual(plan["rebuild_job_keys"], {1, 2})
+
+        already_processed = root_dependency_round_plan(
+            [{"job_key": 1, "dependencies": [provider]}],
+            processed_provider_keys={normalized_path_key(provider)},
+        )
+        self.assertEqual(already_processed["new_providers"], [])
+        self.assertEqual(already_processed["rebuild_job_keys"], set())
+
+    def test_parallel_root_material_contract_is_sealed_to_unique_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            current = root / "SK_tree_push_material_contract_current.json"
+            sealed = root / "SK_tree_fleet_material_contract_run_001.json"
+            current.write_text('{"root":1}', encoding="utf-8")
+            command, outputs = seal_root_material_contract(
+                ["blender", "--material-contract", str(current)],
+                {"material_contract": current},
+                sealed,
+            )
+            current.write_text('{"root":2}', encoding="utf-8")
+
+            self.assertEqual(
+                json.loads(sealed.read_text(encoding="utf-8")),
+                {"root": 1},
+            )
+            marker = command.index("--material-contract")
+            self.assertEqual(Path(command[marker + 1]), sealed.resolve())
+            self.assertEqual(outputs["material_contract"], sealed.resolve())
+
+    def test_headless_fleet_runs_independent_root_assemblies_concurrently(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            blender = root / "blender.exe"
+            logs = root / "logs"
+            blender.write_bytes(b"exe")
+            targets = []
+            for number in (1, 2):
+                spm = root / f"tree_{number}" / f"SK_tree_{number}.spm"
+                manifest = spm.parent / "assembly" / "current.json"
+                manifest.parent.mkdir(parents=True)
+                spm.write_bytes(b"spm")
+                manifest.write_text("{}", encoding="utf-8")
+                targets.append({
+                    "spm": spm,
+                    "stem": spm.stem,
+                    "manifest": manifest,
+                    "birch_paper": False,
+                })
+
+            barrier = threading.Barrier(2)
+            assembly_sources = []
+
+            def fake_owned_run(_command, **kwargs):
+                source = kwargs.get("source")
+                if source == "sk_batch.cluster_fleet_push.blender_assembly":
+                    assembly_sources.append(source)
+                    barrier.wait(timeout=2)
+                return SimpleNamespace(returncode=0, resource_usage={})
+
+            def fake_exact_push(spm, **_kwargs):
+                stem = Path(spm).stem
+                material_contract = logs / f"{stem}_material.json"
+                material_contract.parent.mkdir(parents=True, exist_ok=True)
+                material_contract.write_text(
+                    json.dumps({"stem": stem}),
+                    encoding="utf-8",
+                )
+                return [
+                    "export",
+                    stem,
+                    "--material-contract",
+                    str(material_contract),
+                ], {
+                    "material_contract": material_contract,
+                    "report": logs / f"{stem}_report.json",
+                    "manifest": logs / f"{stem}_manifest.json",
+                    "checkpoint": logs / f"{stem}_checkpoint.json",
+                    "batch_report": logs / f"{stem}_batch.json",
+                }
+
+            def high_memory_stage(*args, **kwargs):
+                kwargs["memory_snapshot_fn"] = lambda: {
+                    "available_physical_bytes": 64 * 1024 ** 3,
+                    "available_commit_bytes": 64 * 1024 ** 3,
+                    "effective_available_bytes": 64 * 1024 ** 3,
+                    "limiting_resource": "physical",
+                }
+                return run_memory_bounded_stage(*args, **kwargs)
+
+            with patch(
+                "cluster_fleet_push.discover_current_cluster_targets",
+                return_value=(targets, []),
+            ), patch(
+                "cluster_fleet_push.discover_provider_dependencies",
+                return_value=([], {}, {}, {}),
+            ), patch(
+                "cluster_fleet_push.build_spm_bone_policy_command",
+                return_value=["policy"],
+            ), patch(
+                "cluster_fleet_push.validate_spm_bone_policy_report",
+                return_value={"status": "ok", "results": []},
+            ), patch(
+                "cluster_fleet_push.build_receipt_refresh_command",
+                side_effect=lambda target, _report: [
+                    "receipt", target["stem"]
+                ],
+            ), patch(
+                "cluster_fleet_push.build_exact_push_command",
+                side_effect=fake_exact_push,
+            ), patch(
+                "cluster_fleet_push.build_assembly_command",
+                side_effect=lambda target, *_args, **_kwargs: [
+                    "assembly", target["stem"]
+                ],
+            ), patch(
+                "cluster_fleet_push.validate_assembly_result",
+                return_value={
+                    "ok": True,
+                    "problems": [],
+                    "pass_through": True,
+                },
+            ), patch(
+                "cluster_fleet_push.owned_run",
+                side_effect=fake_owned_run,
+            ), patch(
+                "cluster_fleet_push.run_memory_bounded_stage",
+                side_effect=high_memory_stage,
+            ):
+                result = main([
+                    "--root", str(root),
+                    "--blender", str(blender),
+                    "--log-dir", str(logs),
+                    "--run-id", "parallel_roots",
+                    "--blender-workers", "2",
+                    "--prepare-only",
+                ])
+
+            fleet = json.loads(
+                (logs / "cluster_fleet_push_parallel_roots.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(assembly_sources), 2)
+        self.assertEqual(
+            fleet["root_assembly_rounds"][0]["dynamic_policy"][
+                "max_concurrent_workers"
+            ],
+            2,
         )
 
     def test_policy_batch_command_uses_factory_startup_and_exact_targets(self):

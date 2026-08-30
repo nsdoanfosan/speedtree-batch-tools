@@ -19,7 +19,6 @@ import os
 import stat
 import subprocess
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
@@ -43,7 +42,7 @@ from push_dependency_schedule import (
     normalized_path_key,
 )
 from sk_common import wind_preset_for_spm
-from stage_batch_policy import stage_worker_policy
+from stage_batch_policy import run_memory_bounded_stage, stage_worker_policy
 from assembly_runtime_contract import assembly_runtime_code_state
 
 
@@ -59,6 +58,82 @@ PCG_AUDIT = (
     / "pcg_st9_texture_batch"
     / "pcg_texture_audit.py"
 )
+
+
+def _persisted_stage_policy(policy):
+    """Keep fleet receipts useful without embedding every RAM poll."""
+    policy = dict(policy or {})
+    checks = list(policy.pop("admission_checks", []) or [])
+    policy["admission_check_count"] = len(checks)
+    policy["denied_admission_count"] = len([
+        row for row in checks if not row.get("admitted")
+    ])
+    if checks:
+        policy["first_memory_sample"] = checks[0]
+        policy["last_memory_sample"] = checks[-1]
+    return policy
+
+
+def root_dependency_round_plan(rows, processed_provider_keys):
+    """Plan the provider barrier after one parallel root Assembly round.
+
+    Every root that observed a provider absent at round start must be rebuilt,
+    including later roots that share a provider first discovered by an earlier
+    completed worker.  Provider processing order stays deterministic.
+    """
+    processed = set(processed_provider_keys)
+    ordered_new = []
+    seen_new = set()
+    rebuild_job_keys = set()
+    for row in rows:
+        job_key = row["job_key"]
+        for provider in row.get("dependencies") or []:
+            provider_key = normalized_path_key(provider)
+            if provider_key in processed:
+                continue
+            rebuild_job_keys.add(job_key)
+            if provider_key not in seen_new:
+                seen_new.add(provider_key)
+                ordered_new.append(Path(provider).resolve())
+    return {
+        "new_providers": ordered_new,
+        "rebuild_job_keys": rebuild_job_keys,
+    }
+
+
+def seal_root_material_contract(command, outputs, sealed_path):
+    """Give a parallel root job an immutable, run-unique contract path."""
+    command = list(command)
+    source = Path(outputs["material_contract"]).resolve()
+    sealed = Path(sealed_path).resolve()
+    try:
+        marker = command.index("--material-contract")
+        command_contract = Path(command[marker + 1]).resolve()
+    except (ValueError, IndexError) as exc:
+        raise ExactPushError(
+            "exact Push command has no material contract argument"
+        ) from exc
+    if command_contract != source:
+        raise ExactPushError(
+            "exact Push command and outputs disagree on material contract"
+        )
+    try:
+        payload = source.read_bytes()
+    except OSError as exc:
+        raise ExactPushError(
+            f"current Push material contract is unreadable: {source}: {exc}"
+        ) from exc
+    if not payload:
+        raise ExactPushError(
+            f"current Push material contract is empty: {source}"
+        )
+    sealed.parent.mkdir(parents=True, exist_ok=True)
+    sealed.write_bytes(payload)
+    command[marker + 1] = str(sealed)
+    outputs["material_contract"] = sealed
+    return command, outputs
+
+
 DEFAULT_P4_CLIENT = "UnrealProjects"
 COMBINED_MANIFEST_SCHEMA_VERSION = 2
 EXTERNAL_ITEM_STORAGE_SCHEMA_VERSION = 1
@@ -1054,8 +1129,8 @@ def parse_args(argv=None):
         type=int,
         default=2,
         help=(
-            "maximum concurrent root Send2UE exports; current available RAM "
-            "can reduce this value"
+            "maximum concurrent root Assembly and Send2UE processes; current "
+            "physical and commit headroom can reduce this value"
         ),
     )
     parser.add_argument("--run-id")
@@ -1512,12 +1587,13 @@ def main(argv=None):
         )
         return 1
 
-    prepared_roots = []
+    prepared_roots_by_index = {}
+    root_jobs = []
     fleet["root_execution_policy"] = (
-        "all_root_assembly_then_all_root_blender_export_then_combined_unreal"
+        "provider_barrier_then_memory_bounded_root_assembly_rounds_then_"
+        "all_root_blender_export_then_combined_unreal"
     )
     for index, target in enumerate(targets, 1):
-        print(f"[{index}/{len(targets)}] ASSEMBLY {target['stem']}", flush=True)
         result = {
             "stem": target["stem"],
             "spm": str(target["spm"]),
@@ -1579,6 +1655,14 @@ def main(argv=None):
                 unreal_project=args.unreal_project,
                 transport=args.transport,
             )
+            command, outputs = seal_root_material_contract(
+                command,
+                outputs,
+                args.log_dir / (
+                    f"{target['stem']}_fleet_material_contract_"
+                    f"{run_id}_{index:03d}.json"
+                ),
+            )
             assembly_report = (
                 args.log_dir
                 / f"{target['stem']}_fleet_assembly_{run_id}_{index:03d}.json"
@@ -1598,90 +1682,15 @@ def main(argv=None):
                 ),
             )
             result["assembly_report"] = str(assembly_report)
-            while True:
-                assembly_started = perf_counter()
-                assembly_completed = owned_run(
-                    assembly_command,
-                    source="sk_batch.cluster_fleet_push.blender_assembly",
-                    run_factory=subprocess.run,
-                    check=False,
-                )
-                result["assembly_execution"] = _completed_process_metrics(
-                    assembly_completed,
-                    assembly_started,
-                )
-                result["assembly_returncode"] = assembly_completed.returncode
-                if assembly_completed.returncode:
-                    raise RuntimeError(
-                        "production Assembly exited "
-                        f"{assembly_completed.returncode}"
-                    )
-                assembly_verification = validate_assembly_result(
-                    assembly_report,
-                    target,
-                )
-                result["assembly_verification"] = assembly_verification
-                if not assembly_verification["ok"]:
-                    raise RuntimeError(
-                        "production Assembly postcondition failed: "
-                        + "; ".join(assembly_verification["problems"])
-                    )
-                if assembly_verification.get("pass_through"):
-                    break
-                assembly_payload = json.loads(
-                    assembly_report.read_text(encoding="utf-8")
-                )
-                dependency_contract = (
-                    exact_dependency_contract_from_validated_manifest(
-                        target["spm"],
-                        assembly_payload.get("cluster_assembly_manifest"),
-                    )
-                )
-                current_dependencies = list(
-                    dependency_contract.get("dependency_spms") or []
-                )
-                result["validated_provider_dependencies"] = (
-                    current_dependencies
-                )
-                newly_processed = False
-                for provider_spm in current_dependencies:
-                    provider_key = normalized_path_key(provider_spm)
-                    if provider_key not in processed_providers:
-                        newly_processed = True
-                    provider_result = process_provider(
-                        provider_spm,
-                        root_key,
-                    )
-                    if provider_result.get("status") == "failed":
-                        raise RuntimeError(
-                            "provider dependency failed: "
-                            + str(provider_spm)
-                        )
-                if not newly_processed:
-                    break
-                result["assembly_repeated_after_new_provider"] = True
-            if assembly_verification.get("pass_through"):
-                if not args.push_pass_through_roots:
-                    result["status"] = "skipped_no_current_assembly"
-                    result["diagnostic"] = (
-                        "current receipt declares Assembly pass-through; it was "
-                        "recorded separately when a production build manifest "
-                        "already existed, and no Assembly was exported"
-                    )
-                    save_fleet()
-                    continue
-                target["pass_through"] = True
-                target["expected_parts"] = 0
-                target["expected_bindings"] = 0
-            else:
-                target["expected_parts"] = assembly_verification["parts"]
-                target["expected_bindings"] = assembly_verification["bindings"]
-            result["status"] = "assembly_ready_for_export"
-            prepared_roots.append({
+            root_jobs.append({
+                "index": index,
+                "root_key": root_key,
                 "target": target,
                 "command": command,
                 "outputs": outputs,
                 "result": result,
+                "assembly_report": assembly_report,
+                "assembly_command": assembly_command,
             })
         except (ExactPushError, OSError, ValueError, RuntimeError) as exc:
             result["status"] = "failed"
@@ -1689,6 +1698,222 @@ def main(argv=None):
         save_fleet()
         if args.fail_fast and result.get("status") == "failed":
             break
+
+    def run_root_assembly(job):
+        target = job["target"]
+        print(
+            f"[{job['index']}/{len(targets)}] ASSEMBLY {target['stem']}",
+            flush=True,
+        )
+        try:
+            assembly_started = perf_counter()
+            assembly_completed = owned_run(
+                job["assembly_command"],
+                source="sk_batch.cluster_fleet_push.blender_assembly",
+                run_factory=subprocess.run,
+                check=False,
+            )
+            execution = _completed_process_metrics(
+                assembly_completed,
+                assembly_started,
+            )
+            if assembly_completed.returncode:
+                raise RuntimeError(
+                    "production Assembly exited "
+                    f"{assembly_completed.returncode}"
+                )
+            verification = validate_assembly_result(
+                job["assembly_report"],
+                target,
+            )
+            if not verification["ok"]:
+                raise RuntimeError(
+                    "production Assembly postcondition failed: "
+                    + "; ".join(verification["problems"])
+                )
+            dependencies = []
+            if not verification.get("pass_through"):
+                assembly_payload = json.loads(
+                    job["assembly_report"].read_text(encoding="utf-8")
+                )
+                dependency_contract = (
+                    exact_dependency_contract_from_validated_manifest(
+                        target["spm"],
+                        assembly_payload.get("cluster_assembly_manifest"),
+                    )
+                )
+                dependencies = list(
+                    dependency_contract.get("dependency_spms") or []
+                )
+            return {
+                "status": "ok",
+                "returncode": assembly_completed.returncode,
+                "execution": execution,
+                "verification": verification,
+                "dependencies": dependencies,
+            }
+        except (ExactPushError, OSError, ValueError, RuntimeError) as exc:
+            return {
+                "status": "failed",
+                "error": str(exc),
+            }
+
+    fleet["root_assembly_rounds"] = []
+    waiting_root_jobs = list(root_jobs)
+    root_round = 0
+    root_failed_fast = False
+    while waiting_root_jobs:
+        root_round += 1
+        if root_round > 1000:
+            for waiting_job in waiting_root_jobs:
+                waiting_job["result"]["status"] = "failed"
+                waiting_job["result"]["error"] = (
+                    "root Assembly dependency rounds exceeded 1000"
+                )
+            save_fleet()
+            break
+        round_jobs = (
+            waiting_root_jobs[:1]
+            if args.fail_fast
+            else waiting_root_jobs
+        )
+        deferred_jobs = (
+            waiting_root_jobs[1:]
+            if args.fail_fast
+            else []
+        )
+        requested_root_workers = (
+            1
+            if args.fail_fast or args.transport == "rpc"
+            else args.blender_workers
+        )
+        initial_root_policy = stage_worker_policy(
+            "assembly",
+            requested_root_workers,
+            len(round_jobs),
+        )
+        round_outcomes, dynamic_root_policy = run_memory_bounded_stage(
+            "assembly",
+            round_jobs,
+            requested_root_workers,
+            run_root_assembly,
+        )
+        round_receipt = {
+            "round": root_round,
+            "job_indices": [job["index"] for job in round_jobs],
+            "initial_policy": initial_root_policy,
+            "dynamic_policy": _persisted_stage_policy(
+                dynamic_root_policy
+            ),
+        }
+        fleet["root_assembly_rounds"].append(round_receipt)
+
+        dependency_rows = []
+        for job, outcome in zip(round_jobs, round_outcomes):
+            result = job["result"]
+            if outcome["status"] != "ok":
+                result["status"] = "failed"
+                result["error"] = outcome["error"]
+                if args.fail_fast:
+                    root_failed_fast = True
+                continue
+            execution = outcome["execution"]
+            result["assembly_execution"] = execution
+            result.setdefault("assembly_executions", []).append(execution)
+            result["assembly_returncode"] = outcome["returncode"]
+            result["assembly_verification"] = outcome["verification"]
+            result["validated_provider_dependencies"] = (
+                outcome["dependencies"]
+            )
+            dependency_rows.append({
+                "job_key": job["index"],
+                "dependencies": outcome["dependencies"],
+            })
+
+        processed_at_round_start = set(processed_providers)
+        dependency_plan = root_dependency_round_plan(
+            dependency_rows,
+            processed_at_round_start,
+        )
+        round_receipt["new_providers"] = [
+            str(path) for path in dependency_plan["new_providers"]
+        ]
+        round_receipt["rebuild_job_indices"] = sorted(
+            dependency_plan["rebuild_job_keys"]
+        )
+
+        provider_failures = {}
+        for job, outcome in zip(round_jobs, round_outcomes):
+            if outcome["status"] != "ok":
+                continue
+            for provider_spm in outcome["dependencies"]:
+                provider_result = process_provider(
+                    provider_spm,
+                    job["root_key"],
+                )
+                if provider_result.get("status") == "failed":
+                    provider_failures[job["index"]] = str(provider_spm)
+                    if args.fail_fast:
+                        root_failed_fast = True
+                        break
+            if root_failed_fast:
+                break
+
+        next_round = []
+        for job, outcome in zip(round_jobs, round_outcomes):
+            result = job["result"]
+            if outcome["status"] != "ok":
+                continue
+            failed_provider = provider_failures.get(job["index"])
+            if failed_provider:
+                result["status"] = "failed"
+                result["error"] = (
+                    "provider dependency failed: " + failed_provider
+                )
+                continue
+            if job["index"] in dependency_plan["rebuild_job_keys"]:
+                result["assembly_repeated_after_new_provider"] = True
+                next_round.append(job)
+                continue
+            verification = outcome["verification"]
+            target = job["target"]
+            if verification.get("pass_through"):
+                if not args.push_pass_through_roots:
+                    result["status"] = "skipped_no_current_assembly"
+                    result["diagnostic"] = (
+                        "current receipt declares Assembly pass-through; it was "
+                        "recorded separately when a production build manifest "
+                        "already existed, and no Assembly was exported"
+                    )
+                    continue
+                target["pass_through"] = True
+                target["expected_parts"] = 0
+                target["expected_bindings"] = 0
+            else:
+                target["expected_parts"] = verification["parts"]
+                target["expected_bindings"] = verification["bindings"]
+            result["status"] = "assembly_ready_for_export"
+            prepared_roots_by_index[job["index"]] = {
+                "target": target,
+                "command": job["command"],
+                "outputs": job["outputs"],
+                "result": result,
+            }
+        save_fleet()
+        if root_failed_fast:
+            for deferred_job in deferred_jobs:
+                deferred_job["result"]["status"] = "not_run"
+                deferred_job["result"]["error"] = (
+                    "not run after fail-fast root Assembly failure"
+                )
+            save_fleet()
+            break
+        waiting_root_jobs = next_round + deferred_jobs
+
+    prepared_roots = [
+        prepared_roots_by_index[index]
+        for index in sorted(prepared_roots_by_index)
+    ]
 
     # The Assembly phase is a real barrier.  This keeps native exporter and
     # Assembly peak lifetimes out of the Send2UE export wave and lets the GUI
@@ -1698,6 +1923,7 @@ def main(argv=None):
         args.blender_workers,
         len(prepared_roots),
     )
+    requested_export_workers = args.blender_workers
     if args.fail_fast or args.transport == "rpc":
         # Preserve strict fail-fast semantics: do not launch work beyond the
         # exact export whose failure is being reported.  An open Editor RPC
@@ -1707,6 +1933,7 @@ def main(argv=None):
         export_worker_policy["serial_override"] = (
             "fail_fast" if args.fail_fast else "rpc_single_editor_owner"
         )
+        requested_export_workers = 1
     fleet["root_export_worker_policy"] = export_worker_policy
     save_fleet()
 
@@ -1777,31 +2004,52 @@ def main(argv=None):
             result["error"] = str(exc)
             return None
 
-    export_workers = export_worker_policy["selected_workers"]
     root_pending_by_index = {}
-    if export_workers > 1:
-        with ThreadPoolExecutor(max_workers=export_workers) as pool:
-            futures = {
-                pool.submit(export_prepared_root, index, prepared): index
-                for index, prepared in enumerate(prepared_roots, 1)
-            }
-            for future in as_completed(futures):
-                export_index = futures[future]
-                pending_entry = future.result()
-                if pending_entry is not None:
-                    root_pending_by_index[export_index] = pending_entry
-                save_fleet()
-    else:
-        for export_index, prepared in enumerate(prepared_roots, 1):
-            pending_entry = export_prepared_root(export_index, prepared)
-            if pending_entry is not None:
-                root_pending_by_index[export_index] = pending_entry
-            save_fleet()
-            if (
-                args.fail_fast
-                and prepared["result"].get("status") == "failed"
-            ):
+    export_entries = list(enumerate(prepared_roots, 1))
+
+    def accept_export(_position, entry, pending_entry):
+        export_index, _prepared = entry
+        if pending_entry is not None:
+            root_pending_by_index[export_index] = pending_entry
+        save_fleet()
+
+    if args.fail_fast:
+        completed_export_entries = []
+        for entry in export_entries:
+            pending_entry = export_prepared_root(*entry)
+            accept_export(
+                len(completed_export_entries),
+                entry,
+                pending_entry,
+            )
+            completed_export_entries.append(entry)
+            if entry[1]["result"].get("status") == "failed":
                 break
+        dynamic_export_policy = {
+            "stage": "blender_export",
+            "requested_workers": 1,
+            "selected_worker_ceiling": 1 if export_entries else 0,
+            "max_concurrent_workers": 1 if completed_export_entries else 0,
+            "per_worker_peak_bytes": export_worker_policy[
+                "per_worker_peak_bytes"
+            ],
+            "reserve_bytes": export_worker_policy["reserve_bytes"],
+            "admission_checks": [],
+            "memory_limited": False,
+            "serial_override": "fail_fast",
+        }
+    else:
+        _export_results, dynamic_export_policy = run_memory_bounded_stage(
+            "blender_export",
+            export_entries,
+            requested_export_workers,
+            lambda entry: export_prepared_root(*entry),
+            on_complete=accept_export,
+        )
+    fleet["root_export_dynamic_policy"] = _persisted_stage_policy(
+        dynamic_export_policy
+    )
+    save_fleet()
     pending.extend(
         root_pending_by_index[index]
         for index in sorted(root_pending_by_index)
