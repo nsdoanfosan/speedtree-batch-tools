@@ -719,6 +719,70 @@ class ClusterSavePolicyTests(unittest.TestCase):
             "current_blender_topology_matcher",
         )
 
+    def test_current_receipt_reference_candidates_remove_one_run_lag(self):
+        helper = load_assembly_selection_helper()
+        inspected_handoff = {
+            "status": "ready",
+            "assembly": {
+                "part_builder_inputs": [{
+                    "provider_key": "branch:branch_01",
+                    "source": "live_fbx",
+                }],
+            },
+        }
+        current_receipt_inputs = [
+            {
+                "provider_key": "branch:branch_03",
+                "speculative_provider_expansion": True,
+                "source": "current_receipt",
+            },
+            {
+                "provider_key": "branch:branch_04",
+                "speculative_provider_expansion": True,
+                "source": "current_receipt",
+            },
+        ]
+        stale_manifest = {
+            "status": "ready",
+            "assembly": {
+                "part_builder_inputs": [
+                    {
+                        "provider_key": "branch:branch_03",
+                        "speculative_provider_expansion": True,
+                        "source": "previous_manifest",
+                    },
+                ],
+            },
+        }
+
+        mode, selected = helper(
+            None,
+            inspected_handoff,
+            stale_manifest,
+            current_receipt_reference_inputs=current_receipt_inputs,
+        )
+
+        self.assertEqual(mode, "build")
+        inputs = selected["assembly"]["part_builder_inputs"]
+        self.assertEqual(
+            [row["provider_key"] for row in inputs],
+            [
+                "branch:branch_01",
+                "branch:branch_03",
+                "branch:branch_04",
+            ],
+        )
+        self.assertEqual(inputs[1]["source"], "current_receipt")
+        self.assertEqual(
+            selected["current_receipt_provider_expansion"][
+                "candidate_count"
+            ],
+            2,
+        )
+        self.assertNotIn(
+            "current_manifest_provider_expansion", selected
+        )
+
     def test_ready_fbx_handoff_does_not_merge_persisted_concrete_roles(self):
         helper = load_assembly_selection_helper()
         inspected_handoff = {

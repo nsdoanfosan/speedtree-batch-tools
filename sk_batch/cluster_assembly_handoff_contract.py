@@ -214,6 +214,86 @@ def _current_dependency_normalized_variants(spm, dependency, persisted):
     return persisted
 
 
+def current_receipt_reference_provider_inputs(
+    spm_path,
+    receipt_contract,
+    *,
+    authority=None,
+):
+    """Return exact SPM-only reference providers from the current receipt.
+
+    These rows remain speculative until Blender proves their normalized UV
+    topology against the current rendered FBX.  Keeping discovery separate
+    from that exact matcher prevents a reference-only row from removing Base
+    geometry merely because it exists in the SPM graph.
+    """
+    spm = Path(spm_path).expanduser().resolve()
+    if not isinstance(receipt_contract, dict):
+        return []
+    inputs = []
+    seen_provider_keys = set()
+    for dependency in receipt_contract.get("dependencies") or []:
+        role_name = str(dependency.get("role") or "").casefold()
+        provider_key = _provider_key(role_name, dependency)
+        target_relation = dependency.get("target_relation") or {}
+        matched_target_spms = {
+            _normalized_path(value)
+            for value in target_relation.get("matched_target_spms") or []
+            if str(value or "").strip()
+        }
+        normalized = _current_dependency_normalized_variants(
+            spm,
+            dependency,
+            dependency.get("normalized_variants") or {},
+        )
+        target_material_names = [
+            str(value).strip()
+            for value in dependency.get("target_material_names") or []
+            if str(value).strip()
+        ]
+        provider_key_folded = provider_key.casefold()
+        if (
+            role_name not in ROLE_ORDER
+            or not provider_key
+            or provider_key_folded in seen_provider_keys
+            or dependency.get("primary_role_source") is not False
+            or dependency.get("decision") != "reference_only"
+            or dependency.get("current_spm_pair_covered") is not True
+            or dependency.get("current_live_pair_covered") is not False
+            or dependency.get("spm_only_provider_candidate") is not True
+            or dependency.get("rendered_provider_expansion_covered")
+            is not True
+            or dependency.get("normalized_delivery_mode")
+            != "connection_incomplete"
+            or target_relation.get("allowed") is not True
+            or _normalized_path(spm) not in matched_target_spms
+            or not _normalized_variant_artifacts_available(normalized)
+            or not target_material_names
+        ):
+            continue
+        material_identity = str(normalized.get("material") or "").strip()
+        aliases = list(dict.fromkeys(
+            target_material_names
+            + ([material_identity] if material_identity else [])
+            + [str(dependency.get("name") or "")]
+        ))
+        row = {
+            "role": role_name,
+            "provider_key": provider_key,
+            "role_identity": target_material_names[0],
+            "role_identity_aliases": aliases,
+            "assignments": [],
+            "rendered_provider_expansion_covered": True,
+            "speculative_provider_expansion": True,
+            "normalized_variants": normalized,
+        }
+        if authority:
+            row["current_reference_authority"] = deepcopy(authority)
+        inputs.append(row)
+        seen_provider_keys.add(provider_key_folded)
+    return inputs
+
+
 def current_assembly_manifest_handoff(spm_path, full_fbx_path):
     """Recover a live Repair handoff from the current production manifest.
 
@@ -299,67 +379,24 @@ def current_assembly_manifest_handoff(spm_path, full_fbx_path):
             str(row.get("provider_key") or "").casefold()
             for row in part_builder_inputs
         }
-        for dependency in receipt_contract.get("dependencies") or []:
-            role_name = str(dependency.get("role") or "").casefold()
-            provider_key = _provider_key(role_name, dependency)
-            target_relation = dependency.get("target_relation") or {}
-            matched_target_spms = {
-                _normalized_path(value)
-                for value in target_relation.get("matched_target_spms") or []
-                if str(value or "").strip()
-            }
-            normalized = _current_dependency_normalized_variants(
-                spm,
-                dependency,
-                dependency.get("normalized_variants") or {},
-            )
-            target_material_names = [
-                str(value).strip()
-                for value in dependency.get("target_material_names") or []
-                if str(value).strip()
-            ]
-            if (
-                role_name not in ROLE_ORDER
-                or provider_key.casefold() in existing_provider_keys
-                or dependency.get("primary_role_source") is not False
-                or dependency.get("decision") != "reference_only"
-                or dependency.get("current_spm_pair_covered") is not True
-                or dependency.get("current_live_pair_covered") is not False
-                or dependency.get("spm_only_provider_candidate") is not True
-                or dependency.get("rendered_provider_expansion_covered")
-                is not True
-                or dependency.get("normalized_delivery_mode")
-                != "connection_incomplete"
-                or target_relation.get("allowed") is not True
-                or _normalized_path(spm) not in matched_target_spms
-                or not _normalized_variant_artifacts_available(normalized)
-                or not target_material_names
-            ):
+        recovered_inputs = current_receipt_reference_provider_inputs(
+            spm,
+            receipt_contract,
+            authority={
+                "status": "current",
+                "source": "production_manifest_pcg_provider_expansion",
+                "manifest": file_fingerprint(manifest_path),
+                "pcg_receipt": file_fingerprint(receipt_path),
+            },
+        )
+        for row in recovered_inputs:
+            provider_key = str(row.get("provider_key") or "")
+            if provider_key.casefold() in existing_provider_keys:
                 continue
-            material_identity = str(
-                normalized.get("material") or ""
-            ).strip()
-            aliases = list(dict.fromkeys(
-                target_material_names
-                + ([material_identity] if material_identity else [])
-                + [str(dependency.get("name") or "")]
-            ))
-            part_builder_inputs.append({
-                "role": role_name,
-                "provider_key": provider_key,
-                "role_identity": target_material_names[0],
-                "role_identity_aliases": aliases,
-                "assignments": [],
-                "rendered_provider_expansion_covered": True,
-                "speculative_provider_expansion": True,
-                "normalized_variants": normalized,
-                "current_manifest_authority": {
-                    "status": "current",
-                    "source": "production_manifest_pcg_provider_expansion",
-                    "manifest": file_fingerprint(manifest_path),
-                    "pcg_receipt": file_fingerprint(receipt_path),
-                },
-            })
+            row["current_manifest_authority"] = row.pop(
+                "current_reference_authority"
+            )
+            part_builder_inputs.append(row)
             existing_provider_keys.add(provider_key.casefold())
     return {
         "status": "ready",
@@ -1955,6 +1992,7 @@ __all__ = [
     "build_assembly_handoff",
     "build_blender_fbx_inventory",
     "classify_inventory_role",
+    "current_receipt_reference_provider_inputs",
     "dependency_role",
     "file_fingerprint",
     "load_cluster_contract",
