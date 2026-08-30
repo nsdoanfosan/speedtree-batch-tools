@@ -15,6 +15,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -36,6 +37,31 @@ COMMIT_LEDGER_SCHEMA_VERSION = 1
 SUCCESS = "valid_success"
 AMBIGUOUS_FAILURE = "ambiguous_failure"
 INVALID = "invalid"
+LEGACY_EVIDENCE_SCHEMA = "speedtree_20260830_pre_durable_saves_v1"
+CURRENT_EVIDENCE_SCHEMA = "speedtree_exact_durable_saves_v2"
+# The affected-refresh fleet was already running from 5171b42 when durable
+# save ownership was added.  Bind the compatibility exception to that exact
+# unreal_ingest.py content fingerprint instead of treating every missing
+# ledger as legacy forever.
+LEGACY_UNREAL_INGEST_FINGERPRINTS = frozenset({
+    "95d69ed9402035939c2480d2d7ab99a9",
+})
+REQUIRED_ASSEMBLY_STATIC_CHECKS = (
+    "build_status",
+    "full_skeletal_mesh_preserved",
+    "skeleton_current_authority",
+    "bone_map_exact_without_approximation",
+    "native_binding_exact",
+    "base_weights_in_final_wind",
+    "final_preserve_area",
+    "assembly_bounds_complete",
+    "dynamic_wind_exact",
+    "provenance_counts_exact",
+    "material_normalization_exact",
+    "final_material_sections_exact",
+    "assembly_writable",
+    "thumbnail_free_save_completed",
+)
 FRESH_PUSH_CONTRACT_KEYS = tuple(PUSH_CONTRACT_KEYS) + (
     "export_contracts",
 )
@@ -43,6 +69,10 @@ FRESH_PUSH_CONTRACT_KEYS = tuple(PUSH_CONTRACT_KEYS) + (
 
 class FinalizationError(RuntimeError):
     """Evidence cannot safely authorize deployment receipts."""
+
+
+class RejectedExportEvidence(FinalizationError):
+    """A completed ingest used a native export path that must be rerun."""
 
 
 def _canonical_json(value: Any) -> str:
@@ -350,10 +380,199 @@ def _single_state(
     return str(queue_id), state
 
 
+def _unreal_package_key(value: Any) -> str:
+    return str(value or "").split(".", 1)[0].replace("\\", "/").casefold()
+
+
+def _legacy_unreal_ingest_fingerprint(item: dict[str, Any]) -> str | None:
+    matches = []
+    for row in item.get("code_files") or []:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("path") or "").replace("\\", "/").rsplit("/", 1)[-1]
+        if name.casefold() == "unreal_ingest.py":
+            matches.append(str(row.get("fingerprint") or "").casefold())
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _validate_durable_save_evidence(
+    state: dict[str, Any],
+    saved: dict[str, Any],
+    assembly: dict[str, Any],
+) -> str:
+    """Select one explicit evidence generation and validate durable ownership."""
+
+    if "durable_saves" not in state:
+        raise FinalizationError(
+            "durable save evidence is missing without a legacy compatibility boundary"
+        )
+    ledger = state.get("durable_saves")
+    if not isinstance(ledger, dict) or ledger.get("schema_version") != 1:
+        raise FinalizationError("durable save evidence schema is invalid")
+    records = ledger.get("records")
+    if not isinstance(records, list) or not records:
+        raise FinalizationError("durable save evidence records are missing")
+
+    by_package: dict[str, dict[str, Any]] = {}
+    for sequence, record in enumerate(records):
+        if not isinstance(record, dict) or record.get("sequence") != sequence:
+            raise FinalizationError("durable save evidence sequence is invalid")
+        package = _unreal_package_key(record.get("package"))
+        if not package.startswith("/game/") or package in by_package:
+            raise FinalizationError(
+                "durable save evidence package ownership is invalid"
+            )
+        if _unreal_package_key(record.get("asset")) != package:
+            raise FinalizationError("durable save evidence asset/package differs")
+        if (
+            record.get("saved") is not True
+            or record.get("dirty_after_save") is not False
+            or not str(record.get("owner") or "")
+            or not str(record.get("role") or "")
+            or not str(record.get("save_mode") or "")
+            or not str(record.get("package_file") or "")
+        ):
+            raise FinalizationError("durable save evidence record is incomplete")
+        for field in ("size", "mtime_ns"):
+            value = record.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise FinalizationError(
+                    f"durable save evidence has invalid {field}"
+                )
+        by_package[package] = record
+
+    required = (
+        (saved.get("skeleton"), "final_skeleton_contract", "skeleton", "editor_asset"),
+        (saved.get("mesh"), "final_skeleton_contract", "mesh", "editor_asset"),
+    )
+    for path, owner, role, save_mode in required:
+        record = by_package.get(_unreal_package_key(path))
+        if record is None or any(
+            record.get(field) != value
+            for field, value in {
+                "owner": owner,
+                "role": role,
+                "save_mode": save_mode,
+            }.items()
+        ):
+            raise FinalizationError(
+                f"durable save ownership is missing for final {role}"
+            )
+
+    if assembly.get("status") == "ok":
+        assembly_path = (assembly.get("build") or {}).get("assembly")
+        record = by_package.get(_unreal_package_key(assembly_path))
+        if record is None or any(
+            record.get(field) != value
+            for field, value in {
+                "owner": "final_nanite_assembly",
+                "role": "assembly",
+                "save_mode": "thumbnail_free",
+            }.items()
+        ):
+            raise FinalizationError(
+                "durable save ownership is missing for final Nanite Assembly"
+            )
+    return CURRENT_EVIDENCE_SCHEMA
+
+
+def _validate_evidence_schema(
+    item: dict[str, Any],
+    state: dict[str, Any],
+    saved: dict[str, Any],
+    assembly: dict[str, Any],
+) -> str:
+    if "durable_saves" in state:
+        return _validate_durable_save_evidence(state, saved, assembly)
+    fingerprint = _legacy_unreal_ingest_fingerprint(item)
+    if fingerprint not in LEGACY_UNREAL_INGEST_FINGERPRINTS:
+        raise FinalizationError(
+            "missing durable save evidence is not from the sealed 20260830 "
+            f"legacy runtime: unreal_ingest={fingerprint!r}"
+        )
+    return LEGACY_EVIDENCE_SCHEMA
+
+
+def _validate_assembly_authoring_contract(
+    item: dict[str, Any],
+    build: dict[str, Any],
+) -> None:
+    payload = item.get("cluster_assembly") or {}
+    manifest = payload.get("manifest") or {}
+    if (
+        manifest.get("kind") != "sk_batch_cluster_nanite_assembly_inputs"
+        or manifest.get("status") != "ready"
+        or manifest.get("content_decision") != "build"
+        or manifest.get("full_skeletal_mesh_preserved") is not True
+    ):
+        raise FinalizationError("Assembly authoring manifest is not exact/ready")
+
+    binding_count = build.get("binding_count")
+    placement = manifest.get("placement_contract") or {}
+    exact_line = placement.get("exact_plan_line") or {}
+    if (
+        placement.get("status") != "ready"
+        or placement.get("identity_policy")
+        != "exact_fbx_vertex_or_native_clipped_origin_v1"
+        or placement.get("translation_source")
+        != "exact_fbx_attachment_vertex_else_native_receipt"
+        or exact_line.get("geometric_fitting") is not False
+        or exact_line.get("nearest_or_farthest_search") is not False
+        or exact_line.get("asset_special_cases") is not False
+        or exact_line.get("binding_count") != binding_count
+    ):
+        raise FinalizationError(
+            "BaseRef/placement contract is not exact or used geometric search"
+        )
+
+    attachment = manifest.get("attachment_bone_contract") or {}
+    if (
+        attachment.get("status") != "ready"
+        or attachment.get("policy")
+        != "native_modeler_runtime_receipt_v5_exact_pose_skeleton_index_zero"
+        or not (attachment.get("receipt") or {}).get("sha256")
+    ):
+        raise FinalizationError("native attachment-bone contract is not exact")
+
+    base = manifest.get("base") or {}
+    weighted_bone_count = base.get("weighted_bone_count")
+    if (
+        isinstance(weighted_bone_count, bool)
+        or not isinstance(weighted_bone_count, int)
+        or weighted_bone_count <= 0
+        or base.get("all_weighted_bones_in_final_wind")
+        not in {True, "diagnostic_only"}
+    ):
+        raise FinalizationError("BaseRef/base weighted bones are absent from final wind")
+
+    manifest_parts = list(manifest.get("parts") or [])
+    if len(manifest_parts) != len(list(build.get("parts") or [])):
+        raise FinalizationError("Assembly authored and imported part counts differ")
+    for part in manifest_parts:
+        external = part.get("external_source") or {}
+        if not external:
+            continue
+        if (
+            external.get("kind")
+            != "send_to_unreal_normalized_skeletal_part"
+            or not re.fullmatch(
+                r"Bone_[1-9][0-9]*_Start",
+                str(external.get("source_bone") or ""),
+            )
+            or external.get("pivot_contract")
+            != "normalized_attachment_origin_0_0_0"
+        ):
+            raise FinalizationError(
+                "Cluster provider did not retain the one reference-axis bone policy"
+            )
+
+
 def _validate_unreal_postcondition(
     item: dict[str, Any],
     state: dict[str, Any],
-) -> None:
+) -> str:
     if state.get("status") != "imported_ok":
         raise FinalizationError("Unreal item status is not imported_ok")
     materials = state.get("materials") or {}
@@ -379,10 +598,11 @@ def _validate_unreal_postcondition(
     if not saved.get("skeleton"):
         raise FinalizationError("saved final Skeleton asset is missing")
     assembly = state.get("cluster_assembly") or {}
+    evidence_schema = _validate_evidence_schema(item, state, saved, assembly)
     if item.get("cluster_assembly") is None:
         if assembly.get("status") != "skipped":
             raise FinalizationError("pass-through Assembly was not skipped")
-        return
+        return evidence_schema
     build = assembly.get("build") or {}
     parts = list(build.get("parts") or [])
     wind = build.get("dynamic_wind") or {}
@@ -402,6 +622,122 @@ def _validate_unreal_postcondition(
     if wind.get("success") is not True or provenance.get("success") is not True:
         raise FinalizationError("Assembly wind/provenance postcondition failed")
 
+    skeleton_diagnostic = build.get("manifest_skeleton_diagnostic") or {}
+    bone_map = build.get("unreal_bone_name_map") or {}
+    native_binding = build.get("native_binding_contract") or {}
+    shape = build.get("final_nanite_shape_preservation") or {}
+    if (
+        skeleton_diagnostic.get("status") != "match"
+        or skeleton_diagnostic.get("exact_order_match") is not True
+        or skeleton_diagnostic.get("current_unreal_skeleton_is_authoritative")
+        is not True
+        or list(skeleton_diagnostic.get("missing_from_current") or [])
+        or list(skeleton_diagnostic.get("added_in_current") or [])
+    ):
+        raise FinalizationError("Assembly reference Skeleton hierarchy is not exact")
+    if (
+        not str(bone_map.get("status") or "").startswith("exact")
+        or bone_map.get("index_offset") != 0
+        or bone_map.get("approximation_used") is not False
+        or list(bone_map.get("renamed_by_unreal_import") or [])
+        or list(bone_map.get("unmapped_authored_prefix_or_suffix") or [])
+    ):
+        raise FinalizationError("Assembly bone map is not exact or used approximation")
+    if (
+        native_binding.get("construction")
+        != "direct_exact_reference_skeleton_indices"
+        or native_binding.get("all_authored_influences_preserved") is not True
+        or native_binding.get("weights_sum_to_one") is not True
+    ):
+        raise FinalizationError("Assembly native/authored influences are not exact")
+    if (
+        wind.get("manifest_skeleton_identity_matches") is not True
+        or wind.get("current_skeleton_is_authoritative") is not True
+        or wind.get("skeleton_asset_matches_final_mesh") is not True
+        or wind.get("skeleton_bind_pose_matches") is not True
+        or wind.get("missing_current_joints") != 0
+        or wind.get("remapped_joint_records") != 0
+        or wind.get("bone_group_mapping_matches_json") is not True
+    ):
+        raise FinalizationError("Assembly DynamicWind bone mapping is not exact")
+    if (
+        shape.get("policy") != "preserve_area"
+        or shape.get("applied_before_finish") is not True
+        or shape.get("base_and_parts_unchanged") is not True
+        or shape.get("preserved_through_finish") is not True
+    ):
+        raise FinalizationError("final Nanite Assembly did not preserve area")
+
+    runtime = assembly.get("runtime") or {}
+    static_checks = runtime.get("assembly_static_checks") or {}
+    failed_checks = [
+        name
+        for name in REQUIRED_ASSEMBLY_STATIC_CHECKS
+        if static_checks.get(name) is not True
+    ]
+    if runtime.get("success") is not True or failed_checks:
+        raise FinalizationError(
+            "Assembly runtime/static contract failed: "
+            + ", ".join(failed_checks or ["runtime_success"])
+        )
+
+    _validate_assembly_authoring_contract(item, build)
+    return evidence_schema
+
+
+def _validate_normal_native_export_bundle(
+    payload: dict[str, Any],
+    *,
+    label: str,
+    evidence_schema: str,
+) -> None:
+    """Reject cache, verification-only, or split fallback export evidence."""
+
+    exports = payload.get("exports") if isinstance(payload, dict) else None
+    if payload.get("force_reexport_requested") is not True:
+        raise RejectedExportEvidence(
+            f"{label} lost top-level forced-export authority"
+        )
+    if not isinstance(exports, dict) or set(exports) != {"fbx", "xml"}:
+        raise RejectedExportEvidence(
+            f"{label} does not contain exact FBX/XML results"
+        )
+    for kind in ("fbx", "xml"):
+        row = exports.get(kind)
+        if not isinstance(row, dict):
+            raise RejectedExportEvidence(f"{label} {kind} result is malformed")
+        attempts = row.get("export_attempts") or []
+        if evidence_schema == LEGACY_EVIDENCE_SCHEMA:
+            # The sealed 5171b42 result predates these two explicit false
+            # fields.  Permit only true absence inside that fingerprint-bound
+            # schema; explicit null and all future-schema omissions fail.
+            normal_mode_fields = all(
+                key not in row or row.get(key) is False
+                for key in ("verification_only", "bundle_fallback")
+            )
+        else:
+            normal_mode_fields = (
+                row.get("verification_only") is False
+                and row.get("bundle_fallback") is False
+            )
+        if (
+            row.get("exists") is not True
+            or row.get("returncode") != 0
+            or row.get("cache_hit") is not False
+            or row.get("force_reexport_requested") is not True
+            or row.get("bundled_process") is not True
+            or not normal_mode_fields
+            or len(attempts) != 1
+            or attempts[0].get("attempt") != 1
+            or attempts[0].get("returncode") != 0
+        ):
+            raise RejectedExportEvidence(
+                f"{label} {kind} was not one forced normal bundled export: "
+                f"verification_only={row.get('verification_only')!r}, "
+                f"bundled_process={row.get('bundled_process')!r}, "
+                f"bundle_fallback={row.get('bundle_fallback')!r}"
+            )
+
 
 @dataclass(frozen=True)
 class CandidateVerdict:
@@ -413,6 +749,7 @@ class CandidateVerdict:
     event_at: datetime
     verification_basis: str
     snapshots: tuple[JsonSnapshot, ...]
+    evidence_schema: str = "not_applicable"
     errors: tuple[str, ...] = ()
 
 
@@ -576,6 +913,7 @@ def validate_exact_bundle(
             "skeleton",
             "final_skeleton_saved",
             "cluster_assembly",
+            "durable_saves",
         )
         for key in agreement_keys:
             expected_value = batch_state.get(key)
@@ -589,7 +927,7 @@ def validate_exact_bundle(
                 )
         if item_report.get("asset_cache"):
             raise FinalizationError("item report used an existing-asset fast path")
-        _validate_unreal_postcondition(item, batch_state)
+        evidence_schema = _validate_unreal_postcondition(item, batch_state)
 
         assembly_snapshot = read_stable_json(bundle.assembly_report)
         snapshots.append(assembly_snapshot)
@@ -601,6 +939,35 @@ def validate_exact_bundle(
         )
         if not assembly_spm or canonical_path(assembly_spm) != target.canonical_spm:
             raise FinalizationError("Assembly export report SPM differs from inventory")
+        if assembly_payload.get("speedtree_export_source") != "forced_export_helper":
+            raise RejectedExportEvidence(
+                "Assembly export did not declare the forced normal export helper"
+            )
+        if evidence_schema == CURRENT_EVIDENCE_SCHEMA:
+            execution_policy = (
+                assembly_payload.get("speedtree_export_execution_policy") or {}
+            )
+            if execution_policy != {
+                "status": "validated",
+                "policy": "normal_collision_export_fail_closed_v1",
+                "explicit_opt_in": False,
+                "verification_fallback_allowed": False,
+            }:
+                raise RejectedExportEvidence(
+                    "current Assembly export lacks the exact normal execution policy"
+                )
+        _validate_normal_native_export_bundle(
+            assembly_payload.get("speedtree_export") or {},
+            label="root SpeedTree export",
+            evidence_schema=evidence_schema,
+        )
+        source_export = assembly_payload.get("cluster_assembly_source_export")
+        if source_export is not None:
+            _validate_normal_native_export_bundle(
+                source_export,
+                label="Cluster Assembly source export",
+                evidence_schema=evidence_schema,
+            )
 
         verification_basis = "derived_atomic_ingest_bundle_v1"
         if bundle.exact_report.is_file():
@@ -636,6 +1003,26 @@ def validate_exact_bundle(
             event_at=event_at,
             verification_basis=verification_basis,
             snapshots=tuple(snapshots),
+            evidence_schema=evidence_schema,
+        )
+    except RejectedExportEvidence as exc:
+        # This is not deployable success, but it is a fully ordered attempt
+        # that a strictly later forced-normal success may explicitly seal.
+        rejected_event = _parse_time(
+            batch_state.get("completed_at") or batch.get("completed_at"),
+            "rejected export completed_at",
+        )
+        return CandidateVerdict(
+            target=target,
+            bundle=bundle,
+            classification=AMBIGUOUS_FAILURE,
+            fingerprint=fingerprint,
+            started_at=started_at,
+            event_at=rejected_event,
+            verification_basis="verification_or_fallback_export_rejected_v1",
+            snapshots=tuple(snapshots),
+            evidence_schema=evidence_schema,
+            errors=(str(exc),),
         )
     except (FinalizationError, OSError, ValueError, TypeError, KeyError) as exc:
         now = datetime.min
@@ -842,6 +1229,7 @@ def build_finalization_plan(
             "spm": str(winner.target.spm),
             "item_fingerprint": candidate.fingerprint,
             "verification_basis": candidate.verification_basis,
+            "evidence_schema": candidate.evidence_schema,
             "attempt": {
                 "run_id": candidate.bundle.run_id,
                 "bundle_id": candidate.bundle.bundle_id,
@@ -1047,6 +1435,9 @@ def commit_deployment_receipts(
         _atomic_write_json(journal_file, journal)
         if after_install is not None:
             after_install(index, final_path)
+    # Installing eighty receipts leaves a non-zero race window after the
+    # initial check.  Revalidate immediately before the global commit marker.
+    _verify_journal_sources(journal)
     ledger_path = Path(journal["commit_ledger"])
     ledger = {
         "schema_version": COMMIT_LEDGER_SCHEMA_VERSION,
@@ -1099,10 +1490,36 @@ def schema2_receipt_is_committed(path: Path | str) -> bool:
             row for row in ledger.get("receipts") or []
             if canonical_path(row.get("path") or "") == key
         ]
-        return (
+        receipt_matches = (
             len(matches) == 1
             and matches[0].get("payload_sha256") == receipt_snapshot.sha256
         )
+        if not receipt_matches:
+            return False
+        immutable_sources = [
+            (
+                receipt.get("native_receipt"),
+                receipt.get("native_receipt_sha256"),
+            ),
+            (
+                receipt.get("assembly_manifest"),
+                receipt.get("assembly_manifest_sha256"),
+            ),
+        ]
+        immutable_sources.extend(
+            (row.get("path"), row.get("sha256"))
+            for row in receipt.get("evidence") or []
+            if isinstance(row, dict)
+        )
+        for source, expected_sha256 in immutable_sources:
+            source_path = Path(str(source or ""))
+            if (
+                not expected_sha256
+                or not source_path.is_file()
+                or _sha256_file(source_path) != expected_sha256
+            ):
+                return False
+        return True
     except (FinalizationError, OSError, KeyError, TypeError, ValueError):
         return False
 

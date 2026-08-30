@@ -53,6 +53,43 @@ def _write_inventory(root: Path, count=80, *, duplicate=False):
 
 def _fresh_item(spm: Path, *, built_assembly=True):
     mesh_path = f"/Game/Test/{spm.stem}"
+    assembly_manifest = {
+        "kind": "sk_batch_cluster_nanite_assembly_inputs",
+        "status": "ready",
+        "content_decision": "build",
+        "full_skeletal_mesh_preserved": True,
+        "base": {
+            "weighted_bone_count": 10,
+            "all_weighted_bones_in_final_wind": True,
+        },
+        "parts": [
+            {
+                "external_source": {
+                    "kind": "send_to_unreal_normalized_skeletal_part",
+                    "source_bone": "Bone_1_Start",
+                    "pivot_contract": "normalized_attachment_origin_0_0_0",
+                }
+            }
+        ],
+        "placement_contract": {
+            "status": "ready",
+            "identity_policy": "exact_fbx_vertex_or_native_clipped_origin_v1",
+            "translation_source": "exact_fbx_attachment_vertex_else_native_receipt",
+            "exact_plan_line": {
+                "geometric_fitting": False,
+                "nearest_or_farthest_search": False,
+                "asset_special_cases": False,
+                "binding_count": 2,
+            },
+        },
+        "attachment_bone_contract": {
+            "status": "ready",
+            "policy": (
+                "native_modeler_runtime_receipt_v5_exact_pose_skeleton_index_zero"
+            ),
+            "receipt": {"sha256": "b" * 64},
+        },
+    }
     contract = {
         "schema_version": 1,
         "source_fingerprint": "source",
@@ -65,8 +102,17 @@ def _fresh_item(spm: Path, *, built_assembly=True):
         "handoff_files": [],
         "wind_file": None,
         "wind_policy": {"required": True},
-        "code_files": [],
-        "cluster_assembly": ({"manifest": {}} if built_assembly else None),
+        "code_files": [
+            {
+                "path": str(SK_BATCH / "unreal_ingest.py"),
+                "fingerprint": next(
+                    iter(finalizer.LEGACY_UNREAL_INGEST_FINGERPRINTS)
+                ),
+            }
+        ],
+        "cluster_assembly": (
+            {"manifest": assembly_manifest} if built_assembly else None
+        ),
         "dependency_orchestrated": True,
         "material_asset_scope": {"mode": "exact"},
         "export_contracts": {"skeleton_root": {"status": "ok"}},
@@ -107,14 +153,55 @@ def _unreal_state(item, started_at, completed_at):
             "status": "ok",
             "build": {
                 "status": "ok",
+                "assembly": f"{mesh}_NaniteAssembly",
                 "parts": [{"bindings": 2}],
                 "binding_count": 2,
                 "final_skeleton_bones": 10,
+                "manifest_skeleton_diagnostic": {
+                    "status": "match",
+                    "exact_order_match": True,
+                    "current_unreal_skeleton_is_authoritative": True,
+                    "missing_from_current": [],
+                    "added_in_current": [],
+                },
+                "unreal_bone_name_map": {
+                    "status": "exact_constant_index_offset",
+                    "index_offset": 0,
+                    "approximation_used": False,
+                    "renamed_by_unreal_import": [],
+                    "unmapped_authored_prefix_or_suffix": [],
+                },
+                "native_binding_contract": {
+                    "construction": "direct_exact_reference_skeleton_indices",
+                    "all_authored_influences_preserved": True,
+                    "weights_sum_to_one": True,
+                },
+                "base_weights_in_final_wind": True,
+                "final_nanite_shape_preservation": {
+                    "policy": "preserve_area",
+                    "applied_before_finish": True,
+                    "base_and_parts_unchanged": True,
+                    "preserved_through_finish": True,
+                },
                 "dynamic_wind": {
                     "success": True,
                     "skeleton_hash": skeleton_hash,
+                    "manifest_skeleton_identity_matches": True,
+                    "current_skeleton_is_authoritative": True,
+                    "skeleton_asset_matches_final_mesh": True,
+                    "skeleton_bind_pose_matches": True,
+                    "missing_current_joints": 0,
+                    "remapped_joint_records": 0,
+                    "bone_group_mapping_matches_json": True,
                 },
                 "provenance": {"success": True},
+            },
+            "runtime": {
+                "success": True,
+                "assembly_static_checks": {
+                    name: True
+                    for name in finalizer.REQUIRED_ASSEMBLY_STATIC_CHECKS
+                },
             },
         },
     }
@@ -129,9 +216,10 @@ def _write_bundle(
     success=True,
     exact_report=True,
     started_at=None,
+    built_assembly=True,
 ):
     spm = Path(target["spm"])
-    item = _fresh_item(spm)
+    item = _fresh_item(spm, built_assembly=built_assembly)
     base = f"{target['stem']}_exact_push_fleet_{run_id}_{ordinal:03d}"
     started_at = started_at or datetime(2026, 8, 30, 1, tzinfo=timezone.utc)
     completed_at = started_at + timedelta(minutes=1)
@@ -151,6 +239,11 @@ def _write_bundle(
     })
     if success:
         state = _unreal_state(item, started_at, completed_at)
+        if not built_assembly:
+            state["cluster_assembly"] = {
+                "status": "skipped",
+                "reason": "no content-driven Assembly manifest",
+            }
         state["manifest"] = str(manifest)
         state["report"] = str(item_report)
         _write_json(checkpoint, {
@@ -198,7 +291,30 @@ def _write_bundle(
         })
         if exact_report:
             _write_json(report, {"status": "failed", "stage": "rpc_ingest"})
-    _write_json(assembly, {"status": "ok", "speedtree_spm": str(spm)})
+    export_rows = {
+        kind: {
+            "exists": True,
+            "returncode": 0,
+            "cache_hit": False,
+            "force_reexport_requested": True,
+            "verification_only": False,
+            "bundled_process": True,
+            "bundle_fallback": False,
+            "export_attempts": [
+                {"attempt": 1, "returncode": 0}
+            ],
+        }
+        for kind in ("fbx", "xml")
+    }
+    _write_json(assembly, {
+        "status": "ok",
+        "speedtree_spm": str(spm),
+        "speedtree_export_source": "forced_export_helper",
+        "speedtree_export": {
+            "force_reexport_requested": True,
+            "exports": export_rows,
+        },
+    })
     return finalizer.ExactBundle(
         run_id=run_id,
         bundle_id=base,
@@ -210,6 +326,67 @@ def _write_bundle(
         assembly_report=assembly,
         fleet_report=log_dir / f"cluster_fleet_push_{run_id}.json",
     )
+
+
+def _mutate_success_state(bundle, mutator):
+    for path in (bundle.checkpoint, bundle.batch):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        state = next(iter(payload["items"].values()))
+        mutator(state)
+        _write_json(path, payload)
+    item_report = json.loads(bundle.item_report.read_text(encoding="utf-8"))
+    mutator(item_report)
+    _write_json(bundle.item_report, item_report)
+    if bundle.exact_report.is_file():
+        report = json.loads(bundle.exact_report.read_text(encoding="utf-8"))
+        mutator(report["unreal_result"])
+        _write_json(bundle.exact_report, report)
+
+
+def _add_current_durable_save_evidence(state):
+    saved = state["final_skeleton_saved"]
+    assembly = state["cluster_assembly"]
+    rows = [
+        (saved["skeleton"], "final_skeleton_contract", "skeleton", "editor_asset"),
+        (saved["mesh"], "final_skeleton_contract", "mesh", "editor_asset"),
+    ]
+    if assembly.get("status") == "ok":
+        rows.append((
+            assembly["build"]["assembly"],
+            "final_nanite_assembly",
+            "assembly",
+            "thumbnail_free",
+        ))
+    state["durable_saves"] = {
+        "schema_version": 1,
+        "records": [
+            {
+                "sequence": sequence,
+                "package": package,
+                "asset": package,
+                "owner": owner,
+                "role": role,
+                "save_mode": save_mode,
+                "saved": True,
+                "dirty_after_save": False,
+                "package_file": f"C:/Project/Content/{sequence}.uasset",
+                "size": 100 + sequence,
+                "mtime_ns": 1000 + sequence,
+            }
+            for sequence, (package, owner, role, save_mode) in enumerate(rows)
+        ],
+    }
+
+
+def _promote_assembly_report_to_current(bundle):
+    payload = json.loads(bundle.assembly_report.read_text(encoding="utf-8"))
+    payload["speedtree_export_execution_policy"] = {
+        "status": "validated",
+        "policy": "normal_collision_export_fail_closed_v1",
+        "explicit_opt_in": False,
+        "verification_fallback_allowed": False,
+    }
+    _write_json(bundle.assembly_report, payload)
 
 
 def _target_from_inventory(inventory, index=0):
@@ -374,6 +551,249 @@ def test_root035_missing_exact_report_derives_terminal_success(tmp_path):
     )
     assert verdict.classification == finalizer.SUCCESS
     assert verdict.verification_basis == "derived_atomic_ingest_bundle_v1"
+    assert verdict.evidence_schema == finalizer.LEGACY_EVIDENCE_SCHEMA
+
+
+def test_missing_durable_saves_requires_exact_20260830_legacy_runtime(
+    tmp_path, monkeypatch,
+):
+    inventory_path, rows = _write_inventory(tmp_path / "inventory", count=1)
+    inventory = finalizer.load_ordered_inventory(inventory_path, expected_count=1)
+    target = _target_from_inventory(inventory)
+    bundle = _write_bundle(tmp_path / "logs", "future", 1, rows[0])
+    monkeypatch.setattr(finalizer, "LEGACY_UNREAL_INGEST_FINGERPRINTS", frozenset())
+
+    verdict = finalizer.validate_exact_bundle(
+        bundle, target, verify_artifacts=False
+    )
+
+    assert verdict.classification == finalizer.INVALID
+    assert "legacy runtime" in verdict.errors[0]
+
+
+def test_current_evidence_requires_and_accepts_durable_save_ownership(tmp_path):
+    inventory_path, rows = _write_inventory(tmp_path / "inventory", count=1)
+    inventory = finalizer.load_ordered_inventory(inventory_path, expected_count=1)
+    target = _target_from_inventory(inventory)
+    bundle = _write_bundle(tmp_path / "logs", "current", 1, rows[0])
+    _mutate_success_state(bundle, _add_current_durable_save_evidence)
+    _promote_assembly_report_to_current(bundle)
+
+    verdict = finalizer.validate_exact_bundle(
+        bundle, target, verify_artifacts=False
+    )
+
+    assert verdict.classification == finalizer.SUCCESS
+    assert verdict.evidence_schema == finalizer.CURRENT_EVIDENCE_SCHEMA
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("approximation", "approximation"),
+        ("authored_influences", "influences"),
+        ("missing_joint", "bone mapping"),
+        ("remapped_joint", "bone mapping"),
+        ("preserve_area", "preserve area"),
+        ("runtime_static", "runtime/static"),
+        ("baseref_nearest", "BaseRef/placement"),
+        ("cluster_axis", "reference-axis"),
+    ],
+)
+def test_exact_assembly_contract_regressions_fail_closed(tmp_path, case, expected):
+    inventory_path, rows = _write_inventory(tmp_path / "inventory", count=1)
+    inventory = finalizer.load_ordered_inventory(inventory_path, expected_count=1)
+    target = _target_from_inventory(inventory)
+    bundle = _write_bundle(tmp_path / "logs", case, 1, rows[0])
+
+    if case in {"baseref_nearest", "cluster_axis"}:
+        manifest = json.loads(bundle.manifest.read_text(encoding="utf-8"))
+        assembly_manifest = manifest["items"][0]["cluster_assembly"]["manifest"]
+        if case == "baseref_nearest":
+            assembly_manifest["placement_contract"]["exact_plan_line"][
+                "nearest_or_farthest_search"
+            ] = True
+        else:
+            assembly_manifest["parts"][0]["external_source"]["source_bone"] = (
+                "Bone_2_End"
+            )
+        contract = {
+            key: manifest["items"][0].get(key)
+            for key in finalizer.FRESH_PUSH_CONTRACT_KEYS
+        }
+        fingerprint = finalizer.stable_fingerprint(contract)
+        manifest["items"][0]["fingerprint"] = fingerprint
+        _write_json(bundle.manifest, manifest)
+
+        def update_fingerprint(state):
+            state["fingerprint"] = fingerprint
+
+        _mutate_success_state(bundle, update_fingerprint)
+        exact = json.loads(bundle.exact_report.read_text(encoding="utf-8"))
+        exact["manifest_fingerprint"] = fingerprint
+        _write_json(bundle.exact_report, exact)
+    else:
+        def mutate(state):
+            build = state["cluster_assembly"]["build"]
+            if case == "approximation":
+                build["unreal_bone_name_map"]["approximation_used"] = True
+            elif case == "authored_influences":
+                build["native_binding_contract"][
+                    "all_authored_influences_preserved"
+                ] = False
+            elif case == "missing_joint":
+                build["dynamic_wind"]["missing_current_joints"] = 1
+            elif case == "remapped_joint":
+                build["dynamic_wind"]["remapped_joint_records"] = 1
+            elif case == "preserve_area":
+                build["final_nanite_shape_preservation"][
+                    "preserved_through_finish"
+                ] = False
+            elif case == "runtime_static":
+                state["cluster_assembly"]["runtime"]["assembly_static_checks"][
+                    "native_binding_exact"
+                ] = False
+
+        _mutate_success_state(bundle, mutate)
+
+    verdict = finalizer.validate_exact_bundle(
+        bundle, target, verify_artifacts=False
+    )
+
+    assert verdict.classification == finalizer.INVALID
+    assert expected.casefold() in verdict.errors[0].casefold()
+
+
+def test_durable_save_owner_regression_fails_closed(tmp_path):
+    inventory_path, rows = _write_inventory(tmp_path / "inventory", count=1)
+    inventory = finalizer.load_ordered_inventory(inventory_path, expected_count=1)
+    target = _target_from_inventory(inventory)
+    bundle = _write_bundle(tmp_path / "logs", "durable", 1, rows[0])
+
+    def mutate(state):
+        _add_current_durable_save_evidence(state)
+        state["durable_saves"]["records"][-1]["owner"] = "terminal_item_assets"
+
+    _mutate_success_state(bundle, mutate)
+    verdict = finalizer.validate_exact_bundle(
+        bundle, target, verify_artifacts=False
+    )
+
+    assert verdict.classification == finalizer.INVALID
+    assert "Nanite Assembly" in verdict.errors[0]
+
+
+def test_verification_only_split_bundle_fallback_is_never_legacy_success(tmp_path):
+    inventory_path, rows = _write_inventory(tmp_path / "inventory", count=1)
+    inventory = finalizer.load_ordered_inventory(inventory_path, expected_count=1)
+    target = _target_from_inventory(inventory)
+    bundle = _write_bundle(tmp_path / "logs", "verification_fallback", 1, rows[0])
+    assembly = json.loads(bundle.assembly_report.read_text(encoding="utf-8"))
+    for row in assembly["speedtree_export"]["exports"].values():
+        row["verification_only"] = True
+        row["bundled_process"] = False
+        row["bundle_fallback"] = True
+    _write_json(bundle.assembly_report, assembly)
+
+    verdict = finalizer.validate_exact_bundle(
+        bundle, target, verify_artifacts=False
+    )
+
+    assert verdict.classification == finalizer.AMBIGUOUS_FAILURE
+    assert "verification_only=True" in verdict.errors[0]
+
+
+@pytest.mark.parametrize("missing_field", ["verification_only", "bundle_fallback"])
+def test_current_normal_bundle_rejects_missing_false_fields(tmp_path, missing_field):
+    inventory_path, rows = _write_inventory(tmp_path / "inventory", count=1)
+    inventory = finalizer.load_ordered_inventory(inventory_path, expected_count=1)
+    target = _target_from_inventory(inventory)
+    bundle = _write_bundle(tmp_path / "logs", "current_missing", 1, rows[0])
+    _mutate_success_state(bundle, _add_current_durable_save_evidence)
+    _promote_assembly_report_to_current(bundle)
+    assembly = json.loads(bundle.assembly_report.read_text(encoding="utf-8"))
+    for row in assembly["speedtree_export"]["exports"].values():
+        row.pop(missing_field)
+    _write_json(bundle.assembly_report, assembly)
+
+    verdict = finalizer.validate_exact_bundle(
+        bundle, target, verify_artifacts=False
+    )
+
+    assert verdict.classification == finalizer.AMBIGUOUS_FAILURE
+    assert f"{missing_field}=None" in verdict.errors[0]
+
+
+def test_fingerprint_bound_legacy_bundle_accepts_only_absent_new_false_fields(tmp_path):
+    inventory_path, rows = _write_inventory(tmp_path / "inventory", count=1)
+    inventory = finalizer.load_ordered_inventory(inventory_path, expected_count=1)
+    target = _target_from_inventory(inventory)
+    bundle = _write_bundle(tmp_path / "logs", "legacy_absent", 1, rows[0])
+    assembly = json.loads(bundle.assembly_report.read_text(encoding="utf-8"))
+    for row in assembly["speedtree_export"]["exports"].values():
+        row.pop("verification_only")
+        row.pop("bundle_fallback")
+    _write_json(bundle.assembly_report, assembly)
+
+    verdict = finalizer.validate_exact_bundle(
+        bundle, target, verify_artifacts=False
+    )
+
+    assert verdict.classification == finalizer.SUCCESS
+    assert verdict.evidence_schema == finalizer.LEGACY_EVIDENCE_SCHEMA
+
+
+def test_later_normal_bundle_success_seals_rejected_verification_fallback(tmp_path):
+    inventory_path, rows = _write_inventory(tmp_path / "inventory", count=1)
+    inventory = finalizer.load_ordered_inventory(inventory_path, expected_count=1)
+    target = _target_from_inventory(inventory)
+    started = datetime(2026, 8, 30, 13, tzinfo=timezone.utc)
+    fallback = _write_bundle(
+        tmp_path / "logs", "fallback", 1, rows[0], started_at=started
+    )
+    payload = json.loads(fallback.assembly_report.read_text(encoding="utf-8"))
+    for row in payload["speedtree_export"]["exports"].values():
+        row["verification_only"] = True
+        row["bundled_process"] = False
+        row["bundle_fallback"] = True
+    _write_json(fallback.assembly_report, payload)
+    normal = _write_bundle(
+        tmp_path / "logs",
+        "normal_rerun",
+        1,
+        rows[0],
+        started_at=started + timedelta(minutes=10),
+    )
+
+    rejected = finalizer.validate_exact_bundle(
+        fallback, target, verify_artifacts=False
+    )
+    success = finalizer.validate_exact_bundle(
+        normal, target, verify_artifacts=False
+    )
+    winner = finalizer.reduce_attempt_history(target, [rejected, success])
+
+    assert rejected.classification == finalizer.AMBIGUOUS_FAILURE
+    assert winner.candidate.bundle.run_id == "normal_rerun"
+    assert winner.sealed_attempts == (fallback.bundle_id,)
+
+
+def test_current_pass_through_evidence_needs_no_assembly_save_owner(tmp_path):
+    inventory_path, rows = _write_inventory(tmp_path / "inventory", count=1)
+    inventory = finalizer.load_ordered_inventory(inventory_path, expected_count=1)
+    target = _target_from_inventory(inventory)
+    bundle = _write_bundle(
+        tmp_path / "logs", "pass_through", 1, rows[0], built_assembly=False
+    )
+    _mutate_success_state(bundle, _add_current_durable_save_evidence)
+    _promote_assembly_report_to_current(bundle)
+
+    verdict = finalizer.validate_exact_bundle(
+        bundle, target, verify_artifacts=False
+    )
+
+    assert verdict.classification == finalizer.SUCCESS
+    assert verdict.evidence_schema == finalizer.CURRENT_EVIDENCE_SCHEMA
 
 
 def test_incomplete_checkpoint_is_not_success(tmp_path):
@@ -708,3 +1128,47 @@ def test_native_or_assembly_change_between_stage_and_commit_aborts(tmp_path):
         receipt.target.deployment_receipt.exists()
         for receipt in plan.receipts
     )
+
+
+def test_source_change_during_receipt_install_blocks_global_commit(tmp_path):
+    audit = _synthetic_ready_audit(tmp_path)
+    plan = finalizer.build_finalization_plan(
+        audit, commit_ledger=tmp_path / "commit.json"
+    )
+    journal = tmp_path / "journal.json"
+    finalizer.stage_deployment_receipts(plan, journal)
+    source = plan.receipts[0].target.native_receipt
+
+    def mutate_after_last_install(index, _path):
+        if index == finalizer.INVENTORY_COUNT:
+            source.write_text('{"changed":"during-install"}', encoding="utf-8")
+
+    with pytest.raises(finalizer.FinalizationError, match="source changed"):
+        finalizer.commit_deployment_receipts(
+            journal,
+            after_install=mutate_after_last_install,
+        )
+
+    assert not plan.commit_ledger.exists()
+    assert finalizer.schema2_receipt_is_committed(
+        plan.receipts[0].target.deployment_receipt
+    ) is False
+
+
+def test_committed_receipt_rejects_later_immutable_source_drift(tmp_path):
+    audit = _synthetic_ready_audit(tmp_path)
+    plan = finalizer.build_finalization_plan(
+        audit, commit_ledger=tmp_path / "commit.json"
+    )
+    journal = tmp_path / "journal.json"
+    finalizer.stage_deployment_receipts(plan, journal)
+    finalizer.commit_deployment_receipts(journal)
+    first = plan.receipts[0]
+
+    assert finalizer.schema2_receipt_is_committed(
+        first.target.deployment_receipt
+    ) is True
+    first.target.manifest.write_text('{"changed":"after-commit"}', encoding="utf-8")
+    assert finalizer.schema2_receipt_is_committed(
+        first.target.deployment_receipt
+    ) is False
