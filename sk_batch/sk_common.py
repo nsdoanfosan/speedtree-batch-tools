@@ -102,6 +102,10 @@ UNREAL_COMMANDLET_BASE_ARGS = (
     "-unattended",
     "-NoSplash",
     "-NoSound",
+    # Vegetation commandlets do not need a viewport.  Make NullRHI an explicit
+    # launch invariant so a future engine/plugin startup change cannot silently
+    # create a D3D device and compete with the editor on an 8 GiB adapter.
+    "-NullRHI",
     "-UTF8Output",
     "-NoDDCCleanup",
 )

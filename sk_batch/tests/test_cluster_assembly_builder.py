@@ -51,6 +51,7 @@ from cluster_assembly_builder import (  # noqa: E402
     _exact_native_attachment_influences,
     _export_selected_fbx,
     _configure_final_assembly_preserve_area,
+    _clear_post_finish_native_reference_collections,
     _validate_final_assembly_preserve_area,
     _generated_material_sidecar,
     _normalized_prototype_for_component,
@@ -170,6 +171,38 @@ class UnrealNaniteAssemblyCompilationTests(unittest.TestCase):
             build_unreal_nanite_assembly(fake_unreal, {}, {})
 
         self.assertEqual(self.FakeSystemLibrary.value, 2)
+
+    def test_post_finish_release_clears_only_temporary_native_collections(self):
+        report_copy = [{"prototype_id": "leaf", "bindings": 2}]
+        part_assets = {"leaf": object()}
+        bindings = [object(), object()]
+        native_influences = [object()]
+        bone_indices = {"Root": 0}
+        bone_names = {"Root": "Root"}
+        skeleton_by_name = {"Root": {"parent": None}}
+        authored_bones = {"Root"}
+
+        _clear_post_finish_native_reference_collections(
+            part_assets,
+            bindings,
+            native_influences,
+            bone_indices,
+            bone_names,
+            skeleton_by_name,
+            authored_bones,
+        )
+
+        self.assertEqual(part_assets, {})
+        self.assertEqual(bindings, [])
+        self.assertEqual(native_influences, [])
+        self.assertEqual(bone_indices, {})
+        self.assertEqual(bone_names, {})
+        self.assertEqual(skeleton_by_name, {})
+        self.assertEqual(authored_bones, set())
+        self.assertEqual(
+            report_copy,
+            [{"prototype_id": "leaf", "bindings": 2}],
+        )
 
 class FinalAssemblyNanitePolicyTests(unittest.TestCase):
     def make_policy_subjects(self):

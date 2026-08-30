@@ -1,5 +1,7 @@
 import importlib.util
+import hashlib
 import json
+import os
 import sys
 import tempfile
 import types
@@ -8,6 +10,7 @@ import stat
 from copy import deepcopy
 from contextlib import nullcontext
 from pathlib import Path
+from unittest import mock
 
 
 RUNNER = Path(__file__).resolve().parents[1] / "unreal_ingest.py"
@@ -56,6 +59,58 @@ def write_manifest(tmp_path, items, max_retries=2):
     return manifest, checkpoint, report
 
 
+def write_manifest_v2(tmp_path, items, max_retries=2):
+    manifest = tmp_path / "manifest_v2.json"
+    checkpoint = tmp_path / "checkpoint_v2.json"
+    report = tmp_path / "report_v2.json"
+    payload_dir = tmp_path / "manifest_v2_items"
+    payload_dir.mkdir()
+    item_refs = []
+    for index, current in enumerate(items):
+        current = dict(current)
+        current.setdefault("schema_version", 1)
+        payload = json.dumps(
+            current,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        digest = hashlib.sha256(payload).hexdigest()
+        payload_path = payload_dir / f"{index:04d}_{digest[:16]}.json"
+        payload_path.write_bytes(payload)
+        item_refs.append({
+            "schema_version": 1,
+            "queue_id": current["queue_id"],
+            "fingerprint": current["fingerprint"],
+            "depends_on_queue_ids": list(
+                current.get("depends_on_queue_ids") or []
+            ),
+            "report_path": current.get("report_path"),
+            "checkout_asset_paths": list(
+                current.get("checkout_asset_paths") or []
+            ),
+            "payload_relpath": payload_path.relative_to(tmp_path).as_posix(),
+            "payload_size": len(payload),
+            "payload_sha256": digest,
+        })
+    manifest.write_text(
+        json.dumps({
+            "schema_version": 2,
+            "item_storage": {
+                "kind": "external_json",
+                "schema_version": 1,
+                "integrity": "sha256",
+                "base_relpath": payload_dir.relative_to(tmp_path).as_posix(),
+            },
+            "checkpoint_path": str(checkpoint),
+            "report_path": str(report),
+            "max_item_crash_retries": max_retries,
+            "items": item_refs,
+        }),
+        encoding="utf-8",
+    )
+    return manifest, checkpoint, report
+
+
 def item(queue_id, fingerprint):
     return {
         "queue_id": queue_id,
@@ -83,6 +138,73 @@ def test_retry_metadata_is_copied_from_manifest_to_batch_report(tmp_path):
     assert result["retry"] == payload["retry"]
     assert persisted["retry"] == payload["retry"]
     assert persisted["recovery"] == payload["recovery"]
+
+
+def test_item_compilation_mode_restores_cvar_when_setup_read_fails():
+    runner = load_runner()
+    commands = []
+    reads = iter([1, RuntimeError("read failed"), 1])
+
+    def get_int(_name):
+        value = next(reads)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    runner.unreal.SystemLibrary = types.SimpleNamespace(
+        get_console_variable_int_value=get_int,
+        execute_console_command=lambda _world, command: commands.append(command),
+    )
+
+    with unittest.TestCase().assertRaisesRegex(RuntimeError, "read failed"):
+        with runner._bounded_item_skinned_asset_compilation():
+            pass
+
+    assert "Editor.AsyncSkinnedAssetCompilation 0" in commands
+    assert "Editor.AsyncSkinnedAssetCompilation 1" in commands
+
+
+def test_item_resource_release_prefers_immediate_unreal_gc():
+    runner = load_runner()
+    calls = []
+    runner.unreal.collect_garbage = lambda: calls.append("immediate")
+    runner.unreal.SystemLibrary = types.SimpleNamespace(
+        execute_console_command=lambda _world, command: calls.append(command),
+        collect_garbage=lambda: calls.append("scheduled"),
+    )
+
+    report = runner._release_item_unreal_resources()
+
+    assert calls[-1] == "immediate"
+    assert "scheduled" not in calls
+    assert report["immediate_unreal_gc"] is True
+    assert report["scheduled_unreal_gc"] is False
+
+
+def test_headless_item_limit_yields_then_resumes_without_marking_complete(
+    tmp_path,
+    monkeypatch,
+):
+    runner = load_runner(monkeypatch)
+    manifest, checkpoint, report_path = write_manifest(
+        tmp_path,
+        [item("first", "a"), item("second", "b")],
+    )
+    monkeypatch.setenv("SK_BATCH_MANIFEST_PATH", str(manifest))
+    monkeypatch.setenv("SK_BATCH_MAX_ITEMS_PER_PROCESS", "1")
+    runner.ingest_item = lambda _item: {"status": "imported_ok"}
+
+    first = runner.run_manifest(manifest, checkpoint, report_path)
+
+    assert first["status"] == "process_yield"
+    assert first["process_yield"]["next_queue_id"] == "second"
+    assert json.loads(checkpoint.read_text(encoding="utf-8"))["complete"] is False
+
+    second = runner.run_manifest(manifest, checkpoint, report_path)
+
+    assert second["status"] == "complete"
+    assert second["process_yield"] is None
+    assert set(second["items"]) == {"first", "second"}
 
 
 class DynamicWindFinalSkeletonContractTests(unittest.TestCase):
@@ -717,6 +839,179 @@ def test_manifest_dependencies_run_provider_before_tree(tmp_path, monkeypatch):
     assert result["items"]["tree"]["status"] == "imported_ok"
 
 
+def test_manifest_v2_lazy_items_preserve_dependency_order(tmp_path, monkeypatch):
+    runner = load_runner(monkeypatch)
+    from cluster_fleet_push import write_combined_lazy_manifest
+
+    root = item("tree", "tree-v1")
+    root["depends_on_queue_ids"] = ["cluster"]
+    root["schema_version"] = 1
+    provider = item("cluster", "cluster-v1")
+    provider["schema_version"] = 1
+    manifest = tmp_path / "writer_reader_manifest_v2.json"
+    _checkpoint = tmp_path / "writer_reader_checkpoint_v2.json"
+    _report = tmp_path / "writer_reader_report_v2.json"
+    write_combined_lazy_manifest(
+        manifest,
+        {
+            "checkpoint_path": str(_checkpoint),
+            "report_path": str(_report),
+            "max_item_crash_retries": 2,
+        },
+        [{"item": root}, {"item": provider}],
+    )
+    loaded = []
+    ingested = []
+    original_loader = runner._load_manifest_item
+
+    def load_item(*args):
+        current = original_loader(*args)
+        loaded.append(current["queue_id"])
+        return current
+
+    monkeypatch.setattr(runner, "_load_manifest_item", load_item)
+    monkeypatch.setattr(
+        runner,
+        "ingest_item",
+        lambda current: ingested.append(current["queue_id"])
+        or {"status": "imported_ok"},
+    )
+
+    result = runner.run_manifest(manifest)
+
+    assert loaded == ["cluster", "tree"]
+    assert ingested == ["cluster", "tree"]
+    assert result["status"] == "complete"
+    assert result["schema_version"] == 1
+    checkpoint_payload = json.loads(_checkpoint.read_text(encoding="utf-8"))
+    assert checkpoint_payload["schema_version"] == 1
+
+
+def test_manifest_v2_terminal_item_does_not_reload_payload(tmp_path, monkeypatch):
+    runner = load_runner(monkeypatch)
+    manifest, checkpoint, report = write_manifest_v2(
+        tmp_path,
+        [item("tree", "tree-v1")],
+    )
+    monkeypatch.setattr(
+        runner,
+        "ingest_item",
+        lambda _current: {"status": "imported_ok"},
+    )
+    runner.run_manifest(manifest, checkpoint, report)
+    monkeypatch.setattr(
+        runner,
+        "_load_manifest_item",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("terminal payload must remain lazy")
+        ),
+    )
+
+    result = runner.run_manifest(manifest, checkpoint, report)
+
+    assert result["items"]["tree"]["status"] == "imported_ok"
+
+
+def test_manifest_v2_payload_hash_failure_is_item_local(tmp_path, monkeypatch):
+    runner = load_runner(monkeypatch)
+    manifest, _checkpoint, _report = write_manifest_v2(
+        tmp_path,
+        [item("bad", "bad-v1"), item("good", "good-v1")],
+    )
+    root = json.loads(manifest.read_text(encoding="utf-8"))
+    bad_payload = tmp_path / Path(root["items"][0]["payload_relpath"])
+    bad_payload.write_bytes(b"{}")
+    calls = []
+    monkeypatch.setattr(
+        runner,
+        "ingest_item",
+        lambda current: calls.append(current["queue_id"])
+        or {"status": "imported_ok"},
+    )
+
+    result = runner.run_manifest(manifest)
+
+    assert result["items"]["bad"]["status"] == "data_error"
+    assert "size mismatch" in result["items"]["bad"]["message"]
+    assert calls == ["good"]
+
+
+def test_manifest_v2_rejects_payload_identity_drift(tmp_path, monkeypatch):
+    runner = load_runner(monkeypatch)
+    manifest, _checkpoint, _report = write_manifest_v2(
+        tmp_path,
+        [item("tree", "tree-v1")],
+    )
+    root = json.loads(manifest.read_text(encoding="utf-8"))
+    item_ref = root["items"][0]
+    payload_path = tmp_path / Path(item_ref["payload_relpath"])
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    payload["queue_id"] = "different"
+    payload_bytes = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    payload_path.write_bytes(payload_bytes)
+    item_ref["payload_size"] = len(payload_bytes)
+    item_ref["payload_sha256"] = hashlib.sha256(payload_bytes).hexdigest()
+    manifest.write_text(json.dumps(root), encoding="utf-8")
+    monkeypatch.setattr(
+        runner,
+        "ingest_item",
+        lambda _current: (_ for _ in ()).throw(
+            AssertionError("identity-drifted payload must not be ingested")
+        ),
+    )
+
+    result = runner.run_manifest(manifest)
+
+    assert result["items"]["tree"]["status"] == "data_error"
+    assert "identity differs" in result["items"]["tree"]["message"]
+
+
+def test_manifest_v2_releases_payload_reference_before_unreal_gc(
+    tmp_path,
+    monkeypatch,
+):
+    runner = load_runner(monkeypatch)
+    manifest, _checkpoint, _report = write_manifest_v2(
+        tmp_path,
+        [item("tree", "tree-v1")],
+    )
+    events = []
+
+    class TrackedItem(dict):
+        def __del__(self):
+            events.append("payload_released")
+
+    monkeypatch.setattr(
+        runner,
+        "_load_manifest_item",
+        lambda *_args: TrackedItem({
+            "queue_id": "tree",
+            "fingerprint": "tree-v1",
+            "report_path": "",
+        }),
+    )
+    monkeypatch.setattr(
+        runner,
+        "ingest_item",
+        lambda _current: {"status": "imported_ok"},
+    )
+
+    def release():
+        assert events == ["payload_released"]
+        events.append("unreal_gc")
+        return {"python_gc": True}
+
+    monkeypatch.setattr(runner, "_release_item_unreal_resources", release)
+
+    runner.run_manifest(manifest)
+
+    assert events == ["payload_released", "unreal_gc"]
+
+
 def test_failed_cluster_marks_dependent_tree_not_run(tmp_path, monkeypatch):
     runner = load_runner(monkeypatch)
     root = item("tree", "tree-v1")
@@ -1270,6 +1565,41 @@ def test_null_rhi_detection_fails_closed_without_unreal_command_line_api():
     assert runner._is_null_rhi_runtime() is False
 
 
+class NullRHIRuntimeInvariantTests(unittest.TestCase):
+    def test_required_null_rhi_is_verified_from_actual_unreal_command_line(self):
+        runner = load_runner()
+        runner.unreal.SystemLibrary = types.SimpleNamespace(
+            get_command_line=lambda: (
+                "UnrealEditor-Cmd.exe Project.uproject -NullRHI"
+            ),
+            parse_param=lambda command_line, name: (
+                name.casefold() == "nullrhi" and "-NullRHI" in command_line
+            ),
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {"SK_BATCH_REQUIRE_NULL_RHI": "1"},
+        ):
+            self.assertTrue(runner._enforce_required_null_rhi_runtime())
+
+    def test_required_null_rhi_rejects_before_manifest_read(self):
+        runner = load_runner()
+        runner.unreal.SystemLibrary = types.SimpleNamespace(
+            get_command_line=lambda: "UnrealEditor-Cmd.exe Project.uproject",
+            parse_param=lambda _command_line, _name: False,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            missing_manifest = Path(temporary) / "does-not-need-to-exist.json"
+            with mock.patch.dict(
+                os.environ,
+                {"SK_BATCH_REQUIRE_NULL_RHI": "1"},
+            ):
+                with self.assertRaisesRegex(RuntimeError, "requires.*-NullRHI"):
+                    runner.run_manifest(missing_manifest)
+
+
 def test_headless_restart_recovers_pending_without_reimport(tmp_path, monkeypatch):
     runner = load_runner(monkeypatch)
     manifest, checkpoint, report = write_manifest(
@@ -1807,6 +2137,8 @@ class DurableSaveOwnershipTests(unittest.TestCase):
             before = list(environment.save_asset_calls)
             runner.validate_manifest_artifacts = lambda _manifest: None
             runner._without_generated_physics_assets = lambda _module: nullcontext(True)
+            runner._prebuild_material_path_once = lambda *_args: None
+            runner._material_postbuild_slot_audit = lambda _path: {}
             runner.build_unreal_nanite_assembly = (
                 lambda *_args: {"status": "ok", "assembly": None}
             )
@@ -1850,6 +2182,8 @@ class DurableSaveOwnershipTests(unittest.TestCase):
             runner.validate_manifest_artifacts = lambda _manifest: None
             runner.validate_file_fingerprint = lambda *_args: None
             runner._without_generated_physics_assets = lambda _module: nullcontext(True)
+            runner._prebuild_material_path_once = lambda *_args: None
+            runner._material_postbuild_slot_audit = lambda _path: {}
             runner._default_physics_asset_preexisting = lambda _path: False
             runner._prepare_speedtree_skeletal_optimization = (
                 lambda *_args: {"status": "ok"}
@@ -2051,6 +2385,12 @@ class UnrealIngestSaveTests(unittest.TestCase):
         runner._save_item_assets = lambda _item, _assets, **_kwargs: (
             events.append("save") or [mesh_path]
         )
+        runner._material_prebuild_compile_and_usage_normalization = (
+            lambda _path: {"mesh": mesh_path}
+        )
+        runner._material_postbuild_slot_audit = (
+            lambda _path: {"mesh": mesh_path}
+        )
 
     def test_save_item_assets_deduplicates_imported_mesh_path(self):
         runner = load_runner()
@@ -2115,7 +2455,7 @@ class UnrealIngestSaveTests(unittest.TestCase):
         events = []
         mesh_path = "/Game/Meshes/Trees/SK_Test"
         self._configure_ingest_runner(runner, events, mesh_path)
-        runner._material_compile_and_slot_validation = (
+        runner._material_postbuild_slot_audit = (
             lambda _path: events.append("validate") or {"mesh": mesh_path}
         )
 
@@ -3285,7 +3625,7 @@ class UnrealIngestSaveTests(unittest.TestCase):
             events.append("validate")
             raise RuntimeError("material compile failed")
 
-        runner._material_compile_and_slot_validation = fail_validation
+        runner._material_postbuild_slot_audit = fail_validation
 
         try:
             runner.ingest_item(

@@ -29,9 +29,11 @@ from cluster_fleet_push import (  # noqa: E402
     parse_args,
     validate_spm_bone_policy_report,
     validate_provider_live_result,
+    validate_transport_batch_scope,
     validate_provider_assembly_result,
     validate_assembly_result,
     validate_live_result,
+    write_combined_lazy_manifest,
 )
 
 
@@ -83,6 +85,18 @@ def exact_identity_contract(binding_count):
 
 
 class ClusterFleetPushTests(unittest.TestCase):
+    def test_fleet_rpc_is_limited_to_one_exact_dependency_free_asset(self):
+        self.assertEqual(
+            validate_transport_batch_scope("rpc", [{"spm": "one"}], []),
+            {"transport": "rpc", "work_count": 1},
+        )
+        with self.assertRaisesRegex(ExactPushError, "fleet RPC import is disabled"):
+            validate_transport_batch_scope(
+                "rpc",
+                [{"spm": "root"}],
+                [Path("provider.spm")],
+            )
+
     def test_policy_batch_command_uses_factory_startup_and_exact_targets(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -488,6 +502,60 @@ class ClusterFleetPushTests(unittest.TestCase):
                     project,
                     run_factory=lambda *_args, **_kwargs: Completed(),
                 )
+
+    def test_combined_manifest_v2_externalizes_items_and_preserves_index_fields(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest_path = root / "combined.json"
+            report_path = root / "item_report.json"
+            item = {
+                "schema_version": 1,
+                "queue_id": "provider.spm",
+                "fingerprint": "provider-v1",
+                "depends_on_queue_ids": ["base.spm"],
+                "report_path": str(report_path),
+                "checkout_asset_paths": ["/Game/Trees/SK_Provider"],
+                "cluster_assembly": {"large": "x" * 10000},
+            }
+
+            manifest = write_combined_lazy_manifest(
+                manifest_path,
+                {
+                    "checkpoint_path": str(root / "checkpoint.json"),
+                    "report_path": str(root / "batch.json"),
+                    "max_item_crash_retries": 2,
+                },
+                [{"item": item}],
+            )
+
+            persisted = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest, persisted)
+            self.assertEqual(persisted["schema_version"], 2)
+            self.assertEqual(
+                persisted["item_storage"]["kind"], "external_json"
+            )
+            item_ref = persisted["items"][0]
+            self.assertEqual(item_ref["queue_id"], item["queue_id"])
+            self.assertEqual(item_ref["fingerprint"], item["fingerprint"])
+            self.assertEqual(
+                item_ref["depends_on_queue_ids"],
+                item["depends_on_queue_ids"],
+            )
+            self.assertEqual(
+                item_ref["checkout_asset_paths"],
+                item["checkout_asset_paths"],
+            )
+            payload_path = root / Path(item_ref["payload_relpath"])
+            self.assertEqual(
+                json.loads(payload_path.read_text(encoding="utf-8")),
+                item,
+            )
+            self.assertLess(
+                manifest_path.stat().st_size,
+                payload_path.stat().st_size,
+            )
 
     def test_receipt_refresh_is_scoped_to_exact_current_spm(self):
         with tempfile.TemporaryDirectory() as temporary:

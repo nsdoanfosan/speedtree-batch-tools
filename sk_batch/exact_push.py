@@ -405,16 +405,42 @@ def run_headless_manifest(
         *UNREAL_COMMANDLET_BASE_ARGS,
     ]
     environment = os.environ.copy()
+    raw_item_limit = environment.get("SK_BATCH_MAX_ITEMS_PER_PROCESS", "6")
+    try:
+        item_limit = int(raw_item_limit)
+    except ValueError as exc:
+        raise ExactPushError(
+            "SK_BATCH_MAX_ITEMS_PER_PROCESS must be an integer"
+        ) from exc
+    if not 1 <= item_limit <= 6:
+        raise ExactPushError(
+            "SK_BATCH_MAX_ITEMS_PER_PROCESS must be between 1 and 6; "
+            "the upper bound is a crash-hardening process lifetime limit"
+        )
     environment.update({
         "SK_BATCH_MANIFEST_PATH": str(manifest_path),
         "SK_BATCH_CHECKPOINT_PATH": str(checkpoint_path),
         "SK_BATCH_REPORT_PATH": str(batch_report_path),
+        # A successful process yield is an intentional package/render-resource
+        # lifetime boundary, not a crash retry.  Six large vegetation items per
+        # commandlet keeps the working set bounded without per-asset startup.
+        "SK_BATCH_MAX_ITEMS_PER_PROCESS": str(item_limit),
+        # The Python entry point verifies the real Unreal command line before
+        # importing anything. This turns -NullRHI from a caller convention into
+        # a fail-closed runtime invariant.
+        "SK_BATCH_REQUIRE_NULL_RHI": "1",
     })
     last_returncode = None
-    for attempt in range(max(0, int(max_restarts)) + 1):
+    crash_restarts = 0
+    launch_count = 0
+    planned_yields = 0
+    restart_budget = max(0, int(max_restarts))
+    while crash_restarts <= restart_budget:
+        launch_count += 1
         print(
             f"UnrealEditor-Cmd headless ingest "
-            f"({attempt + 1}/{max(0, int(max_restarts)) + 1})",
+            f"(launch {launch_count}, crash restarts "
+            f"{crash_restarts}/{restart_budget})",
             flush=True,
         )
         completed = owned_run(
@@ -436,9 +462,19 @@ def run_headless_manifest(
                 raise ExactPushError(
                     f"Unreal batch report is unreadable: {exc}"
                 ) from exc
+        if completed.returncode == 0 and checkpoint.get("process_yield"):
+            planned_yields += 1
+            if planned_yields > 1000:
+                raise ExactPushError(
+                    "Unreal headless ingest exceeded 1000 planned process "
+                    f"lifetime yields: {checkpoint_path}"
+                )
+            continue
+        crash_restarts += 1
     raise ExactPushError(
         "UnrealEditor-Cmd did not complete the manifest after "
-        f"{max(0, int(max_restarts)) + 1} launches; "
+        f"{launch_count} launches and {crash_restarts} failed/incomplete "
+        f"launches; crash restart budget={restart_budget}, "
         f"last return code={last_returncode}, checkpoint={checkpoint_path}"
     )
 
