@@ -84,6 +84,82 @@ class FakeBlender:
 
 
 class ClusterSavePolicyTests(unittest.TestCase):
+    def test_normal_collision_export_rejects_any_verification_fallback(self):
+        helper = load_job_functions(
+            ["validate_normal_collision_export_result"]
+        )["validate_normal_collision_export_result"]
+
+        def export_row():
+            return {
+                "exists": True,
+                "returncode": 0,
+                "cache_hit": False,
+                "force_reexport_requested": True,
+                "verification_only": False,
+                "bundled_process": True,
+                "bundle_fallback": False,
+                "stdout": "Post-collision export completed.",
+                "export_attempts": [{"attempt": 1, "returncode": 0}],
+            }
+
+        result = {
+            "force_reexport_requested": True,
+            "exports": {"fbx": export_row(), "xml": export_row()},
+        }
+        policy = helper(result)
+        self.assertEqual(policy["status"], "validated")
+
+        for field, value in (
+            ("verification_only", True),
+            ("verification_only", None),
+            ("bundle_fallback", True),
+            ("bundle_fallback", None),
+            ("bundled_process", False),
+            ("cache_hit", True),
+        ):
+            with self.subTest(field=field, value=value):
+                broken = {
+                    "force_reexport_requested": True,
+                    "exports": {"fbx": export_row(), "xml": export_row()},
+                }
+                if value is None:
+                    broken["exports"]["fbx"].pop(field)
+                else:
+                    broken["exports"]["fbx"][field] = value
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "evidence is invalid",
+                ):
+                    helper(broken)
+
+    def test_normal_collision_export_requires_one_success_and_marker(self):
+        helper = load_job_functions(
+            ["validate_normal_collision_export_result"]
+        )["validate_normal_collision_export_result"]
+        row = {
+            "exists": True,
+            "returncode": 0,
+            "cache_hit": False,
+            "force_reexport_requested": True,
+            "verification_only": False,
+            "bundled_process": True,
+            "bundle_fallback": False,
+            "stdout": "Post-collision export completed.",
+            "export_attempts": [{"attempt": 1, "returncode": 0}],
+        }
+        result = {
+            "force_reexport_requested": True,
+            "exports": {"fbx": dict(row), "xml": dict(row)},
+        }
+        result["exports"]["fbx"]["export_attempts"] = []
+        with self.assertRaisesRegex(RuntimeError, "one exact successful"):
+            helper(result)
+
+        result["exports"]["fbx"] = dict(row)
+        result["exports"]["fbx"]["stdout"] = ""
+        with self.assertRaisesRegex(RuntimeError, "completion marker"):
+            helper(result)
+
     def test_fresh_verification_mode_requires_force_and_exact_pair(self):
         helper = load_job_functions(
             ["validate_native_export_mode_arguments"]

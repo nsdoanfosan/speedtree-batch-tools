@@ -164,6 +164,15 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--speedtree-export-timeout",
+        type=int,
+        default=1200,
+        help=(
+            "outer timeout in seconds for one normal bundled SpeedTree "
+            "FBX/XML export; the native wrapper must use a smaller timeout"
+        ),
+    )
+    parser.add_argument(
         "--force-cluster-assembly-rebuild",
         action="store_true",
         help=(
@@ -1017,6 +1026,60 @@ def validate_fresh_verification_export_result(result):
     return evidence
 
 
+def validate_normal_collision_export_result(result):
+    """Reject any silent verification fallback before Blender/Unreal ingest."""
+
+    if not isinstance(result, dict):
+        raise RuntimeError("Normal SpeedTree export result is missing")
+    if result.get("force_reexport_requested") is not True:
+        raise RuntimeError("Normal SpeedTree export lost forced-export authority")
+    exports = result.get("exports")
+    if not isinstance(exports, dict) or set(exports) != {"fbx", "xml"}:
+        raise RuntimeError("Normal SpeedTree export requires exact FBX/XML results")
+
+    for kind in ("fbx", "xml"):
+        row = exports.get(kind)
+        if not isinstance(row, dict):
+            raise RuntimeError(f"Normal SpeedTree {kind.upper()} result is missing")
+        exact = {
+            "exists": True,
+            "returncode": 0,
+            "cache_hit": False,
+            "force_reexport_requested": True,
+            "verification_only": False,
+            "bundled_process": True,
+            "bundle_fallback": False,
+        }
+        for field, expected in exact.items():
+            if row.get(field) != expected or type(row.get(field)) is not type(expected):
+                raise RuntimeError(
+                    "Normal SpeedTree export evidence is invalid: "
+                    f"kind={kind}, {field}={row.get(field)!r}"
+                )
+        attempts = row.get("export_attempts")
+        if (
+            not isinstance(attempts, list)
+            or len(attempts) != 1
+            or attempts[0].get("attempt") != 1
+            or attempts[0].get("returncode") != 0
+        ):
+            raise RuntimeError(
+                f"Normal SpeedTree {kind.upper()} export lacks one exact "
+                "successful bundled attempt"
+            )
+        if "Post-collision export completed." not in str(row.get("stdout") or ""):
+            raise RuntimeError(
+                f"Normal SpeedTree {kind.upper()} export lacks the "
+                "post-collision completion marker"
+            )
+    return {
+        "status": "validated",
+        "policy": "normal_collision_export_fail_closed_v1",
+        "explicit_opt_in": False,
+        "verification_fallback_allowed": False,
+    }
+
+
 def resolve_job_cluster_receipt_path(
     spm_path,
     embedded_contract_path=None,
@@ -1362,6 +1425,11 @@ def main():
                 collision_hook,
             )
         if speedtree_export is None:
+            export_kwargs = {
+                "timeout_seconds": args.speedtree_export_timeout,
+            }
+            if not args.fresh_verification_only_export:
+                export_kwargs["allow_verification_fallback"] = False
             speedtree_export = run_selected_speedtree_export(
                 str(speedtree_spm),
                 speedtree_exe_path=export_settings["speedtree_exe_path"],
@@ -1379,6 +1447,7 @@ def main():
                 export_fbx=export_settings["speedtree_export_fbx"],
                 export_xml=export_settings["speedtree_export_xml"],
                 force_reexport=args.force_native_export,
+                **export_kwargs,
             )
             report["speedtree_export_source"] = (
                 "fresh_verification_only_export_helper"
@@ -1399,11 +1468,15 @@ def main():
         report["speedtree_export_execution_policy"] = (
             validate_fresh_verification_export_result(speedtree_export)
             if args.fresh_verification_only_export
-            else {
-                "status": "not_requested",
-                "policy": "normal_collision_export_path",
-                "explicit_opt_in": False,
-            }
+            else (
+                validate_normal_collision_export_result(speedtree_export)
+                if args.force_native_export
+                else {
+                    "status": "not_requested",
+                    "policy": "normal_collision_export_path",
+                    "explicit_opt_in": False,
+                }
+            )
         )
         fbx_export = speedtree_export["exports"].get("fbx", {})
         xml_export = speedtree_export["exports"].get("xml", {})
@@ -1466,6 +1539,11 @@ def main():
             if source_spm_path == speedtree_spm:
                 assembly_source_export = speedtree_export
             else:
+                source_export_kwargs = {
+                    "timeout_seconds": args.speedtree_export_timeout,
+                }
+                if not args.fresh_verification_only_export:
+                    source_export_kwargs["allow_verification_fallback"] = False
                 assembly_source_export = run_selected_speedtree_export(
                     str(source_spm_path),
                     speedtree_exe_path=export_settings[
@@ -1485,6 +1563,7 @@ def main():
                     export_fbx=export_settings["speedtree_export_fbx"],
                     export_xml=export_settings["speedtree_export_xml"],
                     force_reexport=args.force_native_export,
+                    **source_export_kwargs,
                     # This secondary SPM contributes Assembly geometry through
                     # the same exact native FBX/XML serialization contract.
                 )
@@ -1493,6 +1572,12 @@ def main():
                 report[
                     "cluster_assembly_source_export_execution_policy"
                 ] = validate_fresh_verification_export_result(
+                    assembly_source_export
+                )
+            elif args.force_native_export:
+                report[
+                    "cluster_assembly_source_export_execution_policy"
+                ] = validate_normal_collision_export_result(
                     assembly_source_export
                 )
             assembly_fbx_export = (

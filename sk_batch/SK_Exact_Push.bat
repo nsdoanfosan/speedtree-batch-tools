@@ -1,5 +1,6 @@
 @echo off
 setlocal
+if not defined SPEEDTREE_COLLISION_WRAPPER_TIMEOUT_MS set "SPEEDTREE_COLLISION_WRAPPER_TIMEOUT_MS=840000"
 set "COLLISION_DIR=%~dp0..\speedtree_collision_cli"
 set "COLLISION_CLI=%COLLISION_DIR%\bin\speedtree_collision_cli.exe"
 set "COLLISION_HOOK=%COLLISION_DIR%\bin\speedtree_collision_hook.dll"
