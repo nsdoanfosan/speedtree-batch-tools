@@ -3184,6 +3184,18 @@ def _component_uv_face_counter(mesh, component):
     return Counter(faces)
 
 
+def _prototype_uv_face_counter(prototype):
+    """Return the immutable source-component counter, lazily for test fakes."""
+
+    key = "component_uv_face_counter"
+    if key not in prototype:
+        prototype[key] = _component_uv_face_counter(
+            prototype["object"].data,
+            prototype["component"],
+        )
+    return prototype[key]
+
+
 def _uv_vertex_candidates(obj, component):
     uv_layer = obj.data.uv_layers.active
     if uv_layer is None:
@@ -3296,6 +3308,18 @@ def _prepare_uv_correspondence(obj, component):
             for key, by_index in candidates.items()
         },
     }
+
+
+def _prototype_prepared_uv_correspondence(prototype):
+    """Return immutable source UV groups, lazily preparing legacy test fakes."""
+
+    key = "prepared_uv_correspondence"
+    if key not in prototype:
+        prototype[key] = _prepare_uv_correspondence(
+            prototype["object"],
+            prototype["component"],
+        )
+    return prototype[key]
 
 
 def _counter_subset(left, right):
@@ -3517,10 +3541,7 @@ def _normalized_prototype_for_component(prototypes, target_mesh, target_componen
         return None
     face_subset_candidates = []
     for prototype in prototypes.values():
-        source_faces = _component_uv_face_counter(
-            prototype["object"].data,
-            prototype["component"],
-        )
+        source_faces = _prototype_uv_face_counter(prototype)
         if source_faces is None or not _counter_subset(
             target_faces, source_faces
         ):
@@ -3537,10 +3558,7 @@ def _normalized_prototype_for_component(prototypes, target_mesh, target_componen
     # best-candidate rank; zero or multiple candidates remain unresolved.
     shared_face_identity_candidates = []
     for prototype in prototypes.values():
-        source_faces = _component_uv_face_counter(
-            prototype["object"].data,
-            prototype["component"],
-        )
+        source_faces = _prototype_uv_face_counter(prototype)
         if source_faces is None:
             continue
         shared_keys = set(source_faces).intersection(target_faces)
@@ -3563,13 +3581,26 @@ def _normalized_prototype_for_component(prototypes, target_mesh, target_componen
         or list(prototypes.values())
     )
     target_obj = SimpleNamespace(data=target_mesh)
+    target_prepared = None
+    target_prepared_ready = False
     for prototype in candidates_to_check:
         try:
+            source_prepared = _prototype_prepared_uv_correspondence(
+                prototype
+            )
+            if source_prepared is not None and not target_prepared_ready:
+                target_prepared = _prepare_uv_correspondence(
+                    target_obj,
+                    target_component,
+                )
+                target_prepared_ready = True
             _ordered_cross_object_correspondence(
                 prototype["object"],
                 prototype["component"],
                 target_obj,
                 target_component,
+                source_prepared=source_prepared,
+                target_prepared=target_prepared,
             )
         except (AttributeError, ClusterAssemblyBuildError):
             continue
@@ -3592,10 +3623,7 @@ def _normalized_prototype_match_diagnostics(
         return [{"reason": "target_has_no_active_uv"}]
     rows = []
     for signature, prototype in prototypes.items():
-        source_faces = _component_uv_face_counter(
-            prototype["object"].data,
-            prototype["component"],
-        )
+        source_faces = _prototype_uv_face_counter(prototype)
         if source_faces is None:
             rows.append({
                 "prototype_signature": signature,
@@ -3997,6 +4025,14 @@ def _import_normalized_plan_prototypes(bpy, contract):
             "object": source_obj,
             "component": component,
             "signature": signature,
+            "component_uv_face_counter": _component_uv_face_counter(
+                source_obj.data,
+                component,
+            ),
+            "prepared_uv_correspondence": _prepare_uv_correspondence(
+                source_obj,
+                component,
+            ),
         }
     if not prototypes:
         raise ClusterAssemblyBuildError(
@@ -5988,7 +6024,6 @@ def build_blender_assembly_inputs(
     exact_attachment_binding_count = 0
     exact_fbx_attachment_binding_count = 0
     native_clipped_origin_attachment_binding_count = 0
-    source_correspondence_cache = {}
     native_point_identity_cache = {}
     base_obj = None
     base_armature = None
@@ -6219,22 +6254,9 @@ def build_blender_assembly_inputs(
                     composite_parts = list(
                         variant.get("composite_parts") or []
                     )
-                    source_correspondence_key = (
-                        id(source_obj.data),
-                        tuple(source_component["polygons"]),
+                    source_prepared = (
+                        _prototype_prepared_uv_correspondence(prototype)
                     )
-                    if source_correspondence_key not in (
-                        source_correspondence_cache
-                    ):
-                        source_correspondence_cache[
-                            source_correspondence_key
-                        ] = _prepare_uv_correspondence(
-                            source_obj,
-                            source_component,
-                        )
-                    source_prepared = source_correspondence_cache[
-                        source_correspondence_key
-                    ]
                     authored_line = _exact_normalized_authored_line(
                         normalized_contract,
                         variant,

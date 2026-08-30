@@ -57,6 +57,7 @@ from cluster_assembly_builder import (  # noqa: E402
     _ordered_cross_object_correspondence,
     _partition_components_by_native_runtime_owner,
     _partition_normalized_render_components,
+    _prepare_uv_correspondence,
     _prepare_exact_source_plan_line,
     _role_geometry_sources,
     _role_material_polygons,
@@ -1266,6 +1267,128 @@ class ComponentTopologyTests(unittest.TestCase):
         )
         self.assertEqual(len(source_indices), 3)
         self.assertEqual(len(target_indices), 3)
+
+    def test_fake_prototype_face_counters_are_lazily_reused_in_order(self):
+        source_component_a = object()
+        source_component_b = object()
+        target_component = object()
+        source_data_a = SimpleNamespace(
+            uv_layers=SimpleNamespace(active=None)
+        )
+        source_data_b = SimpleNamespace(
+            uv_layers=SimpleNamespace(active=None)
+        )
+        prototypes = {
+            "a": {
+                "object": SimpleNamespace(data=source_data_a),
+                "component": source_component_a,
+            },
+            "b": {
+                "object": SimpleNamespace(data=source_data_b),
+                "component": source_component_b,
+            },
+        }
+        faces = Counter({("face", 1): 1})
+        counter_components = []
+
+        def select_counter(_mesh, component):
+            counter_components.append(component)
+            return faces
+
+        with mock.patch(
+            "cluster_assembly_builder._component_signature",
+            return_value="target",
+        ), mock.patch(
+            "cluster_assembly_builder._component_uv_face_counter",
+            side_effect=select_counter,
+        ), mock.patch(
+            "cluster_assembly_builder._ordered_cross_object_correspondence",
+            side_effect=ClusterAssemblyBuildError("no exact match"),
+        ) as correspondence:
+            first = _normalized_prototype_for_component(
+                prototypes,
+                object(),
+                target_component,
+            )
+            second = _normalized_prototype_for_component(
+                prototypes,
+                object(),
+                target_component,
+            )
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        self.assertEqual(
+            counter_components,
+            [
+                target_component,
+                source_component_a,
+                source_component_b,
+                target_component,
+            ],
+        )
+        self.assertEqual(
+            [call.args[0] for call in correspondence.call_args_list],
+            [
+                prototypes["a"]["object"],
+                prototypes["b"]["object"],
+                prototypes["a"]["object"],
+                prototypes["b"]["object"],
+            ],
+        )
+        self.assertEqual(
+            prototypes["a"]["component_uv_face_counter"],
+            faces,
+        )
+        self.assertEqual(
+            prototypes["b"]["component_uv_face_counter"],
+            faces,
+        )
+
+    def test_prepared_uv_target_is_reused_without_changing_ambiguity(self):
+        source = seam_split_test_mesh(False)
+        target = seam_split_test_mesh(False)
+        source_component = _component_groups(source, [0, 1])[0]
+        target_component = _component_groups(target, [0, 1])[0]
+        source_obj = SimpleNamespace(name="source", data=source)
+        source_prepared = _prepare_uv_correspondence(
+            source_obj,
+            source_component,
+        )
+        prototypes = {
+            "a": {
+                "object": source_obj,
+                "component": source_component,
+                "prepared_uv_correspondence": source_prepared,
+            },
+            "b": {
+                "object": source_obj,
+                "component": source_component,
+                "prepared_uv_correspondence": source_prepared,
+            },
+        }
+
+        with mock.patch(
+            "cluster_assembly_builder._component_signature",
+            return_value="forced-target-signature",
+        ), mock.patch(
+            "cluster_assembly_builder._prepare_uv_correspondence",
+            wraps=_prepare_uv_correspondence,
+        ) as prepare:
+            with self.assertRaisesRegex(
+                ClusterAssemblyBuildError,
+                "normalized plan exact UV identity is ambiguous for component: "
+                "forced-target-signature",
+            ):
+                _normalized_prototype_for_component(
+                    prototypes,
+                    target,
+                    target_component,
+                )
+
+        self.assertEqual(prepare.call_count, 1)
+        self.assertIs(prepare.call_args.args[0].data, target)
+        self.assertIs(prepare.call_args.args[1], target_component)
 
     def test_speedtree_boundary_clipping_accepts_unique_final_fbx_subset(self):
         source_component = object()
