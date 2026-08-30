@@ -48,6 +48,7 @@ FINAL_SKELETON_HASH_METADATA = (
     "SKBatchFinalSkeletonBoneNameIndexParentSha1"
 )
 FINAL_SKELETON_BONE_COUNT_METADATA = "SKBatchFinalSkeletonBoneCount"
+DURABLE_SAVE_SCHEMA_VERSION = 1
 
 
 def _now():
@@ -2162,7 +2163,231 @@ def _apply_dynamic_wind(item):
     }
 
 
-def _save_final_skeleton_contract_assets(full_mesh):
+def _normalize_durable_package(asset_path):
+    package = _normalized_unreal_asset_path(asset_path).replace("\\", "/")
+    if not package.casefold().startswith("/game/"):
+        raise RuntimeError(f"durable save package is outside /Game: {package}")
+    return package
+
+
+def _durable_package_file(asset_path):
+    package = _normalize_durable_package(asset_path)
+    paths = getattr(unreal, "Paths", None)
+    project_content_dir = getattr(paths, "project_content_dir", None)
+    convert_to_full = getattr(paths, "convert_relative_path_to_full", None)
+    if not callable(project_content_dir):
+        raise RuntimeError(
+            "cannot resolve durable save package filename through Unreal Paths: "
+            + package
+        )
+    content_dir = project_content_dir()
+    if callable(convert_to_full):
+        content_dir = convert_to_full(content_dir)
+    return Path(str(content_dir)).joinpath(
+        *package[len("/Game/") :].split("/")
+    ).with_suffix(".uasset")
+
+
+def _new_durable_save_ledger():
+    return {
+        "schema_version": DURABLE_SAVE_SCHEMA_VERSION,
+        "records": [],
+    }
+
+
+def _durable_save_records(ledger):
+    if not isinstance(ledger, dict):
+        raise RuntimeError("durable save ledger is missing")
+    if ledger.get("schema_version") != DURABLE_SAVE_SCHEMA_VERSION:
+        raise RuntimeError(
+            "durable save ledger schema mismatch: "
+            f"expected={DURABLE_SAVE_SCHEMA_VERSION}, "
+            f"actual={ledger.get('schema_version')!r}"
+        )
+    records = ledger.get("records")
+    if not isinstance(records, list):
+        raise RuntimeError("durable save ledger records are malformed")
+    return records
+
+
+def _find_durable_save(ledger, asset_path):
+    key = _normalize_durable_package(asset_path).casefold()
+    matches = [
+        record
+        for record in _durable_save_records(ledger)
+        if str(record.get("package") or "").casefold() == key
+    ]
+    if len(matches) > 1:
+        raise RuntimeError(
+            "durable save ledger has duplicate package ownership: "
+            + _normalize_durable_package(asset_path)
+        )
+    return matches[0] if matches else None
+
+
+def _dirty_content_packages():
+    utilities = getattr(unreal, "EditorLoadingAndSavingUtils", None)
+    get_dirty = getattr(utilities, "get_dirty_content_packages", None)
+    if not callable(get_dirty):
+        raise RuntimeError("Unreal dirty-content package query is unavailable")
+    result = {}
+    for package in get_dirty() or []:
+        getter = getattr(package, "get_path_name", None)
+        value = getter() if callable(getter) else package
+        path = _normalized_unreal_asset_path(value).replace("\\", "/")
+        if path.casefold().startswith("/game/"):
+            result[path.casefold()] = path
+    return result
+
+
+def _assert_durable_save_unowned(ledger, asset_path, owner):
+    existing = _find_durable_save(ledger, asset_path)
+    if existing is not None:
+        raise RuntimeError(
+            "durable save package already has an owner: "
+            f"package={existing.get('package')}, "
+            f"owner={existing.get('owner')}, requested_owner={owner}"
+        )
+
+
+def _record_durable_save(ledger, asset_path, *, owner, role, save_mode):
+    package = _normalize_durable_package(asset_path)
+    _assert_durable_save_unowned(ledger, package, owner)
+    if package.casefold() in _dirty_content_packages():
+        raise RuntimeError(
+            f"durable save left its package dirty: owner={owner}, package={package}"
+        )
+    package_file = _durable_package_file(package)
+    if not package_file.is_file():
+        raise RuntimeError(
+            f"durable save did not create a package file: {package_file}"
+        )
+    stat_result = package_file.stat()
+    if stat_result.st_size <= 0:
+        raise RuntimeError(f"durable save created an empty package: {package_file}")
+    record = {
+        "sequence": len(_durable_save_records(ledger)),
+        "package": package,
+        "asset": package,
+        "owner": str(owner),
+        "role": str(role),
+        "save_mode": str(save_mode),
+        "saved": True,
+        "dirty_after_save": False,
+        "package_file": str(package_file),
+        "size": int(stat_result.st_size),
+        "mtime_ns": int(stat_result.st_mtime_ns),
+    }
+    _durable_save_records(ledger).append(record)
+    return record
+
+
+def _require_durable_save(
+    ledger,
+    asset_path,
+    *,
+    owner=None,
+    role=None,
+    save_mode=None,
+):
+    package = _normalize_durable_package(asset_path)
+    record = _find_durable_save(ledger, package)
+    if record is None:
+        raise RuntimeError(f"durable save receipt is missing: {package}")
+    expected = {
+        "owner": owner,
+        "role": role,
+        "save_mode": save_mode,
+    }
+    mismatches = {
+        field: {"expected": value, "actual": record.get(field)}
+        for field, value in expected.items()
+        if value is not None and record.get(field) != value
+    }
+    if mismatches:
+        raise RuntimeError(
+            f"durable save ownership mismatch: package={package}, "
+            f"mismatches={mismatches}"
+        )
+    if record.get("saved") is not True or record.get("dirty_after_save") is not False:
+        raise RuntimeError(f"durable save receipt is incomplete: {package}")
+    if package.casefold() in _dirty_content_packages():
+        raise RuntimeError(f"owned durable package became dirty: {package}")
+
+    expected_file = _durable_package_file(package)
+    recorded_file = Path(str(record.get("package_file") or ""))
+    expected_key = os.path.normcase(os.path.abspath(str(expected_file)))
+    recorded_key = os.path.normcase(os.path.abspath(str(recorded_file)))
+    if expected_key != recorded_key:
+        raise RuntimeError(
+            "durable save package filename changed: "
+            f"package={package}, expected={expected_file}, recorded={recorded_file}"
+        )
+    if not expected_file.is_file():
+        raise RuntimeError(f"durable save package file disappeared: {expected_file}")
+    stat_result = expected_file.stat()
+    if (
+        stat_result.st_size <= 0
+        or int(stat_result.st_size) != record.get("size")
+        or int(stat_result.st_mtime_ns) != record.get("mtime_ns")
+    ):
+        raise RuntimeError(
+            "durable save package changed after ownership was recorded: "
+            f"package={package}, expected_size={record.get('size')}, "
+            f"actual_size={stat_result.st_size}, "
+            f"expected_mtime_ns={record.get('mtime_ns')}, "
+            f"actual_mtime_ns={stat_result.st_mtime_ns}"
+        )
+    return record
+
+
+def _validate_durable_save_ledger(ledger):
+    records = _durable_save_records(ledger)
+    for sequence, record in enumerate(records):
+        if record.get("sequence") != sequence:
+            raise RuntimeError(
+                "durable save ledger sequence changed: "
+                f"expected={sequence}, actual={record.get('sequence')!r}"
+            )
+        _require_durable_save(ledger, record.get("package"))
+    return True
+
+
+def _durable_save_report(ledger):
+    _validate_durable_save_ledger(ledger)
+    return deepcopy(ledger)
+
+
+def _save_asset_owned(
+    asset_path,
+    durable_saves,
+    *,
+    owner,
+    role,
+    save_mode="editor_asset",
+):
+    package = _normalize_durable_package(asset_path)
+    _validate_durable_save_ledger(durable_saves)
+    _assert_durable_save_unowned(durable_saves, package, owner)
+    if not unreal.EditorAssetLibrary.save_asset(
+        package,
+        only_if_is_dirty=False,
+    ):
+        raise RuntimeError(
+            f"failed to persist owned asset: owner={owner}, package={package}"
+        )
+    record = _record_durable_save(
+        durable_saves,
+        package,
+        owner=owner,
+        role=role,
+        save_mode=save_mode,
+    )
+    _validate_durable_save_ledger(durable_saves)
+    return record
+
+
+def _save_final_skeleton_contract_assets(full_mesh, *, durable_saves):
     """Persist the Full mesh, generated USkeleton, and imported wind together.
 
     Send2UE creates the dedicated Skeleton as a separate package. Saving only the
@@ -2182,17 +2407,19 @@ def _save_final_skeleton_contract_assets(full_mesh):
         )
     # Save the referenced dependency first, then the referring mesh package.
     asset_paths = [skeleton.get_path_name(), full_mesh.get_path_name()]
-    saved = []
-    for object_path in asset_paths:
-        asset_path = str(object_path).split(".")[0]
-        if not unreal.EditorAssetLibrary.save_asset(
-            asset_path,
-            only_if_is_dirty=False,
-        ):
-            raise RuntimeError(
-                f"failed to persist final Skeleton contract asset: {asset_path}"
-            )
-        saved.append(asset_path)
+    saved = [str(object_path).split(".")[0] for object_path in asset_paths]
+    _save_asset_owned(
+        saved[0],
+        durable_saves,
+        owner="final_skeleton_contract",
+        role="skeleton",
+    )
+    _save_asset_owned(
+        saved[1],
+        durable_saves,
+        owner="final_skeleton_contract",
+        role="mesh",
+    )
     return {
         "mesh": saved[1],
         "skeleton": saved[0],
@@ -2200,7 +2427,49 @@ def _save_final_skeleton_contract_assets(full_mesh):
     }
 
 
-def _save_large_assembly_without_thumbnail(asset_path):
+def _verify_final_skeleton_contract_receipt(
+    full_mesh,
+    receipt,
+    *,
+    durable_saves,
+):
+    if full_mesh is None:
+        raise RuntimeError("cannot verify a missing Full SK final mesh")
+    skeleton = full_mesh.get_editor_property("skeleton")
+    if skeleton is None:
+        raise RuntimeError("cannot verify Full SK without its final Skeleton")
+    skeleton_path = _normalized_unreal_asset_path(skeleton.get_path_name())
+    mesh_path = _normalized_unreal_asset_path(full_mesh.get_path_name())
+    expected = {
+        "mesh": mesh_path,
+        "skeleton": skeleton_path,
+        "saved": [skeleton_path, mesh_path],
+    }
+    if not isinstance(receipt, dict) or any(
+        receipt.get(field) != value for field, value in expected.items()
+    ):
+        raise RuntimeError(
+            "final Skeleton durable receipt does not match the live Full mesh: "
+            f"expected={expected}, actual={receipt}"
+        )
+    _require_durable_save(
+        durable_saves,
+        skeleton_path,
+        owner="final_skeleton_contract",
+        role="skeleton",
+        save_mode="editor_asset",
+    )
+    _require_durable_save(
+        durable_saves,
+        mesh_path,
+        owner="final_skeleton_contract",
+        role="mesh",
+        save_mode="editor_asset",
+    )
+    return expected
+
+
+def _save_large_assembly_without_thumbnail(asset_path, *, durable_saves):
     """Persist a built Nanite Assembly without rendering its thumbnail.
 
     UE 5.8's normal editor save path renders a missing SkeletalMesh thumbnail.
@@ -2226,11 +2495,25 @@ def _save_large_assembly_without_thumbnail(asset_path):
             "CodexMaterialToolsLibrary thumbnail-free package save API is "
             "unavailable"
         )
+    _validate_durable_save_ledger(durable_saves)
+    _assert_durable_save_unowned(
+        durable_saves,
+        candidate,
+        "final_nanite_assembly",
+    )
     if not saver(asset):
         raise RuntimeError(
             "failed to persist Cluster Assembly without thumbnail rendering: "
             + candidate
         )
+    _record_durable_save(
+        durable_saves,
+        candidate,
+        owner="final_nanite_assembly",
+        role="assembly",
+        save_mode="thumbnail_free",
+    )
+    _validate_durable_save_ledger(durable_saves)
     return candidate
 
 
@@ -2418,7 +2701,14 @@ def _best_effort_cancel_instanced_dynamic_wind_runtime(probe_token):
         }
 
 
-def _ingest_cluster_assembly(send2ue_unreal, item, full_wind):
+def _ingest_cluster_assembly(
+    send2ue_unreal,
+    item,
+    full_wind,
+    *,
+    durable_saves=None,
+    final_skeleton_receipt=None,
+):
     payload = item.get("cluster_assembly")
     if not payload:
         return {"status": "skipped", "reason": "no content-driven Assembly manifest"}
@@ -2430,6 +2720,11 @@ def _ingest_cluster_assembly(send2ue_unreal, item, full_wind):
     if (full_wind or {}).get("status") != "ok":
         raise RuntimeError(
             "Cluster Assembly requires successful Full SK final-skeleton wind import"
+        )
+    if durable_saves is None or final_skeleton_receipt is None:
+        raise RuntimeError(
+            "Cluster Assembly requires the authoritative final Skeleton durable "
+            "save receipt"
         )
     manifest = payload.get("manifest") or {}
     validate_manifest_artifacts(manifest)
@@ -2446,7 +2741,11 @@ def _ingest_cluster_assembly(send2ue_unreal, item, full_wind):
     if full_skeleton is None:
         raise RuntimeError("Cluster Assembly Full SK has no final Skeleton")
     full_skeleton_path = full_skeleton.get_path_name()
-    persisted_final_contract = _save_final_skeleton_contract_assets(full_mesh)
+    persisted_final_contract = _verify_final_skeleton_contract_receipt(
+        full_mesh,
+        final_skeleton_receipt,
+        durable_saves=durable_saves,
+    )
 
     generated_assets = []
     optimizations = []
@@ -2503,13 +2802,12 @@ def _ingest_cluster_assembly(send2ue_unreal, item, full_wind):
             save_writability.append(
                 _ensure_declared_package_writable(item, asset_path)
             )
-            if not unreal.EditorAssetLibrary.save_asset(
+            _save_asset_owned(
                 asset_path,
-                only_if_is_dirty=False,
-            ):
-                raise RuntimeError(
-                    f"failed to persist Assembly prototype before build: {asset_path}"
-                )
+                durable_saves,
+                owner="assembly_prototype_prebuild",
+                role="prototype",
+            )
             persisted_generated_assets.append(asset_path)
     result = build_unreal_nanite_assembly(unreal, manifest, asset_contract)
     assembly_path = result.get("assembly")
@@ -2523,7 +2821,10 @@ def _ingest_cluster_assembly(send2ue_unreal, item, full_wind):
         else None
     )
     thumbnail_free_saved = (
-        _save_large_assembly_without_thumbnail(assembly_path)
+        _save_large_assembly_without_thumbnail(
+            assembly_path,
+            durable_saves=durable_saves,
+        )
         if assembly_path
         else None
     )
@@ -2664,7 +2965,7 @@ def _material_compile_and_slot_validation(mesh_path):
     }
 
 
-def _save_item_assets(item, imported_assets):
+def _save_item_assets(item, imported_assets, *, durable_saves):
     asset_paths = []
     seen_paths = set()
     for value in imported_assets:
@@ -2679,23 +2980,78 @@ def _save_item_assets(item, imported_assets):
 
     saved = []
     for asset_path in asset_paths:
-        if asset_path and unreal.EditorAssetLibrary.does_asset_exist(asset_path):
-            if not unreal.EditorAssetLibrary.save_asset(
-                asset_path,
-                only_if_is_dirty=False,
-            ):
-                raise RuntimeError(f"failed to save imported asset: {asset_path}")
+        if not asset_path:
+            continue
+        existing_receipt = _find_durable_save(durable_saves, asset_path)
+        asset_exists = unreal.EditorAssetLibrary.does_asset_exist(asset_path)
+        if existing_receipt is not None and not asset_exists:
+            raise RuntimeError(
+                "owned durable asset disappeared from the Asset Registry: "
+                + _normalized_unreal_asset_path(asset_path)
+            )
+        if asset_exists:
+            if existing_receipt is not None:
+                _require_durable_save(durable_saves, asset_path)
+            else:
+                _save_asset_owned(
+                    asset_path,
+                    durable_saves,
+                    owner="terminal_item_assets",
+                    role="imported_asset",
+                )
             saved.append(asset_path)
+
     folder = item.get("unreal_folder")
-    if folder and not unreal.EditorAssetLibrary.save_directory(
-        folder,
-        only_if_is_dirty=True,
-    ):
-        raise RuntimeError(f"failed to save imported asset directory: {folder}")
+    if folder:
+        folder_path = str(folder).replace("\\", "/").rstrip("/") + "/"
+        folder_key = folder_path.casefold()
+        _validate_durable_save_ledger(durable_saves)
+        dirty_before = {
+            key: package
+            for key, package in _dirty_content_packages().items()
+            if key.startswith(folder_key)
+        }
+        owned_dirty = [
+            package
+            for key, package in dirty_before.items()
+            if _find_durable_save(durable_saves, package) is not None
+        ]
+        if owned_dirty:
+            raise RuntimeError(
+                "terminal directory save cannot take ownership of dirty durable "
+                "packages: "
+                + ", ".join(sorted(owned_dirty))
+            )
+        if not unreal.EditorAssetLibrary.save_directory(
+            folder,
+            only_if_is_dirty=True,
+        ):
+            raise RuntimeError(f"failed to save imported asset directory: {folder}")
+        dirty_after = _dirty_content_packages()
+        unsaved = [
+            package for key, package in dirty_before.items() if key in dirty_after
+        ]
+        if unsaved:
+            raise RuntimeError(
+                "terminal directory save left packages dirty: "
+                + ", ".join(sorted(unsaved))
+            )
+        for package in dirty_before.values():
+            _record_durable_save(
+                durable_saves,
+                package,
+                owner="terminal_directory",
+                role="auxiliary",
+                save_mode="directory_dirty_only",
+            )
+        _validate_durable_save_ledger(durable_saves)
+    else:
+        _validate_durable_save_ledger(durable_saves)
     return saved
 
 
 def ingest_item(item):
+    durable_saves = _new_durable_save_ledger()
     send2ue_unreal = _load_send2ue_unreal(item["send2ue_unreal_py"])
     checkout = _checkout_existing_assets(item)
     # Source-controlled packages must be writable before stale mesh/Skeleton
@@ -2796,11 +3152,22 @@ def ingest_item(item):
         and (item.get("wind_policy") or {}).get("requires_json")
     ):
         final_skeleton_saved = _save_final_skeleton_contract_assets(
-            unreal.EditorAssetLibrary.load_asset(mesh_path)
+            unreal.EditorAssetLibrary.load_asset(mesh_path),
+            durable_saves=durable_saves,
         )
-    assembly = _ingest_cluster_assembly(send2ue_unreal, item, wind)
+    assembly = _ingest_cluster_assembly(
+        send2ue_unreal,
+        item,
+        wind,
+        durable_saves=durable_saves,
+        final_skeleton_receipt=(final_skeleton_saved or None),
+    )
     imported_assets.extend(assembly.get("assets") or [])
-    saved = _save_item_assets(item, imported_assets)
+    saved = _save_item_assets(
+        item,
+        imported_assets,
+        durable_saves=durable_saves,
+    )
     optimization = _finalize_speedtree_skeletal_optimization(optimization)
     materials = _material_compile_and_slot_validation(mesh_path)
     item_status = _prepare_assembly_runtime_validation(assembly)
@@ -2819,6 +3186,7 @@ def ingest_item(item):
         "materials": materials,
         "optimization": optimization,
         "saved": saved,
+        "durable_saves": _durable_save_report(durable_saves),
     }
 
 

@@ -6,6 +6,7 @@ import types
 import unittest
 import stat
 from copy import deepcopy
+from contextlib import nullcontext
 from pathlib import Path
 
 
@@ -1604,6 +1605,427 @@ class NaniteVoxelMaterialUsageTests(unittest.TestCase):
         )
 
 
+class _DurableSaveFake:
+    def __init__(self, runner, content_dir):
+        self.runner = runner
+        self.content_dir = Path(content_dir)
+        self.assets = {}
+        self.dirty = set()
+        self.save_asset_calls = []
+        self.save_directory_calls = []
+        self.native_save_calls = []
+        self.write_count = 0
+        self.directory_intruder = None
+
+        environment = self
+
+        class FakePackage:
+            def __init__(self, path):
+                self.path = path
+
+            def get_path_name(self):
+                return self.path
+
+        class FakeEditorAssetLibrary:
+            @staticmethod
+            def does_asset_exist(path):
+                return environment.normalize(path) in environment.assets
+
+            @staticmethod
+            def load_asset(path):
+                return environment.assets.get(environment.normalize(path))
+
+            @staticmethod
+            def save_asset(path, only_if_is_dirty=False):
+                package = environment.normalize(path)
+                environment.save_asset_calls.append(
+                    (package, only_if_is_dirty)
+                )
+                environment.write_package(package, "editor")
+                environment.dirty.discard(package.casefold())
+                return True
+
+            @staticmethod
+            def save_directory(path, only_if_is_dirty=True):
+                folder = str(path).replace("\\", "/").rstrip("/") + "/"
+                environment.save_directory_calls.append(
+                    (path, only_if_is_dirty)
+                )
+                for key in list(environment.dirty):
+                    package = environment.package_for_key(key)
+                    if package and package.casefold().startswith(folder.casefold()):
+                        environment.write_package(package, "directory")
+                        environment.dirty.discard(key)
+                if environment.directory_intruder is not None:
+                    environment.directory_intruder()
+                return True
+
+        runner.unreal.Paths = types.SimpleNamespace(
+            project_content_dir=lambda: str(self.content_dir),
+            convert_relative_path_to_full=lambda value: value,
+        )
+        runner.unreal.EditorAssetLibrary = FakeEditorAssetLibrary
+        runner.unreal.EditorLoadingAndSavingUtils = types.SimpleNamespace(
+            get_dirty_content_packages=lambda: [
+                FakePackage(self.package_for_key(key))
+                for key in sorted(self.dirty)
+            ]
+        )
+
+    @staticmethod
+    def normalize(path):
+        return str(path or "").split(".", 1)[0].replace("\\", "/")
+
+    def package_for_key(self, key):
+        return next(
+            (
+                package
+                for package in self.assets
+                if package.casefold() == key
+            ),
+            None,
+        )
+
+    def package_file(self, package):
+        package = self.normalize(package)
+        return self.content_dir.joinpath(
+            *package[len("/Game/") :].split("/")
+        ).with_suffix(".uasset")
+
+    def write_package(self, package, source):
+        package_file = self.package_file(package)
+        package_file.parent.mkdir(parents=True, exist_ok=True)
+        self.write_count += 1
+        package_file.write_bytes(
+            f"{source}-{self.write_count}-{package}".encode("utf-8")
+        )
+        return package_file
+
+    def add_asset(self, package, asset=None):
+        package = self.normalize(package)
+        if asset is None:
+            asset = object()
+        self.assets[package] = asset
+        return asset
+
+    def install_thumbnail_free_saver(self):
+        def save(asset):
+            package = next(
+                path for path, candidate in self.assets.items()
+                if candidate is asset
+            )
+            self.native_save_calls.append(package)
+            self.write_package(package, "thumbnail-free")
+            self.dirty.discard(package.casefold())
+            return True
+
+        self.runner.unreal.CodexMaterialToolsLibrary = types.SimpleNamespace(
+            save_asset_package_without_thumbnail=save,
+        )
+
+
+class DurableSaveOwnershipTests(unittest.TestCase):
+    class FakeSkeleton:
+        def __init__(self, path):
+            self.path = path
+
+        def get_name(self):
+            return self.path.rsplit("/", 1)[-1]
+
+        def get_path_name(self):
+            name = self.path.rsplit("/", 1)[-1]
+            return f"{self.path}.{name}"
+
+    class FakeMesh:
+        def __init__(self, path, skeleton):
+            self.path = path
+            self.skeleton = skeleton
+
+        def get_path_name(self):
+            name = self.path.rsplit("/", 1)[-1]
+            return f"{self.path}.{name}"
+
+        def get_editor_property(self, name):
+            if name != "skeleton":
+                raise AssertionError(name)
+            return self.skeleton
+
+    def _final_contract(self, runner, environment):
+        mesh_path = "/Game/Meshes/Trees/SK_Test"
+        skeleton_path = mesh_path + "_Skeleton"
+        skeleton = self.FakeSkeleton(skeleton_path)
+        mesh = self.FakeMesh(mesh_path, skeleton)
+        environment.add_asset(skeleton_path, skeleton)
+        environment.add_asset(mesh_path, mesh)
+        ledger = runner._new_durable_save_ledger()
+        receipt = runner._save_final_skeleton_contract_assets(
+            mesh,
+            durable_saves=ledger,
+        )
+        return mesh, skeleton, ledger, receipt
+
+    def test_final_contract_owns_dependency_before_mesh_and_rejects_resave(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = _DurableSaveFake(runner, Path(temporary) / "Content")
+            mesh, _skeleton, ledger, receipt = self._final_contract(
+                runner,
+                environment,
+            )
+
+            self.assertEqual(
+                environment.save_asset_calls,
+                [
+                    (receipt["skeleton"], False),
+                    (receipt["mesh"], False),
+                ],
+            )
+            self.assertEqual(
+                [row["role"] for row in ledger["records"]],
+                ["skeleton", "mesh"],
+            )
+            self.assertEqual(
+                json.loads(json.dumps(runner._durable_save_report(ledger))),
+                ledger,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "already has an owner"):
+                runner._save_final_skeleton_contract_assets(
+                    mesh,
+                    durable_saves=ledger,
+                )
+            self.assertEqual(len(environment.save_asset_calls), 2)
+
+    def test_cluster_assembly_verifies_first_receipt_without_second_save(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = _DurableSaveFake(runner, Path(temporary) / "Content")
+            mesh, _skeleton, ledger, receipt = self._final_contract(
+                runner,
+                environment,
+            )
+            before = list(environment.save_asset_calls)
+            runner.validate_manifest_artifacts = lambda _manifest: None
+            runner._without_generated_physics_assets = lambda _module: nullcontext(True)
+            runner.build_unreal_nanite_assembly = (
+                lambda *_args: {"status": "ok", "assembly": None}
+            )
+
+            result = runner._ingest_cluster_assembly(
+                object(),
+                {
+                    "cluster_assembly": {
+                        "manifest": {"status": "ready"},
+                        "ingest_plan": {
+                            "status": "ready",
+                            "asset_contract": {
+                                "full_skeletal_mesh": mesh.path,
+                            },
+                            "assets": [],
+                        },
+                    }
+                },
+                {"status": "ok"},
+                durable_saves=ledger,
+                final_skeleton_receipt=receipt,
+            )
+
+            self.assertEqual(result["persisted_final_contract"], receipt)
+            self.assertEqual(environment.save_asset_calls, before)
+
+    def test_prototype_and_final_assembly_each_have_one_save_owner(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = _DurableSaveFake(runner, Path(temporary) / "Content")
+            mesh, _skeleton, ledger, receipt = self._final_contract(
+                runner,
+                environment,
+            )
+            prototype = "/Game/Meshes/Trees/Assembly/SK_Test_NA_Base"
+            assembly_path = (
+                "/Game/Meshes/Trees/Assembly/SK_Test_NaniteAssembly"
+            )
+            assembly = environment.add_asset(assembly_path)
+            environment.install_thumbnail_free_saver()
+            runner.validate_manifest_artifacts = lambda _manifest: None
+            runner.validate_file_fingerprint = lambda *_args: None
+            runner._without_generated_physics_assets = lambda _module: nullcontext(True)
+            runner._default_physics_asset_preexisting = lambda _path: False
+            runner._prepare_speedtree_skeletal_optimization = (
+                lambda *_args: {"status": "ok"}
+            )
+            runner._finalize_speedtree_skeletal_optimization = lambda value: value
+            runner._ensure_declared_package_writable = (
+                lambda _item, path: {"status": "writable", "asset": path}
+            )
+
+            def import_asset(_module, manifest_asset):
+                path = manifest_asset["asset_data"]["asset_path"]
+                environment.add_asset(path)
+                return {"asset_path": path}
+
+            runner._import_manifest_asset = import_asset
+            runner.build_unreal_nanite_assembly = (
+                lambda *_args: {
+                    "status": "ok",
+                    "assembly": assembly_path,
+                }
+            )
+            runner._material_compile_and_slot_validation = lambda _path: {}
+
+            result = runner._ingest_cluster_assembly(
+                object(),
+                {
+                    "cluster_assembly": {
+                        "manifest": {"status": "ready"},
+                        "ingest_plan": {
+                            "status": "ready",
+                            "asset_contract": {
+                                "full_skeletal_mesh": mesh.path,
+                            },
+                            "assets": [
+                                {
+                                    "asset_data": {
+                                        "asset_path": prototype,
+                                        "_material_pipeline_json_fingerprint": {},
+                                    }
+                                }
+                            ],
+                        },
+                    }
+                },
+                {"status": "ok"},
+                durable_saves=ledger,
+                final_skeleton_receipt=receipt,
+            )
+
+            self.assertEqual(result["persisted_generated_assets"], [prototype])
+            self.assertEqual(environment.save_asset_calls.count((prototype, False)), 1)
+            self.assertEqual(environment.native_save_calls, [assembly_path])
+            prototype_record = runner._find_durable_save(ledger, prototype)
+            assembly_record = runner._find_durable_save(ledger, assembly_path)
+            self.assertEqual(
+                prototype_record["owner"],
+                "assembly_prototype_prebuild",
+            )
+            self.assertEqual(assembly_record["save_mode"], "thumbnail_free")
+            self.assertIs(environment.assets[assembly_path], assembly)
+
+    def test_terminal_save_keeps_saved_shape_and_verifies_owned_asset(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = _DurableSaveFake(runner, Path(temporary) / "Content")
+            mesh_path = "/Game/Meshes/Trees/SK_Test"
+            provider_path = "/Game/Meshes/Trees/DA_WindProvider"
+            environment.add_asset(mesh_path)
+            environment.add_asset(provider_path)
+            ledger = runner._new_durable_save_ledger()
+            runner._save_asset_owned(
+                mesh_path,
+                ledger,
+                owner="final_skeleton_contract",
+                role="mesh",
+            )
+            before = list(environment.save_asset_calls)
+
+            saved = runner._save_item_assets(
+                {
+                    "mesh_path": mesh_path,
+                    "unreal_folder": "/Game/Meshes/Trees/",
+                },
+                [
+                    {"asset_path": mesh_path},
+                    {"asset_path": mesh_path},
+                    {"asset_path": provider_path},
+                ],
+                durable_saves=ledger,
+            )
+
+            self.assertEqual(saved, [mesh_path, provider_path])
+            self.assertEqual(
+                environment.save_asset_calls,
+                before + [(provider_path, False)],
+            )
+            self.assertEqual(
+                environment.save_directory_calls,
+                [("/Game/Meshes/Trees/", True)],
+            )
+
+    def test_terminal_directory_save_rejects_dirty_owned_package(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = _DurableSaveFake(runner, Path(temporary) / "Content")
+            assembly_path = (
+                "/Game/Meshes/Trees/Assembly/SK_Test_NaniteAssembly"
+            )
+            environment.add_asset(assembly_path)
+            environment.install_thumbnail_free_saver()
+            ledger = runner._new_durable_save_ledger()
+            runner._save_large_assembly_without_thumbnail(
+                assembly_path,
+                durable_saves=ledger,
+            )
+            environment.dirty.add(assembly_path.casefold())
+
+            with self.assertRaisesRegex(RuntimeError, "became dirty"):
+                runner._save_item_assets(
+                    {"unreal_folder": "/Game/Meshes/Trees/"},
+                    [],
+                    durable_saves=ledger,
+                )
+            self.assertEqual(environment.save_directory_calls, [])
+
+    def test_terminal_directory_save_detects_owned_package_stat_change(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = _DurableSaveFake(runner, Path(temporary) / "Content")
+            assembly_path = (
+                "/Game/Meshes/Trees/Assembly/SK_Test_NaniteAssembly"
+            )
+            environment.add_asset(assembly_path)
+            environment.install_thumbnail_free_saver()
+            ledger = runner._new_durable_save_ledger()
+            runner._save_large_assembly_without_thumbnail(
+                assembly_path,
+                durable_saves=ledger,
+            )
+            environment.directory_intruder = lambda: environment.write_package(
+                assembly_path,
+                "intruding-directory-save",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "changed after ownership"):
+                runner._save_item_assets(
+                    {"unreal_folder": "/Game/Meshes/Trees/"},
+                    [],
+                    durable_saves=ledger,
+                )
+
+    def test_terminal_directory_records_only_unowned_dirty_auxiliaries(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = _DurableSaveFake(runner, Path(temporary) / "Content")
+            auxiliary = "/Game/Meshes/Trees/MI_Auxiliary"
+            environment.add_asset(auxiliary)
+            environment.dirty.add(auxiliary.casefold())
+            ledger = runner._new_durable_save_ledger()
+
+            saved = runner._save_item_assets(
+                {"unreal_folder": "/Game/Meshes/Trees/"},
+                [],
+                durable_saves=ledger,
+            )
+
+            self.assertEqual(saved, [])
+            self.assertEqual(len(ledger["records"]), 1)
+            record = ledger["records"][0]
+            self.assertEqual(record["package"], auxiliary)
+            self.assertEqual(record["owner"], "terminal_directory")
+            self.assertEqual(record["role"], "auxiliary")
+            self.assertEqual(record["save_mode"], "directory_dirty_only")
+            self.assertNotIn(auxiliary.casefold(), environment.dirty)
+
+
 class UnrealIngestSaveTests(unittest.TestCase):
     @staticmethod
     def _configure_ingest_runner(runner, events, mesh_path):
@@ -1626,62 +2048,52 @@ class UnrealIngestSaveTests(unittest.TestCase):
         runner._finalize_speedtree_skeletal_optimization = lambda value: value
         runner._clear_placeholder_skeleton_before_import = lambda _item: {"status": "ok"}
         runner._apply_dynamic_wind = lambda _item: {"status": "ok"}
-        runner._save_item_assets = (
-            lambda _item, _assets: events.append("save") or [mesh_path]
+        runner._save_item_assets = lambda _item, _assets, **_kwargs: (
+            events.append("save") or [mesh_path]
         )
 
     def test_save_item_assets_deduplicates_imported_mesh_path(self):
         runner = load_runner()
-        save_calls = []
-        directory_calls = []
-
-        class FakeEditorAssetLibrary:
-            @staticmethod
-            def does_asset_exist(_path):
-                return True
-
-            @staticmethod
-            def save_asset(path, only_if_is_dirty=False):
-                save_calls.append((path, only_if_is_dirty))
-                return True
-
-            @staticmethod
-            def save_directory(path, only_if_is_dirty=True):
-                directory_calls.append((path, only_if_is_dirty))
-                return True
-
-        runner.unreal.EditorAssetLibrary = FakeEditorAssetLibrary
         mesh_path = "/Game/Meshes/Trees/SK_Test"
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = _DurableSaveFake(runner, Path(temporary) / "Content")
+            environment.add_asset(mesh_path)
+            saved = runner._save_item_assets(
+                {
+                    "mesh_path": mesh_path,
+                    "unreal_folder": "/Game/Meshes/Trees/",
+                },
+                [{"asset_path": mesh_path}, {"asset_path": mesh_path}],
+                durable_saves=runner._new_durable_save_ledger(),
+            )
 
-        saved = runner._save_item_assets(
-            {"mesh_path": mesh_path, "unreal_folder": "/Game/Meshes/Trees/"},
-            [{"asset_path": mesh_path}, {"asset_path": mesh_path}],
-        )
-
-        self.assertEqual(saved, [mesh_path])
-        self.assertEqual(save_calls, [(mesh_path, False)])
-        self.assertEqual(directory_calls, [("/Game/Meshes/Trees/", True)])
+            self.assertEqual(saved, [mesh_path])
+            self.assertEqual(
+                environment.save_asset_calls,
+                [(mesh_path, False)],
+            )
+            self.assertEqual(
+                environment.save_directory_calls,
+                [("/Game/Meshes/Trees/", True)],
+            )
 
     def test_large_assembly_uses_thumbnail_free_package_save(self):
         runner = load_runner()
         assembly_path = "/Game/Meshes/Trees/Assembly/SK_Test_NaniteAssembly"
-        assembly = object()
-        saved = []
-        runner.unreal.EditorAssetLibrary = types.SimpleNamespace(
-            load_asset=lambda path: assembly if path == assembly_path else None,
-        )
-        runner.unreal.CodexMaterialToolsLibrary = types.SimpleNamespace(
-            save_asset_package_without_thumbnail=(
-                lambda asset: saved.append(asset) or True
-            ),
-        )
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = _DurableSaveFake(runner, Path(temporary) / "Content")
+            environment.add_asset(assembly_path)
+            environment.install_thumbnail_free_saver()
+            ledger = runner._new_durable_save_ledger()
 
-        result = runner._save_large_assembly_without_thumbnail(
-            assembly_path + ".SK_Test_NaniteAssembly"
-        )
+            result = runner._save_large_assembly_without_thumbnail(
+                assembly_path + ".SK_Test_NaniteAssembly",
+                durable_saves=ledger,
+            )
 
-        self.assertEqual(result, assembly_path)
-        self.assertEqual(saved, [assembly])
+            self.assertEqual(result, assembly_path)
+            self.assertEqual(environment.native_save_calls, [assembly_path])
+            self.assertEqual(ledger["records"][0]["save_mode"], "thumbnail_free")
 
     def test_large_assembly_save_fails_closed_without_native_helper(self):
         runner = load_runner()
@@ -1694,7 +2106,8 @@ class UnrealIngestSaveTests(unittest.TestCase):
             "thumbnail-free package save API is unavailable",
         ):
             runner._save_large_assembly_without_thumbnail(
-                "/Game/Meshes/Trees/Assembly/SK_Test_NaniteAssembly"
+                "/Game/Meshes/Trees/Assembly/SK_Test_NaniteAssembly",
+                durable_saves=runner._new_durable_save_ledger(),
             )
 
     def test_ingest_item_saves_once_before_material_validation(self):
@@ -1716,6 +2129,10 @@ class UnrealIngestSaveTests(unittest.TestCase):
 
         self.assertEqual(events, ["save", "validate"])
         self.assertEqual(result["saved"], [mesh_path])
+        self.assertEqual(
+            result["durable_saves"],
+            {"schema_version": 1, "records": []},
+        )
 
     @staticmethod
     def _skeleton_fixture(
