@@ -93,11 +93,12 @@ geometry는 만들지만 export bone record는 만들지 않습니다. 이 경�
 source bone ID가 모두 0이 되어 grass 한 패치가 `Root` 하나에 붙습니다.
 
 지면 배치는 런타임 부모 체인이 정확히
-`CLeafMeshNode -> CZoneNode -> CStartNode`인 경우에 적용됩니다. 또한 과거의
-"Branch/Base 조상 Leaf Mesh 제외" 정책은 제거되었습니다. 현재는
-`Leaf Mesh -> Branch ... -> Base` 체인의 Base가 유효한
-`CBaseRefNode -> target CBranchNode` 역참조를 가질 때도 leaf별 exact bone을
-생성합니다. 불완전한 BaseRef 체인을 이름이나 위치로 추정하지 않습니다.
+`CLeafMeshNode -> CZoneNode -> CStartNode`인 경우에만 적용됩니다.
+`Leaf Mesh -> Branch ... -> Base` 데이터는 Leaf별 본을 만들지 않습니다.
+비-Cluster Branch/Spline Branch의 무본 문제는 SPM의 해당 generator를
+`Physics:Bone style=Absolute`, `Physics:Bones=1`로 영구 수정해 해결하며,
+그 Branch에 연결된 Leaf Mesh는 Modeler가 내보낸 기존 Branch 웨이트를 그대로
+사용합니다.
 
 이 변경은 최종 Tree/Grass SPM에만 적용됩니다. 부모 폴더가 `Cluster`이거나
 stem이 `SK_cluster_`인 클러스터 소스는 leaf별 synthetic bone 대상에서 제외하며,

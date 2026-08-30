@@ -201,8 +201,6 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         self.assertIn(".?AVCFrondNode@@", scope)
         self.assertIn("return sawZone", scope)
         self.assertIn("!clusterSource && IsRootZoneLeafMesh", leaf_export)
-        self.assertIn("ClassifyBaseRefBranchLeaf", leaf_export)
-        self.assertIn("rootZoneLeaf || baseRefBranchLeaf", leaf_export)
         self.assertIn("geometryEndBefore == geometryEndAfter", leaf_export)
         self.assertIn("if (!needsSyntheticBone)", leaf_export)
         self.assertIn("ReserveSyntheticLeafBoneId", leaf_export)
@@ -210,34 +208,6 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         self.assertIn("primary.replacementWeight = 1.0", weight_hook)
         self.assertIn("RemoveHook(gLeafMeshExportHook)", source)
         self.assertIn("HookedLeafMeshExport", source[source.index("bool InstallHooks"):])
-
-    def test_baseref_branch_leaf_meshes_get_exact_rigid_bones(self):
-        source = HOOK_SOURCE.read_text(encoding="utf-8")
-        scope = source[
-            source.index("BaseRefBranchLeafStatus ClassifyBaseRefBranchLeaf"):
-            source.index("void LogMissingIdZeroBoneRecordOnce")
-        ]
-
-        self.assertIn(".?AVCBranchNode@@", scope)
-        self.assertIn(".?AVCBaseNode@@", scope)
-        self.assertIn(".?AVCBaseRefNode@@", scope)
-        self.assertIn("baseBytes + 0x2C8", scope)
-        self.assertIn("baseBytes + 0x2D0", scope)
-        self.assertIn("targetBranch", scope)
-        self.assertIn("immediateBranch", scope)
-        self.assertIn("if (immediateBranch == nullptr)", scope)
-        self.assertIn("ResolveExactBaseRefLeafParentBoneId", scope)
-        self.assertIn("0x500 / sizeof(void*)", scope)
-        self.assertIn("0x6F8 / sizeof(void*)", scope)
-        self.assertIn("leafNode) + 0x140", scope)
-        self.assertIn("resolveAttachmentBone", scope)
-        root_scope = source[
-            source.index("bool IsRootZoneLeafMesh"):
-            source.index("BaseRefBranchLeafStatus ClassifyBaseRefBranchLeaf")
-        ]
-        self.assertNotIn(
-            'std::strcmp(type, ".?AVCBaseNode@@") == 0', root_scope
-        )
 
     def test_cluster_sources_keep_single_axis_reference_bone_policy(self):
         source = HOOK_SOURCE.read_text(encoding="utf-8")
@@ -253,7 +223,6 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         self.assertIn('L"cluster"', classifier)
         self.assertIn('L"SK_cluster_"', classifier)
         self.assertIn("!clusterSource && IsRootZoneLeafMesh", leaf_export)
-        self.assertIn("ClassifyBaseRefBranchLeaf", leaf_export)
         self.assertIn("NativeParsedBoneCount() == 0", leaf_export)
 
     def test_zero_bone_spm_gets_one_absolute_rigid_fallback(self):
@@ -284,26 +253,15 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         self.assertIn("sourceBoneId == gZeroBoneAbsoluteFallbackId", weight_hook)
         self.assertIn("primary.replacementWeight = 1.0", weight_hook)
 
-    def test_baseref_leaf_parent_and_cluster_fallback_are_fail_closed(self):
+    def test_cluster_fallback_is_fail_closed(self):
         source = HOOK_SOURCE.read_text(encoding="utf-8")
-        leaf_export = source[
-            source.index("void __fastcall HookedLeafMeshExport"):
-            source.index("void LogCollisionInputTypes")
-        ]
         insert_hook = source[
             source.index("void __fastcall HookedInsertExportBone"):
             source.index("bool TryReadExportGeometryEnd")
         ]
 
-        self.assertIn("ResolveExactBaseRefLeafParentBoneId", leaf_export)
-        self.assertIn("baseRefParentBranch", leaf_export)
         self.assertIn("gObservedExportBoneIds[row.boneId]", source)
         self.assertIn("return gObservedExportBoneIds.size()", source)
-        self.assertIn("RequireExactParentBoneId(parentId)", source)
-        self.assertIn("gRequiredExactParentBoneIds", source)
-        self.assertIn("was never serialized by the native exporter", source)
-        self.assertIn("could not resolve an exact native parent bone ID", source)
-        self.assertIn("BaseRefBranchLeafStatus::Invalid", leaf_export)
         self.assertIn("gZeroBoneAbsoluteFallbackId > 0", insert_hook)
         self.assertIn("cannot absorb a later native bone", insert_hook)
         self.assertNotIn("FindNearest", source)
