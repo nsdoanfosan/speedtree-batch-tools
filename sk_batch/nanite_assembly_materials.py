@@ -246,11 +246,26 @@ def audit_unreal_skeletal_mesh_material_sections(unreal, mesh_path, slot_count=N
         )
 
     raw = audit(str(mesh_path))
-    values = raw if isinstance(raw, tuple) else (raw,)
-    native_success = next(
-        (value for value in values if isinstance(value, bool)),
-        None,
-    )
+    if (
+        isinstance(raw, tuple)
+        and len(raw) == 3
+        and type(raw[0]) is bool
+        and isinstance(raw[1], str)
+        and isinstance(raw[2], list)
+    ):
+        native_success = raw[0]
+    elif (
+        isinstance(raw, tuple)
+        and len(raw) == 2
+        and isinstance(raw[0], str)
+        and isinstance(raw[1], list)
+    ):
+        native_success = None
+    else:
+        raise NaniteAssemblyMaterialError(
+            "skeletal mesh material-section audit returned an unexpected "
+            f"Python binding shape: {type(raw).__name__}"
+        )
     try:
         result = _json_result(raw)
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -274,7 +289,10 @@ def audit_unreal_skeletal_mesh_material_sections(unreal, mesh_path, slot_count=N
         )
 
     expected_mesh = str(mesh_path)
-    if result.get("schema_version") != MATERIAL_SECTION_AUDIT_SCHEMA_VERSION:
+    if (
+        type(result.get("schema_version")) is not int
+        or result.get("schema_version") != MATERIAL_SECTION_AUDIT_SCHEMA_VERSION
+    ):
         raise NaniteAssemblyMaterialError(
             "skeletal mesh material-section audit schema mismatch: "
             f"expected={MATERIAL_SECTION_AUDIT_SCHEMA_VERSION}, "
@@ -336,7 +354,7 @@ def audit_unreal_skeletal_mesh_material_sections(unreal, mesh_path, slot_count=N
             raise NaniteAssemblyMaterialError(
                 "skeletal mesh material-section audit material row is malformed"
             )
-        if row.get("index") != material_index:
+        if type(row.get("index")) is not int or row.get("index") != material_index:
             raise NaniteAssemblyMaterialError(
                 "skeletal mesh material-section audit material order changed: "
                 f"expected={material_index}, actual={row.get('index')!r}"

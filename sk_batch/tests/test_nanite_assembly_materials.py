@@ -128,6 +128,46 @@ class SkeletalMeshMaterialSectionAuditTests(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["slot_count"], 2)
 
+    def test_ue58_python_binding_without_bool_still_fails_closed(self):
+        failed_payload = self.payload()
+        failed_payload["ok"] = False
+        cases = [
+            (json.dumps(failed_payload), []),
+            (json.dumps(self.payload()), ["native audit error"]),
+        ]
+        for raw in cases:
+            with self.subTest(raw=raw):
+                with self.assertRaisesRegex(
+                    NaniteAssemblyMaterialError,
+                    "material-section audit failed",
+                ):
+                    audit_unreal_skeletal_mesh_material_sections(
+                        self.fake_unreal(raw),
+                        self.MESH,
+                        slot_count=2,
+                    )
+
+    def test_unexpected_python_binding_shapes_fail_closed(self):
+        payload = json.dumps(self.payload())
+        cases = [
+            payload,
+            (payload,),
+            (0, payload, []),
+            (payload, "not-an-error-array"),
+            ("unexpected", payload, []),
+        ]
+        for raw in cases:
+            with self.subTest(raw=raw):
+                with self.assertRaisesRegex(
+                    NaniteAssemblyMaterialError,
+                    "unexpected Python binding shape",
+                ):
+                    audit_unreal_skeletal_mesh_material_sections(
+                        self.fake_unreal(raw),
+                        self.MESH,
+                        slot_count=2,
+                    )
+
     def test_missing_lightweight_helper_fails_closed(self):
         fake_unreal = types.SimpleNamespace(
             CodexMaterialToolsLibrary=types.SimpleNamespace(
@@ -149,7 +189,7 @@ class SkeletalMeshMaterialSectionAuditTests(unittest.TestCase):
 
     def test_native_failure_or_returned_errors_fails_closed(self):
         cases = [
-            (False, json.dumps({**self.payload(), "ok": False}), []),
+            (False, json.dumps(self.payload()), []),
             (True, json.dumps(self.payload()), ["native audit error"]),
         ]
         for raw in cases:
@@ -170,6 +210,10 @@ class SkeletalMeshMaterialSectionAuditTests(unittest.TestCase):
         wrong_schema = self.payload()
         wrong_schema["schema_version"] = 2
         cases.append(("schema mismatch", wrong_schema, 2))
+
+        boolean_schema = self.payload()
+        boolean_schema["schema_version"] = True
+        cases.append(("schema mismatch", boolean_schema, 2))
 
         wrong_kind = self.payload()
         wrong_kind["audit"] = "skeletal_mesh_lod0_streams"
@@ -221,6 +265,20 @@ class SkeletalMeshMaterialSectionAuditTests(unittest.TestCase):
         with self.assertRaisesRegex(
             NaniteAssemblyMaterialError,
             "invalid section material indices",
+        ):
+            audit_unreal_skeletal_mesh_material_sections(
+                self.fake_unreal((True, json.dumps(payload), [])),
+                self.MESH,
+                slot_count=2,
+            )
+
+    def test_boolean_material_row_index_fails_closed(self):
+        payload = deepcopy(self.payload())
+        payload["materials"][0]["index"] = False
+
+        with self.assertRaisesRegex(
+            NaniteAssemblyMaterialError,
+            "material order changed",
         ):
             audit_unreal_skeletal_mesh_material_sections(
                 self.fake_unreal((True, json.dumps(payload), [])),
