@@ -133,7 +133,7 @@ class SourceReviewPolicyTests(unittest.TestCase):
 
     def test_live_contract_is_refreshed_without_a_second_validator(self):
         tree = job_tree()
-        export_lines = call_lines(tree, "run_speedtree_cli_export")
+        export_lines = call_lines(tree, "run_selected_speedtree_export")
         material_validation_lines = call_lines(
             tree, "validate_preflight_report"
         )
@@ -167,11 +167,11 @@ class SourceReviewPolicyTests(unittest.TestCase):
                 and (
                     (
                         isinstance(node.func, ast.Attribute)
-                        and node.func.attr == "run_speedtree_cli_export"
+                        and node.func.attr == "run_selected_speedtree_export"
                     )
                     or (
                         isinstance(node.func, ast.Name)
-                        and node.func.id == "run_speedtree_cli_export"
+                        and node.func.id == "run_selected_speedtree_export"
                     )
                 )
             ),
@@ -192,6 +192,12 @@ class SourceReviewPolicyTests(unittest.TestCase):
                     )
                 ),
             )
+
+    def test_runtime_gateway_selects_only_explicit_export_modes(self):
+        source = JOB_PATH.read_text(encoding="utf-8")
+        self.assertIn('"run_speedtree_cli_export"', source)
+        self.assertIn('"run_fresh_verification_only_export"', source)
+        self.assertIn("run_selected_speedtree_export =", source)
 
 
 if __name__ == "__main__":

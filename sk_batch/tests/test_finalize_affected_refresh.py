@@ -432,6 +432,7 @@ def _bind_handoff_artifact(bundle, artifact: Path):
 
 
 def _validate_fixture_artifacts(item):
+    validated = []
     for record in item.get("handoff_files") or []:
         path = Path(record["path"])
         payload = path.read_bytes()
@@ -440,6 +441,8 @@ def _validate_fixture_artifacts(item):
         actual = hashlib.blake2b(payload, digest_size=16).hexdigest()
         if actual != record["fingerprint"]:
             raise finalizer.PushUnrealRecoveryError("handoff file content changed")
+        validated.append(record)
+    return validated
 
 
 def test_inventory_uses_selected_array_order_not_mutated_flags(tmp_path):
@@ -466,6 +469,34 @@ def test_stable_source_snapshot_detects_change_after_audit(tmp_path):
 
     with pytest.raises(finalizer.FinalizationError, match="changed after audit"):
         finalizer.verify_snapshot_unchanged(snapshot)
+
+
+def test_stable_artifact_read_binds_both_validator_hash_algorithms(
+    tmp_path, monkeypatch,
+):
+    path = tmp_path / "artifact.fbx"
+    payload = b"exact-artifact-bytes" * 150_000
+    path.write_bytes(payload)
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("artifact hashing must remain streaming")
+        ),
+    )
+
+    snapshot = finalizer.read_stable_file(
+        path,
+        expected_size=len(payload),
+        expected_sha256=hashlib.sha256(payload).hexdigest(),
+        expected_fingerprint=hashlib.blake2b(payload, digest_size=16).hexdigest(),
+    )
+
+    assert snapshot.sha256 == hashlib.sha256(payload).hexdigest()
+    with pytest.raises(finalizer.FinalizationError, match="SHA-256 changed"):
+        finalizer.read_stable_file(path, expected_sha256="0" * 64)
+    with pytest.raises(finalizer.FinalizationError, match="fingerprint changed"):
+        finalizer.read_stable_file(path, expected_fingerprint="0" * 32)
 
 
 def test_active_running_fleet_writer_is_blocked(tmp_path):
@@ -778,6 +809,70 @@ def test_later_normal_bundle_success_seals_rejected_verification_fallback(tmp_pa
     assert winner.sealed_attempts == (fallback.bundle_id,)
 
 
+def test_latest_success_alone_seals_mutable_handoff_after_fallback(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(
+        finalizer, "validate_item_artifacts", _validate_fixture_artifacts
+    )
+    inventory_path, rows = _write_inventory(tmp_path / "inventory", count=1)
+    inventory = finalizer.load_ordered_inventory(inventory_path, expected_count=1)
+    target = _target_from_inventory(inventory)
+    first = datetime(2026, 8, 30, 13, tzinfo=timezone.utc)
+    handoff = tmp_path / "shared" / "root.fbx"
+    handoff.parent.mkdir(parents=True)
+    handoff.write_text("fallback-bytes", encoding="utf-8")
+    fallback = _write_bundle(
+        tmp_path / "logs", "fallback", 1, rows[0], started_at=first
+    )
+    fallback_payload = json.loads(
+        fallback.assembly_report.read_text(encoding="utf-8")
+    )
+    for row in fallback_payload["speedtree_export"]["exports"].values():
+        row["verification_only"] = True
+        row["bundled_process"] = False
+        row["bundle_fallback"] = True
+    _write_json(fallback.assembly_report, fallback_payload)
+    _bind_handoff_artifact(fallback, handoff)
+
+    handoff.write_text("latest-normal-bytes", encoding="utf-8")
+    normal = _write_bundle(
+        tmp_path / "logs",
+        "normal_rerun",
+        1,
+        rows[0],
+        started_at=first + timedelta(minutes=10),
+    )
+    _bind_handoff_artifact(normal, handoff)
+    fallback_structural = finalizer.validate_exact_bundle(
+        fallback, target, verify_artifacts=False
+    )
+    normal_structural = finalizer.validate_exact_bundle(
+        normal, target, verify_artifacts=False
+    )
+
+    verified = finalizer._verify_latest_success_artifacts(
+        target,
+        [fallback_structural, normal_structural],
+        {"fallback": None, "normal_rerun": None},
+        verify_artifacts=True,
+    )
+    winner = finalizer.reduce_attempt_history(target, verified)
+
+    assert verified[0].classification == finalizer.AMBIGUOUS_FAILURE
+    assert verified[1].classification == finalizer.SUCCESS
+    artifact_snapshots = [
+        snapshot for snapshot in verified[1].snapshots
+        if snapshot.path == handoff.resolve()
+    ]
+    assert len(artifact_snapshots) == 1
+    assert artifact_snapshots[0].sha256 == hashlib.sha256(
+        handoff.read_bytes()
+    ).hexdigest()
+    assert winner.candidate.bundle.run_id == "normal_rerun"
+    assert winner.sealed_attempts == (fallback.bundle_id,)
+
+
 def test_current_pass_through_evidence_needs_no_assembly_save_owner(tmp_path):
     inventory_path, rows = _write_inventory(tmp_path / "inventory", count=1)
     inventory = finalizer.load_ordered_inventory(inventory_path, expected_count=1)
@@ -794,6 +889,91 @@ def test_current_pass_through_evidence_needs_no_assembly_save_owner(tmp_path):
 
     assert verdict.classification == finalizer.SUCCESS
     assert verdict.evidence_schema == finalizer.CURRENT_EVIDENCE_SCHEMA
+
+
+def test_artifact_validator_must_return_a_content_bound_identity(
+    tmp_path, monkeypatch,
+):
+    inventory_path, rows = _write_inventory(tmp_path / "inventory", count=1)
+    inventory = finalizer.load_ordered_inventory(inventory_path, expected_count=1)
+    target = _target_from_inventory(inventory)
+    bundle = _write_bundle(tmp_path / "logs", "unbound", 1, rows[0])
+    artifact = tmp_path / "artifact.fbx"
+    artifact.write_bytes(b"bytes")
+    monkeypatch.setattr(
+        finalizer,
+        "validate_item_artifacts",
+        lambda _item: [{"path": str(artifact), "size": artifact.stat().st_size}],
+    )
+
+    verdict = finalizer.validate_exact_bundle(
+        bundle, target, verify_artifacts=True
+    )
+
+    assert verdict.classification == finalizer.INVALID
+    assert "not content-bound" in verdict.errors[0]
+
+
+def test_current_nested_artifact_requires_recorded_identity_match(
+    tmp_path, monkeypatch,
+):
+    inventory_path, rows = _write_inventory(tmp_path / "inventory", count=1)
+    inventory = finalizer.load_ordered_inventory(inventory_path, expected_count=1)
+    target = _target_from_inventory(inventory)
+    bundle = _write_bundle(tmp_path / "logs", "current_mismatch", 1, rows[0])
+    _mutate_success_state(bundle, _add_current_durable_save_evidence)
+    _promote_assembly_report_to_current(bundle)
+    artifact = tmp_path / "artifact.fbx"
+    payload = b"current-bytes"
+    artifact.write_bytes(payload)
+    monkeypatch.setattr(
+        finalizer,
+        "validate_item_artifacts",
+        lambda _item: [{
+            "path": str(artifact),
+            "size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "identity_scope": "cluster_assembly_artifact",
+            "recorded_identity_matches_current": False,
+        }],
+    )
+
+    verdict = finalizer.validate_exact_bundle(
+        bundle, target, verify_artifacts=True
+    )
+
+    assert verdict.classification == finalizer.INVALID
+    assert "differs from its recorded identity" in verdict.errors[0]
+
+
+def test_current_artifact_identity_requires_an_explicit_scope(
+    tmp_path, monkeypatch,
+):
+    inventory_path, rows = _write_inventory(tmp_path / "inventory", count=1)
+    inventory = finalizer.load_ordered_inventory(inventory_path, expected_count=1)
+    target = _target_from_inventory(inventory)
+    bundle = _write_bundle(tmp_path / "logs", "current_scope", 1, rows[0])
+    _mutate_success_state(bundle, _add_current_durable_save_evidence)
+    _promote_assembly_report_to_current(bundle)
+    artifact = tmp_path / "artifact.fbx"
+    payload = b"current-bytes"
+    artifact.write_bytes(payload)
+    monkeypatch.setattr(
+        finalizer,
+        "validate_item_artifacts",
+        lambda _item: [{
+            "path": str(artifact),
+            "size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }],
+    )
+
+    verdict = finalizer.validate_exact_bundle(
+        bundle, target, verify_artifacts=True
+    )
+
+    assert verdict.classification == finalizer.INVALID
+    assert "identity scope is missing or invalid" in verdict.errors[0]
 
 
 def test_incomplete_checkpoint_is_not_success(tmp_path):

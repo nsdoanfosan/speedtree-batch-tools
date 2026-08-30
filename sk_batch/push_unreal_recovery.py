@@ -119,9 +119,11 @@ def validate_item_artifacts(item):
     validated = []
     for group_label, records in groups:
         for index, record in enumerate(records):
-            validated.append(
-                validate_content_identity(record, f"{group_label} #{index + 1}")
+            identity = validate_content_identity(
+                record, f"{group_label} #{index + 1}"
             )
+            identity["identity_scope"] = "push_item_artifact"
+            validated.append(identity)
     assembly = item.get("cluster_assembly")
     if assembly is not None:
         manifest = assembly.get("manifest") if isinstance(assembly, dict) else None
@@ -130,9 +132,26 @@ def validate_item_artifacts(item):
                 "Cluster Assembly manifest is missing from the parent item"
             )
         try:
-            validate_manifest_artifacts(manifest)
+            checked = validate_manifest_artifacts(manifest)
         except ClusterAssemblyBuildError as exc:
             raise PushUnrealRecoveryError(str(exc)) from exc
+        for key in ("full_fbx", "base_fbx", "wind_json"):
+            record = checked.get(key)
+            if isinstance(record, dict) and record.get("path"):
+                identity = dict(record)
+                identity["identity_scope"] = "cluster_assembly_artifact"
+                validated.append(identity)
+        for record in (checked.get("parts") or {}).values():
+            if isinstance(record, dict) and record.get("path"):
+                identity = dict(record)
+                identity["identity_scope"] = "cluster_assembly_artifact"
+                validated.append(identity)
+                continue
+            plan_fbx = record.get("plan_fbx") if isinstance(record, dict) else None
+            if isinstance(plan_fbx, dict) and plan_fbx.get("path"):
+                identity = dict(plan_fbx)
+                identity["identity_scope"] = "cluster_assembly_artifact"
+                validated.append(identity)
     return validated
 
 

@@ -155,6 +155,72 @@ def read_stable_json(
     raise FinalizationError(f"stable JSON read failed: {candidate}: {last_error}")
 
 
+def read_stable_file(
+    path: Path | str,
+    *,
+    expected_size: int | None = None,
+    expected_sha256: str | None = None,
+    expected_fingerprint: str | None = None,
+    attempts: int = 3,
+    retry_delay: float = 0.02,
+) -> JsonSnapshot:
+    """Hash stable bytes and bind them to the validator's exact identity."""
+    candidate = Path(path).resolve()
+    last_error: Exception | None = None
+    for attempt in range(max(1, int(attempts))):
+        try:
+            before = candidate.stat()
+            sha256_digest = hashlib.sha256()
+            fingerprint_digest = hashlib.blake2b(digest_size=16)
+            observed_size = 0
+            with candidate.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    observed_size += len(chunk)
+                    sha256_digest.update(chunk)
+                    fingerprint_digest.update(chunk)
+            after = candidate.stat()
+            if (
+                before.st_size != after.st_size
+                or before.st_mtime_ns != after.st_mtime_ns
+                or observed_size != after.st_size
+            ):
+                raise FinalizationError(
+                    f"artifact changed during read: {candidate}"
+                )
+            sha256 = sha256_digest.hexdigest()
+            if expected_size is not None and observed_size != int(expected_size):
+                raise FinalizationError(
+                    f"validated artifact size changed: {candidate}"
+                )
+            if (
+                expected_sha256
+                and sha256.casefold() != str(expected_sha256).casefold()
+            ):
+                raise FinalizationError(
+                    f"validated artifact SHA-256 changed: {candidate}"
+                )
+            if expected_fingerprint:
+                fingerprint = fingerprint_digest.hexdigest()
+                if fingerprint.casefold() != str(expected_fingerprint).casefold():
+                    raise FinalizationError(
+                        f"validated artifact fingerprint changed: {candidate}"
+                    )
+            return JsonSnapshot(
+                path=candidate,
+                payload={},
+                sha256=sha256,
+                size=after.st_size,
+                mtime_ns=after.st_mtime_ns,
+            )
+        except (OSError, FinalizationError) as exc:
+            last_error = exc
+            if attempt + 1 < max(1, int(attempts)):
+                time.sleep(max(0.0, float(retry_delay)))
+    raise FinalizationError(
+        f"stable artifact read failed: {candidate}: {last_error}"
+    )
+
+
 def verify_snapshot_unchanged(snapshot: JsonSnapshot) -> None:
     try:
         stat_result = snapshot.path.stat()
@@ -850,17 +916,6 @@ def validate_exact_bundle(
         if checkpoint.get("current_item") not in (None, ""):
             raise FinalizationError("complete checkpoint still has current_item")
 
-        # Only a candidate that claims success may seal the mutable handoff
-        # artifacts against their current bytes.  A terminal failed/incomplete
-        # attempt above is ordered history, not a success claim; a strictly
-        # later fully validated success may seal it even when that later fresh
-        # run necessarily rewrote the same handoff path.
-        if verify_artifacts:
-            try:
-                validate_item_artifacts(item)
-            except PushUnrealRecoveryError as exc:
-                raise FinalizationError(str(exc)) from exc
-
         batch_snapshot = read_stable_json(bundle.batch)
         item_snapshot = read_stable_json(bundle.item_report)
         snapshots.extend((batch_snapshot, item_snapshot))
@@ -928,6 +983,58 @@ def validate_exact_bundle(
         if item_report.get("asset_cache"):
             raise FinalizationError("item report used an existing-asset fast path")
         evidence_schema = _validate_unreal_postcondition(item, batch_state)
+
+        # Only a candidate that claims success may seal the mutable handoff
+        # artifacts against their current bytes.  A terminal failed/incomplete
+        # attempt above is ordered history, not a success claim; a strictly
+        # later fully validated success may seal it even when that later fresh
+        # run necessarily rewrote the same handoff path.
+        if verify_artifacts:
+            try:
+                artifact_identities = validate_item_artifacts(item)
+            except PushUnrealRecoveryError as exc:
+                raise FinalizationError(str(exc)) from exc
+            artifact_snapshots: dict[str, JsonSnapshot] = {}
+            for identity in artifact_identities:
+                if not isinstance(identity, dict) or not identity.get("path"):
+                    raise FinalizationError(
+                        "validated artifact identity has no path"
+                    )
+                if identity.get("size") is None or not (
+                    identity.get("sha256") or identity.get("fingerprint")
+                ):
+                    raise FinalizationError(
+                        "validated artifact identity is not content-bound: "
+                        + str(identity.get("path"))
+                    )
+                if evidence_schema == CURRENT_EVIDENCE_SCHEMA:
+                    identity_scope = identity.get("identity_scope")
+                    if identity_scope not in {
+                        "push_item_artifact",
+                        "cluster_assembly_artifact",
+                    }:
+                        raise FinalizationError(
+                            "current artifact identity scope is missing or invalid: "
+                            + str(identity.get("path"))
+                        )
+                    if (
+                        identity_scope == "cluster_assembly_artifact"
+                        and identity.get("recorded_identity_matches_current") is not True
+                    ):
+                        raise FinalizationError(
+                            "current Assembly artifact differs from its recorded identity: "
+                            + str(identity.get("path"))
+                        )
+                artifact_snapshot = read_stable_file(
+                    identity["path"],
+                    expected_size=identity.get("size"),
+                    expected_sha256=identity.get("sha256"),
+                    expected_fingerprint=identity.get("fingerprint"),
+                )
+                artifact_snapshots[
+                    canonical_path(artifact_snapshot.path)
+                ] = artifact_snapshot
+            snapshots.extend(artifact_snapshots.values())
 
         assembly_snapshot = read_stable_json(bundle.assembly_report)
         snapshots.append(assembly_snapshot)
@@ -1088,6 +1195,35 @@ class AuditResult:
         return not self.missing and len(self.winners) == len(self.inventory.targets)
 
 
+def _verify_latest_success_artifacts(
+    target: InventoryTarget,
+    candidates: Iterable[CandidateVerdict],
+    fleet_results_by_run: dict[str, dict[str, Any] | None],
+    *,
+    verify_artifacts: bool,
+) -> list[CandidateVerdict]:
+    rows = list(candidates)
+    if not verify_artifacts:
+        return rows
+    successful_rows = [row for row in rows if row.classification == SUCCESS]
+    if not successful_rows:
+        return rows
+    latest_success = max(
+        successful_rows,
+        key=lambda row: (row.event_at, row.bundle.bundle_id),
+    )
+    verified_latest = validate_exact_bundle(
+        latest_success.bundle,
+        target,
+        fleet_result=fleet_results_by_run.get(latest_success.bundle.run_id),
+        verify_artifacts=True,
+    )
+    return [
+        verified_latest if row is latest_success else row
+        for row in rows
+    ]
+
+
 def audit_runs(
     inventory_path: Path | str,
     log_dir: Path | str,
@@ -1129,12 +1265,28 @@ def audit_runs(
             bundle,
             target,
             fleet_result=fleet_result,
-            verify_artifacts=verify_artifacts,
+            # Every forced-fresh success rewrites the same mutable handoff
+            # paths.  Historical attempts therefore cannot be compared with
+            # the current bytes until their temporal winner is known.  Their
+            # immutable reports are still validated here; the latest
+            # structurally successful attempt is sealed against the live
+            # handoff artifacts below.
+            verify_artifacts=False,
         ))
     winners: list[Winner] = []
     missing: list[str] = []
     for target in ordered.targets:
         rows = candidates_by_spm[target.canonical_spm]
+        rows = _verify_latest_success_artifacts(
+            target,
+            rows,
+            {
+                run_id: source.results_by_spm.get(target.canonical_spm)
+                for run_id, source in fleets.items()
+            },
+            verify_artifacts=verify_artifacts,
+        )
+        candidates_by_spm[target.canonical_spm] = rows
         try:
             winners.append(reduce_attempt_history(target, rows))
         except FinalizationError:
