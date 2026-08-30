@@ -44,6 +44,8 @@ ACTIVE_RECEIPT_INDEX_VERSION = 1
 ACTIVE_RECEIPT_DIRECTORY_NAME = "active_v1"
 ACTIVE_RECEIPT_MIGRATION_MARKER = ".active_index_v1_complete"
 MAX_TERMINAL_RECEIPTS = 512
+PROCESS_RECEIPT_REPLACE_RETRY_DELAYS_SECONDS = (0.01, 0.025, 0.05, 0.1)
+PROCESS_RECEIPT_RETRYABLE_WINERRORS = frozenset({5, 32})
 _DEFAULT_POPEN = subprocess.Popen
 _DEFAULT_RUN = subprocess.run
 _SUPERVISOR_LOCK = threading.RLock()
@@ -52,6 +54,27 @@ _SUPERVISOR = None
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _replace_path_with_windows_retry(source, target):
+    """Bound transient Windows sharing/access races without hiding failures."""
+    for attempt in range(
+        len(PROCESS_RECEIPT_REPLACE_RETRY_DELAYS_SECONDS) + 1
+    ):
+        try:
+            os.replace(source, target)
+            return
+        except OSError as exc:
+            retryable = (
+                getattr(exc, "winerror", None)
+                in PROCESS_RECEIPT_RETRYABLE_WINERRORS
+            )
+            if (
+                not retryable
+                or attempt >= len(PROCESS_RECEIPT_REPLACE_RETRY_DELAYS_SECONDS)
+            ):
+                raise
+            time.sleep(PROCESS_RECEIPT_REPLACE_RETRY_DELAYS_SECONDS[attempt])
 
 
 class ProcessLifecycleError(RuntimeError):
@@ -532,7 +555,7 @@ def _publish_active_receipt_marker(directory, run_id):
             f"active_receipt_index_v{ACTIVE_RECEIPT_INDEX_VERSION}\n",
             encoding="ascii",
         )
-        os.replace(temporary, marker)
+        _replace_path_with_windows_retry(temporary, marker)
     finally:
         try:
             temporary.unlink()
@@ -785,33 +808,55 @@ class ProcessSupervisor:
             }
 
     def _write_receipt(self):
-        payload = self.receipt()
-        try:
-            self.receipt_dir.mkdir(parents=True, exist_ok=True)
+        # Every caller, including parallel worker completions, shares this
+        # per-supervisor RLock.  Keep the snapshot, temporary write, atomic
+        # replacement, and active-index transition in one ordered boundary so
+        # an older snapshot cannot replace a newer one after a racing writer.
+        with self._lock:
+            payload = self.receipt()
             temporary = self.receipt_path.with_name(
-                f".{self.receipt_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+                f".{self.receipt_path.name}.{os.getpid()}."
+                f"{threading.get_ident()}.tmp"
             )
-            temporary.write_text(
-                json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True)
-                + "\n",
-                encoding="utf-8",
-            )
-            os.replace(temporary, self.receipt_path)
-            if self.status in {"running", "shutting_down"}:
-                _publish_active_receipt_marker(
-                    self.receipt_dir,
-                    self.run_id,
+            try:
+                self.receipt_dir.mkdir(parents=True, exist_ok=True)
+                temporary.write_text(
+                    json.dumps(
+                        payload,
+                        indent=2,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
                 )
-            else:
-                _remove_active_receipt_marker(
-                    self.receipt_dir,
-                    self.run_id,
+                _replace_path_with_windows_retry(
+                    temporary,
+                    self.receipt_path,
                 )
-        except OSError as exc:
-            raise ProcessLifecycleError(
-                "process_receipt_write_failed",
-                evidence={"path": str(self.receipt_path), "error": str(exc)},
-            ) from exc
+                if self.status in {"running", "shutting_down"}:
+                    _publish_active_receipt_marker(
+                        self.receipt_dir,
+                        self.run_id,
+                    )
+                else:
+                    _remove_active_receipt_marker(
+                        self.receipt_dir,
+                        self.run_id,
+                    )
+            except OSError as exc:
+                raise ProcessLifecycleError(
+                    "process_receipt_write_failed",
+                    evidence={
+                        "path": str(self.receipt_path),
+                        "error": str(exc),
+                    },
+                ) from exc
+            finally:
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
 
     def _register_owned(
         self,
@@ -851,7 +896,16 @@ class ProcessSupervisor:
         with self._lock:
             self.entries.append(entry)
             self._entry_by_process_id[id(process)] = entry
-            self._write_receipt()
+            try:
+                self._write_receipt()
+            except BaseException:
+                if self._entry_by_process_id.get(id(process)) is entry:
+                    self._entry_by_process_id.pop(id(process), None)
+                try:
+                    self.entries.remove(entry)
+                except ValueError:
+                    pass
+                raise
         process.speedtree_lifecycle_launch_id = entry["launch_id"]
         process.speedtree_lifecycle_tree_job = tree_job
         return entry
