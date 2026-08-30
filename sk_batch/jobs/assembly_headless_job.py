@@ -988,12 +988,13 @@ def validate_speedtree_export_timeout_layering(
         or outer_timeout_seconds <= 0
     ):
         raise RuntimeError("SpeedTree outer export timeout must be a positive integer")
+    timeout_source = "environment"
     if wrapper_timeout_ms in (None, ""):
-        return {
-            "outer_timeout_seconds": outer_timeout_seconds,
-            "wrapper_timeout_ms": None,
-            "layering_validated": False,
-        }
+        # Direct Python/fleet entry points do not pass through SK_Exact_Push.bat,
+        # so apply the same native-wrapper budget here instead of silently
+        # falling back to the launcher's 600-second default.
+        wrapper_timeout_ms = 840000
+        timeout_source = "assembly_job_default"
     try:
         wrapper_ms = int(wrapper_timeout_ms)
     except (TypeError, ValueError) as exc:
@@ -1009,6 +1010,7 @@ def validate_speedtree_export_timeout_layering(
         "outer_timeout_seconds": outer_timeout_seconds,
         "wrapper_timeout_ms": wrapper_ms,
         "layering_validated": True,
+        "wrapper_timeout_source": timeout_source,
     }
 
 
@@ -1241,6 +1243,9 @@ def main():
     timeout_layering = validate_speedtree_export_timeout_layering(
         args.speedtree_export_timeout,
         os.environ.get("SPEEDTREE_COLLISION_WRAPPER_TIMEOUT_MS"),
+    )
+    os.environ["SPEEDTREE_COLLISION_WRAPPER_TIMEOUT_MS"] = str(
+        timeout_layering["wrapper_timeout_ms"]
     )
     report = {
         "spm": str(canonical_spm),

@@ -92,8 +92,18 @@ class ClusterSavePolicyTests(unittest.TestCase):
         policy = helper(1200, "840000")
         self.assertTrue(policy["layering_validated"])
         self.assertEqual(policy["wrapper_timeout_ms"], 840000)
+        self.assertEqual(policy["wrapper_timeout_source"], "environment")
+        defaulted = helper(1200, None)
+        self.assertTrue(defaulted["layering_validated"])
+        self.assertEqual(defaulted["wrapper_timeout_ms"], 840000)
+        self.assertEqual(
+            defaulted["wrapper_timeout_source"],
+            "assembly_job_default",
+        )
         with self.assertRaisesRegex(RuntimeError, "smaller"):
             helper(840, "840000")
+        with self.assertRaisesRegex(RuntimeError, "smaller"):
+            helper(840, None)
         with self.assertRaisesRegex(RuntimeError, "positive integer"):
             helper(1200, "not-a-number")
         with self.assertRaisesRegex(RuntimeError, "positive integer"):
