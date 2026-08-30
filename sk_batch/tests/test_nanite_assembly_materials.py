@@ -118,9 +118,27 @@ class SkeletalMeshMaterialSectionAuditTests(unittest.TestCase):
             ],
         )
 
+    @staticmethod
+    def reflected_error_array(*values):
+        array_type = type(
+            "Array",
+            (),
+            {
+                "__module__": "builtins",
+                "__init__": lambda self, rows: setattr(self, "rows", rows),
+                "__iter__": lambda self: iter(self.rows),
+            },
+        )
+        return array_type(values)
+
     def test_ue58_python_binding_without_native_bool_uses_validated_json(self):
         result = audit_unreal_skeletal_mesh_material_sections(
-            self.fake_unreal((json.dumps(self.payload()), [])),
+            self.fake_unreal(
+                (
+                    json.dumps(self.payload()),
+                    self.reflected_error_array(),
+                )
+            ),
             self.MESH,
             slot_count=2,
         )

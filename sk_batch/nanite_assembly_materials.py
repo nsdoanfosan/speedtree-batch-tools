@@ -189,6 +189,16 @@ def _unreal_slot_record(slot, index):
     }
 
 
+def _is_unreal_error_array(value):
+    """Recognize UE's reflected ``TArray<FString>`` without importing unreal."""
+
+    return isinstance(value, list) or (
+        type(value).__module__ == "builtins"
+        and type(value).__name__ == "Array"
+        and hasattr(value, "__iter__")
+    )
+
+
 def _json_result(raw):
     values = raw if isinstance(raw, tuple) else (raw,)
     payload = next(
@@ -199,7 +209,7 @@ def _json_result(raw):
         ),
         "{}",
     )
-    errors = next((value for value in values if isinstance(value, list)), [])
+    errors = next((value for value in values if _is_unreal_error_array(value)), [])
     result = json.loads(payload)
     result["returned_errors"] = [str(error) for error in errors]
     return result
@@ -251,14 +261,14 @@ def audit_unreal_skeletal_mesh_material_sections(unreal, mesh_path, slot_count=N
         and len(raw) == 3
         and type(raw[0]) is bool
         and isinstance(raw[1], str)
-        and isinstance(raw[2], list)
+        and _is_unreal_error_array(raw[2])
     ):
         native_success = raw[0]
     elif (
         isinstance(raw, tuple)
         and len(raw) == 2
         and isinstance(raw[0], str)
-        and isinstance(raw[1], list)
+        and _is_unreal_error_array(raw[1])
     ):
         native_success = None
     else:
