@@ -205,36 +205,185 @@ def _json_result(raw):
     return result
 
 
+MATERIAL_SECTION_AUDIT_SCHEMA_VERSION = 1
+MATERIAL_SECTION_AUDIT_KIND = "skeletal_mesh_lod0_material_sections"
+MATERIAL_SECTION_FIELDS = (
+    "section",
+    "material_index",
+    "base_index",
+    "num_triangles",
+    "base_vertex_index",
+    "num_vertices",
+)
+
+
+def _audit_integer(result, field, *, minimum=None):
+    value = result.get(field)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise NaniteAssemblyMaterialError(
+            f"skeletal mesh material-section audit has invalid {field}: {value!r}"
+        )
+    if minimum is not None and value < minimum:
+        raise NaniteAssemblyMaterialError(
+            f"skeletal mesh material-section audit has invalid {field}: {value!r}"
+        )
+    return value
+
+
 def audit_unreal_skeletal_mesh_material_sections(unreal, mesh_path, slot_count=None):
     """Fail closed when a render section points outside the material table."""
 
     library = getattr(unreal, "CodexMaterialToolsLibrary", None)
-    audit = getattr(library, "audit_skeletal_mesh_lod0_streams", None)
-    if not callable(audit):
-        return {
-            "status": "unavailable",
-            "mesh": str(mesh_path),
-            "reason": "CodexMaterialToolsLibrary audit is unavailable",
-        }
-    result = _json_result(audit(str(mesh_path)))
-    if result.get("returned_errors") or result.get("ok") is False:
-        raise NaniteAssemblyMaterialError(
-            f"skeletal mesh stream audit failed for {mesh_path}: {result}"
-        )
-    material_count = int(
-        slot_count
-        if slot_count is not None
-        else len(list(result.get("materials") or []))
+    audit = getattr(
+        library,
+        "audit_skeletal_mesh_lod0_material_sections",
+        None,
     )
-    invalid = [
-        {
-            "section": int(row.get("section", -1)),
-            "material_index": int(row.get("material_index", -1)),
-        }
-        for row in list(result.get("sections") or [])
-        if int(row.get("material_index", -1)) < 0
-        or int(row.get("material_index", -1)) >= material_count
-    ]
+    if not callable(audit):
+        raise NaniteAssemblyMaterialError(
+            "CodexMaterialToolsLibrary lightweight material-section audit is "
+            "unavailable"
+        )
+
+    raw = audit(str(mesh_path))
+    values = raw if isinstance(raw, tuple) else (raw,)
+    native_success = next(
+        (value for value in values if isinstance(value, bool)),
+        None,
+    )
+    try:
+        result = _json_result(raw)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise NaniteAssemblyMaterialError(
+            f"skeletal mesh material-section audit returned invalid JSON for "
+            f"{mesh_path}: {exc}"
+        ) from exc
+    if (
+        native_success is not True
+        or result.get("returned_errors")
+        or result.get("ok") is not True
+    ):
+        raise NaniteAssemblyMaterialError(
+            f"skeletal mesh material-section audit failed for {mesh_path}: "
+            f"native_success={native_success!r}, result={result}"
+        )
+
+    expected_mesh = str(mesh_path)
+    if result.get("schema_version") != MATERIAL_SECTION_AUDIT_SCHEMA_VERSION:
+        raise NaniteAssemblyMaterialError(
+            "skeletal mesh material-section audit schema mismatch: "
+            f"expected={MATERIAL_SECTION_AUDIT_SCHEMA_VERSION}, "
+            f"actual={result.get('schema_version')!r}"
+        )
+    if result.get("audit") != MATERIAL_SECTION_AUDIT_KIND:
+        raise NaniteAssemblyMaterialError(
+            "skeletal mesh material-section audit kind mismatch: "
+            f"expected={MATERIAL_SECTION_AUDIT_KIND!r}, "
+            f"actual={result.get('audit')!r}"
+        )
+    if result.get("skeletal_mesh") != expected_mesh:
+        raise NaniteAssemblyMaterialError(
+            "skeletal mesh material-section audit target mismatch: "
+            f"expected={expected_mesh!r}, "
+            f"actual={result.get('skeletal_mesh')!r}"
+        )
+    if not isinstance(result.get("target_compiling_before"), bool):
+        raise NaniteAssemblyMaterialError(
+            "skeletal mesh material-section audit is missing the target compile state"
+        )
+    if result.get("target_compiling_after") is not False:
+        raise NaniteAssemblyMaterialError(
+            "skeletal mesh material-section audit target is still compiling"
+        )
+    if _audit_integer(result, "lod_index", minimum=0) != 0:
+        raise NaniteAssemblyMaterialError(
+            "skeletal mesh material-section audit did not inspect LOD0"
+        )
+    _audit_integer(result, "lod_count", minimum=1)
+
+    materials = result.get("materials")
+    sections = result.get("sections")
+    if not isinstance(materials, list) or not isinstance(sections, list):
+        raise NaniteAssemblyMaterialError(
+            "skeletal mesh material-section audit arrays are malformed"
+        )
+    material_count = _audit_integer(result, "material_count", minimum=0)
+    section_count = _audit_integer(result, "section_count", minimum=0)
+    if material_count != len(materials) or section_count != len(sections):
+        raise NaniteAssemblyMaterialError(
+            "skeletal mesh material-section audit count mismatch: "
+            f"materials={material_count}/{len(materials)}, "
+            f"sections={section_count}/{len(sections)}"
+        )
+    if slot_count is not None:
+        if isinstance(slot_count, bool) or not isinstance(slot_count, int):
+            raise NaniteAssemblyMaterialError(
+                f"skeletal mesh slot count is invalid: {slot_count!r}"
+            )
+        if slot_count != material_count:
+            raise NaniteAssemblyMaterialError(
+                "skeletal mesh material count changed across validation: "
+                f"loaded={slot_count}, audited={material_count}"
+            )
+
+    for material_index, row in enumerate(materials):
+        if not isinstance(row, dict):
+            raise NaniteAssemblyMaterialError(
+                "skeletal mesh material-section audit material row is malformed"
+            )
+        if row.get("index") != material_index:
+            raise NaniteAssemblyMaterialError(
+                "skeletal mesh material-section audit material order changed: "
+                f"expected={material_index}, actual={row.get('index')!r}"
+            )
+        for field in ("slot_name", "imported_slot_name", "material"):
+            if not isinstance(row.get(field), str):
+                raise NaniteAssemblyMaterialError(
+                    "skeletal mesh material-section audit material row is missing "
+                    f"{field}: index={material_index}"
+                )
+
+    normalized_sections = []
+    invalid = []
+    for section_index, row in enumerate(sections):
+        if not isinstance(row, dict):
+            raise NaniteAssemblyMaterialError(
+                "skeletal mesh material-section audit section row is malformed"
+            )
+        missing = [field for field in MATERIAL_SECTION_FIELDS if field not in row]
+        if missing:
+            raise NaniteAssemblyMaterialError(
+                "skeletal mesh material-section audit section row is missing "
+                f"fields: section={section_index}, missing={missing}"
+            )
+        values = {}
+        for field in MATERIAL_SECTION_FIELDS:
+            value = row[field]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise NaniteAssemblyMaterialError(
+                    "skeletal mesh material-section audit section row has invalid "
+                    f"{field}: section={section_index}, value={value!r}"
+                )
+            values[field] = value
+        if values["section"] != section_index:
+            raise NaniteAssemblyMaterialError(
+                "skeletal mesh material-section audit section order changed: "
+                f"expected={section_index}, actual={values['section']}"
+            )
+        if values["material_index"] >= material_count:
+            invalid.append(
+                {
+                    "section": values["section"],
+                    "material_index": values["material_index"],
+                }
+            )
+        normalized_sections.append(
+            {
+                "section": values["section"],
+                "material_index": values["material_index"],
+                "num_triangles": values["num_triangles"],
+            }
+        )
     if invalid:
         raise NaniteAssemblyMaterialError(
             f"skeletal mesh has invalid section material indices: "
@@ -244,14 +393,7 @@ def audit_unreal_skeletal_mesh_material_sections(unreal, mesh_path, slot_count=N
         "status": "ok",
         "mesh": str(mesh_path),
         "slot_count": material_count,
-        "sections": [
-            {
-                "section": int(row.get("section", -1)),
-                "material_index": int(row.get("material_index", -1)),
-                "num_triangles": int(row.get("num_triangles", 0)),
-            }
-            for row in list(result.get("sections") or [])
-        ],
+        "sections": normalized_sections,
     }
 
 
