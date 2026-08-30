@@ -615,16 +615,16 @@ class ClusterFleetPushTests(unittest.TestCase):
                 fresh_verification_only_export=True,
             )
 
-            self.assertNotIn("--fresh-verification-only-export", baseline)
+            self.assertNotIn("--fresh-collision-prune-export", baseline)
             self.assertEqual(
-                direct.count("--fresh-verification-only-export"),
+                direct.count("--fresh-collision-prune-export"),
                 1,
             )
             self.assertEqual(
                 [
                     value
                     for value in direct
-                    if value != "--fresh-verification-only-export"
+                    if value != "--fresh-collision-prune-export"
                 ],
                 baseline,
             )
@@ -646,6 +646,12 @@ class ClusterFleetPushTests(unittest.TestCase):
             "requires --force-native-export",
         ):
             main(["--fresh-verification-only-export"])
+
+        with self.assertRaisesRegex(
+            SystemExit,
+            "requires --force-native-export",
+        ):
+            main(["--fresh-collision-prune-export"])
 
     def test_fresh_verification_opt_in_is_forwarded_to_both_call_sites(self):
         source = Path(__file__).resolve().parents[1] / "cluster_fleet_push.py"

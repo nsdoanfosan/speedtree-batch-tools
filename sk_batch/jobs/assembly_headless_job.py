@@ -156,12 +156,14 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--fresh-collision-prune-export",
         "--fresh-verification-only-export",
+        dest="fresh_verification_only_export",
         action="store_true",
         help=(
-            "explicitly replace the normal collision-prune export with one "
-            "fresh verification-only FBX/XML/native-receipt transaction; "
-            "requires --force-native-export and fails closed"
+            "run one forced fresh normal Collision/Prune FBX/XML/native-"
+            "receipt transaction; the old fresh-verification-only spelling "
+            "is a compatibility alias and no longer skips Collision/Prune"
         ),
     )
     parser.add_argument(
@@ -942,17 +944,17 @@ def validate_native_export_mode_arguments(
     export_fbx=None,
     export_xml=None,
 ):
-    """Reject an incomplete sole-export opt-in before native execution."""
+    """Reject an incomplete fresh Collision/Prune opt-in before execution."""
     if fresh_verification_only_export and not force_native_export:
         raise RuntimeError(
-            "--fresh-verification-only-export requires "
+            "--fresh-collision-prune-export requires "
             "--force-native-export"
         )
     if fresh_verification_only_export and (
         export_fbx is not None or export_xml is not None
     ) and (export_fbx is not True or export_xml is not True):
         raise RuntimeError(
-            "--fresh-verification-only-export requires exact FBX and XML "
+            "--fresh-collision-prune-export requires exact FBX and XML "
             "export targets"
         )
 
@@ -1298,7 +1300,7 @@ def main():
         ]
         if args.fresh_verification_only_export:
             required_speedtree_capabilities.append(
-                "fresh_verification_export_v1"
+                "fresh_collision_prune_export_v1"
             )
         addon_runtime = prepare_runtime(
             "sk_batch.jobs.assembly_headless_job",
@@ -1336,7 +1338,7 @@ def main():
         run_selected_speedtree_export = addon_runtime.operation(
             "speedtree_bone_weight_repair",
             (
-                "run_fresh_verification_only_export"
+                "run_fresh_collision_prune_export"
                 if args.fresh_verification_only_export
                 else "run_speedtree_cli_export"
             ),
@@ -1522,9 +1524,8 @@ def main():
         if speedtree_export is None:
             export_kwargs = {
                 "timeout_seconds": args.speedtree_export_timeout,
+                "allow_verification_fallback": False,
             }
-            if not args.fresh_verification_only_export:
-                export_kwargs["allow_verification_fallback"] = False
             speedtree_export = run_selected_speedtree_export(
                 str(speedtree_spm),
                 speedtree_exe_path=export_settings["speedtree_exe_path"],
@@ -1545,7 +1546,7 @@ def main():
                 **export_kwargs,
             )
             report["speedtree_export_source"] = (
-                "fresh_verification_only_export_helper"
+                "forced_export_helper"
                 if args.fresh_verification_only_export
                 else (
                     "forced_export_helper"
@@ -1561,17 +1562,13 @@ def main():
             speedtree_export_started,
         )
         report["speedtree_export_execution_policy"] = (
-            validate_fresh_verification_export_result(speedtree_export)
-            if args.fresh_verification_only_export
-            else (
-                validate_normal_collision_export_result(speedtree_export)
-                if args.force_native_export
-                else {
-                    "status": "not_requested",
-                    "policy": "normal_collision_export_path",
-                    "explicit_opt_in": False,
-                }
-            )
+            validate_normal_collision_export_result(speedtree_export)
+            if args.force_native_export
+            else {
+                "status": "not_requested",
+                "policy": "normal_collision_export_path",
+                "explicit_opt_in": False,
+            }
         )
         fbx_export = speedtree_export["exports"].get("fbx", {})
         xml_export = speedtree_export["exports"].get("xml", {})
@@ -1636,9 +1633,8 @@ def main():
             else:
                 source_export_kwargs = {
                     "timeout_seconds": args.speedtree_export_timeout,
+                    "allow_verification_fallback": False,
                 }
-                if not args.fresh_verification_only_export:
-                    source_export_kwargs["allow_verification_fallback"] = False
                 assembly_source_export = run_selected_speedtree_export(
                     str(source_spm_path),
                     speedtree_exe_path=export_settings[
@@ -1663,13 +1659,7 @@ def main():
                     # the same exact native FBX/XML serialization contract.
                 )
             report["cluster_assembly_source_export"] = assembly_source_export
-            if args.fresh_verification_only_export:
-                report[
-                    "cluster_assembly_source_export_execution_policy"
-                ] = validate_fresh_verification_export_result(
-                    assembly_source_export
-                )
-            elif args.force_native_export:
+            if args.force_native_export:
                 report[
                     "cluster_assembly_source_export_execution_policy"
                 ] = validate_normal_collision_export_result(

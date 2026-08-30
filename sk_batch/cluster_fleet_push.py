@@ -165,7 +165,7 @@ def build_assembly_command(
 ):
     if fresh_verification_only_export and not force_native_export:
         raise ExactPushError(
-            "fresh verification-only export requires force native export"
+            "fresh Collision/Prune export requires force native export"
         )
     if provider_no_owner_receipt and cluster_assembly_contract:
         raise ExactPushError(
@@ -205,7 +205,7 @@ def build_assembly_command(
     if force_native_export:
         command.insert(-2, "--force-native-export")
     if fresh_verification_only_export:
-        command.insert(-2, "--fresh-verification-only-export")
+        command.insert(-2, "--fresh-collision-prune-export")
     if force_cluster_assembly_rebuild:
         command.insert(-2, "--force-cluster-assembly-rebuild")
     return command
@@ -922,12 +922,14 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--fresh-collision-prune-export",
         "--fresh-verification-only-export",
+        dest="fresh_verification_only_export",
         action="store_true",
         help=(
-            "explicitly use one fresh verification-only FBX/XML/receipt "
-            "transaction as the sole native export for every selected job; "
-            "requires --force-native-export"
+            "use one forced fresh normal Collision/Prune FBX/XML/receipt "
+            "transaction for every selected job; the old fresh-"
+            "verification-only spelling is a compatibility alias"
         ),
     )
     parser.add_argument(
@@ -986,7 +988,7 @@ def main(argv=None):
     args = parse_args(argv)
     if args.fresh_verification_only_export and not args.force_native_export:
         raise SystemExit(
-            "--fresh-verification-only-export requires --force-native-export"
+            "--fresh-collision-prune-export requires --force-native-export"
         )
     if args.prepare_only and args.transport == "rpc":
         raise SystemExit("--prepare-only cannot be combined with --transport rpc")

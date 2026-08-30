@@ -196,8 +196,34 @@ class SourceReviewPolicyTests(unittest.TestCase):
     def test_runtime_gateway_selects_only_explicit_export_modes(self):
         source = JOB_PATH.read_text(encoding="utf-8")
         self.assertIn('"run_speedtree_cli_export"', source)
-        self.assertIn('"run_fresh_verification_only_export"', source)
+        self.assertIn('"run_fresh_collision_prune_export"', source)
         self.assertIn("run_selected_speedtree_export =", source)
+
+        tree = ast.parse(source)
+        main_function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "main"
+        )
+        selected_operations = {
+            node.value
+            for node in ast.walk(main_function)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value.startswith("run_fresh_")
+        }
+        self.assertEqual(
+            selected_operations,
+            {"run_fresh_collision_prune_export"},
+        )
+        self.assertFalse(
+            any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "validate_fresh_verification_export_result"
+                for node in ast.walk(main_function)
+            )
+        )
 
 
 if __name__ == "__main__":
