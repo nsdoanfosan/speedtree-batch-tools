@@ -258,8 +258,13 @@ def audit_unreal_skeletal_mesh_material_sections(unreal, mesh_path, slot_count=N
             f"skeletal mesh material-section audit returned invalid JSON for "
             f"{mesh_path}: {exc}"
         ) from exc
+    # UE 5.8 Python reflection omits the native bool return when the UFUNCTION
+    # also exposes JSON/error out parameters.  In that binding shape the
+    # schema-validated JSON ``ok`` flag and empty returned-errors array are the
+    # authoritative fail-closed result.  Preserve explicit native ``False``
+    # handling for mocked/older bindings that do surface the bool.
     if (
-        native_success is not True
+        native_success is False
         or result.get("returned_errors")
         or result.get("ok") is not True
     ):

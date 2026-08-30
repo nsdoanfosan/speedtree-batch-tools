@@ -118,6 +118,16 @@ class SkeletalMeshMaterialSectionAuditTests(unittest.TestCase):
             ],
         )
 
+    def test_ue58_python_binding_without_native_bool_uses_validated_json(self):
+        result = audit_unreal_skeletal_mesh_material_sections(
+            self.fake_unreal((json.dumps(self.payload()), [])),
+            self.MESH,
+            slot_count=2,
+        )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["slot_count"], 2)
+
     def test_missing_lightweight_helper_fails_closed(self):
         fake_unreal = types.SimpleNamespace(
             CodexMaterialToolsLibrary=types.SimpleNamespace(
