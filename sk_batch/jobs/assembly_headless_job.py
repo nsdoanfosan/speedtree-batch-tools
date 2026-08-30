@@ -789,7 +789,60 @@ def select_cluster_assembly_build_handoff(
         isinstance(inspected_handoff, dict)
         and inspected_handoff.get("status") == "ready"
     ):
-        return "build", inspected_handoff
+        # A live FBX inspection can be conclusive for one connected provider
+        # while exact Base-Reference providers are intentionally absent from
+        # the Full FBX named-pair inventory.  Keep the live roles authoritative
+        # and merge only the current manifest's SPM-only recovery candidates;
+        # Blender's topology matcher remains the fail-closed authority that
+        # decides which of those candidates are actually rendered.
+        selected = inspected_handoff
+        if (
+            isinstance(current_manifest_handoff, dict)
+            and current_manifest_handoff.get("status") == "ready"
+        ):
+            live_assembly = inspected_handoff.get("assembly") or {}
+            live_inputs = list(live_assembly.get("part_builder_inputs") or [])
+            existing_provider_keys = {
+                str(row.get("provider_key") or "").casefold()
+                for row in live_inputs
+                if isinstance(row, dict)
+            }
+            recovered_inputs = []
+            for row in (
+                (current_manifest_handoff.get("assembly") or {}).get(
+                    "part_builder_inputs"
+                )
+                or []
+            ):
+                if not isinstance(row, dict):
+                    continue
+                provider_key = str(row.get("provider_key") or "")
+                if (
+                    row.get("speculative_provider_expansion") is not True
+                    or not provider_key
+                    or provider_key.casefold() in existing_provider_keys
+                ):
+                    continue
+                recovered_inputs.append(dict(row))
+                existing_provider_keys.add(provider_key.casefold())
+            if recovered_inputs:
+                selected = dict(inspected_handoff)
+                selected_assembly = dict(live_assembly)
+                selected_assembly["part_builder_inputs"] = (
+                    live_inputs + recovered_inputs
+                )
+                selected["assembly"] = selected_assembly
+                selected["current_manifest_provider_expansion"] = {
+                    "status": "merged",
+                    "candidate_count": len(recovered_inputs),
+                    "provider_keys": [
+                        row["provider_key"] for row in recovered_inputs
+                    ],
+                    "selection_authority": (
+                        "current_blender_topology_matcher"
+                    ),
+                }
+        return "build", selected
     if (
         isinstance(inspected_handoff, dict)
         and inspected_handoff.get("status") == "pass_through"
@@ -2191,7 +2244,7 @@ def main():
             and (
                 not isinstance(cluster_assembly_handoff, dict)
                 or cluster_assembly_handoff.get("status")
-                not in {"ready", "pass_through"}
+                != "pass_through"
             )
             and pipeline_data is not None
             and merged_object is not None

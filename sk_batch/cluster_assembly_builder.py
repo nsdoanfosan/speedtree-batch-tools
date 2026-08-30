@@ -1372,17 +1372,17 @@ def validate_normalized_prototype_unit_contract(manifest):
         raise ClusterAssemblyBuildError(
             "physical normalized production manifest has no native prototypes/variants"
         )
-    unit_probe_receipts = {
-        _canonical_json(payload): payload
-        for _role, payload in receipts["unit_probe"]
-    }
-    if len(unit_probe_receipts) != 1:
+    validated_unit_probe_contracts = {}
+    for _role, payload in receipts["unit_probe"]:
+        semantic_contract = _validate_unit_probe_receipt(payload)
+        validated_unit_probe_contracts[
+            _canonical_json(semantic_contract)
+        ] = semantic_contract
+    if len(validated_unit_probe_contracts) != 1:
         raise ClusterAssemblyBuildError(
             "physical normalized production requires one common unit-probe contract"
         )
-    unit_probe = _validate_unit_probe_receipt(
-        next(iter(unit_probe_receipts.values()))
-    )
+    unit_probe = next(iter(validated_unit_probe_contracts.values()))
 
     prototype_rows = {}
     prototype_ids = set()

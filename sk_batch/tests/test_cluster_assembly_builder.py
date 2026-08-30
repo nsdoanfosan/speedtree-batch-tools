@@ -2646,6 +2646,73 @@ class PhysicalProductionContractTests(unittest.TestCase):
         self.assertEqual(report["instance_fit"], "uniform_similarity_3d")
         self.assertFalse(report["role_specific_scale_patch"])
 
+    def test_semantically_identical_unit_probes_allow_evidence_metadata_differences(self):
+        manifest = physical_production_manifest()
+        primary = manifest["unit_probe_contract"]
+        primary["candidates"] = [{
+            "name": "identity_probe",
+            "evidence_fingerprint": "primary-evidence-sha256",
+        }]
+        for row in primary["generator_results"]:
+            row["evidence"] = {
+                "evidence_fingerprint": (
+                    "primary-" + row["generator_type"].casefold().replace(" ", "-")
+                ),
+            }
+
+        secondary = json.loads(json.dumps(primary))
+        secondary["candidates"] = [{
+            "name": "identity_probe",
+            "exists": False,
+            "evidence_fingerprint": None,
+        }]
+        for row in secondary["generator_results"]:
+            row["evidence"] = {
+                "exists": False,
+                "evidence_fingerprint": None,
+            }
+        manifest["secondary_unit_probe_contract"] = secondary
+
+        report = validate_normalized_prototype_unit_contract(manifest)
+
+        self.assertEqual(report["status"], "verified")
+        self.assertEqual(report["downstream_unit_scale"], 1.0)
+        self.assertEqual(report["scale_location"], "IDENTITY")
+
+    def test_valid_unit_probes_with_different_selected_contracts_are_rejected(self):
+        manifest = physical_production_manifest()
+        secondary = json.loads(json.dumps(manifest["unit_probe_contract"]))
+        secondary["selected"].update({
+            "mesh_geometry_scale": 1.0,
+            "mesh_asset_scale": 0.01,
+            "generator_scale": 1.0,
+            "scale_location": "SPM_MESH_ASSET",
+            "effective_scale": 0.01,
+        })
+        manifest["secondary_unit_probe_contract"] = secondary
+
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "requires one common unit-probe contract",
+        ):
+            validate_normalized_prototype_unit_contract(manifest)
+
+    def test_each_semantic_unit_probe_is_still_strictly_validated(self):
+        manifest = physical_production_manifest()
+        secondary = json.loads(json.dumps(manifest["unit_probe_contract"]))
+        secondary["generator_results"] = [
+            row
+            for row in secondary["generator_results"]
+            if row["generator_type"] != "Leaf Mesh"
+        ]
+        manifest["secondary_unit_probe_contract"] = secondary
+
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "did not verify one common contract for: Leaf Mesh",
+        ):
+            validate_normalized_prototype_unit_contract(manifest)
+
     def test_same_role_providers_keep_independent_variant_ordinals(self):
         manifest = physical_production_manifest()
         for row in manifest["parts"]:

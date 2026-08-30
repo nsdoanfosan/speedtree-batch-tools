@@ -289,6 +289,7 @@ def current_assembly_manifest_handoff(spm_path, full_fbx_path):
             receipt_contract = select_cluster_contract(
                 receipt_payload,
                 spm,
+                require_exact=True,
             )
         except (OSError, ValueError):
             # Provider expansion is optional recovery metadata.  Persisted
@@ -301,6 +302,12 @@ def current_assembly_manifest_handoff(spm_path, full_fbx_path):
         for dependency in receipt_contract.get("dependencies") or []:
             role_name = str(dependency.get("role") or "").casefold()
             provider_key = _provider_key(role_name, dependency)
+            target_relation = dependency.get("target_relation") or {}
+            matched_target_spms = {
+                _normalized_path(value)
+                for value in target_relation.get("matched_target_spms") or []
+                if str(value or "").strip()
+            }
             normalized = _current_dependency_normalized_variants(
                 spm,
                 dependency,
@@ -314,7 +321,17 @@ def current_assembly_manifest_handoff(spm_path, full_fbx_path):
             if (
                 role_name not in ROLE_ORDER
                 or provider_key.casefold() in existing_provider_keys
+                or dependency.get("primary_role_source") is not False
+                or dependency.get("decision") != "reference_only"
+                or dependency.get("current_spm_pair_covered") is not True
+                or dependency.get("current_live_pair_covered") is not False
                 or dependency.get("spm_only_provider_candidate") is not True
+                or dependency.get("rendered_provider_expansion_covered")
+                is not True
+                or dependency.get("normalized_delivery_mode")
+                != "connection_incomplete"
+                or target_relation.get("allowed") is not True
+                or _normalized_path(spm) not in matched_target_spms
                 or not _normalized_variant_artifacts_available(normalized)
                 or not target_material_names
             ):

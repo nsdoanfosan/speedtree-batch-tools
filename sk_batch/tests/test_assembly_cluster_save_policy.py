@@ -664,6 +664,86 @@ class ClusterSavePolicyTests(unittest.TestCase):
         self.assertEqual(mode, "build")
         self.assertIs(selected, inspected_handoff)
 
+    def test_ready_fbx_handoff_merges_only_spm_only_recovery_candidates(self):
+        helper = load_assembly_selection_helper()
+        inspected_handoff = {
+            "status": "ready",
+            "assembly": {
+                "part_builder_inputs": [{
+                    "provider_key": "leaf_side:side_01",
+                    "source": "live_fbx",
+                }],
+            },
+        }
+        current_handoff = {
+            "status": "ready",
+            "assembly": {
+                "part_builder_inputs": [
+                    {
+                        "provider_key": "leaf_side:side_01",
+                        "source": "persisted_concrete",
+                    },
+                    {
+                        "provider_key": "branch:branch_03",
+                        "speculative_provider_expansion": True,
+                    },
+                    {
+                        "provider_key": "branch:branch_04",
+                        "speculative_provider_expansion": True,
+                    },
+                ],
+            },
+        }
+
+        mode, selected = helper(
+            None,
+            inspected_handoff,
+            current_handoff,
+        )
+
+        self.assertEqual(mode, "build")
+        inputs = selected["assembly"]["part_builder_inputs"]
+        self.assertEqual(
+            [row["provider_key"] for row in inputs],
+            [
+                "leaf_side:side_01",
+                "branch:branch_03",
+                "branch:branch_04",
+            ],
+        )
+        self.assertEqual(inputs[0]["source"], "live_fbx")
+        self.assertEqual(
+            selected["current_manifest_provider_expansion"][
+                "selection_authority"
+            ],
+            "current_blender_topology_matcher",
+        )
+
+    def test_ready_fbx_handoff_does_not_merge_persisted_concrete_roles(self):
+        helper = load_assembly_selection_helper()
+        inspected_handoff = {
+            "status": "ready",
+            "assembly": {"part_builder_inputs": []},
+        }
+        current_handoff = {
+            "status": "ready",
+            "assembly": {
+                "part_builder_inputs": [{
+                    "provider_key": "branch:stale_01",
+                    "speculative_provider_expansion": False,
+                }],
+            },
+        }
+
+        mode, selected = helper(
+            None,
+            inspected_handoff,
+            current_handoff,
+        )
+
+        self.assertEqual(mode, "build")
+        self.assertIs(selected, inspected_handoff)
+
     def test_receipt_pass_through_remains_without_ready_fbx_roles(self):
         helper = load_assembly_selection_helper()
         receipt_handoff = {"status": "pass_through", "source": "receipt"}

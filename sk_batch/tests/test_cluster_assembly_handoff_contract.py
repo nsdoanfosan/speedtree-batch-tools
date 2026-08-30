@@ -216,13 +216,49 @@ class CurrentFbxRoleAuthorityTests(unittest.TestCase):
             receipt.write_text(json.dumps({
                 "cluster_assembly": {
                     "folder": str(root),
-                    "dependencies": [{
-                        "role": "leaf",
-                        "name": "SK_cluster_tree_07",
-                        "target_material_names": ["leaf_tree_05"],
-                        "spm_only_provider_candidate": True,
-                        "normalized_variants": normalized,
+                    "tree_source_identities": [{
+                        "target_spm": file_fingerprint(spm),
                     }],
+                    "dependencies": [
+                        {
+                            "role": "leaf",
+                            "name": "SK_cluster_tree_07",
+                            "target_material_names": ["leaf_tree_05"],
+                            "primary_role_source": False,
+                            "decision": "reference_only",
+                            "current_spm_pair_covered": True,
+                            "current_live_pair_covered": False,
+                            "spm_only_provider_candidate": True,
+                            "rendered_provider_expansion_covered": True,
+                            "normalized_delivery_mode": (
+                                "connection_incomplete"
+                            ),
+                            "target_relation": {
+                                "allowed": True,
+                                "matched_target_spms": [str(spm)],
+                            },
+                            "normalized_variants": normalized,
+                        },
+                        {
+                            "role": "branch",
+                            "name": "SK_branch_tree_01",
+                            "target_material_names": ["branch_tree_01"],
+                            "primary_role_source": True,
+                            "decision": "pass_through",
+                            "current_spm_pair_covered": True,
+                            "current_live_pair_covered": False,
+                            "spm_only_provider_candidate": True,
+                            "rendered_provider_expansion_covered": True,
+                            "normalized_delivery_mode": (
+                                "asset_registration_only"
+                            ),
+                            "target_relation": {
+                                "allowed": True,
+                                "matched_target_spms": [str(spm)],
+                            },
+                            "normalized_variants": normalized,
+                        },
+                    ],
                     "handoff": {"roles": []},
                 },
             }), encoding="utf-8")
@@ -313,11 +349,26 @@ class CurrentFbxRoleAuthorityTests(unittest.TestCase):
             receipt.write_text(json.dumps({
                 "cluster_assembly": {
                     "folder": str(root),
+                    "tree_source_identities": [{
+                        "target_spm": file_fingerprint(spm),
+                    }],
                     "dependencies": [{
                         "role": "leaf",
                         "name": "SK_cluster_tree_07",
                         "target_material_names": ["leaf_tree_05"],
+                        "primary_role_source": False,
+                        "decision": "reference_only",
+                        "current_spm_pair_covered": True,
+                        "current_live_pair_covered": False,
                         "spm_only_provider_candidate": True,
+                        "rendered_provider_expansion_covered": True,
+                        "normalized_delivery_mode": (
+                            "connection_incomplete"
+                        ),
+                        "target_relation": {
+                            "allowed": True,
+                            "matched_target_spms": [str(spm)],
+                        },
                         "normalized_variants": persisted,
                     }],
                     "handoff": {"roles": []},
