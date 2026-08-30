@@ -135,6 +135,15 @@ def parse_args():
     parser.add_argument("--bark-normalization-manifest", default="")
     parser.add_argument("--cluster-source-build-only", action="store_true")
     parser.add_argument(
+        "--provider-no-owner-receipt",
+        action="store_true",
+        help=(
+            "declare a fleet dependency-provider invocation that cannot own "
+            "a root Cluster Assembly receipt; only the unrelated global "
+            "receipt discovery is omitted"
+        ),
+    )
+    parser.add_argument(
         "--force-native-export",
         action="store_true",
         help=(
@@ -822,13 +831,77 @@ def cluster_assembly_contract_from_material_contract(
 def validate_cluster_job_mode_arguments(
     cluster_source_build_only,
     cluster_assembly_contract,
+    provider_no_owner_receipt=False,
+    canonical_spm=None,
 ):
-    """Reject an explicit Assembly authority that source-only mode ignores."""
+    """Reject contradictory Cluster invocation authorities before Blender I/O."""
     if cluster_source_build_only and cluster_assembly_contract:
         raise RuntimeError(
             "--cluster-source-build-only cannot be combined with "
             "--cluster-assembly-contract"
         )
+    if provider_no_owner_receipt and cluster_assembly_contract:
+        raise RuntimeError(
+            "--provider-no-owner-receipt cannot be combined with "
+            "--cluster-assembly-contract"
+        )
+    if provider_no_owner_receipt and cluster_source_build_only:
+        raise RuntimeError(
+            "--provider-no-owner-receipt cannot be combined with "
+            "--cluster-source-build-only"
+        )
+    if provider_no_owner_receipt and (
+        canonical_spm is None
+        or not is_cluster_normalization_spm(canonical_spm)
+    ):
+        raise RuntimeError(
+            "--provider-no-owner-receipt requires a canonical Cluster "
+            "dependency-provider SPM"
+        )
+
+
+def resolve_job_cluster_receipt_path(
+    spm_path,
+    embedded_contract_path=None,
+    *,
+    cluster_source_build_only=False,
+    provider_no_owner_receipt=False,
+    require_embedded_live_audit=False,
+):
+    """Resolve root authority without scanning it for provider-only jobs."""
+    if cluster_source_build_only:
+        return None, {
+            "policy": "cluster_source_provider_no_owner_receipt",
+            "requested_spm": str(spm_path),
+            "selected_receipt": None,
+            "current_candidates": [],
+            "superseded_current_receipts": [],
+            "ignored_stale_candidates": [],
+        }
+    if provider_no_owner_receipt:
+        return None, {
+            "policy": "fleet_provider_dependency_no_owner_receipt",
+            "requested_spm": str(spm_path),
+            "selected_receipt": None,
+            "current_candidates": [],
+            "superseded_current_receipts": [],
+            "ignored_stale_candidates": [],
+            "skipped_global_discovery": {
+                "status": "not_run",
+                "operation": "cluster_assembly_receipt_resolution",
+                "authority": "cluster_fleet_provider_dependency_v1",
+                "reason": (
+                    "provider invocation has no root-owner receipt contract"
+                ),
+                "candidate_files_read": 0,
+            },
+        }
+    return resolve_cluster_receipt_path(
+        spm_path,
+        embedded_contract_path,
+        include_resolution=True,
+        require_embedded_live_audit=bool(require_embedded_live_audit),
+    )
 
 
 def main():
@@ -864,6 +937,8 @@ def main():
         validate_cluster_job_mode_arguments(
             args.cluster_source_build_only,
             args.cluster_assembly_contract,
+            args.provider_no_owner_receipt,
+            canonical_spm,
         )
         preflight_started = perf_counter()
         bark_normalization_manifest = None
@@ -989,36 +1064,22 @@ def main():
         cluster_assembly_raw_import_state = None
         cluster_assembly_receipt_payload = None
         cluster_assembly_source_resolution = None
-        if args.cluster_source_build_only:
-            # This SPM is a raw provider consumed by another owner's
-            # Normalizer transaction. It cannot own a content-driven Assembly
-            # receipt under its own path, so scanning historical receipt
-            # candidates is pure delay and previously cost 10-20 seconds.
-            cluster_receipt_path = None
-            cluster_receipt_resolution = {
-                "policy": "cluster_source_provider_no_owner_receipt",
-                "requested_spm": str(speedtree_spm),
-                "selected_receipt": None,
-                "current_candidates": [],
-                "superseded_current_receipts": [],
-                "ignored_stale_candidates": [],
-            }
-        else:
-            embedded_cluster_contract = (
-                args.cluster_assembly_contract
-                or args.material_contract
-                or None
+        embedded_cluster_contract = (
+            args.cluster_assembly_contract
+            or args.material_contract
+            or None
+        )
+        cluster_receipt_path, cluster_receipt_resolution = (
+            resolve_job_cluster_receipt_path(
+                speedtree_spm,
+                embedded_cluster_contract,
+                cluster_source_build_only=args.cluster_source_build_only,
+                provider_no_owner_receipt=args.provider_no_owner_receipt,
+                require_embedded_live_audit=bool(
+                    args.cluster_assembly_contract
+                ),
             )
-            cluster_receipt_path, cluster_receipt_resolution = (
-                resolve_cluster_receipt_path(
-                    speedtree_spm,
-                    embedded_cluster_contract,
-                    include_resolution=True,
-                    require_embedded_live_audit=bool(
-                        args.cluster_assembly_contract
-                    ),
-                )
-            )
+        )
         report["cluster_assembly_receipt_resolution"] = (
             cluster_receipt_resolution
         )

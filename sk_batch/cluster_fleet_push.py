@@ -160,7 +160,13 @@ def build_assembly_command(
     cluster_assembly_contract=None,
     force_native_export=False,
     force_cluster_assembly_rebuild=False,
+    provider_no_owner_receipt=False,
 ):
+    if provider_no_owner_receipt and cluster_assembly_contract:
+        raise ExactPushError(
+            "provider no-owner receipt mode cannot carry a root Cluster "
+            "Assembly contract"
+        )
     spm = Path(target["spm"]).resolve()
     command = [
         str(Path(blender).resolve()),
@@ -185,6 +191,8 @@ def build_assembly_command(
             "--cluster-assembly-contract",
             str(Path(cluster_assembly_contract).resolve()),
         ])
+    if provider_no_owner_receipt:
+        command.append("--provider-no-owner-receipt")
     command.extend([
         "--report",
         str(Path(report_path).resolve()),
@@ -1121,6 +1129,10 @@ def main(argv=None):
             "spm": str(provider_spm),
             "dependency_of": [dependency_of] if dependency_of else [],
             "status": "running",
+            "assembly_invocation_role": "provider_dependency",
+            "owner_receipt_policy": (
+                "fleet_provider_dependency_no_owner_receipt"
+            ),
         }
         processed_providers[key] = result
         fleet["provider_results"].append(result)
@@ -1209,6 +1221,7 @@ def main(argv=None):
                 force_cluster_assembly_rebuild=(
                     args.force_cluster_assembly_rebuild
                 ),
+                provider_no_owner_receipt=True,
             )
             result["assembly_report"] = str(assembly_report)
             if (

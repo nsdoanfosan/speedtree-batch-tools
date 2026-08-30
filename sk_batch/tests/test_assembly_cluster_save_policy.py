@@ -304,6 +304,104 @@ class ClusterSavePolicyTests(unittest.TestCase):
         helper(True, "")
         helper(False, "live_assembly.json")
 
+    def test_provider_no_owner_receipt_mode_is_fail_closed_and_distinct(self):
+        helpers = load_job_functions([
+            "is_cluster_normalization_spm",
+            "validate_cluster_job_mode_arguments",
+        ])
+        helper = helpers["validate_cluster_job_mode_arguments"]
+        provider = Path("C:/trees/tree/cluster/SK_branch_01.spm")
+
+        helper(False, "", True, provider)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "cannot be combined with --cluster-assembly-contract",
+        ):
+            helper(False, "live_assembly.json", True, provider)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "cannot be combined with --cluster-source-build-only",
+        ):
+            helper(True, "", True, provider)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "requires a canonical Cluster dependency-provider SPM",
+        ):
+            helper(
+                False,
+                "",
+                True,
+                Path("C:/trees/tree/SK_tree_01.spm"),
+            )
+
+    def test_provider_no_owner_receipt_never_calls_global_resolution(self):
+        calls = []
+
+        def resolve(*args, **kwargs):
+            calls.append((args, kwargs))
+            return Path("C:/receipt.json"), {"policy": "resolved"}
+
+        helper = load_job_functions(
+            ["resolve_job_cluster_receipt_path"],
+            {"resolve_cluster_receipt_path": resolve},
+        )["resolve_job_cluster_receipt_path"]
+        provider = Path("C:/trees/tree/cluster/SK_branch_01.spm")
+
+        path, evidence = helper(
+            provider,
+            "material.json",
+            provider_no_owner_receipt=True,
+        )
+
+        self.assertIsNone(path)
+        self.assertEqual(calls, [])
+        self.assertEqual(
+            evidence["policy"],
+            "fleet_provider_dependency_no_owner_receipt",
+        )
+        self.assertEqual(
+            evidence["skipped_global_discovery"],
+            {
+                "status": "not_run",
+                "operation": "cluster_assembly_receipt_resolution",
+                "authority": "cluster_fleet_provider_dependency_v1",
+                "reason": (
+                    "provider invocation has no root-owner receipt contract"
+                ),
+                "candidate_files_read": 0,
+            },
+        )
+
+        source_path, source_evidence = helper(
+            provider,
+            "material.json",
+            cluster_source_build_only=True,
+        )
+        self.assertIsNone(source_path)
+        self.assertEqual(
+            source_evidence["policy"],
+            "cluster_source_provider_no_owner_receipt",
+        )
+        self.assertNotIn("skipped_global_discovery", source_evidence)
+        self.assertEqual(calls, [])
+
+        resolved_path, resolved_evidence = helper(
+            provider,
+            "live.json",
+            require_embedded_live_audit=True,
+        )
+        self.assertEqual(resolved_path, Path("C:/receipt.json"))
+        self.assertEqual(resolved_evidence, {"policy": "resolved"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], (provider, "live.json"))
+        self.assertEqual(
+            calls[0][1],
+            {
+                "include_resolution": True,
+                "require_embedded_live_audit": True,
+            },
+        )
+
     def test_contract_snapshot_rechecks_live_authority(self):
         contract = {"handoff": {"status": "pass_through"}}
         payload = {

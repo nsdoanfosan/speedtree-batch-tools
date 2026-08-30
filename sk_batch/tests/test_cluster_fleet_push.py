@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 import stat
@@ -550,6 +551,80 @@ class ClusterFleetPushTests(unittest.TestCase):
             )
             self.assertIn("--force-native-export", command)
             self.assertIn("--force-cluster-assembly-rebuild", command)
+            self.assertNotIn("--provider-no-owner-receipt", command)
+
+    def test_provider_assembly_command_has_only_no_owner_receipt_authority(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "tree" / "cluster" / "SK_branch_01.spm"
+            blender = root / "blender.exe"
+            contract = root / "material.json"
+            report = root / "assembly_report.json"
+            spm.parent.mkdir(parents=True)
+            for path in (spm, blender, contract):
+                path.write_bytes(b"current")
+
+            command = build_assembly_command(
+                {"spm": spm},
+                blender,
+                contract,
+                report,
+                provider_no_owner_receipt=True,
+            )
+
+            self.assertEqual(command.count("--provider-no-owner-receipt"), 1)
+            self.assertNotIn("--cluster-source-build-only", command)
+            self.assertNotIn("--cluster-assembly-contract", command)
+            with self.assertRaisesRegex(
+                ExactPushError,
+                "cannot carry a root Cluster Assembly contract",
+            ):
+                build_assembly_command(
+                    {"spm": spm},
+                    blender,
+                    contract,
+                    report,
+                    cluster_assembly_contract=root / "live.json",
+                    provider_no_owner_receipt=True,
+                )
+
+    def test_only_provider_fleet_callsite_can_request_no_owner_receipt(self):
+        source = Path(__file__).resolve().parents[1] / "cluster_fleet_push.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "build_assembly_command"
+        ]
+        self.assertEqual(len(calls), 2)
+        provider_calls = [
+            node
+            for node in calls
+            if any(
+                keyword.arg == "provider_no_owner_receipt"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value is True
+                for keyword in node.keywords
+            )
+        ]
+        root_calls = [node for node in calls if node not in provider_calls]
+
+        self.assertEqual(len(provider_calls), 1)
+        self.assertEqual(len(root_calls), 1)
+        self.assertFalse(any(
+            keyword.arg == "cluster_assembly_contract"
+            for keyword in provider_calls[0].keywords
+        ))
+        self.assertTrue(any(
+            keyword.arg == "cluster_assembly_contract"
+            for keyword in root_calls[0].keywords
+        ))
+        self.assertFalse(any(
+            keyword.arg == "provider_no_owner_receipt"
+            for keyword in root_calls[0].keywords
+        ))
 
     def test_assembly_result_requires_exact_attachment_bindings(self):
         with tempfile.TemporaryDirectory() as temporary:
