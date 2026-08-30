@@ -159,9 +159,14 @@ def build_assembly_command(
     *,
     cluster_assembly_contract=None,
     force_native_export=False,
+    fresh_verification_only_export=False,
     force_cluster_assembly_rebuild=False,
     provider_no_owner_receipt=False,
 ):
+    if fresh_verification_only_export and not force_native_export:
+        raise ExactPushError(
+            "fresh verification-only export requires force native export"
+        )
     if provider_no_owner_receipt and cluster_assembly_contract:
         raise ExactPushError(
             "provider no-owner receipt mode cannot carry a root Cluster "
@@ -199,6 +204,8 @@ def build_assembly_command(
     ])
     if force_native_export:
         command.insert(-2, "--force-native-export")
+    if fresh_verification_only_export:
+        command.insert(-2, "--fresh-verification-only-export")
     if force_cluster_assembly_rebuild:
         command.insert(-2, "--force-cluster-assembly-rebuild")
     return command
@@ -915,6 +922,15 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--fresh-verification-only-export",
+        action="store_true",
+        help=(
+            "explicitly use one fresh verification-only FBX/XML/receipt "
+            "transaction as the sole native export for every selected job; "
+            "requires --force-native-export"
+        ),
+    )
+    parser.add_argument(
         "--force-cluster-assembly-rebuild",
         action="store_true",
         help=(
@@ -968,6 +984,10 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.fresh_verification_only_export and not args.force_native_export:
+        raise SystemExit(
+            "--fresh-verification-only-export requires --force-native-export"
+        )
     if args.prepare_only and args.transport == "rpc":
         raise SystemExit("--prepare-only cannot be combined with --transport rpc")
     exact_target_keys = {
@@ -1033,6 +1053,13 @@ def main(argv=None):
             "provider_assembly_push_then_refresh_exact_target_"
             "assembly_export_and_push"
         ),
+        "native_export_execution_policy": {
+            "fresh_verification_only_export": bool(
+                args.fresh_verification_only_export
+            ),
+            "explicit_opt_in": bool(args.fresh_verification_only_export),
+            "force_native_export": bool(args.force_native_export),
+        },
         "birch_paper_order": "last",
         "targets": [str(row["spm"]) for row in targets],
         "requested_target_spms": [
@@ -1218,6 +1245,9 @@ def main(argv=None):
                 outputs["material_contract"],
                 assembly_report,
                 force_native_export=args.force_native_export,
+                fresh_verification_only_export=(
+                    args.fresh_verification_only_export
+                ),
                 force_cluster_assembly_rebuild=(
                     args.force_cluster_assembly_rebuild
                 ),
@@ -1452,6 +1482,9 @@ def main(argv=None):
                 assembly_report,
                 cluster_assembly_contract=receipt_refresh_report,
                 force_native_export=args.force_native_export,
+                fresh_verification_only_export=(
+                    args.fresh_verification_only_export
+                ),
                 force_cluster_assembly_rebuild=(
                     args.force_cluster_assembly_rebuild
                 ),

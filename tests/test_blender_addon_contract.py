@@ -181,6 +181,10 @@ class BlenderAddonGatewayTests(unittest.TestCase):
         core = types.ModuleType("speedtree_bone_weight_repair.core")
         core.run_import_and_assemble = lambda value: ("assembled", value)
         core.run_speedtree_cli_export = lambda **kwargs: kwargs
+        core.run_fresh_verification_only_export = lambda **kwargs: (
+            "fresh_verification_only",
+            kwargs,
+        )
         core.consolidate_speedtree_group_materials = lambda *args: args
         core.load_speedtree_texture_readiness_contract = lambda *args: args
         core.normalize_speedtree_material_textures = lambda *args: args
@@ -218,6 +222,44 @@ class BlenderAddonGatewayTests(unittest.TestCase):
                 self.assertEqual(row["mode"], "gateway_adapter")
                 with self.assertRaisesRegex(
                     gateway.BlenderAddonGatewayError, "was not granted"
+                ):
+                    session.operation(
+                        "speedtree_bone_weight_repair",
+                        "run_speedtree_cli_export",
+                    )
+
+    def test_fresh_verification_operation_requires_its_own_capability(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            package_file = Path(temporary) / "__init__.py"
+            package_file.write_text("# fake addon\n", encoding="utf-8")
+            modules = self._fake_modules(package_file)
+            with mock.patch.dict(sys.modules, modules, clear=False), mock.patch.dict(
+                os.environ,
+                {"SPEEDTREE_BWR_ADDON_DIR": temporary},
+                clear=False,
+            ):
+                session = gateway.prepare_runtime(
+                    "test.fresh_export",
+                    {
+                        "speedtree_bone_weight_repair": [
+                            "fresh_verification_export_v1",
+                        ]
+                    },
+                )
+                operation = session.operation(
+                    "speedtree_bone_weight_repair",
+                    "run_fresh_verification_only_export",
+                )
+                self.assertEqual(
+                    operation(force_reexport=True),
+                    (
+                        "fresh_verification_only",
+                        {"force_reexport": True},
+                    ),
+                )
+                with self.assertRaisesRegex(
+                    gateway.BlenderAddonGatewayError,
+                    "was not granted",
                 ):
                     session.operation(
                         "speedtree_bone_weight_repair",

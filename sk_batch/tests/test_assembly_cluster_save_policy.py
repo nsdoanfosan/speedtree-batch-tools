@@ -4,6 +4,7 @@ The production job imports ``bpy`` at module load, so extract the small helper
 from its AST and execute that exact function with a fake Blender module.
 """
 import ast
+import hashlib
 import tempfile
 import types
 import unittest
@@ -83,6 +84,126 @@ class FakeBlender:
 
 
 class ClusterSavePolicyTests(unittest.TestCase):
+    def test_fresh_verification_mode_requires_force_and_exact_pair(self):
+        helper = load_job_functions(
+            ["validate_native_export_mode_arguments"]
+        )["validate_native_export_mode_arguments"]
+
+        helper(True, True, export_fbx=True, export_xml=True)
+        helper(False, False, export_fbx=False, export_xml=False)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "requires --force-native-export",
+        ):
+            helper(False, True)
+        with self.assertRaisesRegex(RuntimeError, "exact FBX and XML"):
+            helper(True, True, export_fbx=True, export_xml=False)
+
+    def test_fresh_verification_result_proves_zero_normal_attempts_and_exact_files(self):
+        marker = "SPEEDTREE_FRESH_VERIFICATION_EXPORT_SEALED=1"
+        helper = load_job_functions(
+            ["validate_fresh_verification_export_result"],
+            {
+                "hashlib": hashlib,
+                "FRESH_VERIFICATION_SEALED_MARKER": marker,
+            },
+        )["validate_fresh_verification_export_result"]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fbx = root / "fbx" / "tree.fbx"
+            stmat = fbx.with_suffix(".stmat")
+            receipt = root / "fbx" / "tree.speedtree_native_receipt.json"
+            xml = root / "xml" / "tree.xml"
+            for path, payload in (
+                (fbx, b"exact-fbx"),
+                (stmat, b"exact-stmat"),
+                (receipt, b'{"exact":true}'),
+                (xml, b"<SpeedTree />"),
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(payload)
+
+            def record(path):
+                return {
+                    "path": str(path.resolve()),
+                    "size": path.stat().st_size,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+
+            attempts = [{"attempt": 1, "returncode": 0}]
+
+            def export_row(path):
+                return {
+                    "path": str(path.resolve()),
+                    "exists": True,
+                    "cache_hit": False,
+                    "force_reexport_requested": True,
+                    "verification_only": True,
+                    "bundled_process": True,
+                    "bundle_fallback": False,
+                    "stdout": marker,
+                    "export_attempts": attempts,
+                }
+
+            evidence = {
+                "status": "sealed",
+                "policy": "fresh_verification_only_as_sole_export_v1",
+                "explicit_opt_in_required": True,
+                "force_reexport": True,
+                "collision_prune_bundle_attempt_count": 0,
+                "verification_bundle_attempt_count": 1,
+                "independent_fallback_attempt_count": 0,
+                "launcher_sealed_completion": {
+                    "status": "observed",
+                    "marker": marker,
+                },
+                "native_receipt": str(receipt.resolve()),
+                "sealed_artifacts": {
+                    "fbx": [record(fbx), record(stmat), record(receipt)],
+                    "xml": [record(xml)],
+                },
+            }
+            result = {
+                "force_reexport_requested": True,
+                "native_receipt": str(receipt.resolve()),
+                "fresh_verification_only_export": evidence,
+                "exports": {
+                    "fbx": export_row(fbx),
+                    "xml": export_row(xml),
+                },
+            }
+
+            self.assertIs(helper(result), evidence)
+            fbx.write_bytes(b"drifted-fbx")
+            with self.assertRaisesRegex(RuntimeError, "artifact drifted"):
+                helper(result)
+
+    def test_fresh_verification_result_fails_without_launcher_marker(self):
+        marker = "SPEEDTREE_FRESH_VERIFICATION_EXPORT_SEALED=1"
+        helper = load_job_functions(
+            ["validate_fresh_verification_export_result"],
+            {
+                "hashlib": hashlib,
+                "FRESH_VERIFICATION_SEALED_MARKER": marker,
+            },
+        )["validate_fresh_verification_export_result"]
+        result = {
+            "force_reexport_requested": True,
+            "fresh_verification_only_export": {
+                "status": "sealed",
+                "policy": "fresh_verification_only_as_sole_export_v1",
+                "explicit_opt_in_required": True,
+                "force_reexport": True,
+                "collision_prune_bundle_attempt_count": 0,
+                "verification_bundle_attempt_count": 1,
+                "independent_fallback_attempt_count": 0,
+                "launcher_sealed_completion": {"status": "missing"},
+            },
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "launcher-sealed"):
+            helper(result)
+
     def test_single_import_requires_the_same_exact_resolved_fbx(self):
         helper = load_job_functions(
             ["same_resolved_fbx_source"]

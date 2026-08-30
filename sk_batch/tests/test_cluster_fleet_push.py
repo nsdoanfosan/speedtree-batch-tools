@@ -25,6 +25,7 @@ from cluster_fleet_push import (  # noqa: E402
     checkout_headless_manifest_assets,
     discover_provider_dependencies,
     discover_current_cluster_targets,
+    main,
     parse_args,
     validate_spm_bone_policy_report,
     validate_provider_live_result,
@@ -587,6 +588,84 @@ class ClusterFleetPushTests(unittest.TestCase):
                     cluster_assembly_contract=root / "live.json",
                     provider_no_owner_receipt=True,
                 )
+
+    def test_fresh_verification_flag_is_explicit_and_command_parity_is_exact(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "Tree_01.spm"
+            blender = root / "blender.exe"
+            contract = root / "material.json"
+            report = root / "assembly.json"
+            for path in (spm, blender, contract):
+                path.write_bytes(b"current")
+
+            baseline = build_assembly_command(
+                {"spm": spm},
+                blender,
+                contract,
+                report,
+                force_native_export=True,
+            )
+            direct = build_assembly_command(
+                {"spm": spm},
+                blender,
+                contract,
+                report,
+                force_native_export=True,
+                fresh_verification_only_export=True,
+            )
+
+            self.assertNotIn("--fresh-verification-only-export", baseline)
+            self.assertEqual(
+                direct.count("--fresh-verification-only-export"),
+                1,
+            )
+            self.assertEqual(
+                [
+                    value
+                    for value in direct
+                    if value != "--fresh-verification-only-export"
+                ],
+                baseline,
+            )
+            with self.assertRaisesRegex(
+                ExactPushError,
+                "requires force native export",
+            ):
+                build_assembly_command(
+                    {"spm": spm},
+                    blender,
+                    contract,
+                    report,
+                    fresh_verification_only_export=True,
+                )
+
+    def test_fleet_rejects_fresh_verification_without_force_before_discovery(self):
+        with self.assertRaisesRegex(
+            SystemExit,
+            "requires --force-native-export",
+        ):
+            main(["--fresh-verification-only-export"])
+
+    def test_fresh_verification_opt_in_is_forwarded_to_both_call_sites(self):
+        source = Path(__file__).resolve().parents[1] / "cluster_fleet_push.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "build_assembly_command"
+        ]
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            keyword = next(
+                row
+                for row in call.keywords
+                if row.arg == "fresh_verification_only_export"
+            )
+            self.assertIsInstance(keyword.value, ast.Attribute)
+            self.assertEqual(keyword.value.attr, "fresh_verification_only_export")
 
     def test_only_provider_fleet_callsite_can_request_no_owner_receipt(self):
         source = Path(__file__).resolve().parents[1] / "cluster_fleet_push.py"

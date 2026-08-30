@@ -39,6 +39,9 @@ DEFAULT_SPEEDTREE_COLLISION_CLI = (
     / "bin"
     / "speedtree_collision_cli.exe"
 )
+FRESH_VERIFICATION_SEALED_MARKER = (
+    "SPEEDTREE_FRESH_VERIFICATION_EXPORT_SEALED=1"
+)
 
 
 def resolve_speedtree_collision_cli():
@@ -149,6 +152,15 @@ def parse_args():
         help=(
             "bypass a reusable material-preflight FBX bundle and serialize "
             "a fresh native SpeedTree FBX/XML/receipt with the installed hook"
+        ),
+    )
+    parser.add_argument(
+        "--fresh-verification-only-export",
+        action="store_true",
+        help=(
+            "explicitly replace the normal collision-prune export with one "
+            "fresh verification-only FBX/XML/native-receipt transaction; "
+            "requires --force-native-export and fails closed"
         ),
     )
     parser.add_argument(
@@ -860,6 +872,151 @@ def validate_cluster_job_mode_arguments(
         )
 
 
+def validate_native_export_mode_arguments(
+    force_native_export,
+    fresh_verification_only_export,
+    *,
+    export_fbx=None,
+    export_xml=None,
+):
+    """Reject an incomplete sole-export opt-in before native execution."""
+    if fresh_verification_only_export and not force_native_export:
+        raise RuntimeError(
+            "--fresh-verification-only-export requires "
+            "--force-native-export"
+        )
+    if fresh_verification_only_export and (
+        export_fbx is not None or export_xml is not None
+    ) and (export_fbx is not True or export_xml is not True):
+        raise RuntimeError(
+            "--fresh-verification-only-export requires exact FBX and XML "
+            "export targets"
+        )
+
+
+def validate_fresh_verification_export_result(result):
+    """Verify the add-on's sealed sole-export evidence and exact artifacts."""
+    if not isinstance(result, dict):
+        raise RuntimeError("Fresh verification-only export result is missing")
+    evidence = result.get("fresh_verification_only_export")
+    if not isinstance(evidence, dict):
+        raise RuntimeError(
+            "Fresh verification-only export evidence is missing"
+        )
+    expected = {
+        "status": "sealed",
+        "policy": "fresh_verification_only_as_sole_export_v1",
+        "explicit_opt_in_required": True,
+        "force_reexport": True,
+        "collision_prune_bundle_attempt_count": 0,
+        "verification_bundle_attempt_count": 1,
+        "independent_fallback_attempt_count": 0,
+    }
+    for field, value in expected.items():
+        if evidence.get(field) != value:
+            raise RuntimeError(
+                "Fresh verification-only export evidence is invalid: "
+                f"{field}={evidence.get(field)!r}"
+            )
+    launcher = evidence.get("launcher_sealed_completion") or {}
+    if (
+        launcher.get("status") != "observed"
+        or launcher.get("marker") != FRESH_VERIFICATION_SEALED_MARKER
+    ):
+        raise RuntimeError(
+            "Fresh verification-only export lacks launcher-sealed completion"
+        )
+    if result.get("force_reexport_requested") is not True:
+        raise RuntimeError(
+            "Fresh verification-only export lost forced-export authority"
+        )
+
+    exports = result.get("exports") or {}
+    sealed = evidence.get("sealed_artifacts") or {}
+    if set(exports) != {"fbx", "xml"} or set(sealed) != {"fbx", "xml"}:
+        raise RuntimeError(
+            "Fresh verification-only export requires exact FBX/XML evidence"
+        )
+    receipt_value = str(result.get("native_receipt") or "").strip()
+    if not receipt_value:
+        raise RuntimeError(
+            "Fresh verification-only export has no native receipt"
+        )
+    receipt = Path(receipt_value).resolve()
+    if Path(str(evidence.get("native_receipt") or "")).resolve() != receipt:
+        raise RuntimeError(
+            "Fresh verification-only native receipt identity disagrees"
+        )
+
+    for kind in ("fbx", "xml"):
+        row = exports[kind]
+        if (
+            row.get("exists") is not True
+            or row.get("cache_hit") is not False
+            or row.get("force_reexport_requested") is not True
+            or row.get("verification_only") is not True
+            or row.get("bundled_process") is not True
+            or row.get("bundle_fallback") is not False
+            or FRESH_VERIFICATION_SEALED_MARKER
+            not in str(row.get("stdout") or "")
+        ):
+            raise RuntimeError(
+                "Fresh verification-only export row is not one sealed "
+                f"bundle: {kind}"
+            )
+        attempts = row.get("export_attempts") or []
+        if (
+            len(attempts) != 1
+            or attempts[0].get("attempt") != 1
+            or attempts[0].get("returncode") != 0
+        ):
+            raise RuntimeError(
+                "Fresh verification-only export did not complete in exactly "
+                f"one process attempt: {kind}"
+            )
+        target = Path(str(row.get("path") or "")).resolve()
+        required = [target]
+        if kind == "fbx":
+            required.extend([target.with_suffix(".stmat"), receipt])
+        records = sealed[kind]
+        if not isinstance(records, list):
+            raise RuntimeError(
+                f"Fresh verification-only sealed artifacts are invalid: {kind}"
+            )
+        by_path = {
+            Path(str(record.get("path") or "")).resolve(): record
+            for record in records
+            if isinstance(record, dict)
+        }
+        if set(by_path) != set(required):
+            raise RuntimeError(
+                "Fresh verification-only sealed artifact set disagrees: "
+                f"{kind}"
+            )
+        for path in required:
+            record = by_path[path]
+            if not path.is_file():
+                raise RuntimeError(
+                    "Fresh verification-only sealed artifact is missing: "
+                    + str(path)
+                )
+            stat = path.stat()
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if (
+                int(record.get("size") or -1) != stat.st_size
+                or str(record.get("sha256") or "").casefold()
+                != digest.hexdigest().casefold()
+            ):
+                raise RuntimeError(
+                    "Fresh verification-only sealed artifact drifted: "
+                    + str(path)
+                )
+    return evidence
+
+
 def resolve_job_cluster_receipt_path(
     spm_path,
     embedded_contract_path=None,
@@ -940,6 +1097,10 @@ def main():
             args.provider_no_owner_receipt,
             canonical_spm,
         )
+        validate_native_export_mode_arguments(
+            args.force_native_export,
+            args.fresh_verification_only_export,
+        )
         preflight_started = perf_counter()
         bark_normalization_manifest = None
         if args.bark_normalization_manifest:
@@ -972,13 +1133,20 @@ def main():
             }
         material_preflight = None
         addon_runtime_started = perf_counter()
+        required_speedtree_capabilities = [
+            "speedtree_export_v1",
+            "assembly_pipeline_v1",
+            "atlas_manifest_consumer_v1",
+        ]
+        if args.fresh_verification_only_export:
+            required_speedtree_capabilities.append(
+                "fresh_verification_export_v1"
+            )
         addon_runtime = prepare_runtime(
             "sk_batch.jobs.assembly_headless_job",
             {
                 "speedtree_bone_weight_repair": (
-                    "speedtree_export_v1",
-                    "assembly_pipeline_v1",
-                    "atlas_manifest_consumer_v1",
+                    *required_speedtree_capabilities,
                 ),
             },
         )
@@ -1007,9 +1175,13 @@ def main():
             "addon_runtime_prepare",
             addon_runtime_started,
         )
-        run_speedtree_cli_export = addon_runtime.operation(
+        run_selected_speedtree_export = addon_runtime.operation(
             "speedtree_bone_weight_repair",
-            "run_speedtree_cli_export",
+            (
+                "run_fresh_verification_only_export"
+                if args.fresh_verification_only_export
+                else "run_speedtree_cli_export"
+            ),
         )
         run_import_and_assemble = addon_runtime.operation(
             "speedtree_bone_weight_repair",
@@ -1174,6 +1346,12 @@ def main():
         )
 
         export_settings = settings.as_dict()
+        validate_native_export_mode_arguments(
+            args.force_native_export,
+            args.fresh_verification_only_export,
+            export_fbx=export_settings["speedtree_export_fbx"],
+            export_xml=export_settings["speedtree_export_xml"],
+        )
         speedtree_export_started = perf_counter()
         speedtree_export = None
         if not args.force_native_export:
@@ -1184,7 +1362,7 @@ def main():
                 collision_hook,
             )
         if speedtree_export is None:
-            speedtree_export = run_speedtree_cli_export(
+            speedtree_export = run_selected_speedtree_export(
                 str(speedtree_spm),
                 speedtree_exe_path=export_settings["speedtree_exe_path"],
                 export_options_path=export_settings[
@@ -1203,9 +1381,13 @@ def main():
                 force_reexport=args.force_native_export,
             )
             report["speedtree_export_source"] = (
-                "forced_export_helper"
-                if args.force_native_export
-                else "export_helper"
+                "fresh_verification_only_export_helper"
+                if args.fresh_verification_only_export
+                else (
+                    "forced_export_helper"
+                    if args.force_native_export
+                    else "export_helper"
+                )
             )
         else:
             report["speedtree_export_source"] = "validated_material_preflight"
@@ -1213,6 +1395,15 @@ def main():
             report,
             "speedtree_export_bundle",
             speedtree_export_started,
+        )
+        report["speedtree_export_execution_policy"] = (
+            validate_fresh_verification_export_result(speedtree_export)
+            if args.fresh_verification_only_export
+            else {
+                "status": "not_requested",
+                "policy": "normal_collision_export_path",
+                "explicit_opt_in": False,
+            }
         )
         fbx_export = speedtree_export["exports"].get("fbx", {})
         xml_export = speedtree_export["exports"].get("xml", {})
@@ -1275,7 +1466,7 @@ def main():
             if source_spm_path == speedtree_spm:
                 assembly_source_export = speedtree_export
             else:
-                assembly_source_export = run_speedtree_cli_export(
+                assembly_source_export = run_selected_speedtree_export(
                     str(source_spm_path),
                     speedtree_exe_path=export_settings[
                         "speedtree_exe_path"
@@ -1298,6 +1489,12 @@ def main():
                     # the same exact native FBX/XML serialization contract.
                 )
             report["cluster_assembly_source_export"] = assembly_source_export
+            if args.fresh_verification_only_export:
+                report[
+                    "cluster_assembly_source_export_execution_policy"
+                ] = validate_fresh_verification_export_result(
+                    assembly_source_export
+                )
             assembly_fbx_export = (
                 assembly_source_export.get("exports", {}).get("fbx", {})
             )

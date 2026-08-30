@@ -81,6 +81,9 @@ ADDONS = {
                     "run_speedtree_cli_export",
                 ],
             },
+            "fresh_verification_export_v1": {
+                "operations": ["run_fresh_verification_only_export"],
+            },
             "assembly_pipeline_v1": {
                 "operations": ["run_import_and_assemble"],
             },
@@ -102,6 +105,10 @@ ADDONS = {
             ),
             "run_speedtree_cli_export": (
                 "speedtree_bone_weight_repair.core:run_speedtree_cli_export"
+            ),
+            "run_fresh_verification_only_export": (
+                "speedtree_bone_weight_repair.core:"
+                "run_fresh_verification_only_export"
             ),
             "run_import_and_assemble": (
                 "speedtree_bone_weight_repair.core:run_import_and_assemble"

@@ -25,7 +25,9 @@
 namespace {
 
 constexpr wchar_t kCapabilityContract[] =
-    L"SPEEDTREE_COLLISION_CLI_CONTRACT=native-runtime-receipt-v16";
+    L"SPEEDTREE_COLLISION_CLI_CONTRACT=native-runtime-receipt-v17";
+constexpr wchar_t kFreshVerificationSealedMarker[] =
+    L"SPEEDTREE_FRESH_VERIFICATION_EXPORT_SEALED=1";
 
 constexpr wchar_t kDefaultModelerPath[] =
     L"C:\\Program Files\\SpeedTree\\SpeedTree Modeler v10.1.0\\win64\\SpeedTree_Modeler.exe";
@@ -1249,6 +1251,15 @@ int wmain(int argc, wchar_t** argv) {
             }
         }
 
+        // This marker is deliberately narrower than generic verification-only
+        // success.  It certifies that one invocation produced the primary FBX,
+        // paired XML, and native receipt and that every freshness check above
+        // passed.  The caller still validates exact content identities before
+        // promoting the staged transaction.
+        if (verificationOnly && !secondaryExportOutput.empty() &&
+            !nativeReceipt.empty()) {
+            std::wcout << kFreshVerificationSealedMarker << L"\n";
+        }
         std::wcout << L"Post-collision export completed.\n";
         std::wcout << L"Hook log: " << std::filesystem::absolute(logPath) << L"\n";
         return 0;

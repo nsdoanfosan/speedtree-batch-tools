@@ -63,7 +63,7 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         launcher = LAUNCHER_SOURCE.read_text(encoding="utf-8")
         contract = (
             "SPEEDTREE_COLLISION_CLI_CONTRACT="
-            "native-runtime-receipt-v16"
+            "native-runtime-receipt-v17"
         )
 
         self.assertIn(contract, launcher)
@@ -75,6 +75,34 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         exact = SK_EXACT_PUSH_BAT.read_text(encoding="utf-8")
         self.assertIn(contract, exact)
         self.assertIn("findstr.exe /x", exact)
+
+    def test_fresh_verification_marker_is_after_all_launcher_seals(self):
+        source = LAUNCHER_SOURCE.read_text(encoding="utf-8")
+        marker_write = source.rindex(
+            "std::wcout << kFreshVerificationSealedMarker"
+        )
+
+        self.assertIn(
+            'L"SPEEDTREE_FRESH_VERIFICATION_EXPORT_SEALED=1"',
+            source,
+        )
+        self.assertIn(
+            "if (verificationOnly && !secondaryExportOutput.empty() &&",
+            source,
+        )
+        for required_check in (
+            "the requested FBX was not created",
+            "The requested FBX was not updated",
+            "the secondary output was not created",
+            "The secondary output was not updated",
+            "the native receipt was not created",
+            "The native receipt was not updated",
+        ):
+            self.assertLess(source.rindex(required_check), marker_write)
+        self.assertLess(
+            marker_write,
+            source.rindex('std::wcout << L"Post-collision export completed.'),
+        )
 
     def test_fbx_root_weights_use_the_native_id_zero_path(self):
         source = HOOK_SOURCE.read_text(encoding="utf-8")
