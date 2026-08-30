@@ -34,6 +34,28 @@ def sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+class ClusterRoleContractTests(unittest.TestCase):
+    def test_leaf_role_preserves_exact_public_material_identity(self):
+        contract = normalization_sync.cluster_role_contract(
+            Path("SK_Leaf_Fagus_multinervis_01.blend")
+        )
+        self.assertEqual(contract["role"], "leaf")
+        self.assertEqual(
+            contract["material_name"],
+            "M_Leaf_Fagus_multinervis_01",
+        )
+
+    def test_leaf_side_role_is_not_folded_into_leaf(self):
+        contract = normalization_sync.cluster_role_contract(
+            Path("SK_Leaf_Fagus_multinervis_side_01.blend")
+        )
+        self.assertEqual(contract["role"], "leaf_side")
+        self.assertEqual(
+            contract["material_name"],
+            "M_Leaf_Fagus_multinervis_side_01",
+        )
+
+
 def persisted_source_index(
     blend,
     *,

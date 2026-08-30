@@ -81,6 +81,7 @@ from cluster_assembly_handoff_contract import (
     role_identity_aliases_from_contract,
 )
 from cluster_assembly_builder import build_blender_assembly_inputs
+from cluster_normalization_sync import cluster_role_contract
 from job_report_contract import mark_job_failed
 from assembly_runtime_contract import (
     ASSEMBLY_OUTPUT_CONTRACT_VERSION,
@@ -1771,6 +1772,16 @@ def main():
             args.cluster_source_build_only
         )
         assembly_settings["source_identity_path"] = str(canonical_spm)
+        if is_cluster_source:
+            role_contract = cluster_role_contract(canonical_spm)
+            assembly_settings["authoritative_cluster_material_names"] = [
+                role_contract["material_name"]
+            ]
+            report["cluster_role_material_identity"] = {
+                "role": role_contract["role"],
+                "material": role_contract["material_name"],
+                "policy": "exact_cluster_normalizer_role_identity",
+            }
         canonical_source_fbx = (
             canonical_spm.parent
             / "fbx"
