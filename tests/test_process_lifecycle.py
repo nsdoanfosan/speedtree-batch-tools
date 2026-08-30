@@ -130,6 +130,34 @@ class ProcessLifecycleWindowsTests(unittest.TestCase):
     def _start(self, source="sanitized:unittest"):
         return start_process_supervisor(source, receipt_dir=self.receipts)
 
+    def test_owned_spawn_writes_one_pre_resume_receipt_not_duplicate_running_state(self):
+        supervisor = self._start()
+
+        class FakeProcess:
+            pid = 987654
+
+            def __init__(self):
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+        process = FakeProcess()
+        with mock.patch.object(supervisor, "_write_receipt") as write_receipt:
+            actual = supervisor._spawn_owned_locked(
+                ["fake.exe", "--first-run"],
+                source="tests.receipt_write_count",
+                popen_factory=lambda *_args, **_kwargs: process,
+            )
+
+            self.assertIs(actual, process)
+            self.assertEqual(write_receipt.call_count, 1)
+            self.assertEqual(supervisor.entry_for(process)["state"], "running")
+
+            process.returncode = 0
+            supervisor.complete_owned(process)
+            self.assertEqual(write_receipt.call_count, 2)
+
     def test_normal_exit_leaves_zero_owned_descendants_and_receipt(self):
         supervisor = self._start()
         ready = self.root / "normal.json"

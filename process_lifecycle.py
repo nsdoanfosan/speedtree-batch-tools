@@ -944,7 +944,13 @@ class ProcessSupervisor:
             if real_windows_launch:
                 tree_job.resume(process)
             entry["state"] = "running"
-            self._write_receipt()
+            # The pre-resume receipt written by ``_register_owned`` is already
+            # the durable ownership proof.  Rewriting the entire cumulative
+            # session receipt immediately after resume adds O(processes^2)
+            # JSON and ReplaceFile work to large first-run batches without
+            # strengthening recovery: every nonterminal recorded state is
+            # terminated with the owner.  Keep the live state in memory and
+            # persist it with the next meaningful transition/completion.
             return process
         except BaseException:
             if process is not None and process.poll() is None:

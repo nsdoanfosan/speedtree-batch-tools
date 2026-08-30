@@ -60,6 +60,12 @@ process-lifetime boundary every six Unreal items.
   references, and requests immediate commandlet GC.
 - Windows Job Object receipts now record exact-tree user/kernel CPU time and
   peak process/job memory for future production measurements.
+- The durable process receipt is written before a suspended child is resumed
+  and again at its terminal transition. The former immediate post-resume
+  rewrite duplicated the full cumulative session JSON without improving crash
+  recovery, so it was removed. This saves exactly one atomic receipt replace
+  per child launch (18 writes in the asset-serial synthetic run and 14 in the
+  stage-batched run) while retaining pre-resume ownership durability.
 
 ## Small benchmark
 
