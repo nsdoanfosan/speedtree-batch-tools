@@ -2641,6 +2641,17 @@ class PushQueueFlowTests(unittest.TestCase):
                         order.append("b1")
 
             app._job_blender = mock.Mock(side_effect=fake_blender)
+            original_stage_runner = gui.run_memory_bounded_stage
+
+            def high_memory_stage(*args, **kwargs):
+                kwargs["memory_snapshot_fn"] = lambda: {
+                    "available_physical_bytes": 64 * 1024 ** 3,
+                    "available_commit_bytes": 64 * 1024 ** 3,
+                    "effective_available_bytes": 64 * 1024 ** 3,
+                    "limiting_resource": "physical",
+                }
+                return original_stage_runner(*args, **kwargs)
+
             with mock.patch.object(
                 gui, "LOG_DIR", root / "logs"
             ), mock.patch.object(gui, "save_state"), mock.patch.object(
@@ -2650,6 +2661,10 @@ class PushQueueFlowTests(unittest.TestCase):
                     "selected_workers": 2,
                     "memory_limited": False,
                 },
+            ), mock.patch.object(
+                gui,
+                "run_memory_bounded_stage",
+                side_effect=high_memory_stage,
             ):
                 result = app._run_batch(
                     "blender", targets, emit_done=False

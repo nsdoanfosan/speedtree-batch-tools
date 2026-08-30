@@ -20,11 +20,28 @@ owns item-local checkpoints, compiler drains, GC, and the six-item process
 lifetime. Cluster dependencies are still completed before their consumers, so
 stage batching does not weaken the native branch/bone contract.
 
-Available physical RAM now caps Assembly and Send2UE worker counts before a
-wave begins. The user's configured worker count remains an upper bound. The
-conservative envelopes are 6 GiB per Assembly worker, 4 GiB per export worker,
-and an 8 GiB system reserve. This prevents paging from turning nominal
-parallelism into worse first-run wall time.
+The headless fleet uses the same root Assembly barrier without allowing worker
+threads to mutate provider state. One memory-bounded root round completes,
+newly discovered providers are processed serially, and every root that observed
+one of those providers is rebuilt in the next round. This repeats only while a
+round discovers a previously unprocessed provider. Shared late providers cause
+every consumer from that round to rebuild, independent of worker completion
+order.
+
+Root preparation also seals the live material contract to a run/index-unique
+path before the parallel round starts. Distinct folders may legally contain
+the same SPM stem, so workers never read the stem-only `current` contract path
+that a later root preparation could overwrite.
+
+Available physical RAM and system commit headroom cap Assembly and Send2UE
+launches. Both values are sampled again before every process admission because
+Windows documents them as volatile. The user's configured worker count remains
+an upper bound. The conservative envelopes are 6 GiB per Assembly worker, 4
+GiB per export worker, and an 8 GiB system reserve. An in-flight process keeps
+one full peak reservation until it exits. This prevents paging or commit
+exhaustion from turning nominal parallelism into worse first-run wall time,
+while allowing later launches to expand if another application releases memory
+during the wave.
 
 ## Structure comparison
 
@@ -60,6 +77,10 @@ process-lifetime boundary every six Unreal items.
   references, and requests immediate commandlet GC.
 - Windows Job Object receipts now record exact-tree user/kernel CPU time and
   peak process/job memory for future production measurements.
+- Durable Unreal checkpoints use compact JSON while item and final reports
+  remain pretty-printed. The schema and atomic replace contract are unchanged;
+  a measured 137-item checkpoint encoded 4.37 times faster and was 35 percent
+  smaller on this workstation.
 - The durable process receipt is written before a suspended child is resumed
   and again at its terminal transition. The former immediate post-resume
   rewrite duplicated the full cumulative session JSON without improving crash

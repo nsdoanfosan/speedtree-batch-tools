@@ -109,6 +109,19 @@ def write_manifest_v2(tmp_path, items, max_retries=2):
     return manifest, checkpoint, report
 
 
+def test_atomic_checkpoint_json_can_use_compact_encoding(tmp_path):
+    runner = load_runner()
+    target = tmp_path / "checkpoint.json"
+    payload = {"items": {"tree": {"status": "imported_ok"}}}
+
+    runner._atomic_write_json(target, payload, compact=True)
+    encoded = target.read_text(encoding="utf-8")
+
+    assert json.loads(encoded) == payload
+    assert "\n" not in encoded
+    assert '": ' not in encoded
+
+
 def item(queue_id, fingerprint):
     return {
         "queue_id": queue_id,
