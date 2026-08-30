@@ -43,6 +43,7 @@ sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(TOOL_DIR))
 
 from process_lifecycle import owned_run, shutdown_process_supervisor
+from stage_batch_policy import stage_worker_policy
 
 from code_compile_gate import (
     CODE_REVISION_RESTART_ROUTE,
@@ -10477,7 +10478,20 @@ class App:
         if phase == "check":
             workers = self.cfg.get("check_parallel_jobs", 8)
         elif phase == "blender":
-            workers = self.cfg.get("blender_parallel_jobs", 2)
+            worker_policy = stage_worker_policy(
+                "assembly",
+                self.cfg.get("blender_parallel_jobs", 2),
+                total,
+            )
+            workers = worker_policy["selected_workers"]
+            if worker_policy["memory_limited"]:
+                self.log(
+                    "Blender Assembly workers memory-capped: "
+                    f"{worker_policy['requested_workers']}→{workers} "
+                    f"(available={worker_policy['available_memory_bytes']}, "
+                    f"reserve={worker_policy['reserve_bytes']}, "
+                    f"per-worker={worker_policy['per_worker_peak_bytes']})"
+                )
         else:
             workers = 1
         workers = max(1, min(int(workers), total))
@@ -17023,10 +17037,20 @@ class App:
         self.ui_queue.put(("batch_progress", (0, total)))
         exported_by_index = {}
         failed_items = set(getattr(self, "_phase_failed_items", set()))
-        workers = max(
-            1,
-            min(int(self.cfg.get("blender_parallel_jobs", 2)), total),
+        export_worker_policy = stage_worker_policy(
+            "blender_export",
+            self.cfg.get("blender_parallel_jobs", 2),
+            total,
         )
+        workers = export_worker_policy["selected_workers"]
+        if export_worker_policy["memory_limited"]:
+            self.log(
+                "Send2UE export workers memory-capped: "
+                f"{export_worker_policy['requested_workers']}→{workers} "
+                f"(available={export_worker_policy['available_memory_bytes']}, "
+                f"reserve={export_worker_policy['reserve_bytes']}, "
+                f"per-worker={export_worker_policy['per_worker_peak_bytes']})"
+            )
         if workers > 1:
             self.log(f"Send2UE export: {workers}개 동시 실행")
 

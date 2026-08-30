@@ -2643,7 +2643,14 @@ class PushQueueFlowTests(unittest.TestCase):
             app._job_blender = mock.Mock(side_effect=fake_blender)
             with mock.patch.object(
                 gui, "LOG_DIR", root / "logs"
-            ), mock.patch.object(gui, "save_state"):
+            ), mock.patch.object(gui, "save_state"), mock.patch.object(
+                gui,
+                "stage_worker_policy",
+                return_value={
+                    "selected_workers": 2,
+                    "memory_limited": False,
+                },
+            ):
                 result = app._run_batch(
                     "blender", targets, emit_done=False
                 )

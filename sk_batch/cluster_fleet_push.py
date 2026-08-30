@@ -19,8 +19,10 @@ import os
 import stat
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 
 from exact_push import (
     DEFAULT_BLENDER,
@@ -41,6 +43,7 @@ from push_dependency_schedule import (
     normalized_path_key,
 )
 from sk_common import wind_preset_for_spm
+from stage_batch_policy import stage_worker_policy
 from assembly_runtime_contract import assembly_runtime_code_state
 
 
@@ -60,6 +63,12 @@ DEFAULT_P4_CLIENT = "UnrealProjects"
 COMBINED_MANIFEST_SCHEMA_VERSION = 2
 EXTERNAL_ITEM_STORAGE_SCHEMA_VERSION = 1
 
+
+def _completed_process_metrics(completed, started):
+    return {
+        "wall_seconds": round(perf_counter() - float(started), 6),
+        "resource_usage": getattr(completed, "resource_usage", None),
+    }
 
 def _atomic_write_bytes(path, payload):
     target = Path(path)
@@ -1040,6 +1049,15 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--blender-workers",
+        type=int,
+        default=2,
+        help=(
+            "maximum concurrent root Send2UE exports; current available RAM "
+            "can reduce this value"
+        ),
+    )
     parser.add_argument("--run-id")
     parser.add_argument("--reset-item-retries", action="store_true")
     parser.add_argument(
@@ -1367,6 +1385,7 @@ def main(argv=None):
                     })
                     save_fleet()
                     return result
+            assembly_started = perf_counter()
             assembly_completed = owned_run(
                 assembly_command,
                 source=(
@@ -1374,6 +1393,10 @@ def main(argv=None):
                 ),
                 run_factory=subprocess.run,
                 check=False,
+            )
+            result["assembly_execution"] = _completed_process_metrics(
+                assembly_completed,
+                assembly_started,
             )
             result["assembly_returncode"] = assembly_completed.returncode
             if assembly_completed.returncode:
@@ -1391,6 +1414,7 @@ def main(argv=None):
                     "provider Assembly postcondition failed: "
                     + "; ".join(verification["problems"])
                 )
+            export_started = perf_counter()
             completed = owned_run(
                 command,
                 source=(
@@ -1398,6 +1422,10 @@ def main(argv=None):
                 ),
                 run_factory=subprocess.run,
                 check=False,
+            )
+            result["export_execution"] = _completed_process_metrics(
+                completed,
+                export_started,
             )
             result["returncode"] = completed.returncode
             result["report"] = str(outputs["report"])
@@ -1484,8 +1512,12 @@ def main(argv=None):
         )
         return 1
 
+    prepared_roots = []
+    fleet["root_execution_policy"] = (
+        "all_root_assembly_then_all_root_blender_export_then_combined_unreal"
+    )
     for index, target in enumerate(targets, 1):
-        print(f"[{index}/{len(targets)}] EXPORT {target['stem']}", flush=True)
+        print(f"[{index}/{len(targets)}] ASSEMBLY {target['stem']}", flush=True)
         result = {
             "stem": target["stem"],
             "spm": str(target["spm"]),
@@ -1567,11 +1599,16 @@ def main(argv=None):
             )
             result["assembly_report"] = str(assembly_report)
             while True:
+                assembly_started = perf_counter()
                 assembly_completed = owned_run(
                     assembly_command,
                     source="sk_batch.cluster_fleet_push.blender_assembly",
                     run_factory=subprocess.run,
                     check=False,
+                )
+                result["assembly_execution"] = _completed_process_metrics(
+                    assembly_completed,
+                    assembly_started,
                 )
                 result["assembly_returncode"] = assembly_completed.returncode
                 if assembly_completed.returncode:
@@ -1639,16 +1676,68 @@ def main(argv=None):
             else:
                 target["expected_parts"] = assembly_verification["parts"]
                 target["expected_bindings"] = assembly_verification["bindings"]
+            result["status"] = "assembly_ready_for_export"
+            prepared_roots.append({
+                "target": target,
+                "command": command,
+                "outputs": outputs,
+                "result": result,
+            })
+        except (ExactPushError, OSError, ValueError, RuntimeError) as exc:
+            result["status"] = "failed"
+            result["error"] = str(exc)
+        save_fleet()
+        if args.fail_fast and result.get("status") == "failed":
+            break
+
+    # The Assembly phase is a real barrier.  This keeps native exporter and
+    # Assembly peak lifetimes out of the Send2UE export wave and lets the GUI
+    # and the fleet tool share the same all-A -> all-B -> all-U structure.
+    export_worker_policy = stage_worker_policy(
+        "blender_export",
+        args.blender_workers,
+        len(prepared_roots),
+    )
+    if args.fail_fast or args.transport == "rpc":
+        # Preserve strict fail-fast semantics: do not launch work beyond the
+        # exact export whose failure is being reported.  An open Editor RPC
+        # endpoint also remains single-owner even though headless export is
+        # safely parallel.
+        export_worker_policy["selected_workers"] = 1
+        export_worker_policy["serial_override"] = (
+            "fail_fast" if args.fail_fast else "rpc_single_editor_owner"
+        )
+    fleet["root_export_worker_policy"] = export_worker_policy
+    save_fleet()
+
+    def export_prepared_root(export_index, prepared):
+        target = prepared["target"]
+        command = prepared["command"]
+        outputs = prepared["outputs"]
+        result = prepared["result"]
+        print(
+            f"[{export_index}/{len(prepared_roots)}] BLENDER EXPORT "
+            f"{target['stem']}",
+            flush=True,
+        )
+        try:
+            export_started = perf_counter()
             completed = owned_run(
                 command,
                 source="sk_batch.cluster_fleet_push.blender_export",
                 run_factory=subprocess.run,
                 check=False,
             )
+            result["export_execution"] = _completed_process_metrics(
+                completed,
+                export_started,
+            )
             result["returncode"] = completed.returncode
             result["report"] = str(outputs["report"])
             if completed.returncode:
-                raise RuntimeError(f"production export exited {completed.returncode}")
+                raise RuntimeError(
+                    f"production export exited {completed.returncode}"
+                )
             export_report = json.loads(
                 outputs["report"].read_text(encoding="utf-8")
             )
@@ -1661,8 +1750,7 @@ def main(argv=None):
                         + "; ".join(verification["problems"])
                     )
                 result["status"] = "verified_in_unreal"
-                save_fleet()
-                continue
+                return None
             if export_report.get("status") != "exported_pending_unreal":
                 raise RuntimeError(
                     "production export did not reach exported_pending_unreal"
@@ -1673,22 +1761,51 @@ def main(argv=None):
             items = list(exported_manifest.get("items") or [])
             if len(items) != 1:
                 raise RuntimeError(
-                    f"exact export manifest item count is {len(items)}, expected 1"
+                    "exact export manifest item count is "
+                    f"{len(items)}, expected 1"
                 )
             result["status"] = "exported_pending_unreal"
-            pending.append({
+            return {
                 "kind": "root",
                 "target": target,
                 "outputs": outputs,
                 "item": items[0],
                 "result": result,
-            })
+            }
         except (ExactPushError, OSError, ValueError, RuntimeError) as exc:
             result["status"] = "failed"
             result["error"] = str(exc)
-        save_fleet()
-        if args.fail_fast and result.get("status") == "failed":
-            break
+            return None
+
+    export_workers = export_worker_policy["selected_workers"]
+    root_pending_by_index = {}
+    if export_workers > 1:
+        with ThreadPoolExecutor(max_workers=export_workers) as pool:
+            futures = {
+                pool.submit(export_prepared_root, index, prepared): index
+                for index, prepared in enumerate(prepared_roots, 1)
+            }
+            for future in as_completed(futures):
+                export_index = futures[future]
+                pending_entry = future.result()
+                if pending_entry is not None:
+                    root_pending_by_index[export_index] = pending_entry
+                save_fleet()
+    else:
+        for export_index, prepared in enumerate(prepared_roots, 1):
+            pending_entry = export_prepared_root(export_index, prepared)
+            if pending_entry is not None:
+                root_pending_by_index[export_index] = pending_entry
+            save_fleet()
+            if (
+                args.fail_fast
+                and prepared["result"].get("status") == "failed"
+            ):
+                break
+    pending.extend(
+        root_pending_by_index[index]
+        for index in sorted(root_pending_by_index)
+    )
 
     if pending and args.prepare_only:
         for entry in pending:

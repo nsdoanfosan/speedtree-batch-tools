@@ -338,6 +338,46 @@ class _WindowsJob:
     def is_empty(self):
         return self.active_process_count() == 0
 
+    def resource_usage(self):
+        """Return cumulative CPU and peak commit for this exact process tree."""
+        with self._handle_lock:
+            if self._closed or not self._handle:
+                return None
+            accounting = self._accounting_type()
+            if not self.kernel32.QueryInformationJobObject(
+                self._handle,
+                self.JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION,
+                self.ctypes.byref(accounting),
+                self.ctypes.sizeof(accounting),
+                None,
+            ):
+                self._raise_last_error("process_job_accounting_query_failed")
+            extended = self._extended_type()
+            if not self.kernel32.QueryInformationJobObject(
+                self._handle,
+                self.JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                self.ctypes.byref(extended),
+                self.ctypes.sizeof(extended),
+                None,
+            ):
+                self._raise_last_error("process_job_memory_query_failed")
+            return {
+                "user_cpu_seconds": round(
+                    int(accounting.TotalUserTime) / 10_000_000.0,
+                    6,
+                ),
+                "kernel_cpu_seconds": round(
+                    int(accounting.TotalKernelTime) / 10_000_000.0,
+                    6,
+                ),
+                "page_fault_count": int(accounting.TotalPageFaultCount),
+                "total_processes": int(accounting.TotalProcesses),
+                "peak_process_memory_bytes": int(
+                    extended.PeakProcessMemoryUsed
+                ),
+                "peak_job_memory_bytes": int(extended.PeakJobMemoryUsed),
+            }
+
     def wait_empty(self, timeout):
         deadline = time.monotonic() + max(0.0, float(timeout))
         while True:
@@ -1026,6 +1066,9 @@ class ProcessSupervisor:
         if forced:
             entry["forced_result"] = str(reason)
         if tree_job is not None:
+            resource_usage = getattr(tree_job, "resource_usage", None)
+            if callable(resource_usage):
+                entry["resource_usage"] = resource_usage()
             tree_job.close()
         self._write_receipt()
         return entry["cleanup_state"]
@@ -1391,6 +1434,10 @@ def owned_run(*popenargs, source, input=None, capture_output=False, timeout=None
         returncode,
         stdout,
         stderr,
+    )
+    entry = get_process_supervisor().entry_for(process)
+    completed.resource_usage = copy.deepcopy(
+        (entry or {}).get("resource_usage")
     )
     if check:
         completed.check_returncode()

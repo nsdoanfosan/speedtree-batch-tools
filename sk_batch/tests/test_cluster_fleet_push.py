@@ -19,6 +19,7 @@ if str(SK_BATCH) not in sys.path:
 from cluster_fleet_push import (  # noqa: E402
     ExactPushError,
     PushDependencyError,
+    _completed_process_metrics,
     build_spm_bone_policy_command,
     build_receipt_refresh_command,
     build_assembly_command,
@@ -84,6 +85,42 @@ def exact_identity_contract(binding_count):
 
 
 class ClusterFleetPushTests(unittest.TestCase):
+    def test_completed_process_metrics_promotes_exact_tree_usage(self):
+        completed = SimpleNamespace(
+            resource_usage={
+                "peak_job_memory_bytes": 123,
+                "user_cpu_seconds": 4.5,
+            }
+        )
+        with patch("cluster_fleet_push.perf_counter", return_value=12.25):
+            metrics = _completed_process_metrics(completed, 10.0)
+
+        self.assertEqual(metrics["wall_seconds"], 2.25)
+        self.assertEqual(metrics["resource_usage"], completed.resource_usage)
+
+    def test_root_execution_has_assembly_barrier_before_export_wave(self):
+        source = (SK_BATCH / "cluster_fleet_push.py").read_text(
+            encoding="utf-8"
+        )
+        assembly_loop = source.index(
+            "    for index, target in enumerate(targets, 1):"
+        )
+        prepared_append = source.index(
+            "            prepared_roots.append({",
+            assembly_loop,
+        )
+        export_loop = source.index(
+            "    for export_index, prepared in enumerate(prepared_roots, 1):",
+            prepared_append,
+        )
+
+        self.assertLess(assembly_loop, prepared_append)
+        self.assertLess(prepared_append, export_loop)
+        self.assertIn(
+            "all_root_assembly_then_all_root_blender_export_then_combined_unreal",
+            source,
+        )
+
     def test_policy_batch_command_uses_factory_startup_and_exact_targets(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

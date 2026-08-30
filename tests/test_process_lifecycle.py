@@ -145,6 +145,11 @@ class ProcessLifecycleWindowsTests(unittest.TestCase):
         )
         evidence = _wait_for_json(ready)
         self.assertEqual(completed.returncode, 0)
+        self.assertIsInstance(completed.resource_usage, dict)
+        self.assertGreater(
+            completed.resource_usage["peak_job_memory_bytes"],
+            0,
+        )
         self.assertTrue(
             _wait_identity_gone(
                 evidence["parent_pid"], evidence["parent_start_identity"]
@@ -158,6 +163,10 @@ class ProcessLifecycleWindowsTests(unittest.TestCase):
         )
         receipt = supervisor.receipt()
         self.assertEqual(receipt["survivors"], [])
+        self.assertEqual(
+            receipt["owned_processes"][0]["resource_usage"],
+            completed.resource_usage,
+        )
         self.assertEqual(
             receipt["owned_processes"][0]["cleanup_state"],
             "process_tree_clean",
