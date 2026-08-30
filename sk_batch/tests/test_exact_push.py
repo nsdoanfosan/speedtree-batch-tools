@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 import tempfile
 import unittest
@@ -17,6 +18,99 @@ from exact_push import ExactPushError, build_exact_push_command  # noqa: E402
 
 
 class ExactPushCommandTests(unittest.TestCase):
+    def test_planned_headless_process_yield_does_not_spend_crash_budget(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            project = root / "MyProject.uproject"
+            editor_cmd = root / "UnrealEditor-Cmd.exe"
+            manifest = root / "manifest.json"
+            checkpoint = root / "checkpoint.json"
+            report = root / "report.json"
+            project.write_text("{}", encoding="utf-8")
+            editor_cmd.write_bytes(b"exe")
+            manifest.write_text(
+                json.dumps({"schema_version": 1, "items": [{"queue_id": "a"}]}),
+                encoding="utf-8",
+            )
+            launches = []
+
+            def fake_run(*_args, **kwargs):
+                launches.append(kwargs["env"])
+                if len(launches) == 1:
+                    checkpoint.write_text(
+                        json.dumps({"complete": False, "process_yield": {"processed": 1}}),
+                        encoding="utf-8",
+                    )
+                else:
+                    checkpoint.write_text(
+                        json.dumps({"complete": True}),
+                        encoding="utf-8",
+                    )
+                    report.write_text(
+                        json.dumps({"status": "complete"}),
+                        encoding="utf-8",
+                    )
+                return mock.Mock(returncode=0)
+
+            with mock.patch.object(exact_push, "owned_run", side_effect=fake_run):
+                result = exact_push.run_headless_manifest(
+                    manifest,
+                    checkpoint,
+                    report,
+                    unreal_project=project,
+                    unreal_editor_cmd=editor_cmd,
+                    max_restarts=0,
+                )
+
+            self.assertEqual(result["status"], "complete")
+            self.assertEqual(len(launches), 2)
+            self.assertEqual(launches[0]["SK_BATCH_MAX_ITEMS_PER_PROCESS"], "6")
+
+    def test_stale_process_yield_marker_spends_incomplete_launch_budget(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            project = root / "MyProject.uproject"
+            editor_cmd = root / "UnrealEditor-Cmd.exe"
+            manifest = root / "manifest.json"
+            checkpoint = root / "checkpoint.json"
+            report = root / "report.json"
+            project.write_text("{}", encoding="utf-8")
+            editor_cmd.write_bytes(b"exe")
+            manifest.write_text(
+                json.dumps({"schema_version": 1, "items": [{"queue_id": "a"}]}),
+                encoding="utf-8",
+            )
+            stale = {
+                "complete": False,
+                "process_yield": {
+                    "at": "2026-08-30T21:00:00",
+                    "next_queue_id": "a",
+                    "processed": 6,
+                },
+            }
+            checkpoint.write_text(json.dumps(stale), encoding="utf-8")
+            launches = []
+
+            def fake_run(*_args, **_kwargs):
+                launches.append(True)
+                return mock.Mock(returncode=0)
+
+            with mock.patch.object(exact_push, "owned_run", side_effect=fake_run):
+                with self.assertRaisesRegex(
+                    ExactPushError,
+                    "crash restart budget=0",
+                ):
+                    exact_push.run_headless_manifest(
+                        manifest,
+                        checkpoint,
+                        report,
+                        unreal_project=project,
+                        unreal_editor_cmd=editor_cmd,
+                        max_restarts=0,
+                    )
+
+            self.assertEqual(len(launches), 1)
+
     def test_promotes_assembly_live_material_contract_into_push_command(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import stat
 import subprocess
 import sys
@@ -56,6 +57,79 @@ PCG_AUDIT = (
     / "pcg_texture_audit.py"
 )
 DEFAULT_P4_CLIENT = "UnrealProjects"
+COMBINED_MANIFEST_SCHEMA_VERSION = 2
+EXTERNAL_ITEM_STORAGE_SCHEMA_VERSION = 1
+
+
+def _atomic_write_bytes(path, payload):
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    temporary.write_bytes(payload)
+    os.replace(temporary, target)
+
+
+def write_combined_lazy_manifest(manifest_path, manifest_metadata, pending):
+    """Publish a small v2 index whose large v1 items live in separate files."""
+    manifest_path = Path(manifest_path).resolve()
+    payload_dir = manifest_path.with_name(manifest_path.stem + "_items")
+    item_refs = []
+    for index, entry in enumerate(pending):
+        item = entry.get("item")
+        if not isinstance(item, dict):
+            raise ExactPushError(
+                f"combined manifest item {index} is not a JSON object"
+            )
+        queue_id = str(item.get("queue_id") or "")
+        fingerprint = str(item.get("fingerprint") or "")
+        if not queue_id or not fingerprint:
+            raise ExactPushError(
+                f"combined manifest item {index} has no queue id or fingerprint"
+            )
+        payload = json.dumps(
+            item,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        payload_sha256 = hashlib.sha256(payload).hexdigest()
+        payload_path = payload_dir / f"{index:04d}_{payload_sha256[:16]}.json"
+        _atomic_write_bytes(payload_path, payload)
+        item_refs.append({
+            "schema_version": 1,
+            "queue_id": queue_id,
+            "fingerprint": fingerprint,
+            "depends_on_queue_ids": list(
+                item.get("depends_on_queue_ids") or []
+            ),
+            "report_path": item.get("report_path"),
+            "checkout_asset_paths": list(
+                item.get("checkout_asset_paths") or []
+            ),
+            "payload_relpath": payload_path.relative_to(
+                manifest_path.parent
+            ).as_posix(),
+            "payload_size": len(payload),
+            "payload_sha256": payload_sha256,
+        })
+
+    manifest = dict(manifest_metadata)
+    manifest.update({
+        "schema_version": COMBINED_MANIFEST_SCHEMA_VERSION,
+        "item_storage": {
+            "kind": "external_json",
+            "schema_version": EXTERNAL_ITEM_STORAGE_SCHEMA_VERSION,
+            "integrity": "sha256",
+            "base_relpath": payload_dir.relative_to(
+                manifest_path.parent
+            ).as_posix(),
+        },
+        "items": item_refs,
+    })
+    _atomic_write_bytes(
+        manifest_path,
+        json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"),
+    )
+    return manifest
 
 
 def _asset_package_file(unreal_project, asset_path):
@@ -1632,18 +1706,18 @@ def main(argv=None):
         manifest_path = args.log_dir / f"cluster_fleet_push_{run_id}_unreal_manifest.json"
         checkpoint_path = args.log_dir / f"cluster_fleet_push_{run_id}_unreal_checkpoint.json"
         batch_report_path = args.log_dir / f"cluster_fleet_push_{run_id}_unreal_report.json"
-        manifest = {
-            "schema_version": 1,
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "checkpoint_path": str(checkpoint_path.resolve()),
-            "report_path": str(batch_report_path.resolve()),
-            "max_item_crash_retries": 2,
-            "items": [entry["item"] for entry in pending],
-        }
-        manifest_path.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        manifest = write_combined_lazy_manifest(
+            manifest_path,
+            {
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "checkpoint_path": str(checkpoint_path.resolve()),
+                "report_path": str(batch_report_path.resolve()),
+                "max_item_crash_retries": 2,
+            },
+            pending,
         )
+        for entry in pending:
+            entry.pop("item", None)
         fleet["unreal_manifest"] = str(manifest_path)
         fleet["unreal_checkpoint"] = str(checkpoint_path)
         fleet["unreal_report"] = str(batch_report_path)

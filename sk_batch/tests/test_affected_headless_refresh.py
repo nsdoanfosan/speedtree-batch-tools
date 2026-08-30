@@ -248,6 +248,7 @@ def test_headless_commandlet_disables_local_ddc_cleanup():
 
     assert "-NoDDCCleanup" in UNREAL_COMMANDLET_BASE_ARGS
     assert "-unattended" in UNREAL_COMMANDLET_BASE_ARGS
+    assert "-NullRHI" in UNREAL_COMMANDLET_BASE_ARGS
     assert "-NoDDCCleanup" in exact_push.UNREAL_COMMANDLET_BASE_ARGS
 
 

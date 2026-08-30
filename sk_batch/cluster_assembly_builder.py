@@ -8757,6 +8757,21 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
     return result
 
 
+def _clear_post_finish_native_reference_collections(*collections):
+    """Drop Python owners of native Assembly inputs after Finish completes.
+
+    ``AddAssemblyParts`` has consumed these arrays by the time
+    ``FinishAssemblyBuild`` returns.  Keeping their Python wrappers alive while
+    material normalization, wind import, and provenance validation run can
+    unnecessarily overlap the completed builder's large input graph with the
+    finished Assembly.  This helper deliberately accepts only temporary
+    containers; report/manifest data is never passed to it.
+    """
+    for collection in collections:
+        if collection is not None:
+            collection.clear()
+
+
 def _build_unreal_nanite_assembly_synchronous(unreal, manifest, asset_contract):
     """Build and save the separate UE 5.8 Assembly from imported inputs.
 
@@ -8877,6 +8892,14 @@ def _build_unreal_nanite_assembly_synchronous(unreal, manifest, asset_contract):
         builder,
     )
     built_parts = []
+    bindings = []
+    native_influences = []
+    influences = []
+    native_influence = None
+    binding = None
+    influence = None
+    row = None
+    part = None
     for part in manifest.get("parts") or []:
         bindings = []
         for row in part.get("bindings") or []:
@@ -8936,10 +8959,55 @@ def _build_unreal_nanite_assembly_synchronous(unreal, manifest, asset_contract):
                 "bindings": len(bindings),
             }
         )
-    finish = builder.finish_assembly_build()
-    success, assembly = _unwrap_struct_result(finish, unreal.SkeletalMesh)
+    # Copy every scalar needed by the result before releasing native input
+    # wrappers.  The final Assembly and its Skeleton remain live; only the
+    # completed builder, source-mesh wrapper map, and binding construction
+    # temporaries are released here.
+    final_skeleton_bone_count = len(actual_bones)
+    base_weighted_bone_count = len(base_weighted_bones)
+    binding_count = sum(row["bindings"] for row in built_parts)
+    finish = None
+    success = False
+    assembly = None
+    finish_failure = None
+    try:
+        finish = builder.finish_assembly_build()
+        success, assembly = _unwrap_struct_result(finish, unreal.SkeletalMesh)
+        if not success or assembly is None:
+            finish_failure = repr(finish)
+    finally:
+        # ``finish_assembly_build`` is the ownership boundary.  Clear all
+        # Python-side owners even when native finish raises so a failed item
+        # does not retain its multi-gigabyte source graph until process exit.
+        builder = None
+        finish = None
+        _clear_post_finish_native_reference_collections(
+            part_assets,
+            bindings,
+            native_influences,
+            actual_bone_indices,
+            unreal_bone_name_map,
+            skeleton_by_name,
+            authored_bones,
+        )
+        full = None
+        base = None
+        base_skeleton = None
+        parameters = None
+        expected_bones = None
+        actual_bones = None
+        base_contract = None
+        base_weighted_bones = None
+        influences = None
+        native_influence = None
+        binding = None
+        influence = None
+        row = None
+        part = None
     if not success or assembly is None:
-        raise ClusterAssemblyBuildError(f"FinishAssemblyBuild failed: {finish!r}")
+        raise ClusterAssemblyBuildError(
+            f"FinishAssemblyBuild failed: {finish_failure}"
+        )
     _validate_final_assembly_preserve_area(
         unreal,
         assembly,
@@ -9028,7 +9096,7 @@ def _build_unreal_nanite_assembly_synchronous(unreal, manifest, asset_contract):
         "full_skeletal_mesh_preserved": True,
         "assembly": assembly.get_path_name(),
         "final_skeleton": full_skeleton.get_path_name(),
-        "final_skeleton_bones": len(actual_bones),
+        "final_skeleton_bones": final_skeleton_bone_count,
         "manifest_skeleton_diagnostic": skeleton_snapshot_diagnostic,
         "unreal_bone_name_map": unreal_bone_name_map_diagnostic,
         "native_binding_contract": {
@@ -9038,8 +9106,8 @@ def _build_unreal_nanite_assembly_synchronous(unreal, manifest, asset_contract):
         },
         "production_skeleton_required": False,
         "parts": built_parts,
-        "binding_count": sum(row["bindings"] for row in built_parts),
-        "base_weighted_bone_count": len(base_weighted_bones),
+        "binding_count": binding_count,
+        "base_weighted_bone_count": base_weighted_bone_count,
         "base_weight_manifest_diagnostic": base_weight_manifest_diagnostic,
         "base_weights_in_final_wind": True,
         "final_nanite_shape_preservation": final_nanite_shape_preservation,
