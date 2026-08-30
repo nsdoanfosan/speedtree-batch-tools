@@ -500,6 +500,41 @@ def test_native_change_after_unreal_deployment_is_selected(tmp_path):
     assert "native receipt hash changed" in audit["deployment_receipt_error"]
 
 
+def test_schema2_deployment_requires_global_commit(tmp_path, monkeypatch):
+    target = _current_target(tmp_path, "SK_tree_schema2_uncommitted_01")
+    deployment_path = refresh.deployment_receipt_path(target)
+    deployment = json.loads(deployment_path.read_text(encoding="utf-8"))
+    deployment["schema_version"] = 2
+    deployment_path.write_text(json.dumps(deployment), encoding="utf-8")
+    monkeypatch.setattr(
+        refresh,
+        "_schema2_deployment_receipt_is_committed",
+        lambda _path, _payload: False,
+    )
+
+    audit = refresh.audit_target(target)
+
+    assert "unreal_deployment_receipt_missing_or_stale" in audit["reasons"]
+    assert "not globally committed" in audit["deployment_receipt_error"]
+
+
+def test_schema2_deployment_accepts_verified_global_commit(tmp_path, monkeypatch):
+    target = _current_target(tmp_path, "SK_tree_schema2_committed_01")
+    deployment_path = refresh.deployment_receipt_path(target)
+    deployment = json.loads(deployment_path.read_text(encoding="utf-8"))
+    deployment["schema_version"] = 2
+    deployment_path.write_text(json.dumps(deployment), encoding="utf-8")
+    monkeypatch.setattr(
+        refresh,
+        "_schema2_deployment_receipt_is_committed",
+        lambda _path, _payload: True,
+    )
+
+    audit = refresh.audit_target(target)
+
+    assert audit["reasons"] == []
+
+
 def test_stale_placement_contract_is_selected(tmp_path):
     target = _current_target(tmp_path, "SK_tree_stale_placement_01")
     _write_manifest(target, placement_version=4)

@@ -49,6 +49,18 @@ def deployment_receipt_path(target):
     return spm.parent / "fbx" / f"{target['stem']}.unreal_deployment_receipt.json"
 
 
+def _schema2_deployment_receipt_is_committed(path, payload):
+    """Require the global commit ledger for transactional schema-2 receipts."""
+
+    if payload.get("schema_version") != 2:
+        return True
+    try:
+        import finalize_affected_refresh as finalizer
+    except ModuleNotFoundError:  # Package import used by external callers/tests.
+        from sk_batch import finalize_affected_refresh as finalizer
+    return finalizer.schema2_receipt_is_committed(path)
+
+
 def _sha256(path):
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -248,6 +260,13 @@ def audit_target(target):
             deployment = json.loads(deployment_path.read_text(encoding="utf-8"))
             if deployment.get("status") != "imported_ok":
                 raise ValueError("deployment status is not imported_ok")
+            if not _schema2_deployment_receipt_is_committed(
+                deployment_path,
+                deployment,
+            ):
+                raise ValueError(
+                    "schema-2 deployment receipt is not globally committed"
+                )
             if deployment.get("native_receipt_sha256") != _sha256(receipt_path):
                 raise ValueError("native receipt hash changed after Unreal import")
             if deployment.get("assembly_manifest_sha256") != _sha256(manifest_path):
