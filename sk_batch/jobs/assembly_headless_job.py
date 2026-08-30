@@ -903,6 +903,42 @@ def validate_native_export_mode_arguments(
         )
 
 
+def validate_speedtree_export_timeout_layering(
+    outer_timeout_seconds,
+    wrapper_timeout_ms,
+):
+    """Keep native wrapper cleanup inside the owning Python timeout."""
+
+    if (
+        isinstance(outer_timeout_seconds, bool)
+        or not isinstance(outer_timeout_seconds, int)
+        or outer_timeout_seconds <= 0
+    ):
+        raise RuntimeError("SpeedTree outer export timeout must be a positive integer")
+    if wrapper_timeout_ms in (None, ""):
+        return {
+            "outer_timeout_seconds": outer_timeout_seconds,
+            "wrapper_timeout_ms": None,
+            "layering_validated": False,
+        }
+    try:
+        wrapper_ms = int(wrapper_timeout_ms)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "SPEEDTREE_COLLISION_WRAPPER_TIMEOUT_MS must be a positive integer"
+        ) from exc
+    if wrapper_ms <= 0 or wrapper_ms >= outer_timeout_seconds * 1000:
+        raise RuntimeError(
+            "SpeedTree native wrapper timeout must be positive and smaller "
+            "than the outer export timeout"
+        )
+    return {
+        "outer_timeout_seconds": outer_timeout_seconds,
+        "wrapper_timeout_ms": wrapper_ms,
+        "layering_validated": True,
+    }
+
+
 def validate_fresh_verification_export_result(result):
     """Verify the add-on's sealed sole-export evidence and exact artifacts."""
     if not isinstance(result, dict):
@@ -1129,11 +1165,16 @@ def main():
     args = parse_args()
     canonical_spm = Path(args.spm).resolve()
     speedtree_spm = Path(args.speedtree_spm or args.spm).resolve()
+    timeout_layering = validate_speedtree_export_timeout_layering(
+        args.speedtree_export_timeout,
+        os.environ.get("SPEEDTREE_COLLISION_WRAPPER_TIMEOUT_MS"),
+    )
     report = {
         "spm": str(canonical_spm),
         "speedtree_spm": str(speedtree_spm),
         "blend": args.blend,
         "wind": args.wind,
+        "speedtree_export_timeout_layering": timeout_layering,
         "status": "failed",
     }
     # Cluster rows reach this job under their canonical SK_ output identity.

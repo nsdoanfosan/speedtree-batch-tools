@@ -84,6 +84,21 @@ class FakeBlender:
 
 
 class ClusterSavePolicyTests(unittest.TestCase):
+    def test_speedtree_export_timeout_layering_is_fail_closed(self):
+        helper = load_job_functions(
+            ["validate_speedtree_export_timeout_layering"]
+        )["validate_speedtree_export_timeout_layering"]
+
+        policy = helper(1200, "840000")
+        self.assertTrue(policy["layering_validated"])
+        self.assertEqual(policy["wrapper_timeout_ms"], 840000)
+        with self.assertRaisesRegex(RuntimeError, "smaller"):
+            helper(840, "840000")
+        with self.assertRaisesRegex(RuntimeError, "positive integer"):
+            helper(1200, "not-a-number")
+        with self.assertRaisesRegex(RuntimeError, "positive integer"):
+            helper(0, "840000")
+
     def test_normal_collision_export_rejects_any_verification_fallback(self):
         helper = load_job_functions(
             ["validate_normal_collision_export_result"]
