@@ -1,13 +1,12 @@
-"""Pure policy helpers for renderer-sensitive Unreal ingest.
+"""Pure policy helpers for resource-heavy Unreal ingest.
 
-The GUI, manifest writers, and Unreal-side runner all import this module so a
-persisted transport preference cannot silently bypass the production guard.
+Manifest writers and the Unreal-side runner share these classifications so
+both RPC and headless execution retain the same ordering and resource guards.
 """
 
 from __future__ import annotations
 
 
-TRANSPORT_POLICY_VERSION = 1
 MAX_HEAVY_ITEMS_PER_PROCESS = 6
 PROVIDER_INGEST_WAVE = "provider_part"
 ASSEMBLY_INGEST_WAVE = "final_assembly"
@@ -37,7 +36,7 @@ def _asset_data_rows(item):
 
 
 def heavy_ingest_reasons(item):
-    """Return stable reasons that require an isolated NullRHI commandlet."""
+    """Return stable reasons that require the heavy-ingest safety controls."""
     if not isinstance(item, dict):
         return []
     reasons = []
@@ -95,47 +94,4 @@ def external_reference_policy_metadata(item_ref):
         "final_assembly_asset_path": str(
             item_ref.get("final_assembly_asset_path") or ""
         ),
-    }
-
-
-def resolve_heavy_push_transport(requested_transport, *, unreal_running):
-    """Keep generated vegetation ingest out of a live renderer process."""
-    requested = str(requested_transport or "headless")
-    if requested != "rpc":
-        return {
-            "requested": requested,
-            "transport": requested,
-            "changed": False,
-            "reason": None,
-        }
-    resolved = "unreal_wait" if unreal_running else "headless"
-    return {
-        "requested": requested,
-        "transport": resolved,
-        "changed": True,
-        "reason": (
-            "generated Nanite skeletal/DynamicWind ingest is isolated from "
-            "live-editor RPC"
-        ),
-    }
-
-
-def migrate_saved_push_transport(config, stored_config=None):
-    """Never let a persisted RPC preference become the next startup default."""
-    normalized = dict(config)
-    stored = stored_config if isinstance(stored_config, dict) else {}
-    try:
-        stored_version = int(stored.get("push_transport_policy_version", 0))
-    except (TypeError, ValueError):
-        stored_version = 0
-    changed = str(stored.get("push_transport") or "") == "rpc"
-    if changed:
-        normalized["push_transport"] = "unreal_wait"
-    normalized["push_transport_policy_version"] = TRANSPORT_POLICY_VERSION
-    return normalized, {
-        "changed": changed,
-        "from": "rpc" if changed else None,
-        "to": "unreal_wait" if changed else None,
-        "policy_version": TRANSPORT_POLICY_VERSION,
-        "stored_policy_version": stored_version,
     }

@@ -981,29 +981,32 @@ def _enforce_manifest_runtime_policy(item_refs, policies):
     headless_manifest = _is_headless_manifest_runtime()
     null_rhi = _is_null_rhi_runtime()
     isolated = headless_manifest and null_rhi
-    if heavy_items and not headless_manifest:
-        preview = "; ".join(
-            f"{row['queue_id']} ({', '.join(row['reasons'])})"
-            for row in heavy_items[:4]
-        )
-        if len(heavy_items) > 4:
-            preview += f"; +{len(heavy_items) - 4} more"
-        raise RuntimeError(
-            "renderer-sensitive SK Batch ingest is forbidden over live-editor "
-            "RPC; export through headless/unreal_wait and import with -NullRHI: "
-            + preview
-        )
-    if heavy_items and not null_rhi:
+    if heavy_items and headless_manifest and not null_rhi:
         raise RuntimeError(
             "renderer-sensitive SK Batch headless ingest requires -NullRHI; "
             "the commandlet launch invariant is missing"
         )
+    if headless_manifest:
+        safety_mode = "commandlet_null_rhi"
+    elif heavy_items:
+        safety_mode = "live_editor_serialized_rpc"
+    else:
+        safety_mode = "standard_rpc"
     return {
-        "policy": "isolated_generated_nanite_ingest_v1",
+        "policy": "generated_nanite_ingest_safety_v2",
         "isolated_runtime": bool(isolated),
+        "safety_mode": safety_mode,
         "heavy_item_count": len(heavy_items),
         "heavy_items": heavy_items,
         "waves": ["provider_part", "final_assembly"],
+        "shared_controls": [
+            "serial_manifest_runner",
+            "synchronous_skinned_asset_compilation",
+            "compiler_drain_before_restore",
+            "item_resource_release",
+            "provider_before_final_assembly_barrier",
+            "thumbnail_free_generated_skeletal_save",
+        ],
     }
 
 

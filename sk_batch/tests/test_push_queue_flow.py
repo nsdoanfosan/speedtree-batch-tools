@@ -4033,7 +4033,7 @@ class PushQueueFlowTests(unittest.TestCase):
         )
         self.assertIn("미실행", app.state["SK_after_2.spm"]["push_status"])
 
-    def test_rpc_preflight_routes_closed_editor_to_headless(self):
+    def test_rpc_preflight_requires_open_editor_without_changing_transport(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         targets = self.targets("SK_first.spm", "SK_second.spm")
@@ -4045,12 +4045,23 @@ class PushQueueFlowTests(unittest.TestCase):
         ):
             ready, reason = app._push_preflight(targets)
 
-        self.assertEqual(ready, targets)
-        self.assertIsNone(reason)
-        self.assertEqual(app.active_push_transport, "headless")
-        self.assertTrue(any("rpc→headless" in call.args[0] for call in app.log.call_args_list))
+        self.assertEqual(ready, [])
+        self.assertIn("Unreal Editor", reason)
+        self.assertEqual(
+            getattr(
+                app,
+                "active_push_transport",
+                app.cfg.get("push_transport", "rpc"),
+            ),
+            "rpc",
+        )
+        for target in targets:
+            self.assertEqual(
+                app.state[str(target["spm"])]["push_status_kind"],
+                "unreal_unavailable",
+            )
 
-    def test_rpc_preflight_routes_open_editor_to_unreal_wait(self):
+    def test_rpc_preflight_keeps_rpc_with_open_editor(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         targets = self.targets("SK_first.spm")
@@ -4062,7 +4073,14 @@ class PushQueueFlowTests(unittest.TestCase):
 
         self.assertEqual(ready, targets)
         self.assertIsNone(reason)
-        self.assertEqual(app.active_push_transport, "unreal_wait")
+        self.assertEqual(
+            getattr(
+                app,
+                "active_push_transport",
+                app.cfg.get("push_transport", "rpc"),
+            ),
+            "rpc",
+        )
 
     def test_all_preflight_excluded_remains_item_local_without_fleet_abort(self):
         gui = load_gui_module()

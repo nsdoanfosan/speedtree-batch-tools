@@ -46,7 +46,6 @@ from process_lifecycle import owned_run, shutdown_process_supervisor
 from stage_batch_policy import run_memory_bounded_stage, stage_worker_policy
 from unreal_ingest_policy import (
     bounded_heavy_process_item_limit,
-    resolve_heavy_push_transport,
 )
 
 from code_compile_gate import (
@@ -2400,7 +2399,7 @@ class App:
         transport_combo.pack(side="left", padx=6)
         Tooltip(
             transport_combo,
-            "rpc = 경량 작업용 열린 Unreal Editor 경로 (생성 Nanite SK는 자동 격리)\n"
+            "rpc = 열린 Unreal Editor에서 직렬·메모리 안전 Push\n"
             "headless = Blender 전체 export 후 UnrealEditor-Cmd 1회 배치 import\n"
             "unreal_wait = export만 완료하고 영구 Unreal 대기 큐에 등록",
         )
@@ -15874,17 +15873,21 @@ class App:
             self.cfg.get("push_transport", "rpc"),
         )
         unreal_running = self._unreal_running()
-        resolution = resolve_heavy_push_transport(
-            transport,
-            unreal_running=unreal_running,
-        )
-        if resolution["changed"]:
-            transport = resolution["transport"]
-            self.active_push_transport = transport
-            self.log(
-                "[Push transport 안전 전환] rpc→"
-                f"{transport}: {resolution['reason']}"
-            )
+        if transport == "rpc" and not unreal_running:
+            reason = "Unreal Editor 종료 — MyProject2가 실행 중이 아님"
+            self.log(f"[중단] {reason}")
+            for item in targets:
+                self._record_phase_status(
+                    str(item["spm"]),
+                    "push_status",
+                    f"중단: {reason}",
+                    "unreal_unavailable",
+                    reason,
+                    persist=False,
+                )
+            with self.state_lock:
+                save_state(self.state)
+            return [], reason
         if transport == "headless" and unreal_running:
             reason = "headless Push는 자산 잠금 충돌 방지를 위해 Unreal Editor를 닫아야 함"
             self.log(f"[중단] {reason}")

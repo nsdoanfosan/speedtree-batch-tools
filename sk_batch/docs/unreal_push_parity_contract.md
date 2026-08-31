@@ -2,14 +2,13 @@
 
 ## Scope
 
-`rpc` and `headless` retain transaction-format parity, but they are not equally
-permitted for every workload. `unreal_wait` uses the headless export contract
-and deliberately stops before Unreal starts. Generated Nanite SkeletalMesh,
-DynamicWind provider, and final Assembly manifests are renderer-sensitive and
-must use `headless`/`unreal_wait`; live RPC is reserved for work that the shared
-policy classifies as lightweight. All modes consume the same versioned item
-manifest, and a mode must not reinterpret Send2UE settings or replace the
-Send2UE importer with a generic FBX task.
+`rpc` and `headless` execute the same transaction for generated Nanite
+SkeletalMesh, DynamicWind provider, and final Assembly workloads. `unreal_wait`
+uses the headless export contract and deliberately stops before Unreal starts.
+All modes consume the same versioned item manifest, and a mode must not
+reinterpret Send2UE settings or replace the Send2UE importer with a generic FBX
+task. Headless adds process isolation and `-NullRHI`; RPC keeps the requested
+live-editor workflow while using the shared serial compiler/GC safety controls.
 
 All three modes must also preserve the channel meanings and failure rules in
 the [Tree Vertex Color contract](tree_vertex_color_contract.md); transport is
@@ -70,8 +69,12 @@ texture availability never changes the target outcome.
 
 Headless invokes this transaction in one
 `UnrealEditor-Cmd.exe -run=pythonscript -NullRHI` session for the pending batch.
-The RPC bridge retains the same serialization contract for lightweight work,
-but the Unreal runner refuses renderer-sensitive manifests before mutation.
+The RPC bridge invokes the same runner one item at a time in the open editor.
+For both transports, each item temporarily disables overlapping asynchronous
+skinned-asset compilation, drains compilers before restoring the editor setting,
+releases transient references, performs Unreal GC, and uses thumbnail-free saves
+for generated SkeletalMeshes. The provider/part and final-Assembly waves retain
+one explicit barrier.
 
 ## Queue and recovery contract
 
@@ -99,11 +102,10 @@ match; `--force` bypasses both caches.
 ## GUI compatibility
 
 - The existing `③ Unreal Push` button remains and defaults to `headless`.
-- A transport selector permits `rpc`, `headless`, or `unreal_wait`, but the
-  generated vegetation preflight resolves RPC to `unreal_wait` when the editor
-  is open and to `headless` when it is closed.
-- Saved RPC preferences are normalized to `unreal_wait`. Runtime enforcement is
-  authoritative even if a current-session selection or direct caller requests RPC.
+- A transport selector permits `rpc`, `headless`, or `unreal_wait`. An explicit
+  RPC selection remains RPC and requires MyProject2 Unreal Editor to be open.
+- Saved RPC preferences remain RPC; loading or saving configuration never
+  silently rewrites the selected transport.
 - `unreal_wait` persists dependency-ordered immutable exports as
   `exported_pending_unreal`. The state and waiting manifest survive GUI restarts.
 - `대기 에셋 임포트` revalidates source and export fingerprints, refuses to
@@ -127,6 +129,6 @@ match; `--force` bypasses both caches.
 - Verification artifacts are listed in
   `logs/verification_headless_rpc_parity.json`.
 
-This evidence proves serialization/transaction parity only. It does not grant
-production permission to execute generated Nanite/DynamicWind ingest through a
-live renderer process under the current isolation policy.
+This evidence supports using either transport. Production RPC additionally
+inherits the current serial compiler-drain, item-GC, thumbnail-free save, and
+two-wave Assembly safety controls.

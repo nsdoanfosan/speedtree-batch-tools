@@ -3,24 +3,25 @@
 This policy concerns only work executed in the current run. Receipt reuse,
 artifact caches, and second-run speedups are outside its scope.
 
-## Renderer-isolation invariant
+## Runtime-safety invariant
 
 Generated Nanite SkeletalMesh, DynamicWind provider, and final Nanite Assembly
-ingest must not mutate assets through a live-editor RPC session. The GUI turns
-an RPC request into `unreal_wait` while the editor is open, or `headless` when
-it is closed. Any saved `push_transport=rpc` preference is normalized to
-`unreal_wait`; a current-session selection still cannot bypass the per-run preflight.
-The Unreal manifest runner independently rejects a renderer-sensitive manifest
-before writing a checkpoint or touching an asset unless it is running in the
-isolated commandlet/NullRHI path.
+ingest is supported through both live-editor `rpc` and commandlet `headless`.
+An explicit RPC selection is never rewritten or silently persisted as another
+transport. RPC requires the editor to be open and stays asset-serial. The shared
+Unreal manifest runner disables overlapping asynchronous skinned-asset builds,
+drains all asset compilers before restoring the editor setting, releases item
+references, runs Unreal GC, saves generated SkeletalMeshes without thumbnails,
+and enforces the provider/part-before-final-Assembly barrier in either transport.
 
-This is a first-import execution rule, not a cache optimization. The commandlet
-launch keeps `-NullRHI`, so thumbnail rendering, viewport residency, and live
-GPUScene allocation cannot compete with Nanite/skinned-asset compilation.
+Headless remains the default and adds process isolation, a six-phase recycle
+ceiling, and `-NullRHI`, so thumbnail rendering, viewport residency, and live
+GPUScene allocation cannot compete with Nanite/skinned-asset compilation. These
+are first-import execution controls, not cache or second-run optimizations.
 
 ## Chosen execution shape
 
-Production uses stage batching with bounded workers:
+Headless and deferred-wait production runs use stage batching with bounded workers:
 
 1. complete the Cluster Blender/Normalizer dependency wave;
 2. complete the root Blender Assembly wave;
@@ -34,9 +35,11 @@ Production uses stage batching with bounded workers:
 The GUI implements the first two barriers in
 `_run_full_pipeline_stages()` and `_run_batch_impl()`. The push stage implements
 the export batch in `_run_headless_push_batch()`. `unreal_ingest.run_manifest()`
-owns item-local checkpoints, compiler drains, GC, and the six-item process
-lifetime. Cluster dependencies are still completed before their consumers, so
-stage batching does not weaken the native branch/bone contract.
+owns item-local checkpoints, compiler drains, and GC for both RPC and headless;
+the six-item process lifetime applies to the recyclable commandlet. Cluster
+dependencies are still completed before their consumers, so stage batching does
+not weaken the native branch/bone contract. Explicit RPC runs use the same
+transaction and safety controls one asset at a time in the open editor.
 
 The Unreal barrier is stricter than ordinary topological ordering. A valid
 provider cannot appear after the first final Assembly item, and a provider is
@@ -108,7 +111,7 @@ process-lifetime boundary every six Unreal items.
   Assembly. Post-build material work is read-only slot/section/usage audit.
 - Each Unreal item disables overlapping asynchronous skinned-asset builds,
   drains compilers before restoring the editor setting, releases Python
-  references, and requests immediate commandlet GC.
+  references, and requests immediate Unreal GC in both RPC and headless.
 - Every batch-generated SkeletalMesh uses the project plugin's direct
   thumbnail-free package save: the Full mesh, generated provider/part
   prototypes, and final Assembly. Skeleton and non-skeletal auxiliary packages

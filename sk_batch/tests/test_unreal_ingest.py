@@ -858,7 +858,7 @@ def test_manifest_dependencies_run_provider_before_tree(tmp_path, monkeypatch):
     assert result["items"]["tree"]["status"] == "imported_ok"
 
 
-def test_live_rpc_rejects_generated_skeletal_manifest_before_mutation(
+def test_live_rpc_runs_generated_skeletal_manifest_with_shared_safety_controls(
     tmp_path,
     monkeypatch,
 ):
@@ -868,23 +868,25 @@ def test_live_rpc_rejects_generated_skeletal_manifest_before_mutation(
         "_asset_type": "SkeletalMesh",
         "asset_path": "/Game/Trees/SK_Tree",
     }}]
-    manifest, checkpoint, report = write_manifest(tmp_path, [current])
+    manifest, checkpoint, report_path = write_manifest(tmp_path, [current])
+    calls = []
     monkeypatch.setattr(
         runner,
         "ingest_item",
-        lambda _item: (_ for _ in ()).throw(
-            AssertionError("RPC guard must run before ingest")
-        ),
+        lambda rpc_item: calls.append(rpc_item["queue_id"])
+        or {"status": "imported_ok"},
     )
 
-    with unittest.TestCase().assertRaisesRegex(
-        RuntimeError,
-        "forbidden over live-editor RPC",
-    ):
-        runner.run_manifest(manifest)
+    result = runner.run_manifest(manifest)
 
-    assert not checkpoint.exists()
-    assert not report.exists()
+    assert calls == ["tree"]
+    assert result["items"]["tree"]["status"] == "imported_ok"
+    policy = result["process_lifetime_policy"]["ingest_policy"]
+    assert policy["safety_mode"] == "live_editor_serialized_rpc"
+    assert policy["heavy_item_count"] == 1
+    assert "compiler_drain_before_restore" in policy["shared_controls"]
+    assert checkpoint.exists()
+    assert report_path.exists()
 
 
 def test_heavy_headless_manifest_fails_closed_without_null_rhi(
