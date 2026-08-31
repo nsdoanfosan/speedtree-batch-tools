@@ -18,17 +18,40 @@ SpeedTree Modeler 10.1.0의 공식 `-export` 경로가 Collision과 Shade Prunin
    FBX/XML serializer가 같은 정확한 계층을 사용하게 합니다.
 7. FBX serializer가 이미 계산한 ID 0/root influence와 단일 root의 Start
    cluster를 deform bone으로 보존합니다.
-8. SPM을 파싱한 export graph의 본 레코드가 0개이면 루트-절대 deform bone을
-   정확히 하나 생성하고 모든 ID 0 vertex를 weight 1로 연결합니다.
-9. 본이 이미 있는 지면형 `Leaf Mesh -> Zone -> Start` 배치와 유효한
-   `BaseRef -> target Branch`로 제작된 Branch Leaf에는 leaf별 export bone을
-   생성하고 해당 Leaf Mesh의 ID 0 vertex를 정확히 연결합니다.
-10. 같은 serializer 호출에서 geometry/local vertex, runtime Node/Generator GUID,
+8. 같은 serializer 호출에서 geometry/local vertex, runtime Node/Generator GUID,
    authored position, 런타임 pose의 단위 tangent와 그 위치의 원본 bone
    influence를 native receipt로 기록합니다.
 
 Modeler 창, 파일 선택창, recovery Question, blank 문서, 마우스 포커스,
 Windows desktop 격리는 생산 경로에서 사용하지 않습니다.
+
+## `native-runtime-receipt-v22` 계약
+
+이 버전의 실행 파일, Python launcher, build script, exact/affected 배치는 모두
+`SPEEDTREE_COLLISION_CLI_CONTRACT=native-runtime-receipt-v22`가 정확히 일치할 때만
+실행됩니다. 이 토큰은 아래 동작을 하나의 원자적 계약으로 고정합니다.
+
+1. serializer source-object 주소는 먼저 원값의 RTTI를 확인하고, 유효하지 않을 때만
+   serializer가 기록한 `pointer - 1`을 정확히 `+1`하여 RTTI를 다시 확인합니다.
+   정렬된 주소나 불투명 token으로 source node를 추정하지 않습니다.
+2. ID 0은 실제 Start-root 소유 vertex에만 `Root`를 의미합니다. parent chain에서
+   `CBaseNode`를 만나는 subtree의 ID 0은 root로 취급하지 않고 Base 경계의 정확한
+   attachment bone ID로 변환합니다.
+3. attachment는 source에서 처음 만난 Base와 그 바로 아래 boundary child, paired
+   BaseRef, target branch, target의 BaseRef 역참조, child anchor record가 모두 정확히
+   일치할 때만 Modeler 원본 resolver로 계산합니다.
+4. bone parent 복원과 vertex weight 변환은 동일한 BaseRef resolver를 사용합니다.
+   둘 중 한 경로만 별도 규칙으로 보정하지 않습니다.
+5. 잘못된 pointer, 끊긴 BaseRef, 불완전한 anchor, 0 이하의 resolver 결과,
+   self-parent는 export 오류입니다. 최근접 본, 위치/이름/tolerance 매칭, node 종류별
+   예외, synthetic bone 또는 임의 weight로 대신하지 않습니다.
+6. 완료 조건은 native receipt의 source record가 모두 해석되고 Base descendant ID 0이
+   0개이며, FBX의 모든 vertex weight 합이 유효하고, Unreal의 bind pose와 dynamic-wind
+   bone 수가 최종 Skeletal Mesh bone 수와 일치하는 것입니다.
+
+Willow 기준 검증에서는 SPM native bone 2,917개, 해석 실패 source record 0개,
+Base descendant ID 0 record 0개를 확인했습니다. 최종 Assembly는 3,720 bones이며
+ID 0 `Root` vertex 119개는 모두 실제 bark Start-root 소유입니다.
 
 ## BaseRef 본 계층 복원
 
@@ -40,7 +63,7 @@ export bone record를 만들 때 일반 parent 조회가 Base node에서 끊겨 
 이 확장은 두 serializer보다 앞선 공통 bone-record 삽입 지점을 version-locked
 hook으로 보완합니다. 끊긴 record마다 Modeler가 이미 파싱한 다음 연결만 사용합니다.
 
-1. child `CBranchNode`의 실제 parent `CBaseNode`
+1. source node에서 parent chain을 따라 만난 첫 `CBaseNode`와 그 바로 아래 boundary child
 2. `CBaseNode`가 보유한 paired `CBaseRefNode`와 target `CBranchNode`
 3. child node에 저장된 anchor index, anchor record, branch offset, section
 4. target branch의 Modeler 원본 bone-ID resolver
@@ -62,7 +85,12 @@ export bone record를 사용해 최대 두 influence를 계산합니다. SPM 밖
 본을 찾는 과정이 아니라 Modeler 자체의 계산입니다. 이 함수와 생성된 FBX cluster를
 추적하면 누락된 값도 이미 내부에 존재합니다.
 
-- source bone ID가 0인 vertex는 `Root` cluster에 weight 1을 기록합니다.
+- 실제 root source bone ID가 0인 vertex는 `Root` cluster에 weight 1을 기록합니다.
+- `CBaseNode` 아래 subtree의 로컬 ID 0은 노드 종류와 무관하게 owning Base를 따라가며,
+  paired `CBaseRefNode`가 가리키는 target branch에서 Modeler resolver가 반환한 하나의
+  attachment bone ID로 직렬화합니다.
+- serializer가 node pointer를 `pointer - 1`로 기록한 레코드는 정확히 `+1`로 원래
+  RTTI node를 복원한 뒤 동일한 Base boundary 규칙을 적용합니다.
 - 첫 실제 본과 ID 0 사이의 vertex는 실제 본 weight를 계산한 뒤 그 보수값을
   ID 0 `Root` cluster에 기록해야 합니다.
 - 그러나 10.1.0은 parent ID가 0이면 보수값을 계산한 직후 조기 반환합니다.
@@ -85,39 +113,6 @@ child weight와 동일한 단정도 연산의 보수값을 Modeler 원본 ID 0 c
 - 1보다 큰 vertex 0개
 - bone이 아닌 vertex group으로 향한 양수 weight 0개
 - BaseRef 305개 XML parent 불일치 0개, FBX orphan 0개
-
-## 지면형 Leaf Mesh bone 생성
-
-SpeedTree 10.1.0은 branch나 frond 없이 루트 `Zone`에 바로 배치된 Leaf Mesh에서
-geometry는 만들지만 export bone record는 만들지 않습니다. 이 경우 serializer의
-source bone ID가 모두 0이 되어 grass 한 패치가 `Root` 하나에 붙습니다.
-
-지면 배치는 런타임 부모 체인이 정확히
-`CLeafMeshNode -> CZoneNode -> CStartNode`인 경우에만 적용됩니다.
-`Leaf Mesh -> Branch ... -> Base` 데이터는 Leaf별 본을 만들지 않습니다.
-비-Cluster Branch/Spline Branch의 무본 문제는 SPM의 해당 generator를
-`Physics:Bone style=Absolute`, `Physics:Bones=1`로 영구 수정해 해결하며,
-그 Branch에 연결된 Leaf Mesh는 Modeler가 내보낸 기존 Branch 웨이트를 그대로
-사용합니다.
-
-이 변경은 최종 Tree/Grass SPM에만 적용됩니다. 부모 폴더가 `Cluster`이거나
-stem이 `SK_cluster_`인 클러스터 소스는 leaf별 synthetic bone 대상에서 제외하며,
-기존의 축 변환·방향 판정용 단일 절대 기준 본 정책을 유지합니다.
-
-대상 Leaf Mesh가 실제 geometry를 생성했을 때만 authored position과 pose tangent로
-export bone을 하나 삽입합니다. 기존 ID 0 record는 그 exact bone ID로 바꾸고 모든
-vertex를 weight 1로 기록합니다. SPM/FBX 사후 repair, 파일명 분류, 최근접 bone 검색,
-외부 weight 정규화는 사용하지 않습니다.
-
-`SK_Weed_Common_grass_a_01.spm` 검증 결과는 다음과 같습니다.
-
-- 기존 velvet bone record 99개 유지
-- 실제 export된 dead/green Leaf Mesh용 bone record 82개 추가
-- dead 12,615 vertex를 62개 leaf bone에 연결, Root-only 0개
-- green 4,387 vertex를 20개 leaf bone에 연결, Root-only 0개
-- Blender 5.1에서 두 mesh의 모든 vertex weight 합 1
-- Unreal 5.8 임시 import에서 LOD0 32,012 vertex, 3 section, 363 skeleton bone 확인
-- `tree_densiflora_01` 회귀검사에서 synthetic bone 0개
 
 ## Native runtime receipt
 

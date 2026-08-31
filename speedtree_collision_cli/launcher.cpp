@@ -25,7 +25,7 @@
 namespace {
 
 constexpr wchar_t kCapabilityContract[] =
-    L"SPEEDTREE_COLLISION_CLI_CONTRACT=native-runtime-receipt-v17";
+    L"SPEEDTREE_COLLISION_CLI_CONTRACT=native-runtime-receipt-v22";
 constexpr wchar_t kFreshVerificationSealedMarker[] =
     L"SPEEDTREE_FRESH_VERIFICATION_EXPORT_SEALED=1";
 

@@ -40,7 +40,6 @@ constexpr std::uintptr_t kNativeExportFinalizeGeometryRva = 0xA7580;
 constexpr std::uintptr_t kNativeExportFinalizeDocumentRva = 0xB1510;
 constexpr std::uintptr_t kResolveBranchBoneIdRva = 0x4B5C00;
 constexpr std::uintptr_t kInsertExportBoneRva = 0x37D4A0;
-constexpr std::uintptr_t kLeafMeshExportRva = 0x584620;
 constexpr std::uintptr_t kExportVertexWeightsRva = 0x6B4FE0;
 constexpr std::uintptr_t kFindExportBoneMappingRva = 0x6B4DF0;
 constexpr std::uintptr_t kFbxClusterAddControlPointRva = 0x1259E50;
@@ -143,12 +142,6 @@ constexpr unsigned char kInsertExportBonePrologue[15] = {
     0x48, 0x89, 0x70, 0x18,
 };
 
-constexpr unsigned char kLeafMeshExportPrologue[15] = {
-    0x48, 0x89, 0x5c, 0x24, 0x08,
-    0x48, 0x89, 0x74, 0x24, 0x10,
-    0x48, 0x89, 0x7c, 0x24, 0x18,
-};
-
 constexpr unsigned char kExportVertexWeightsPrologue[15] = {
     0x48, 0x8B, 0xC4,
     0x48, 0x89, 0x58, 0x08,
@@ -213,7 +206,6 @@ using InsertExportBoneFn = void(__fastcall*)(
     void* exportData,
     void* sourceBoneRecord,
     void* sourceBranch);
-using LeafMeshExportFn = void(__fastcall*)(void* leafNode, void* exportData);
 using ExportVertexWeightsFn = void(__fastcall*)(
     void* exporter,
     const float* position,
@@ -329,7 +321,6 @@ NativeExportFinalizeGeometryFn gOriginalNativeExportFinalizeGeometry = nullptr;
 NativeExportFinalizeDocumentFn gOriginalNativeExportFinalizeDocument = nullptr;
 ResolveBranchBoneIdFn gResolveBranchBoneId = nullptr;
 InsertExportBoneFn gOriginalInsertExportBone = nullptr;
-LeafMeshExportFn gOriginalLeafMeshExport = nullptr;
 ExportVertexWeightsFn gOriginalExportVertexWeights = nullptr;
 FindExportBoneMappingFn gFindExportBoneMapping = nullptr;
 FbxClusterAddControlPointFn gUnusedOriginalFbxClusterAddControlPoint = nullptr;
@@ -388,7 +379,6 @@ HookRecord gNativeModelUpdateHook;
 HookRecord gNativeExportFinalizeGeometryHook;
 HookRecord gNativeExportFinalizeDocumentHook;
 HookRecord gInsertExportBoneHook;
-HookRecord gLeafMeshExportHook;
 HookRecord gExportVertexWeightsHook;
 HookRecord gFbxClusterAddControlPointHook;
 HookRecord gFbxNodeCreateHook;
@@ -430,17 +420,6 @@ struct NativeReceiptBone {
     float end[3]{};
     std::string sourceType;
 };
-
-struct SyntheticLeafBoneRecord {
-    int boneId = 0;
-    int parentId = 0;
-    float start[3]{};
-    float end[3]{};
-    float startRadius = 0.0f;
-    float endRadius = 0.0f;
-};
-
-static_assert(sizeof(SyntheticLeafBoneRecord) == 0x28);
 
 struct NativeReceiptRange {
     int firstVertex = -1;
@@ -546,12 +525,6 @@ std::unordered_map<
     NativeReceiptProxyKey,
     std::size_t,
     NativeReceiptProxyKeyHash> gNativeReceiptProxyIndexes;
-std::unordered_map<void*, int> gSyntheticLeafBoneIds;
-constexpr int kSyntheticLeafBoneIdBase = 10000;
-constexpr int kSyntheticLeafBoneIdLimit = 30000;
-int gNextSyntheticLeafBoneId = kSyntheticLeafBoneIdBase;
-int gZeroBoneAbsoluteFallbackId = 0;
-const void* gZeroBoneAbsoluteFallbackSource = nullptr;
 NativeStateProbe gNativeStateProbes[] = {
     {0x135A59, "native export probe 135A59"},
     {0x135A9D, "native export probe 135A9D"},
@@ -910,132 +883,134 @@ ExportBoneMapping* FindExactExportBoneMapping(void* exporter, int boneId) {
         : nullptr;
 }
 
-int FindSyntheticLeafBoneId(void* leafNode) {
-    std::lock_guard<std::mutex> lock(gNativeReceiptMutex);
-    const auto found = gSyntheticLeafBoneIds.find(leafNode);
-    return found == gSyntheticLeafBoneIds.end() ? 0 : found->second;
-}
-
-int ReserveSyntheticLeafBoneId(void* leafNode) {
-    int boneId = 0;
-    bool nativeCollision = false;
-    {
-        std::lock_guard<std::mutex> lock(gNativeReceiptMutex);
-        const auto found = gSyntheticLeafBoneIds.find(leafNode);
-        if (found != gSyntheticLeafBoneIds.end()) {
-            return found->second;
-        }
-        if (gNextSyntheticLeafBoneId < kSyntheticLeafBoneIdLimit) {
-            boneId = gNextSyntheticLeafBoneId;
-            nativeCollision = gObservedExportBoneIds.find(boneId) !=
-                gObservedExportBoneIds.end();
-            if (!nativeCollision) {
-                ++gNextSyntheticLeafBoneId;
-                gSyntheticLeafBoneIds.emplace(leafNode, boneId);
-            }
-        }
-    }
-    if (boneId == 0) {
-        AbortExport(
-            kHookRuntimeFailureExitCode,
-            "Leaf Mesh bone serialization exhausted its reserved exact-ID range");
-    }
-    if (nativeCollision) {
-        AbortExport(
-            kHookRuntimeFailureExitCode,
-            "Leaf Mesh synthetic bone ID collides with a native bone record");
-    }
-    return boneId;
-}
-
 std::size_t NativeParsedBoneCount() {
     std::lock_guard<std::mutex> lock(gNativeReceiptMutex);
     return gObservedExportBoneIds.size();
 }
 
-int ReserveZeroBoneAbsoluteFallbackId(const void* sourceObject) {
-    int boneId = 0;
-    bool nativeCollision = false;
-    {
-        std::lock_guard<std::mutex> lock(gNativeReceiptMutex);
-        if (gZeroBoneAbsoluteFallbackId > 0) {
-            return gZeroBoneAbsoluteFallbackId;
-        }
-        if (gNextSyntheticLeafBoneId < kSyntheticLeafBoneIdLimit) {
-            boneId = gNextSyntheticLeafBoneId;
-            nativeCollision = gObservedExportBoneIds.find(boneId) !=
-                gObservedExportBoneIds.end();
-            if (!nativeCollision) {
-                ++gNextSyntheticLeafBoneId;
-                gZeroBoneAbsoluteFallbackId = boneId;
-                gZeroBoneAbsoluteFallbackSource = sourceObject;
-            }
+void* ReadExportSourceObject(const unsigned char* sourceRecord) {
+    if (sourceRecord == nullptr) {
+        return nullptr;
+    }
+    void* encoded = *reinterpret_cast<void* const*>(sourceRecord + 0x110);
+    if (ReadSpeedTreeRttiName(encoded) != nullptr) {
+        return encoded;
+    }
+    const std::uintptr_t encodedAddress =
+        reinterpret_cast<std::uintptr_t>(encoded);
+    if (encodedAddress != UINTPTR_MAX) {
+        void* predecessorEncoded = reinterpret_cast<void*>(encodedAddress + 1);
+        if (ReadSpeedTreeRttiName(predecessorEncoded) != nullptr) {
+            return predecessorEncoded;
         }
     }
-    if (boneId == 0) {
-        AbortExport(
-            kHookRuntimeFailureExitCode,
-            "Zero-bone SPM fallback exhausted its reserved exact-ID range");
-    }
-    if (nativeCollision) {
-        AbortExport(
-            kHookRuntimeFailureExitCode,
-            "Zero-bone SPM fallback ID collides with a native bone record");
-    }
-    return boneId;
+    void* aligned = reinterpret_cast<void*>(
+        encodedAddress & ~static_cast<std::uintptr_t>(0xF));
+    return aligned != encoded && ReadSpeedTreeRttiName(aligned) != nullptr
+        ? aligned
+        : encoded;
 }
 
-bool IsExpectedSyntheticBoneRecord(const void* sourceObject, int boneId) {
-    std::lock_guard<std::mutex> lock(gNativeReceiptMutex);
-    if (boneId == gZeroBoneAbsoluteFallbackId && boneId > 0 &&
-        sourceObject == gZeroBoneAbsoluteFallbackSource) {
-        return true;
+int ResolveBaseRefAttachmentBoneIdAtBoundary(
+    void* boundaryChild,
+    void* baseNode) {
+    if (boundaryChild == nullptr || baseNode == nullptr) {
+        return 0;
     }
-    const auto found = gSyntheticLeafBoneIds.find(
-        const_cast<void*>(sourceObject));
-    return found != gSyntheticLeafBoneIds.end() &&
-        found->second == boneId;
+    const char* boundaryType = ReadSpeedTreeRttiName(boundaryChild);
+    const char* baseType = ReadSpeedTreeRttiName(baseNode);
+    if (boundaryType == nullptr || std::strstr(boundaryType, "Node@@") == nullptr ||
+        baseType == nullptr || std::strcmp(baseType, ".?AVCBaseNode@@") != 0 ||
+        *reinterpret_cast<void* const*>(
+            static_cast<const unsigned char*>(boundaryChild) + 0x98) != baseNode) {
+        return 0;
+    }
+
+    const auto* sourceBytes = static_cast<const unsigned char*>(boundaryChild);
+    const auto* baseBytes = static_cast<const unsigned char*>(baseNode);
+    void* targetBranch = *reinterpret_cast<void* const*>(baseBytes + 0x2C8);
+    void* baseRef = *reinterpret_cast<void* const*>(baseBytes + 0x2D0);
+    const char* targetType = ReadSpeedTreeRttiName(targetBranch);
+    const char* baseRefType = ReadSpeedTreeRttiName(baseRef);
+    if (targetType == nullptr ||
+        std::strcmp(targetType, ".?AVCBranchNode@@") != 0 ||
+        baseRefType == nullptr ||
+        std::strcmp(baseRefType, ".?AVCBaseRefNode@@") != 0 ||
+        *reinterpret_cast<void* const*>(
+            static_cast<const unsigned char*>(baseRef) + 0x98) != targetBranch) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "BaseRef export rejected an incomplete parsed reference chain");
+    }
+
+    const std::int16_t anchorIndex =
+        *reinterpret_cast<const std::int16_t*>(sourceBytes + 0x1B8);
+    float anchorPosition = 0.0f;
+    if (anchorIndex != -1) {
+        const auto* anchorBegin =
+            *reinterpret_cast<const unsigned char* const*>(sourceBytes + 0x1D8);
+        const auto* anchorEnd =
+            *reinterpret_cast<const unsigned char* const*>(sourceBytes + 0x1E0);
+        const std::size_t requiredBytes =
+            (static_cast<std::size_t>(anchorIndex) + 1) * 24;
+        if (anchorIndex < 0 || anchorBegin == nullptr || anchorEnd < anchorBegin ||
+            static_cast<std::size_t>(anchorEnd - anchorBegin) < requiredBytes) {
+            AbortExport(
+                kHookRuntimeFailureExitCode,
+                "BaseRef export rejected an invalid parsed anchor record");
+        }
+        anchorPosition = *reinterpret_cast<const float*>(
+            anchorBegin + static_cast<std::size_t>(anchorIndex) * 24);
+    }
+
+    const float branchOffset =
+        *reinterpret_cast<const float*>(sourceBytes + 0x144);
+    const int section = *reinterpret_cast<const int*>(sourceBytes + 0x140);
+    const int resolvedBoneId = gResolveBranchBoneId(
+        targetBranch,
+        anchorPosition + branchOffset,
+        section);
+    if (resolvedBoneId <= 0) {
+        AbortExport(
+            kHookRuntimeFailureExitCode,
+            "BaseRef export could not resolve an exact attachment bone ID");
+    }
+    return resolvedBoneId;
 }
 
-bool IsRootZoneLeafMesh(void* leafNode) {
-    if (leafNode == nullptr) {
-        return false;
+int ResolveBaseRefAttachmentBoneId(void* sourceObject) {
+    if (sourceObject == nullptr || ReadSpeedTreeRttiName(sourceObject) == nullptr) {
+        return 0;
     }
-    __try {
-        void* visited[16]{};
-        std::size_t visitedCount = 0;
-        void* current = *reinterpret_cast<void* const*>(
-            static_cast<const unsigned char*>(leafNode) + 0x98);
-        bool sawZone = false;
-        while (current != nullptr && visitedCount < std::size(visited)) {
-            for (std::size_t index = 0; index < visitedCount; ++index) {
-                if (visited[index] == current) {
-                    return false;
-                }
+    void* visited[64]{};
+    std::size_t visitedCount = 0;
+    void* current = sourceObject;
+    while (current != nullptr && visitedCount < std::size(visited)) {
+        for (std::size_t index = 0; index < visitedCount; ++index) {
+            if (visited[index] == current) {
+                AbortExport(
+                    kHookRuntimeFailureExitCode,
+                    "BaseRef owner traversal found a cycle in the parsed node graph");
             }
-            visited[visitedCount++] = current;
-            const char* type = ReadSpeedTreeRttiName(current);
-            if (type == nullptr) {
-                return false;
-            }
-            if (std::strcmp(type, ".?AVCBranchNode@@") == 0 ||
-                std::strcmp(type, ".?AVCFrondNode@@") == 0) {
-                return false;
-            }
-            if (std::strcmp(type, ".?AVCZoneNode@@") == 0) {
-                sawZone = true;
-            } else if (std::strcmp(type, ".?AVCStartNode@@") == 0) {
-                return sawZone;
-            } else if (std::strcmp(type, ".?AVCLeafMeshNode@@") != 0) {
-                return false;
-            }
-            current = *reinterpret_cast<void* const*>(
-                static_cast<const unsigned char*>(current) + 0x98);
         }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
+        visited[visitedCount++] = current;
+        const char* type = ReadSpeedTreeRttiName(current);
+        if (type == nullptr) {
+            return 0;
+        }
+        if (std::strcmp(type, ".?AVCStartNode@@") == 0) {
+            return 0;
+        }
+        void* parent = *reinterpret_cast<void* const*>(
+            static_cast<const unsigned char*>(current) + 0x98);
+        const char* parentType = ReadSpeedTreeRttiName(parent);
+        if (parentType != nullptr &&
+            std::strcmp(parentType, ".?AVCBaseNode@@") == 0) {
+            return ResolveBaseRefAttachmentBoneIdAtBoundary(current, parent);
+        }
+        current = parent;
     }
-    return false;
+    return 0;
 }
 
 bool IsClusterSourceInput() {
@@ -1120,10 +1095,6 @@ void ResetNativeReceiptCapture() {
     gObservedExportBoneIds.clear();
     gNativeReceiptProxies.clear();
     gNativeReceiptProxyIndexes.clear();
-    gSyntheticLeafBoneIds.clear();
-    gNextSyntheticLeafBoneId = kSyntheticLeafBoneIdBase;
-    gZeroBoneAbsoluteFallbackId = 0;
-    gZeroBoneAbsoluteFallbackSource = nullptr;
 }
 
 int NativeReceiptGeometryOrdinal(void* geometry, int vertexIndex) {
@@ -1319,7 +1290,7 @@ void CaptureNativeReceiptProxy(
 
     const auto* record = static_cast<const unsigned char*>(
         gCurrentExportSourceVertexRecord);
-    void* sourceObject = *reinterpret_cast<void* const*>(record + 0x110);
+    void* sourceObject = ReadExportSourceObject(record);
 
     NativeReceiptProxyKey key{};
     key.sourceBoneId = sourceBoneId;
@@ -1382,15 +1353,9 @@ void CaptureNativeReceiptProxy(
             };
 
             FbxWeightExportContext probe{};
-            const auto synthetic = gSyntheticLeafBoneIds.find(sourceObject);
-            const bool syntheticLeafWeight =
-                synthetic != gSyntheticLeafBoneIds.end() &&
-                synthetic->second == sourceBoneId;
-            if (sourceBoneId == 0 || syntheticLeafWeight) {
+            if (sourceBoneId == 0) {
                 // The serializer's exact source ID is the authored root.  The
                 // entry stub preserves and executes the stock call unchanged.
-                // Root-zone Leaf Mesh records are intentionally rigid on
-                // their exact synthetic bone instead of inheriting Root.
                 probe.additionCount = 1;
                 probe.additions[0] = {
                     nullptr,
@@ -1500,29 +1465,7 @@ void __fastcall HookedExportVertexWeights(
     int sourceBoneId,
     int vertexIndex,
     void* clusterMap) {
-    bool syntheticLeafWeight = sourceBoneId > 0 &&
-        sourceBoneId == gZeroBoneAbsoluteFallbackId;
-    __try {
-        if (!syntheticLeafWeight && sourceBoneId > 0 &&
-            gCurrentExportSourceVertexRecord != nullptr) {
-            const auto* record = static_cast<const unsigned char*>(
-                gCurrentExportSourceVertexRecord);
-            void* sourceObject = *reinterpret_cast<void* const*>(record + 0x110);
-            syntheticLeafWeight =
-                FindSyntheticLeafBoneId(sourceObject) == sourceBoneId;
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        AbortExport(
-            kHookRuntimeFailureExitCode,
-            "Synthetic Leaf Mesh FBX weight mapping could not read its source record");
-    }
-
-    // Preserve the stock lookup and cluster selection. Root-zone Leaf Mesh
-    // ownership is rigid by construction, so only that path overrides the
-    // stock distance-derived scalar with an exact weight of one.
     FbxWeightExportContext primary{};
-    primary.overrideWeight = syntheticLeafWeight;
-    primary.replacementWeight = 1.0;
     FbxWeightExportContext* previousContext = gFbxWeightExportContext;
     gFbxWeightExportContext = &primary;
     gOriginalExportVertexWeights(
@@ -1539,16 +1482,6 @@ void __fastcall HookedExportVertexWeights(
         sourceBoneId,
         vertexIndex,
         clusterMap);
-    if (syntheticLeafWeight) {
-        if (primary.additionCount != 1 ||
-            primary.additions[0].vertexIndex != vertexIndex ||
-            primary.additions[0].weight != 1.0) {
-            AbortExport(
-                kHookRuntimeFailureExitCode,
-                "Synthetic Leaf Mesh FBX weight did not emit one exact rigid influence");
-        }
-        return;
-    }
     if (sourceBoneId <= 0 || exporter == nullptr || position == nullptr ||
         clusterMap == nullptr) {
         return;
@@ -1669,10 +1602,9 @@ bool BuildExportVertexWeightsEntryStub() {
     stub[24] = 0x89;
     stub[25] = 0x38;
     // Native ID-0 is an implicit serializer path. Capture its exact serializer
-    // record while preserving the caller's volatile state. Leaf Mesh records
-    // return their exact synthetic bone ID in EAX and place it into the saved
-    // R8 slot. Unchanged ID-0 records tail-jump to the stock routine. Both
-    // initially-positive and synthetically remapped IDs enter the compiled weight hook.
+    // record while preserving the caller's volatile state. A BaseRef-local
+    // ID-0 returns the exact parsed attachment bone in EAX and enters the
+    // compiled weight hook. An unchanged ID-0 tail-jumps to the stock routine.
     stub[26] = 0x45;
     stub[27] = 0x85;
     stub[28] = 0xC0;             // test r8d, r8d
@@ -1774,32 +1706,24 @@ int __fastcall CaptureNativeReceiptIdZero(
     int effectiveBoneId = sourceBoneId;
     __try {
         if (sourceBoneId == 0 && gCurrentExportSourceVertexRecord != nullptr) {
-            if (gZeroBoneAbsoluteFallbackId > 0) {
-                effectiveBoneId = gZeroBoneAbsoluteFallbackId;
-            }
             const auto* record = static_cast<const unsigned char*>(
                 gCurrentExportSourceVertexRecord);
-            void* sourceObject = *reinterpret_cast<void* const*>(record + 0x110);
-            const char* sourceType = ReadSpeedTreeRttiName(sourceObject);
-            if (effectiveBoneId == 0 && sourceType != nullptr &&
-                std::strcmp(sourceType, ".?AVCLeafMeshNode@@") == 0) {
-                const int syntheticBoneId = FindSyntheticLeafBoneId(sourceObject);
-                if (syntheticBoneId > 0) {
-                    effectiveBoneId = syntheticBoneId;
-                }
-            }
+            void* sourceObject = ReadExportSourceObject(record);
+            effectiveBoneId = ResolveBaseRefAttachmentBoneId(sourceObject);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         AbortExport(
             kHookRuntimeFailureExitCode,
-            "Leaf Mesh FBX weight mapping raised an exception while reading the source record");
+            "BaseRef FBX weight mapping raised an exception while reading the source record");
     }
-    CaptureNativeReceiptProxy(
-        exporter,
-        position,
-        effectiveBoneId,
-        vertexIndex,
-        clusterMap);
+    if (effectiveBoneId == 0) {
+        CaptureNativeReceiptProxy(
+            exporter,
+            position,
+            sourceBoneId,
+            vertexIndex,
+            clusterMap);
+    }
     return effectiveBoneId;
 }
 
@@ -1816,117 +1740,30 @@ void __fastcall HookedInsertExportBone(
     void* exportData,
     void* sourceBoneRecord,
     void* sourceBranch) {
-    if (sourceBoneRecord != nullptr) {
-        __try {
-            const int boneId = *reinterpret_cast<const int*>(sourceBoneRecord);
-            if (gZeroBoneAbsoluteFallbackId > 0 &&
-                boneId != gZeroBoneAbsoluteFallbackId) {
-                AbortExport(
-                    kHookRuntimeFailureExitCode,
-                    "Cluster zero-bone fallback cannot absorb a later native bone");
-            }
-            if (boneId >= kSyntheticLeafBoneIdBase &&
-                boneId < kSyntheticLeafBoneIdLimit &&
-                !IsExpectedSyntheticBoneRecord(sourceBranch, boneId)) {
-                AbortExport(
-                    kHookRuntimeFailureExitCode,
-                    "Native bone record collides with the reserved synthetic bone ID range");
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            AbortExport(
-                kHookRuntimeFailureExitCode,
-                "Bone serialization guard raised an exception while reading a source record");
-        }
-    }
     if (sourceBoneRecord != nullptr && sourceBranch != nullptr) {
         __try {
             auto* recordBytes = static_cast<unsigned char*>(sourceBoneRecord);
             const int boneId = *reinterpret_cast<const int*>(recordBytes);
             int& parentId = *reinterpret_cast<int*>(recordBytes + 0x04);
             if (boneId != 1 && parentId == 0) {
-                const char* sourceType = ReadSpeedTreeRttiName(sourceBranch);
-                if (sourceType != nullptr &&
-                    std::strcmp(sourceType, ".?AVCBranchNode@@") == 0) {
-                    const auto* sourceBytes =
-                        static_cast<const unsigned char*>(sourceBranch);
-                    void* baseNode = *reinterpret_cast<void* const*>(
-                        sourceBytes + 0x98);
-                    const char* baseType = ReadSpeedTreeRttiName(baseNode);
-                    if (baseType != nullptr &&
-                        std::strcmp(baseType, ".?AVCBaseNode@@") == 0) {
-                        const auto* baseBytes =
-                            static_cast<const unsigned char*>(baseNode);
-                        void* targetBranch = *reinterpret_cast<void* const*>(
-                            baseBytes + 0x2C8);
-                        void* baseRef = *reinterpret_cast<void* const*>(
-                            baseBytes + 0x2D0);
-                        const char* targetType = ReadSpeedTreeRttiName(targetBranch);
-                        const char* baseRefType = ReadSpeedTreeRttiName(baseRef);
-                        if (targetType == nullptr ||
-                            std::strcmp(targetType, ".?AVCBranchNode@@") != 0 ||
-                            baseRefType == nullptr ||
-                            std::strcmp(baseRefType, ".?AVCBaseRefNode@@") != 0 ||
-                            *reinterpret_cast<void* const*>(
-                                static_cast<const unsigned char*>(baseRef) + 0x98) !=
-                                targetBranch) {
-                            AbortExport(
-                                kHookRuntimeFailureExitCode,
-                                "BaseRef bone serialization rejected an incomplete parsed reference chain");
-                        }
-
-                        const std::int16_t anchorIndex =
-                            *reinterpret_cast<const std::int16_t*>(sourceBytes + 0x1B8);
-                        float anchorPosition = 0.0f;
-                        if (anchorIndex != -1) {
-                            const auto* anchorBegin =
-                                *reinterpret_cast<const unsigned char* const*>(
-                                    sourceBytes + 0x1D8);
-                            const auto* anchorEnd =
-                                *reinterpret_cast<const unsigned char* const*>(
-                                    sourceBytes + 0x1E0);
-                            const std::size_t requiredBytes =
-                                (static_cast<std::size_t>(anchorIndex) + 1) * 24;
-                            if (anchorIndex < 0 || anchorBegin == nullptr ||
-                                anchorEnd < anchorBegin ||
-                                static_cast<std::size_t>(anchorEnd - anchorBegin) <
-                                    requiredBytes) {
-                                AbortExport(
-                                    kHookRuntimeFailureExitCode,
-                                    "BaseRef bone serialization rejected an invalid parsed anchor record");
-                            }
-                            anchorPosition = *reinterpret_cast<const float*>(
-                                anchorBegin + static_cast<std::size_t>(anchorIndex) * 24);
-                        }
-
-                        const float branchOffset =
-                            *reinterpret_cast<const float*>(sourceBytes + 0x144);
-                        const int section =
-                            *reinterpret_cast<const int*>(sourceBytes + 0x140);
-                        const int resolvedParentId = gResolveBranchBoneId(
-                            targetBranch,
-                            anchorPosition + branchOffset,
-                            section);
-                        if (resolvedParentId <= 0 || resolvedParentId == boneId) {
-                            AbortExport(
-                                kHookRuntimeFailureExitCode,
-                                "BaseRef bone serialization could not resolve an exact parent bone ID");
-                        }
-                        parentId = resolvedParentId;
-                        char message[384]{};
-                        _snprintf_s(
-                            message,
-                            sizeof(message),
-                            _TRUNCATE,
-                            "BaseRef bone graph restored child=%d parent=%d "
-                            "target_branch=%p anchor_index=%d position=%.9g section=%d",
-                            boneId,
-                            resolvedParentId,
-                            targetBranch,
-                            static_cast<int>(anchorIndex),
-                            static_cast<double>(anchorPosition + branchOffset),
-                            section);
-                        Log(message);
+                const int resolvedParentId =
+                    ResolveBaseRefAttachmentBoneId(sourceBranch);
+                if (resolvedParentId > 0) {
+                    if (resolvedParentId == boneId) {
+                        AbortExport(
+                            kHookRuntimeFailureExitCode,
+                            "BaseRef bone serialization resolved itself as its parent");
                     }
+                    parentId = resolvedParentId;
+                    char message[384]{};
+                    _snprintf_s(
+                        message,
+                        sizeof(message),
+                        _TRUNCATE,
+                        "BaseRef bone graph restored child=%d parent=%d",
+                        boneId,
+                        resolvedParentId);
+                    Log(message);
                 }
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -1938,101 +1775,6 @@ void __fastcall HookedInsertExportBone(
     gOriginalInsertExportBone(exportData, sourceBoneRecord, sourceBranch);
     CaptureNativeReceiptBone(sourceBoneRecord, sourceBranch);
 }
-
-bool TryReadExportGeometryEnd(void* exportData, void** geometryEnd) {
-    if (exportData == nullptr || geometryEnd == nullptr) {
-        return false;
-    }
-    __try {
-        *geometryEnd = *reinterpret_cast<void**>(
-            static_cast<unsigned char*>(exportData) + 0x3BC);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-void __fastcall HookedLeafMeshExport(void* leafNode, void* exportData) {
-    const bool clusterSource = IsClusterSourceInput();
-    const bool needsSyntheticBone =
-        !clusterSource && IsRootZoneLeafMesh(leafNode);
-    void* geometryEndBefore = nullptr;
-    if (!TryReadExportGeometryEnd(exportData, &geometryEndBefore)) {
-        AbortExport(
-            kHookRuntimeFailureExitCode,
-            "Leaf Mesh bone serialization could not read the native geometry list");
-    }
-    gOriginalLeafMeshExport(leafNode, exportData);
-    void* geometryEndAfter = nullptr;
-    if (!TryReadExportGeometryEnd(exportData, &geometryEndAfter)) {
-        AbortExport(
-            kHookRuntimeFailureExitCode,
-            "Leaf Mesh bone serialization lost the native geometry list");
-    }
-    if (geometryEndBefore == geometryEndAfter) {
-        return;
-    }
-
-    // Cluster assets retain their original single absolute reference-axis
-    // policy. Non-Cluster zero-bone Branch/Spline Branch generators are
-    // persistently authored as Absolute/1 in the SPM before this exporter is
-    // launched, so they must never be consolidated into this fallback.
-    if (clusterSource && !needsSyntheticBone && NativeParsedBoneCount() == 0) {
-        SyntheticLeafBoneRecord fallback{};
-        fallback.boneId = ReserveZeroBoneAbsoluteFallbackId(leafNode);
-        fallback.parentId = 0;
-        fallback.start[0] = 0.0f;
-        fallback.start[1] = 0.0f;
-        fallback.start[2] = 0.0f;
-        fallback.end[0] = 0.0f;
-        fallback.end[1] = 0.0f;
-        fallback.end[2] = 1.0f;
-        HookedInsertExportBone(exportData, &fallback, leafNode);
-        Log("parsed zero-bone SPM received one absolute rigid fallback bone");
-        return;
-    }
-    if (!needsSyntheticBone) {
-        return;
-    }
-
-    NativeReceiptProxy authoredPose{};
-    if (!CaptureNativeAuthoredPose(leafNode, &authoredPose) ||
-        !authoredPose.hasAuthoredPosition ||
-        !authoredPose.hasAuthoredTangent) {
-        AbortExport(
-            kHookRuntimeFailureExitCode,
-            "Leaf Mesh bone serialization could not read its authored pose and tangent");
-    }
-    float tangentLengthSquared = 0.0f;
-    for (int axis = 0; axis < 3; ++axis) {
-        if (!std::isfinite(authoredPose.authoredPositionNative[axis]) ||
-            !std::isfinite(authoredPose.authoredTangentNativeUnit[axis])) {
-            AbortExport(
-                kHookRuntimeFailureExitCode,
-                "Leaf Mesh bone serialization rejected a non-finite authored pose");
-        }
-        tangentLengthSquared +=
-            authoredPose.authoredTangentNativeUnit[axis] *
-            authoredPose.authoredTangentNativeUnit[axis];
-    }
-    if (!(tangentLengthSquared > 0.25f) || tangentLengthSquared > 4.0f) {
-        AbortExport(
-            kHookRuntimeFailureExitCode,
-            "Leaf Mesh bone serialization rejected an invalid authored tangent");
-    }
-
-    SyntheticLeafBoneRecord record{};
-    record.boneId = ReserveSyntheticLeafBoneId(leafNode);
-    record.parentId = 0;
-    for (int axis = 0; axis < 3; ++axis) {
-        record.start[axis] = authoredPose.authoredPositionNative[axis];
-        record.end[axis] =
-            authoredPose.authoredPositionNative[axis] +
-            authoredPose.authoredTangentNativeUnit[axis];
-    }
-    HookedInsertExportBone(exportData, &record, leafNode);
-}
-
 
 void LogCollisionInputTypes(const char* phase, void* model) {
     if (model == nullptr) {
@@ -2431,7 +2173,6 @@ bool SetRlmConnectFailFastPatch(bool enabled) {
 }
 
 void RemoveCommonHooks() {
-    RemoveHook(gLeafMeshExportHook);
     RemoveHook(gInsertExportBoneHook);
     RemoveHook(gExportVertexWeightsHook);
     FreeExportVertexWeightsEntryStub();
@@ -3590,9 +3331,8 @@ void __fastcall HookedNativeExportBuild(void* exportBuilder) {
     if (gNativeCliExportActive.load(std::memory_order_acquire) &&
         !gSecondaryNativeSerializationActive.load(std::memory_order_acquire) &&
         IsClusterSourceInput() && NativeParsedBoneCount() == 0) {
-        // The Cluster contract requires one exact reference-axis bone. A
-        // Branch/Frond-only provider may never enter the Leaf Mesh hook, so do
-        // not allow a silent boneless export here. Creating a bone without an
+        // The Cluster contract requires one exact reference-axis bone.
+        // Creating a bone without an
         // exact parsed source owner would be arbitrary; fail closed instead.
         AbortExport(
             kHookRuntimeFailureExitCode,
@@ -6110,15 +5850,6 @@ bool InstallHooks() {
             HookedInsertExportBone,
             kInsertExportBonePrologue,
             reinterpret_cast<void**>(&gOriginalInsertExportBone))) {
-        RemoveCommonHooks();
-        return false;
-    }
-    if (!InstallHook(
-            gLeafMeshExportHook,
-            reinterpret_cast<void*>(gSpeedTreeBase + kLeafMeshExportRva),
-            HookedLeafMeshExport,
-            kLeafMeshExportPrologue,
-            reinterpret_cast<void**>(&gOriginalLeafMeshExport))) {
         RemoveCommonHooks();
         return false;
     }

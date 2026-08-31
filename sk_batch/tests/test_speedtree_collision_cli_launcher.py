@@ -63,7 +63,7 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         launcher = LAUNCHER_SOURCE.read_text(encoding="utf-8")
         contract = (
             "SPEEDTREE_COLLISION_CLI_CONTRACT="
-            "native-runtime-receipt-v17"
+            "native-runtime-receipt-v22"
         )
 
         self.assertIn(contract, launcher)
@@ -174,102 +174,19 @@ class SpeedTreeCollisionCliLauncherTests(unittest.TestCase):
         self.assertIn("test r8d, r8d", entry_stub)
         self.assertIn("&gOriginalExportVertexWeights", entry_stub)
         self.assertIn("CaptureNativeReceiptIdZero", entry_stub)
-        self.assertIn("tail-jump to", entry_stub)
-        self.assertIn("IDs enter the compiled weight hook", entry_stub)
+        self.assertIn("BaseRef-local", entry_stub)
+        self.assertIn("attachment bone in EAX", entry_stub)
+        self.assertIn("tail-jumps to", entry_stub)
+        self.assertIn("ResolveBaseRefAttachmentBoneId(sourceObject)", entry_stub)
+        self.assertIn("ResolveBaseRefAttachmentBoneIdAtBoundary", source)
+        self.assertIn("encodedAddress + 1", source)
+        self.assertNotIn("FindOwningBaseRefAttachmentBoneId", source)
+        self.assertNotIn("RecordBaseRefAttachmentBoneId", source)
+        self.assertNotIn("gBaseRefAttachmentBoneIds", source)
+        self.assertNotIn("OpaqueExportSource", source)
+        self.assertNotIn("gOpaqueExportSourceBoneIds", source)
         self.assertIn("FbxSkeleton::eLimbNode", source)
         self.assertIn("No spatial lookup or normalization", weight_hook)
-
-    def test_root_zone_leaf_meshes_get_exact_rigid_bones(self):
-        source = HOOK_SOURCE.read_text(encoding="utf-8")
-
-        scope = source[
-            source.index("bool IsRootZoneLeafMesh"):
-            source.index("void LogMissingIdZeroBoneRecordOnce")
-        ]
-        leaf_export = source[
-            source.index("void __fastcall HookedLeafMeshExport"):
-            source.index("void LogCollisionInputTypes")
-        ]
-        weight_hook = source[
-            source.index("void __fastcall HookedExportVertexWeights"):
-            source.index("int __fastcall CaptureNativeReceiptIdZero")
-        ]
-
-        self.assertIn(".?AVCZoneNode@@", scope)
-        self.assertIn(".?AVCStartNode@@", scope)
-        self.assertIn(".?AVCBranchNode@@", scope)
-        self.assertIn(".?AVCFrondNode@@", scope)
-        self.assertIn("return sawZone", scope)
-        self.assertIn("!clusterSource && IsRootZoneLeafMesh", leaf_export)
-        self.assertIn("geometryEndBefore == geometryEndAfter", leaf_export)
-        self.assertIn("if (!needsSyntheticBone)", leaf_export)
-        self.assertIn("ReserveSyntheticLeafBoneId", leaf_export)
-        self.assertIn("primary.overrideWeight = syntheticLeafWeight", weight_hook)
-        self.assertIn("primary.replacementWeight = 1.0", weight_hook)
-        self.assertIn("RemoveHook(gLeafMeshExportHook)", source)
-        self.assertIn("HookedLeafMeshExport", source[source.index("bool InstallHooks"):])
-
-    def test_cluster_sources_keep_single_axis_reference_bone_policy(self):
-        source = HOOK_SOURCE.read_text(encoding="utf-8")
-        classifier = source[
-            source.index("bool IsClusterSourceInput"):
-            source.index("void LogMissingIdZeroBoneRecordOnce")
-        ]
-        leaf_export = source[
-            source.index("void __fastcall HookedLeafMeshExport"):
-            source.index("void LogCollisionInputTypes")
-        ]
-
-        self.assertIn('L"cluster"', classifier)
-        self.assertIn('L"SK_cluster_"', classifier)
-        self.assertIn("!clusterSource && IsRootZoneLeafMesh", leaf_export)
-        self.assertIn("NativeParsedBoneCount() == 0", leaf_export)
-
-    def test_zero_bone_spm_gets_one_absolute_rigid_fallback(self):
-        source = HOOK_SOURCE.read_text(encoding="utf-8")
-        leaf_export = source[
-            source.index("void __fastcall HookedLeafMeshExport"):
-            source.index("void LogCollisionInputTypes")
-        ]
-        id_zero = source[
-            source.index("int __fastcall CaptureNativeReceiptIdZero"):
-            source.index("void FreeExportVertexWeightsEntryStub")
-        ]
-        weight_hook = source[
-            source.index("void __fastcall HookedExportVertexWeights"):
-            source.index("int __fastcall CaptureNativeReceiptIdZero")
-        ]
-
-        self.assertIn(
-            "clusterSource && !needsSyntheticBone && NativeParsedBoneCount() == 0",
-            leaf_export,
-        )
-        self.assertIn("ReserveZeroBoneAbsoluteFallbackId", leaf_export)
-        self.assertIn("fallback.parentId = 0", leaf_export)
-        self.assertIn("fallback.start[0] = 0.0f", leaf_export)
-        self.assertIn("fallback.end[2] = 1.0f", leaf_export)
-        self.assertIn("gZeroBoneAbsoluteFallbackId", id_zero)
-        self.assertIn("effectiveBoneId = gZeroBoneAbsoluteFallbackId", id_zero)
-        self.assertIn("sourceBoneId == gZeroBoneAbsoluteFallbackId", weight_hook)
-        self.assertIn("primary.replacementWeight = 1.0", weight_hook)
-
-    def test_cluster_fallback_is_fail_closed(self):
-        source = HOOK_SOURCE.read_text(encoding="utf-8")
-        insert_hook = source[
-            source.index("void __fastcall HookedInsertExportBone"):
-            source.index("bool TryReadExportGeometryEnd")
-        ]
-
-        self.assertIn("gObservedExportBoneIds[row.boneId]", source)
-        self.assertIn("return gObservedExportBoneIds.size()", source)
-        self.assertIn("gZeroBoneAbsoluteFallbackId > 0", insert_hook)
-        self.assertIn("cannot absorb a later native bone", insert_hook)
-        self.assertNotIn("FindNearest", source)
-        self.assertNotIn("nearestBone", source)
-        native_build_start = source.index("void __fastcall HookedNativeExportBuild")
-        native_build = source[native_build_start:]
-        self.assertIn("IsClusterSourceInput() && NativeParsedBoneCount() == 0", native_build)
-        self.assertIn("required reference-axis bone", native_build)
 
     def test_disappeared_persistent_pipe_starts_a_replacement(self):
         source = LAUNCHER_SOURCE.read_text(encoding="utf-8")

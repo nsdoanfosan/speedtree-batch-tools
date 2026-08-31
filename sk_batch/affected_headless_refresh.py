@@ -1,4 +1,4 @@
-"""Audit and force-refresh assets affected by native Leaf Mesh export changes."""
+"""Audit and force-refresh assets covered by the native BaseRef/ID-0 contract."""
 
 from __future__ import annotations
 
@@ -178,7 +178,7 @@ def audit_target(target):
             for row in generated_instances
         )
         if missing_source_object_identity_count:
-            # v15 records the serializer's actual runtime source-object
+            # v22 records the serializer's actual runtime source-object
             # identity.  node_guid and native_instance_id both collide in real
             # receipts, so an older row cannot safely prove which per-bone
             # records belong to one node.
@@ -322,7 +322,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description=(
             "Audit current production Assemblies and force-refresh every asset "
-            "affected by the native root-zone Leaf Mesh bone fix, including "
+            "covered by the native BaseRef/ID-0 export contract, including "
             "the complete grass verification scope, without GUI control"
         )
     )
