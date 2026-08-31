@@ -3,6 +3,21 @@
 This policy concerns only work executed in the current run. Receipt reuse,
 artifact caches, and second-run speedups are outside its scope.
 
+## Renderer-isolation invariant
+
+Generated Nanite SkeletalMesh, DynamicWind provider, and final Nanite Assembly
+ingest must not mutate assets through a live-editor RPC session. The GUI turns
+an RPC request into `unreal_wait` while the editor is open, or `headless` when
+it is closed. Any saved `push_transport=rpc` preference is normalized to
+`unreal_wait`; a current-session selection still cannot bypass the per-run preflight.
+The Unreal manifest runner independently rejects a renderer-sensitive manifest
+before writing a checkpoint or touching an asset unless it is running in the
+isolated commandlet/NullRHI path.
+
+This is a first-import execution rule, not a cache optimization. The commandlet
+launch keeps `-NullRHI`, so thumbnail rendering, viewport residency, and live
+GPUScene allocation cannot compete with Nanite/skinned-asset compilation.
+
 ## Chosen execution shape
 
 Production uses stage batching with bounded workers:
@@ -10,8 +25,11 @@ Production uses stage batching with bounded workers:
 1. complete the Cluster Blender/Normalizer dependency wave;
 2. complete the root Blender Assembly wave;
 3. export every eligible Send2UE item with bounded Blender workers;
-4. ingest the combined lazy manifest serially in Unreal, checkpointing and
-   collecting each item, and recycle the commandlet after six completed items.
+4. ingest every provider item and prepare every root's Full mesh, wind, and
+   generated part prototypes serially in Unreal;
+5. cross a manifest-level barrier and build/publish final Assemblies, rejecting
+   duplicate final Assembly targets; then checkpoint, collect each item, and
+   recycle the commandlet after six completed item phases.
 
 The GUI implements the first two barriers in
 `_run_full_pipeline_stages()` and `_run_batch_impl()`. The push stage implements
@@ -19,6 +37,22 @@ the export batch in `_run_headless_push_batch()`. `unreal_ingest.run_manifest()`
 owns item-local checkpoints, compiler drains, GC, and the six-item process
 lifetime. Cluster dependencies are still completed before their consumers, so
 stage batching does not weaken the native branch/bone contract.
+
+The Unreal barrier is stricter than ordinary topological ordering. A valid
+provider cannot appear after the first final Assembly item, and a provider is
+not allowed to depend on an Assembly-wave item. This prevents canonical
+provider mutations from interleaving with final builds and gives every final
+Assembly one explicit publish turn.
+
+Prepared roots are checkpointed as `assembly_prepared` only after their inputs
+have been saved and collected. A process recycle resumes at the final build
+without replaying import/wind/prototype work. A crash recorded as
+`assembly_building` likewise returns to `assembly_prepared` and retries only the
+single final build until its existing per-item crash ceiling is exhausted.
+The six-phase commandlet ceiling is enforced again inside the Unreal runner;
+an inherited environment value may lower the ceiling but cannot set it to zero
+or raise it above six. Planned process yields do not consume the crash-restart
+budget in either the GUI or exact/headless launcher.
 
 The headless fleet uses the same root Assembly barrier without allowing worker
 threads to mutate provider state. One memory-bounded root round completes,
@@ -75,6 +109,11 @@ process-lifetime boundary every six Unreal items.
 - Each Unreal item disables overlapping asynchronous skinned-asset builds,
   drains compilers before restoring the editor setting, releases Python
   references, and requests immediate commandlet GC.
+- Every batch-generated SkeletalMesh uses the project plugin's direct
+  thumbnail-free package save: the Full mesh, generated provider/part
+  prototypes, and final Assembly. Skeleton and non-skeletal auxiliary packages
+  retain the normal editor save path. The batch fails closed if the native
+  no-thumbnail helper is unavailable.
 - Windows Job Object receipts now record exact-tree user/kernel CPU time and
   peak process/job memory for future production measurements.
 - Durable Unreal checkpoints use compact JSON while item and final reports

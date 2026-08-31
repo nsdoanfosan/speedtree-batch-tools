@@ -44,6 +44,10 @@ from process_lifecycle import (
     terminate_owned_process,
 )
 from blender_addon_contract import discover_installed_addon_source
+from unreal_ingest_policy import (
+    TRANSPORT_POLICY_VERSION,
+    migrate_saved_push_transport,
+)
 
 
 def _default_addon_dir():
@@ -178,6 +182,7 @@ DEFAULT_CONFIG = {
     # Headless is the safe default.  Interactive RPC remains available, while
     # ``unreal_wait`` can materialize exports for a later manual headless run.
     "push_transport": "headless",
+    "push_transport_policy_version": TRANSPORT_POLICY_VERSION,
     "night_headless": True,
     "unreal_editor_cmd": r"C:\Program Files\Epic Games\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe",
     "unreal_project": r"C:\UnrealProjects\MyProject2\MyProject2.uproject",
@@ -317,6 +322,7 @@ def atomic_write_json(path, data):
 
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
+    data = {}
     if CONFIG_PATH.exists():
         try:
             data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -324,14 +330,20 @@ def load_config():
             # (e.g. the old per-branch-average knobs) don't linger in the file.
             cfg.update({k: v for k, v in data.items() if k in DEFAULT_CONFIG})
         except Exception:
-            pass
+            data = {}
+    cfg, _migration = migrate_saved_push_transport(cfg, data)
     cfg["blender_exe"] = DEFAULT_CONFIG["blender_exe"]
     return cfg
 
 
 def save_config(cfg):
     normalized = dict(cfg)
+    normalized, _migration = migrate_saved_push_transport(
+        normalized,
+        normalized,
+    )
     normalized["blender_exe"] = DEFAULT_CONFIG["blender_exe"]
+    normalized["push_transport_policy_version"] = TRANSPORT_POLICY_VERSION
     _atomic_write_json(CONFIG_PATH, normalized)
 
 

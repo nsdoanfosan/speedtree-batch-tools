@@ -4033,21 +4033,36 @@ class PushQueueFlowTests(unittest.TestCase):
         )
         self.assertIn("미실행", app.state["SK_after_2.spm"]["push_status"])
 
-    def test_preflight_unreal_off_is_a_failure_not_false_completion(self):
+    def test_rpc_preflight_routes_closed_editor_to_headless(self):
         gui = load_gui_module()
         app = self.make_app(gui)
         targets = self.targets("SK_first.spm", "SK_second.spm")
 
         with mock.patch.object(app, "_unreal_running", return_value=False), mock.patch.object(
+            app, "_handoff_ready", return_value=(True, "")
+        ), mock.patch.object(
             gui, "save_state"
         ):
             ready, reason = app._push_preflight(targets)
 
-        self.assertEqual(ready, [])
-        self.assertIn("Unreal Editor", reason)
-        self.assertEqual(
-            app.state["SK_first.spm"]["push_status_kind"], "unreal_unavailable"
-        )
+        self.assertEqual(ready, targets)
+        self.assertIsNone(reason)
+        self.assertEqual(app.active_push_transport, "headless")
+        self.assertTrue(any("rpc→headless" in call.args[0] for call in app.log.call_args_list))
+
+    def test_rpc_preflight_routes_open_editor_to_unreal_wait(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        targets = self.targets("SK_first.spm")
+
+        with mock.patch.object(app, "_unreal_running", return_value=True), mock.patch.object(
+            app, "_handoff_ready", return_value=(True, "")
+        ), mock.patch.object(gui, "save_state"):
+            ready, reason = app._push_preflight(targets)
+
+        self.assertEqual(ready, targets)
+        self.assertIsNone(reason)
+        self.assertEqual(app.active_push_transport, "unreal_wait")
 
     def test_all_preflight_excluded_remains_item_local_without_fleet_abort(self):
         gui = load_gui_module()
@@ -4338,6 +4353,132 @@ class PushQueueFlowTests(unittest.TestCase):
         self.assertIsNone(result["current_item"])
         self.assertEqual(result["items"]["item-a"]["status"], "unreal_crash")
         self.assertEqual(result["items"]["item-a"]["crash_count"], 1)
+
+    def test_watchdog_requeues_only_final_build_from_prepared_checkpoint(self):
+        gui = load_gui_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint = Path(temp_dir) / "checkpoint.json"
+            checkpoint.write_text(
+                json.dumps({
+                    "current_item": "item-a",
+                    "items": {
+                        "item-a": {
+                            "status": "assembly_building",
+                            "crash_count": 0,
+                            "cluster_assembly": {
+                                "status": "prepared_for_build"
+                            },
+                        }
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+            result = gui.App._record_headless_process_exit(checkpoint, 2)
+
+        state = result["items"]["item-a"]
+        self.assertIsNone(result["current_item"])
+        self.assertEqual(state["status"], "assembly_prepared")
+        self.assertEqual(state["crash_count"], 1)
+        self.assertEqual(
+            state["cluster_assembly"]["status"],
+            "prepared_for_build",
+        )
+
+    def test_gui_planned_process_yield_does_not_spend_crash_budget(self):
+        gui = load_gui_module()
+        app = self.make_app(gui)
+        app.cfg = {
+            "unreal_editor_cmd": "UnrealEditor-Cmd.exe",
+            "unreal_project": "MyProject2.uproject",
+            "headless_item_crash_retries": 2,
+            "headless_batch_max_restarts": 0,
+            "headless_job_timeout": 100,
+        }
+        pending = [{
+            "queue_id": "root",
+            "fingerprint": "root-v1",
+            "report_path": "",
+        }]
+        launches = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+
+            def run_commandlet(_cmd, log_name, _timeout, **kwargs):
+                launches.append(dict(kwargs["env"]))
+                checkpoint_path = Path(
+                    kwargs["env"]["SK_BATCH_CHECKPOINT_PATH"]
+                )
+                report_path = Path(kwargs["env"]["SK_BATCH_REPORT_PATH"])
+                if len(launches) == 1:
+                    checkpoint_path.write_text(
+                        json.dumps({
+                            "complete": False,
+                            "current_item": None,
+                            "process_yield": {
+                                "reason": "assembly_build_process_lifetime_limit",
+                                "processed": 1,
+                                "next_queue_id": "root",
+                            },
+                            "items": {
+                                "root": {
+                                    "status": "assembly_prepared",
+                                    "fingerprint": "root-v1",
+                                }
+                            },
+                        }),
+                        encoding="utf-8",
+                    )
+                else:
+                    states = {
+                        "root": {
+                            "status": "imported_ok",
+                            "fingerprint": "root-v1",
+                        }
+                    }
+                    checkpoint_path.write_text(
+                        json.dumps({
+                            "complete": True,
+                            "current_item": None,
+                            "items": states,
+                        }),
+                        encoding="utf-8",
+                    )
+                    report_path.write_text(
+                        json.dumps({"status": "complete", "items": states}),
+                        encoding="utf-8",
+                    )
+                return 0, temp_root / log_name
+
+            def sync(checkpoint_path, *_args, **_kwargs):
+                try:
+                    return json.loads(
+                        Path(checkpoint_path).read_text(encoding="utf-8")
+                    )
+                except (OSError, ValueError):
+                    return {}
+
+            app._run_limited = run_commandlet
+            app._sync_headless_checkpoint = sync
+            app._record_headless_process_exit = mock.Mock(
+                wraps=app._record_headless_process_exit
+            )
+            with mock.patch.object(gui, "LOG_DIR", temp_root), mock.patch.object(
+                gui, "save_state"
+            ):
+                result = app._run_headless_import_items(
+                    pending,
+                    [{"spm": Path("root")}],
+                    set(),
+                    emit_done=False,
+                    batch_stamp="20260831_120000",
+                )
+
+        self.assertTrue(result)
+        self.assertEqual(len(launches), 2)
+        self.assertEqual(launches[0]["SK_BATCH_MAX_ITEMS_PER_PROCESS"], "6")
+        app._record_headless_process_exit.assert_not_called()
 
     def test_headless_checkpoint_replaces_stale_blender_progress(self):
         gui = load_gui_module()

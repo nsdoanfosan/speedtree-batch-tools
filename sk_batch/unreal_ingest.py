@@ -39,6 +39,12 @@ from cluster_assembly_builder import (  # noqa: E402
 from nanite_assembly_materials import (  # noqa: E402
     audit_unreal_skeletal_mesh_material_sections,
 )
+from unreal_ingest_policy import (  # noqa: E402
+    ASSEMBLY_INGEST_WAVE,
+    bounded_heavy_process_item_limit,
+    external_reference_policy_metadata,
+    manifest_item_policy_metadata,
+)
 
 
 SCHEMA_VERSION = 1
@@ -371,6 +377,9 @@ def _item_reference_projection(item):
         ],
         "report_path": item.get("report_path"),
         "checkout_asset_paths": list(item.get("checkout_asset_paths") or []),
+        "ingest_wave": item.get("ingest_wave"),
+        "heavy_ingest_reasons": list(item.get("heavy_ingest_reasons") or []),
+        "final_assembly_asset_path": item.get("final_assembly_asset_path"),
     }
 
 
@@ -431,6 +440,20 @@ def _load_manifest_item(manifest_path, manifest, item_ref):
     if _item_reference_projection(item) != _item_reference_projection(item_ref):
         raise RuntimeError(
             f"external manifest item identity differs from its index: {payload_path}"
+        )
+    computed_policy = manifest_item_policy_metadata(item)
+    declared_policy = {
+        key: item.get(key)
+        for key in (
+            "ingest_wave",
+            "heavy_ingest_reasons",
+            "final_assembly_asset_path",
+        )
+    }
+    if declared_policy != computed_policy:
+        raise RuntimeError(
+            "external manifest ingest policy differs from its payload content: "
+            + str(payload_path)
         )
     return item
 
@@ -841,8 +864,21 @@ def _verify_manifest_assets_exist(item):
     }
 
 
-def _manifest_items_dependency_order(items):
-    """Return a stable topological order from explicit queue dependencies."""
+def _manifest_reference_policies(manifest, items):
+    policies = {}
+    external = manifest.get("schema_version") == 2
+    for item in items:
+        queue_id = str(item["queue_id"])
+        policies[queue_id] = (
+            external_reference_policy_metadata(item)
+            if external
+            else manifest_item_policy_metadata(item)
+        )
+    return policies
+
+
+def _manifest_items_dependency_order(items, *, policies=None):
+    """Return dependency order with one provider/part -> Assembly barrier."""
     items = list(items)
     by_id = {}
     order = []
@@ -876,7 +912,99 @@ def _manifest_items_dependency_order(items):
             raise RuntimeError(
                 "manifest dependency cycle: " + ", ".join(remaining)
             )
-    return result
+    policies = policies or {
+        str(item["queue_id"]): manifest_item_policy_metadata(item)
+        for item in items
+    }
+    provider_items = [
+        item
+        for item in result
+        if policies[str(item["queue_id"])].get("ingest_wave")
+        != ASSEMBLY_INGEST_WAVE
+    ]
+    assembly_items = [
+        item
+        for item in result
+        if policies[str(item["queue_id"])].get("ingest_wave")
+        == ASSEMBLY_INGEST_WAVE
+    ]
+    assembly_targets = {}
+    for item in assembly_items:
+        queue_id = str(item["queue_id"])
+        target = str(
+            policies[queue_id].get("final_assembly_asset_path") or ""
+        ).casefold()
+        if not target:
+            continue
+        if target in assembly_targets:
+            raise RuntimeError(
+                "final Assembly target is scheduled more than once: "
+                f"{policies[queue_id]['final_assembly_asset_path']} "
+                f"({assembly_targets[target]}, {queue_id})"
+            )
+        assembly_targets[target] = queue_id
+    wave_order = provider_items + assembly_items
+    emitted = set()
+    for item in wave_order:
+        queue_id = str(item["queue_id"])
+        dependencies = {
+            str(value)
+            for value in item.get("depends_on_queue_ids") or []
+            if str(value) in by_id
+        }
+        if not dependencies.issubset(emitted):
+            blocked = ", ".join(sorted(dependencies - emitted))
+            raise RuntimeError(
+                "provider/part ingest cannot depend on a final Assembly wave: "
+                f"item={queue_id}, blocked_by={blocked}"
+            )
+        emitted.add(queue_id)
+    return wave_order
+
+
+def _enforce_manifest_runtime_policy(item_refs, policies):
+    heavy_items = []
+    legacy_policy_items = []
+    for item_ref in item_refs:
+        queue_id = str(item_ref["queue_id"])
+        reasons = list(policies[queue_id].get("heavy_ingest_reasons") or [])
+        if "legacy_external_manifest_missing_policy_metadata" in reasons:
+            legacy_policy_items.append(queue_id)
+        if reasons:
+            heavy_items.append({"queue_id": queue_id, "reasons": reasons})
+    if legacy_policy_items:
+        raise RuntimeError(
+            "external manifest predates the required ingest-wave policy; "
+            "re-export before Unreal import: "
+            + ", ".join(legacy_policy_items[:8])
+        )
+    headless_manifest = _is_headless_manifest_runtime()
+    null_rhi = _is_null_rhi_runtime()
+    isolated = headless_manifest and null_rhi
+    if heavy_items and not headless_manifest:
+        preview = "; ".join(
+            f"{row['queue_id']} ({', '.join(row['reasons'])})"
+            for row in heavy_items[:4]
+        )
+        if len(heavy_items) > 4:
+            preview += f"; +{len(heavy_items) - 4} more"
+        raise RuntimeError(
+            "renderer-sensitive SK Batch ingest is forbidden over live-editor "
+            "RPC; export through headless/unreal_wait and import with -NullRHI: "
+            + preview
+        )
+    if heavy_items and not null_rhi:
+        raise RuntimeError(
+            "renderer-sensitive SK Batch headless ingest requires -NullRHI; "
+            "the commandlet launch invariant is missing"
+        )
+    return {
+        "policy": "isolated_generated_nanite_ingest_v1",
+        "isolated_runtime": bool(isolated),
+        "heavy_item_count": len(heavy_items),
+        "heavy_items": heavy_items,
+        "waves": ["provider_part", "final_assembly"],
+    }
 
 
 def _dependency_block_message(item, checkpoint):
@@ -2649,7 +2777,7 @@ def _save_final_skeleton_contract_assets(full_mesh, *, durable_saves):
         owner="final_skeleton_contract",
         role="skeleton",
     )
-    _save_asset_owned(
+    _save_skeletal_mesh_owned_without_thumbnail(
         saved[1],
         durable_saves,
         owner="final_skeleton_contract",
@@ -2699,19 +2827,24 @@ def _verify_final_skeleton_contract_receipt(
         mesh_path,
         owner="final_skeleton_contract",
         role="mesh",
-        save_mode="editor_asset",
+        save_mode="thumbnail_free",
     )
     return expected
 
 
-def _save_large_assembly_without_thumbnail(asset_path, *, durable_saves):
-    """Persist a built Nanite Assembly without rendering its thumbnail.
+def _save_skeletal_mesh_owned_without_thumbnail(
+    asset_path,
+    durable_saves,
+    *,
+    owner,
+    role,
+):
+    """Persist one generated SkeletalMesh without entering thumbnail rendering.
 
     UE 5.8's normal editor save path renders a missing SkeletalMesh thumbnail.
-    A production Assembly can exceed the practical preview-GPU budget even
-    though its Nanite build itself completed successfully.  The project plugin
-    exposes the same direct UPackage::SavePackage path already used for other
-    renderer-sensitive assets, so fail closed if that exact API is unavailable.
+    Generated Full meshes, provider/part prototypes, and final Assemblies all
+    use the renderer-independent project-plugin save API and fail closed when
+    that API is unavailable.
     """
     candidate = str(asset_path or "").split(".")[0]
     asset = unreal.EditorAssetLibrary.load_asset(candidate) if candidate else None
@@ -2723,7 +2856,7 @@ def _save_large_assembly_without_thumbnail(asset_path, *, durable_saves):
     )
     if asset is None:
         raise RuntimeError(
-            f"cannot save missing Cluster Assembly asset: {candidate}"
+            f"cannot save missing generated SkeletalMesh asset: {candidate}"
         )
     if not callable(saver):
         raise RuntimeError(
@@ -2734,22 +2867,32 @@ def _save_large_assembly_without_thumbnail(asset_path, *, durable_saves):
     _assert_durable_save_unowned(
         durable_saves,
         candidate,
-        "final_nanite_assembly",
+        owner,
     )
     if not saver(asset):
         raise RuntimeError(
-            "failed to persist Cluster Assembly without thumbnail rendering: "
+            "failed to persist generated SkeletalMesh without thumbnail rendering: "
             + candidate
         )
     _record_durable_save(
         durable_saves,
         candidate,
-        owner="final_nanite_assembly",
-        role="assembly",
+        owner=owner,
+        role=role,
         save_mode="thumbnail_free",
     )
     _validate_durable_save_ledger(durable_saves)
     return candidate
+
+
+def _save_large_assembly_without_thumbnail(asset_path, *, durable_saves):
+    """Backward-compatible final Assembly wrapper for the generic SK saver."""
+    return _save_skeletal_mesh_owned_without_thumbnail(
+        asset_path,
+        durable_saves,
+        owner="final_nanite_assembly",
+        role="assembly",
+    )
 
 
 def _clear_generated_mesh_with_mismatched_skeleton(asset_path, expected_skeleton):
@@ -2945,6 +3088,7 @@ def _ingest_cluster_assembly(
     final_skeleton_receipt=None,
     prebuild_materials=None,
     prebuilt_material_paths=None,
+    defer_build=False,
 ):
     payload = item.get("cluster_assembly")
     if not payload:
@@ -3053,7 +3197,7 @@ def _ingest_cluster_assembly(
             save_writability.append(
                 _ensure_declared_package_writable(item, asset_path)
             )
-            _save_asset_owned(
+            _save_skeletal_mesh_owned_without_thumbnail(
                 asset_path,
                 durable_saves,
                 owner="assembly_prototype_prebuild",
@@ -3083,8 +3227,42 @@ def _ingest_cluster_assembly(
             prebuild_materials,
             prebuilt_material_paths,
         )
+    prepared = {
+        "status": "prepared_for_build",
+        "assets": generated_assets,
+        "optimizations": optimizations,
+        "persisted_generated_assets": persisted_generated_assets,
+        "save_writability": save_writability,
+        "skeleton_reimports": skeleton_reimports,
+        "prebuild_materials": list(prebuild_materials),
+        "full_final_skeleton": full_skeleton_path,
+        "persisted_final_contract": persisted_final_contract,
+        "wind_contract_comparison": wind_contract_comparison,
+    }
+    if defer_build:
+        return prepared
+    return _finalize_prepared_cluster_assembly(
+        item,
+        prepared,
+        durable_saves=durable_saves,
+    )
+
+
+def _finalize_prepared_cluster_assembly(item, prepared, *, durable_saves):
+    """Build one final Assembly from durable, already-normalized inputs."""
+    if (prepared or {}).get("status") != "prepared_for_build":
+        raise RuntimeError("Cluster Assembly build requires a prepared provider wave")
+    payload = item.get("cluster_assembly") or {}
+    plan = payload.get("ingest_plan") or {}
+    if plan.get("status") != "ready":
+        raise RuntimeError("prepared Cluster Assembly ingest plan is not ready")
+    manifest = payload.get("manifest") or {}
+    validate_manifest_artifacts(manifest)
+    asset_contract = plan.get("asset_contract") or {}
+    _validate_durable_save_ledger(durable_saves)
     result = build_unreal_nanite_assembly(unreal, manifest, asset_contract)
     assembly_path = result.get("assembly")
+    save_writability = list(prepared.get("save_writability") or [])
     if assembly_path:
         save_writability.append(
             _ensure_declared_package_writable(item, assembly_path)
@@ -3102,24 +3280,18 @@ def _ingest_cluster_assembly(
         if assembly_path
         else None
     )
-    return {
+    finalized = deepcopy(prepared)
+    finalized.update({
         "status": "ready_for_runtime",
-        "assets": generated_assets,
-        "optimizations": optimizations,
-        "persisted_generated_assets": persisted_generated_assets,
         "save_writability": save_writability,
-        "skeleton_reimports": skeleton_reimports,
         "build": result,
         "materials": materials,
-        "prebuild_materials": list(prebuild_materials),
         "thumbnail_free_save": {
             "status": "ok",
             "asset": thumbnail_free_saved,
         } if thumbnail_free_saved else None,
-        "full_final_skeleton": full_skeleton_path,
-        "persisted_final_contract": persisted_final_contract,
-        "wind_contract_comparison": wind_contract_comparison,
-    }
+    })
+    return finalized
 
 
 def _ensure_nanite_voxel_material_usage(base_material):
@@ -3303,6 +3475,35 @@ def _prebuild_material_path_once(mesh_path, reports, seen_paths):
 
 
 def _save_item_assets(item, imported_assets, *, durable_saves):
+    generated_skeletal_paths = {
+        _normalized_unreal_asset_path(item.get("mesh_path")).casefold()
+    }
+    for manifest_asset in item.get("assets") or []:
+        asset_data = (
+            manifest_asset.get("asset_data")
+            if isinstance(manifest_asset, dict)
+            else None
+        ) or {}
+        if asset_data.get("_asset_type") == "SkeletalMesh":
+            generated_skeletal_paths.add(
+                _normalized_unreal_asset_path(
+                    asset_data.get("asset_path")
+                ).casefold()
+            )
+    assembly_plan = ((item.get("cluster_assembly") or {}).get("ingest_plan") or {})
+    for manifest_asset in assembly_plan.get("assets") or []:
+        asset_data = (
+            manifest_asset.get("asset_data")
+            if isinstance(manifest_asset, dict)
+            else None
+        ) or {}
+        if asset_data.get("_asset_type") == "SkeletalMesh":
+            generated_skeletal_paths.add(
+                _normalized_unreal_asset_path(
+                    asset_data.get("asset_path")
+                ).casefold()
+            )
+    generated_skeletal_paths.discard("")
     asset_paths = []
     seen_paths = set()
     for value in imported_assets:
@@ -3329,6 +3530,16 @@ def _save_item_assets(item, imported_assets, *, durable_saves):
         if asset_exists:
             if existing_receipt is not None:
                 _require_durable_save(durable_saves, asset_path)
+            elif (
+                _normalized_unreal_asset_path(asset_path).casefold()
+                in generated_skeletal_paths
+            ):
+                _save_skeletal_mesh_owned_without_thumbnail(
+                    asset_path,
+                    durable_saves,
+                    owner="terminal_item_assets",
+                    role="generated_skeletal_mesh",
+                )
             else:
                 _save_asset_owned(
                     asset_path,
@@ -3387,7 +3598,7 @@ def _save_item_assets(item, imported_assets, *, durable_saves):
     return saved
 
 
-def ingest_item(item):
+def ingest_item(item, *, defer_cluster_build=False):
     durable_saves = _new_durable_save_ledger()
     send2ue_unreal = _load_send2ue_unreal(item["send2ue_unreal_py"])
     checkout = _checkout_existing_assets(item)
@@ -3526,6 +3737,7 @@ def ingest_item(item):
         final_skeleton_receipt=(final_skeleton_saved or None),
         prebuild_materials=prebuild_materials,
         prebuilt_material_paths=prebuilt_material_paths,
+        defer_build=defer_cluster_build,
     )
     imported_assets.extend(assembly.get("assets") or [])
     saved = _save_item_assets(
@@ -3535,7 +3747,11 @@ def ingest_item(item):
     )
     optimization = _finalize_speedtree_skeletal_optimization(optimization)
     materials = _material_postbuild_slot_audit(mesh_path)
-    item_status = _prepare_assembly_runtime_validation(assembly)
+    item_status = (
+        "assembly_prepared"
+        if assembly.get("status") == "prepared_for_build"
+        else _prepare_assembly_runtime_validation(assembly)
+    )
     return {
         "status": item_status,
         "checkout": checkout,
@@ -3552,6 +3768,21 @@ def ingest_item(item):
         "prebuild_materials": prebuild_materials,
         "optimization": optimization,
         "saved": saved,
+        "durable_saves": _durable_save_report(durable_saves),
+    }
+
+
+def _finalize_prepared_assembly_item(item, prepared_state):
+    """Publish one final Assembly without replaying its import/provider work."""
+    durable_saves = deepcopy(prepared_state.get("durable_saves") or {})
+    assembly = _finalize_prepared_cluster_assembly(
+        item,
+        prepared_state.get("cluster_assembly") or {},
+        durable_saves=durable_saves,
+    )
+    return {
+        "status": _prepare_assembly_runtime_validation(assembly),
+        "cluster_assembly": assembly,
         "durable_saves": _durable_save_report(durable_saves),
     }
 
@@ -3588,19 +3819,27 @@ def _recover_interrupted_item(checkpoint, max_item_crash_retries):
     if not current_id:
         return
     state = checkpoint.setdefault("items", {}).get(current_id)
-    if not state or state.get("status") != "importing":
+    interrupted_status = (state or {}).get("status")
+    if not state or interrupted_status not in {"importing", "assembly_building"}:
         checkpoint["current_item"] = None
         return
 
     crash_count = int(state.get("crash_count", 0)) + 1
-    state.update(
-        {
-            "status": "unreal_crash",
-            "crash_count": crash_count,
-            "updated_at": _now(),
-            "message": "UnrealEditor-Cmd exited while this item was importing",
-        }
-    )
+    state.update({
+        "status": (
+            "assembly_prepared"
+            if interrupted_status == "assembly_building"
+            else "unreal_crash"
+        ),
+        "crash_count": crash_count,
+        "updated_at": _now(),
+        "message": (
+            "UnrealEditor-Cmd exited while this item's final Assembly was building; "
+            "durable prepared inputs will be reused"
+            if interrupted_status == "assembly_building"
+            else "UnrealEditor-Cmd exited while this item was importing"
+        ),
+    })
     if crash_count > max_item_crash_retries:
         state.update(
             {
@@ -3656,13 +3895,26 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
     report_path = str(Path(report_path or manifest["report_path"]).resolve())
     checkpoint = _load_json(checkpoint_path, default=None) or _initial_checkpoint(manifest)
     max_retries = int(manifest.get("max_item_crash_retries", 2))
-    manifest_items = _manifest_items_dependency_order(
-        manifest_item_refs
+    manifest_policies = _manifest_reference_policies(manifest, manifest_item_refs)
+    runtime_ingest_policy = _enforce_manifest_runtime_policy(
+        manifest_item_refs,
+        manifest_policies,
     )
+    manifest_items = _manifest_items_dependency_order(
+        manifest_item_refs,
+        policies=manifest_policies,
+    )
+    assembly_item_refs = [
+        item_ref
+        for item_ref in manifest_items
+        if manifest_policies[str(item_ref["queue_id"])].get("ingest_wave")
+        == ASSEMBLY_INGEST_WAVE
+    ]
     max_items_per_process = 0
+    requested_max_items_per_process = 0
     if _is_headless_manifest_runtime() or _is_null_rhi_runtime():
         try:
-            max_items_per_process = max(
+            requested_max_items_per_process = max(
                 0,
                 int(os.environ.get("SK_BATCH_MAX_ITEMS_PER_PROCESS", "0")),
             )
@@ -3670,17 +3922,24 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
             raise RuntimeError(
                 "SK_BATCH_MAX_ITEMS_PER_PROCESS must be an integer"
             ) from exc
+        max_items_per_process = requested_max_items_per_process
+        if runtime_ingest_policy["heavy_item_count"]:
+            max_items_per_process = bounded_heavy_process_item_limit(
+                requested_max_items_per_process
+            )
     processed_this_process = 0
     process_lifetime_policy = {
         "transport": (
             "headless" if _is_headless_manifest_runtime() else "rpc"
         ),
         "max_items_per_process": max_items_per_process,
+        "requested_max_items_per_process": requested_max_items_per_process,
         "immediate_gc_mode": (
             "commandlet_full_purge"
             if _is_headless_manifest_runtime()
             else "editor_keep_standalone"
         ),
+        "ingest_policy": runtime_ingest_policy,
     }
     checkpoint["process_lifetime_policy"] = process_lifetime_policy
     checkpoint.pop("process_yield", None)
@@ -3775,6 +4034,11 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
         ):
             continue
         if (
+            previous.get("fingerprint") == fingerprint
+            and previous.get("status") == "assembly_prepared"
+        ):
+            continue
+        if (
             max_items_per_process
             and processed_this_process >= max_items_per_process
         ):
@@ -3817,7 +4081,16 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
                         "asset_cache": asset_cache,
                     }
                 else:
-                    result = ingest_item(item)
+                    if (
+                        manifest_policies[queue_id].get("ingest_wave")
+                        == ASSEMBLY_INGEST_WAVE
+                    ):
+                        result = ingest_item(
+                            item,
+                            defer_cluster_build=True,
+                        )
+                    else:
+                        result = ingest_item(item)
                     if asset_cache is not None:
                         result["asset_cache_preflight"] = asset_cache
             state.update(result)
@@ -3868,6 +4141,96 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
             if item_ref.get("report_path"):
                 _atomic_write_json(item_ref["report_path"], item_report)
             processed_this_process += 1
+
+    if not checkpoint.get("process_yield"):
+        for item_ref in assembly_item_refs:
+            queue_id = str(item_ref["queue_id"])
+            fingerprint = item_ref["fingerprint"]
+            state = checkpoint.setdefault("items", {}).get(queue_id, {})
+            if (
+                state.get("fingerprint") == fingerprint
+                and state.get("status") in TERMINAL_STATES
+            ):
+                continue
+            if not (
+                state.get("fingerprint") == fingerprint
+                and state.get("status") == "assembly_prepared"
+            ):
+                state.update({
+                    "status": "data_error",
+                    "fingerprint": fingerprint,
+                    "message": (
+                        "final Assembly build wave reached an item without "
+                        "durable prepared inputs"
+                    ),
+                    "completed_at": _now(),
+                    "updated_at": _now(),
+                })
+                checkpoint["items"][queue_id] = state
+                checkpoint["updated_at"] = _now()
+                _atomic_write_json(checkpoint_path, checkpoint, compact=True)
+                if item_ref.get("report_path"):
+                    item_report = dict(state)
+                    item_report["queue_id"] = queue_id
+                    item_report["checkpoint"] = checkpoint_path
+                    _atomic_write_json(item_ref["report_path"], item_report)
+                continue
+            if (
+                max_items_per_process
+                and processed_this_process >= max_items_per_process
+            ):
+                checkpoint["process_yield"] = {
+                    "reason": "assembly_build_process_lifetime_limit",
+                    "max_items": max_items_per_process,
+                    "processed": processed_this_process,
+                    "next_queue_id": queue_id,
+                    "at": _now(),
+                }
+                break
+
+            state["status"] = "assembly_building"
+            state["assembly_build_started_at"] = _now()
+            state["updated_at"] = _now()
+            checkpoint["current_item"] = queue_id
+            checkpoint["updated_at"] = _now()
+            _atomic_write_json(checkpoint_path, checkpoint, compact=True)
+
+            result = None
+            item = None
+            compilation_lifetime = None
+            try:
+                item = _load_manifest_item(manifest_path, manifest, item_ref)
+                with _bounded_item_skinned_asset_compilation() as compilation_lifetime:
+                    result = _finalize_prepared_assembly_item(item, state)
+                state.update(result)
+                state["compilation_lifetime"] = compilation_lifetime
+                state["status"] = result.get("status", "imported_ok")
+                if state["status"] == "imported_ok":
+                    state["completed_at"] = _now()
+                state["updated_at"] = _now()
+            except Exception as exc:
+                state.update({
+                    "status": "data_error",
+                    "message": str(exc),
+                    "traceback": traceback.format_exc(),
+                    "completed_at": _now(),
+                    "updated_at": _now(),
+                })
+            finally:
+                result = None
+                item = None
+                if compilation_lifetime is not None:
+                    state["compilation_lifetime"] = compilation_lifetime
+                state["resource_release"] = _release_item_unreal_resources()
+                checkpoint["current_item"] = None
+                checkpoint["updated_at"] = _now()
+                _atomic_write_json(checkpoint_path, checkpoint, compact=True)
+                item_report = dict(state)
+                item_report["queue_id"] = queue_id
+                item_report["checkpoint"] = checkpoint_path
+                if item_ref.get("report_path"):
+                    _atomic_write_json(item_ref["report_path"], item_report)
+                processed_this_process += 1
 
     checkpoint["complete"] = _checkpoint_all_manifest_items_terminal(
         checkpoint,

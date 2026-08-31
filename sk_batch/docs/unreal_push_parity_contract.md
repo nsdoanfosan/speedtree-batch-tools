@@ -2,12 +2,14 @@
 
 ## Scope
 
-`rpc` and `headless` are execution transports. `unreal_wait` uses the headless
-export contract but deliberately stops before Unreal starts. All three consume
-the same versioned item manifest; the later `대기 에셋 임포트` action executes
-waiting items through the same Unreal-side headless ingest function. A mode must
-not reinterpret Send2UE settings or replace the Send2UE importer with a generic
-FBX task.
+`rpc` and `headless` retain transaction-format parity, but they are not equally
+permitted for every workload. `unreal_wait` uses the headless export contract
+and deliberately stops before Unreal starts. Generated Nanite SkeletalMesh,
+DynamicWind provider, and final Assembly manifests are renderer-sensitive and
+must use `headless`/`unreal_wait`; live RPC is reserved for work that the shared
+policy classifies as lightweight. All modes consume the same versioned item
+manifest, and a mode must not reinterpret Send2UE settings or replace the
+Send2UE importer with a generic FBX task.
 
 All three modes must also preserve the channel meanings and failure rules in
 the [Tree Vertex Color contract](tree_vertex_color_contract.md); transport is
@@ -52,8 +54,9 @@ not allowed to remap, regenerate, or discard R/G.
     and its PhysicsAsset assignment are disabled. A default generated
     PhysicsAsset is deleted only when it has no foreign referencer.
 11. Dynamic wind is applied through `CodexDynamicWindImportLibrary`.
-12. Assets/directories are saved, assigned slots are verified, and relevant
-    materials are compiled/checked.
+12. Generated SkeletalMeshes are saved through the thumbnail-free package API;
+    Skeleton and auxiliary assets use the normal save path. Assigned slots are
+    verified and relevant materials are compiled/checked.
 
 ## Optional texture availability
 
@@ -65,9 +68,10 @@ left unassigned; ambiguous, stale, or unsafe candidates are omitted. The
 material instance is still reused or created and assigned to its mesh slot, and
 texture availability never changes the target outcome.
 
-RPC invokes this transaction through the open editor's existing Send2UE RPC
-bridge. Headless invokes the identical transaction in one
-`UnrealEditor-Cmd.exe -run=pythonscript` session for the pending batch.
+Headless invokes this transaction in one
+`UnrealEditor-Cmd.exe -run=pythonscript -NullRHI` session for the pending batch.
+The RPC bridge retains the same serialization contract for lightweight work,
+but the Unreal runner refuses renderer-sensitive manifests before mutation.
 
 ## Queue and recovery contract
 
@@ -95,8 +99,11 @@ match; `--force` bypasses both caches.
 ## GUI compatibility
 
 - The existing `③ Unreal Push` button remains and defaults to `headless`.
-- A transport selector permits explicit `rpc`, `headless`, or `unreal_wait`
-  runs.
+- A transport selector permits `rpc`, `headless`, or `unreal_wait`, but the
+  generated vegetation preflight resolves RPC to `unreal_wait` when the editor
+  is open and to `headless` when it is closed.
+- Saved RPC preferences are normalized to `unreal_wait`. Runtime enforcement is
+  authoritative even if a current-session selection or direct caller requests RPC.
 - `unreal_wait` persists dependency-ordered immutable exports as
   `exported_pending_unreal`. The state and waiting manifest survive GUI restarts.
 - `대기 에셋 임포트` revalidates source and export fingerprints, refuses to
@@ -105,7 +112,7 @@ match; `--force` bypasses both caches.
 - The full unattended pipeline defaults to `headless`, preserving the existing
   one-click workflow while removing its open-editor requirement.
 
-## Runtime parity evidence (2026-07-14)
+## Historical runtime parity evidence (2026-07-14)
 
 - MyProject2: Unreal Engine 5.8.0, `UnrealEditor-Cmd -run=pythonscript`.
 - Headless and open-editor RPC both completed `SK_bush_blackgum_01` through the
@@ -119,3 +126,7 @@ match; `--force` bypasses both caches.
   `/Game/Material/Tree/AssetTree/Master/M_TreeAsset_Master`.
 - Verification artifacts are listed in
   `logs/verification_headless_rpc_parity.json`.
+
+This evidence proves serialization/transaction parity only. It does not grant
+production permission to execute generated Nanite/DynamicWind ingest through a
+live renderer process under the current isolation policy.

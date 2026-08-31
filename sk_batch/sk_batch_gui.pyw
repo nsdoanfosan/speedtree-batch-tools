@@ -44,6 +44,10 @@ sys.path.insert(0, str(TOOL_DIR))
 
 from process_lifecycle import owned_run, shutdown_process_supervisor
 from stage_batch_policy import run_memory_bounded_stage, stage_worker_policy
+from unreal_ingest_policy import (
+    bounded_heavy_process_item_limit,
+    resolve_heavy_push_transport,
+)
 
 from code_compile_gate import (
     CODE_REVISION_RESTART_ROUTE,
@@ -2396,7 +2400,7 @@ class App:
         transport_combo.pack(side="left", padx=6)
         Tooltip(
             transport_combo,
-            "rpc = 기존 열린 Unreal Editor 경로\n"
+            "rpc = 경량 작업용 열린 Unreal Editor 경로 (생성 Nanite SK는 자동 격리)\n"
             "headless = Blender 전체 export 후 UnrealEditor-Cmd 1회 배치 import\n"
             "unreal_wait = export만 완료하고 영구 Unreal 대기 큐에 등록",
         )
@@ -15869,23 +15873,19 @@ class App:
             "active_push_transport",
             self.cfg.get("push_transport", "rpc"),
         )
-        if transport == "rpc" and not self._unreal_running():
-            reason = "Unreal Editor 종료 — MyProject2가 실행 중이 아님"
-            self.log(f"[중단] {reason}")
-            for item in targets:
-                iid = str(item["spm"])
-                self._record_phase_status(
-                    iid,
-                    "push_status",
-                    f"중단: {reason}",
-                    "unreal_unavailable",
-                    reason,
-                    persist=False,
-                )
-            with self.state_lock:
-                save_state(self.state)
-            return [], reason
-        if transport == "headless" and self._unreal_running():
+        unreal_running = self._unreal_running()
+        resolution = resolve_heavy_push_transport(
+            transport,
+            unreal_running=unreal_running,
+        )
+        if resolution["changed"]:
+            transport = resolution["transport"]
+            self.active_push_transport = transport
+            self.log(
+                "[Push transport 안전 전환] rpc→"
+                f"{transport}: {resolution['reason']}"
+            )
+        if transport == "headless" and unreal_running:
             reason = "headless Push는 자산 잠금 충돌 방지를 위해 Unreal Editor를 닫아야 함"
             self.log(f"[중단] {reason}")
             for item in targets:
@@ -16648,6 +16648,8 @@ class App:
             return {}
         labels = {
             "importing": "Unreal import 중...",
+            "assembly_prepared": "Assembly 입력 준비 완료",
+            "assembly_building": "Final Assembly build 중...",
             "imported_ok": "완료 (headless)",
             "data_error": "실패: data error",
             "manual_required": "수동 처리 필요",
@@ -16659,7 +16661,7 @@ class App:
                 continue
             status = result.get("status", "not_run")
             message = result.get("message") or labels.get(status, status)
-            if status == "importing":
+            if status in {"importing", "assembly_building"}:
                 versions = self.__dict__.setdefault(
                     "_retry_checkpoint_versions", {}
                 )
@@ -16734,25 +16736,32 @@ class App:
             status = str(result.get("status") or "not_run")
             status_counts[status] = status_counts.get(status, 0) + 1
         total = len(item_by_id)
-        active = status_counts.get("importing", 0)
-        completed = sum(
-            count
-            for status, count in status_counts.items()
-            if status != "importing"
+        active = (
+            status_counts.get("importing", 0)
+            + status_counts.get("assembly_building", 0)
         )
-        progress_snapshot = (completed, total, active)
+        prepared = status_counts.get("assembly_prepared", 0)
+        completed = sum(
+            status_counts.get(status, 0)
+            for status in (
+                "imported_ok",
+                "data_error",
+                "manual_required",
+                "not_run",
+            )
+        )
+        progress_snapshot = (completed, total, active, prepared)
         if progress_snapshot != getattr(
             self, "_headless_progress_snapshot", None
         ):
             self._headless_progress_snapshot = progress_snapshot
-            self.ui_queue.put(
-                (
-                    "progress",
-                    f"{getattr(self, '_headless_progress_label', 'Unreal Push')} "
-                    f"{completed}/{total} · "
-                    f"headless 처리 중 {active}개",
-                )
+            progress_text = (
+                f"{getattr(self, '_headless_progress_label', 'Unreal Push')} "
+                f"{completed}/{total} · headless 처리 중 {active}개"
             )
+            if prepared:
+                progress_text += f" · Assembly 준비 {prepared}개"
+            self.ui_queue.put(("progress", progress_text))
         return checkpoint
 
     @staticmethod
@@ -16764,20 +16773,34 @@ class App:
             return {}
         current_id = checkpoint.get("current_item")
         state = (checkpoint.get("items") or {}).get(current_id)
-        if not current_id or not state or state.get("status") != "importing":
+        interrupted_status = (state or {}).get("status")
+        if (
+            not current_id
+            or not state
+            or interrupted_status not in {"importing", "assembly_building"}
+        ):
             return checkpoint
         crash_count = int(state.get("crash_count", 0)) + 1
         status = (
             "manual_required"
             if crash_count > int(max_item_crash_retries)
-            else "unreal_crash"
+            else (
+                "assembly_prepared"
+                if interrupted_status == "assembly_building"
+                else "unreal_crash"
+            )
         )
         message = (
             "Unreal commandlet crash retry limit exceeded "
             f"({max_item_crash_retries}); an operator stop counts as a crash, "
             "so clear it with --reset-item-retries to requeue"
             if status == "manual_required"
-            else "UnrealEditor-Cmd exited while this item was importing"
+            else (
+                "UnrealEditor-Cmd exited during final Assembly build; "
+                "retrying from durable prepared inputs"
+                if interrupted_status == "assembly_building"
+                else "UnrealEditor-Cmd exited while this item was importing"
+            )
         )
         state.update(
             {
@@ -17571,7 +17594,15 @@ class App:
                 "SK_BATCH_MANIFEST_PATH": str(manifest_path.resolve()),
                 "SK_BATCH_CHECKPOINT_PATH": str(checkpoint_path.resolve()),
                 "SK_BATCH_REPORT_PATH": str(report_path.resolve()),
+                "SK_BATCH_MAX_ITEMS_PER_PROCESS": env.get(
+                    "SK_BATCH_MAX_ITEMS_PER_PROCESS", "6"
+                ),
             }
+        )
+        env["SK_BATCH_MAX_ITEMS_PER_PROCESS"] = str(
+            bounded_heavy_process_item_limit(
+                env["SK_BATCH_MAX_ITEMS_PER_PROCESS"]
+            )
         )
         max_restarts = max(
             0, int(self.cfg.get("headless_batch_max_restarts", 10))
@@ -17579,21 +17610,35 @@ class App:
         complete = False
         last_log = None
         checkpoint = {}
-        for launch_index in range(max_restarts + 1):
+        crash_restarts = 0
+        launch_index = 0
+        planned_yields = 0
+        while crash_restarts <= max_restarts:
             if self.stop_flag.is_set():
                 break
+            launch_index += 1
+            try:
+                prelaunch_checkpoint = json.loads(
+                    checkpoint_path.read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError):
+                prelaunch_checkpoint = {}
+            prelaunch_yield = prelaunch_checkpoint.get("process_yield")
             self.ui_queue.put(
                 (
                     "progress",
                     f"{progress_label} headless 시작 · "
-                    f"시도 {launch_index + 1}/{max_restarts + 1}",
+                    f"launch {launch_index} · "
+                    f"crash {crash_restarts}/{max_restarts}",
                 )
             )
             self.log(
-                f"UnrealEditor-Cmd headless 시작 ({launch_index + 1}/{max_restarts + 1})"
+                "UnrealEditor-Cmd headless 시작 "
+                f"(launch {launch_index}, crash "
+                f"{crash_restarts}/{max_restarts})"
             )
             attempt_log = LOG_DIR / (
-                f"{file_prefix}_unreal_{batch_stamp}_{launch_index + 1}.log"
+                f"{file_prefix}_unreal_{batch_stamp}_{launch_index}.log"
             )
             last_log = attempt_log
             try:
@@ -17627,6 +17672,25 @@ class App:
             complete = bool(checkpoint.get("complete")) and report_path.is_file()
             if complete:
                 break
+            current_yield = checkpoint.get("process_yield")
+            if (
+                code == 0
+                and current_yield
+                and current_yield != prelaunch_yield
+            ):
+                planned_yields += 1
+                if planned_yields > 1000:
+                    self.log(
+                        "[headless 중단] planned process yield 1000회 초과"
+                    )
+                    break
+                self.log(
+                    "[headless process recycle] "
+                    f"{current_yield.get('processed', 0)} phase 완료 · "
+                    f"다음={current_yield.get('next_queue_id', '?')}"
+                )
+                continue
+            crash_restarts += 1
             checkpoint = self._record_headless_process_exit(
                 checkpoint_path,
                 manifest["max_item_crash_retries"],
@@ -17637,7 +17701,8 @@ class App:
                 last_log,
             )
             self.log(
-                f"[headless watchdog] commandlet 종료 code={code}; checkpoint 재개"
+                f"[headless watchdog] commandlet 종료 code={code}; "
+                f"crash {crash_restarts}/{max_restarts}; checkpoint 재개"
             )
 
         if self.stop_flag.is_set():

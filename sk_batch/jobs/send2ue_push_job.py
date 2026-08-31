@@ -84,6 +84,7 @@ from child_progress_contract import (
     SEND2UE_RPC_OWNED_START_MARKER,
     emit_progress_marker as emit_child_progress_marker,
 )
+from unreal_ingest_policy import manifest_item_policy_metadata
 from blender_addon_gateway import prepare_runtime
 
 
@@ -975,6 +976,12 @@ def main():
         )
         if wind_policy_module.is_file():
             code_files.append(file_fingerprint(wind_policy_module))
+        ingest_policy_module = (
+            Path(__file__).resolve().parents[1]
+            / "unreal_ingest_policy.py"
+        )
+        if ingest_policy_module.is_file():
+            code_files.append(file_fingerprint(ingest_policy_module))
         cluster_builder = Path(__file__).resolve().parents[1] / "cluster_assembly_builder.py"
         if cluster_builder.is_file():
             code_files.append(file_fingerprint(cluster_builder))
@@ -1007,6 +1014,7 @@ def main():
                 "skeleton_root": report["send2ue_skeleton_root_export"],
             },
         }
+        contract.update(manifest_item_policy_metadata(contract))
         fingerprint = stable_fingerprint(contract)
         queue_id = args.queue_id or str(Path(blend_path).resolve())
         item_import_report = args.item_import_report or str(
