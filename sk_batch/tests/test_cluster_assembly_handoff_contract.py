@@ -1,3 +1,4 @@
+import copy
 import json
 import sys
 import tempfile
@@ -22,6 +23,7 @@ from cluster_assembly_handoff_contract import (  # noqa: E402
     build_blender_fbx_inventory,
     classify_inventory_role,
     current_assembly_manifest_handoff,
+    current_receipt_reference_provider_inputs,
     file_fingerprint,
     normalize_export_name,
     _normalized_variants_ready,
@@ -56,6 +58,116 @@ class NormalizedVariantBoneIdentityTests(unittest.TestCase):
 
 
 class CurrentFbxRoleAuthorityTests(unittest.TestCase):
+    @staticmethod
+    def _strict_reference_dependency(spm, normalized):
+        return {
+            "role": "branch",
+            "name": "SK_branch_tree_03",
+            "target_material_names": ["branch_tree_03"],
+            "primary_role_source": False,
+            "decision": "reference_only",
+            "current_spm_pair_covered": True,
+            "current_live_pair_covered": False,
+            "spm_only_provider_candidate": True,
+            "rendered_provider_expansion_covered": True,
+            "normalized_delivery_mode": "connection_incomplete",
+            "target_relation": {
+                "allowed": True,
+                "matched_target_spms": [str(spm)],
+            },
+            "normalized_variants": normalized,
+        }
+
+    def test_current_receipt_exposes_reference_provider_on_first_run(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "Tree_01.spm"
+            manifest = root / "branch_03.json"
+            plan_fbx = root / "branch_03_01.fbx"
+            spm.write_bytes(b"spm-current")
+            manifest.write_bytes(b"manifest-current")
+            plan_fbx.write_bytes(b"plan-current")
+            normalized = {
+                "status": "ready",
+                "material": "M_branch_tree_03",
+                "manifest": file_fingerprint(manifest),
+                "variants": [{
+                    "ordinal": 1,
+                    "plan_fbx": file_fingerprint(plan_fbx),
+                }],
+            }
+            contract = {
+                "dependencies": [
+                    self._strict_reference_dependency(spm, normalized)
+                ],
+            }
+
+            inputs = current_receipt_reference_provider_inputs(
+                spm,
+                contract,
+                authority={"source": "current_receipt"},
+            )
+
+            self.assertEqual(
+                [row["provider_key"] for row in inputs],
+                ["branch:branch_tree_03"],
+            )
+            self.assertEqual(inputs[0]["role_identity"], "branch_tree_03")
+            self.assertTrue(inputs[0]["speculative_provider_expansion"])
+            self.assertEqual(
+                inputs[0]["current_reference_authority"]["source"],
+                "current_receipt",
+            )
+
+    def test_current_receipt_reference_provider_is_strict_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "Tree_01.spm"
+            manifest = root / "branch_03.json"
+            plan_fbx = root / "branch_03_01.fbx"
+            spm.write_bytes(b"spm-current")
+            manifest.write_bytes(b"manifest-current")
+            plan_fbx.write_bytes(b"plan-current")
+            normalized = {
+                "manifest": file_fingerprint(manifest),
+                "variants": [{
+                    "plan_fbx": file_fingerprint(plan_fbx),
+                }],
+            }
+            dependency = self._strict_reference_dependency(
+                spm, normalized
+            )
+            invalid_cases = {
+                "primary": ("primary_role_source", True),
+                "wrong_decision": ("decision", "normalize_part"),
+                "live_pair": ("current_live_pair_covered", True),
+                "wrong_mode": (
+                    "normalized_delivery_mode",
+                    "asset_registration_only",
+                ),
+            }
+            for label, (field, value) in invalid_cases.items():
+                with self.subTest(label=label):
+                    invalid = copy.deepcopy(dependency)
+                    invalid[field] = value
+                    self.assertEqual(
+                        current_receipt_reference_provider_inputs(
+                            spm, {"dependencies": [invalid]}
+                        ),
+                        [],
+                    )
+
+            wrong_target = copy.deepcopy(dependency)
+            wrong_target["target_relation"]["matched_target_spms"] = [
+                str(root / "Other.spm")
+            ]
+            self.assertEqual(
+                current_receipt_reference_provider_inputs(
+                    spm, {"dependencies": [wrong_target]}
+                ),
+                [],
+            )
+
     def test_current_production_manifest_recovers_repair_handoff(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -216,13 +328,49 @@ class CurrentFbxRoleAuthorityTests(unittest.TestCase):
             receipt.write_text(json.dumps({
                 "cluster_assembly": {
                     "folder": str(root),
-                    "dependencies": [{
-                        "role": "leaf",
-                        "name": "SK_cluster_tree_07",
-                        "target_material_names": ["leaf_tree_05"],
-                        "spm_only_provider_candidate": True,
-                        "normalized_variants": normalized,
+                    "tree_source_identities": [{
+                        "target_spm": file_fingerprint(spm),
                     }],
+                    "dependencies": [
+                        {
+                            "role": "leaf",
+                            "name": "SK_cluster_tree_07",
+                            "target_material_names": ["leaf_tree_05"],
+                            "primary_role_source": False,
+                            "decision": "reference_only",
+                            "current_spm_pair_covered": True,
+                            "current_live_pair_covered": False,
+                            "spm_only_provider_candidate": True,
+                            "rendered_provider_expansion_covered": True,
+                            "normalized_delivery_mode": (
+                                "connection_incomplete"
+                            ),
+                            "target_relation": {
+                                "allowed": True,
+                                "matched_target_spms": [str(spm)],
+                            },
+                            "normalized_variants": normalized,
+                        },
+                        {
+                            "role": "branch",
+                            "name": "SK_branch_tree_01",
+                            "target_material_names": ["branch_tree_01"],
+                            "primary_role_source": True,
+                            "decision": "pass_through",
+                            "current_spm_pair_covered": True,
+                            "current_live_pair_covered": False,
+                            "spm_only_provider_candidate": True,
+                            "rendered_provider_expansion_covered": True,
+                            "normalized_delivery_mode": (
+                                "asset_registration_only"
+                            ),
+                            "target_relation": {
+                                "allowed": True,
+                                "matched_target_spms": [str(spm)],
+                            },
+                            "normalized_variants": normalized,
+                        },
+                    ],
                     "handoff": {"roles": []},
                 },
             }), encoding="utf-8")
@@ -313,11 +461,26 @@ class CurrentFbxRoleAuthorityTests(unittest.TestCase):
             receipt.write_text(json.dumps({
                 "cluster_assembly": {
                     "folder": str(root),
+                    "tree_source_identities": [{
+                        "target_spm": file_fingerprint(spm),
+                    }],
                     "dependencies": [{
                         "role": "leaf",
                         "name": "SK_cluster_tree_07",
                         "target_material_names": ["leaf_tree_05"],
+                        "primary_role_source": False,
+                        "decision": "reference_only",
+                        "current_spm_pair_covered": True,
+                        "current_live_pair_covered": False,
                         "spm_only_provider_candidate": True,
+                        "rendered_provider_expansion_covered": True,
+                        "normalized_delivery_mode": (
+                            "connection_incomplete"
+                        ),
+                        "target_relation": {
+                            "allowed": True,
+                            "matched_target_spms": [str(spm)],
+                        },
                         "normalized_variants": persisted,
                     }],
                     "handoff": {"roles": []},

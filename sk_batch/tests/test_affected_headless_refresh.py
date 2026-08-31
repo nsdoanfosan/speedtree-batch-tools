@@ -90,7 +90,7 @@ def test_main_uses_dependency_fleet_for_every_selected_target(tmp_path, monkeypa
     monkeypatch.setattr(
         refresh,
         "discover_affected_targets",
-        lambda _root: (selected, selected, []),
+        lambda _root: (selected[:1], selected, []),
     )
     captured = {}
 
@@ -105,7 +105,9 @@ def test_main_uses_dependency_fleet_for_every_selected_target(tmp_path, monkeypa
 
     monkeypatch.setattr(refresh.cluster_fleet_push, "main", fake_fleet)
     result = refresh.main([
-        "--root", str(tmp_path), "--log-dir", str(tmp_path), "--dry-run"
+        "--root", str(tmp_path), "--log-dir", str(tmp_path), "--dry-run",
+        "--all-current-targets", "--force-cluster-assembly-rebuild",
+        "--transport", "rpc",
     ])
 
     assert result == 0
@@ -114,9 +116,21 @@ def test_main_uses_dependency_fleet_for_every_selected_target(tmp_path, monkeypa
     assert "--push-pass-through-roots" in call
     assert "--fail-fast" in call
     assert "--dry-run" in call
+    assert "--force-cluster-assembly-rebuild" in call
+    assert call[call.index("--transport") + 1] == "rpc"
     assert call.count("--target-spm") == 2
     assert "SK_tree_a" in " ".join(call)
     assert "SK_weed_grass_b" in " ".join(call)
+
+
+def test_prepare_only_rejects_rpc_transport(tmp_path):
+    import pytest
+
+    with pytest.raises(SystemExit):
+        refresh.main([
+            "--log-dir", str(tmp_path), "--prepare-only",
+            "--transport", "rpc",
+        ])
 
 
 def test_main_resumes_prepared_run_without_reexport(tmp_path, monkeypatch):
@@ -175,6 +189,51 @@ def test_main_resumes_prepared_run_without_reexport(tmp_path, monkeypatch):
     assert inventory["failed_count"] == 0
 
 
+def test_full_fleet_resume_keeps_targets_that_are_current(tmp_path, monkeypatch):
+    run_id = "20260830_022824"
+    spm = tmp_path / "SK_tree_current_but_not_run.spm"
+    inventory_path = tmp_path / f"affected_headless_refresh_{run_id}.json"
+    inventory_path.write_text(
+        json.dumps({
+            "all_current_targets": True,
+            "selected": [{"stem": spm.stem, "spm": str(spm)}],
+            "audited": [],
+            "discovery_missing": [],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        refresh,
+        "audit_target",
+        lambda target: {**target, "selected": False, "reasons": []},
+    )
+
+    def fake_fleet(argv):
+        assert "--target-spm" in argv
+        assert str(spm) in argv
+        assert "--resume-prepared" in argv
+        (tmp_path / f"cluster_fleet_push_{run_id}.json").write_text(
+            json.dumps({
+                "status": "ok",
+                "verified_count": 1,
+                "failed_count": 0,
+                "provider_failed_count": 0,
+                "results": [],
+            }),
+            encoding="utf-8",
+        )
+        return 0
+
+    monkeypatch.setattr(refresh.cluster_fleet_push, "main", fake_fleet)
+
+    assert refresh.main([
+        "--log-dir", str(tmp_path), "--resume-run-id", run_id,
+    ]) == 0
+    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+    assert len(inventory["selected"]) == 1
+    assert inventory["resume_skipped_current"] == []
+
+
 def test_reset_item_retries_requires_resume_run_id():
     import pytest
 
@@ -189,6 +248,7 @@ def test_headless_commandlet_disables_local_ddc_cleanup():
 
     assert "-NoDDCCleanup" in UNREAL_COMMANDLET_BASE_ARGS
     assert "-unattended" in UNREAL_COMMANDLET_BASE_ARGS
+    assert "-NullRHI" in UNREAL_COMMANDLET_BASE_ARGS
     assert "-NoDDCCleanup" in exact_push.UNREAL_COMMANDLET_BASE_ARGS
 
 
@@ -441,6 +501,41 @@ def test_native_change_after_unreal_deployment_is_selected(tmp_path):
     assert "native receipt hash changed" in audit["deployment_receipt_error"]
 
 
+def test_schema2_deployment_requires_global_commit(tmp_path, monkeypatch):
+    target = _current_target(tmp_path, "SK_tree_schema2_uncommitted_01")
+    deployment_path = refresh.deployment_receipt_path(target)
+    deployment = json.loads(deployment_path.read_text(encoding="utf-8"))
+    deployment["schema_version"] = 2
+    deployment_path.write_text(json.dumps(deployment), encoding="utf-8")
+    monkeypatch.setattr(
+        refresh,
+        "_schema2_deployment_receipt_is_committed",
+        lambda _path, _payload: False,
+    )
+
+    audit = refresh.audit_target(target)
+
+    assert "unreal_deployment_receipt_missing_or_stale" in audit["reasons"]
+    assert "not globally committed" in audit["deployment_receipt_error"]
+
+
+def test_schema2_deployment_accepts_verified_global_commit(tmp_path, monkeypatch):
+    target = _current_target(tmp_path, "SK_tree_schema2_committed_01")
+    deployment_path = refresh.deployment_receipt_path(target)
+    deployment = json.loads(deployment_path.read_text(encoding="utf-8"))
+    deployment["schema_version"] = 2
+    deployment_path.write_text(json.dumps(deployment), encoding="utf-8")
+    monkeypatch.setattr(
+        refresh,
+        "_schema2_deployment_receipt_is_committed",
+        lambda _path, _payload: True,
+    )
+
+    audit = refresh.audit_target(target)
+
+    assert audit["reasons"] == []
+
+
 def test_stale_placement_contract_is_selected(tmp_path):
     target = _current_target(tmp_path, "SK_tree_stale_placement_01")
     _write_manifest(target, placement_version=4)
@@ -485,6 +580,37 @@ def test_surviving_zero_bone_leaf_mesh_is_selected(tmp_path):
     assert "zero_bone_leaf_mesh_present" in audit["reasons"]
     assert audit["zero_bone_leaf_mesh_instance_count"] == 1
     assert audit["selected"] is True
+
+
+def test_intentional_direct_base_native_root_leaf_is_not_zero_bone_defect(tmp_path):
+    target = _current_target(tmp_path, "SK_tree_direct_base_root_01")
+    _write_receipt(
+        target,
+        schema_version=refresh.NATIVE_RECEIPT_SCHEMA_VERSION,
+        bones=[{"id": 1}],
+        instances=[{
+            "source_rtti": refresh.LEAF_MESH_RTTI,
+            "source_bone_id": 0,
+            "parent_rtti": refresh.BASE_RTTI,
+            "ancestor_chain": [
+                {"source_rtti": refresh.BASE_RTTI},
+                {"source_rtti": refresh.START_RTTI},
+            ],
+            "authored_position_influences": [{
+                "bone_id": 0,
+                "native_root": True,
+                "weight": 1.0,
+            }],
+        }],
+    )
+    _write_manifest(target, placement_version=refresh.PLACEMENT_CONTRACT_VERSION)
+
+    audit = refresh.audit_target(target)
+
+    assert "zero_bone_leaf_mesh_present" not in audit["reasons"]
+    assert audit["zero_bone_leaf_mesh_instance_count"] == 0
+    assert audit["intentional_direct_base_root_leaf_mesh_instance_count"] == 1
+    assert audit["selected"] is False
 
 
 def test_missing_assembly_manifest_is_selected(tmp_path):

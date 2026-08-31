@@ -42,6 +42,13 @@ SpeedTree SPM을 Blender Assembly와 Unreal 전달 산출물로 처리하는 배
 8코어로 제한된다는 뜻이 아니라 작업 하나의 상한이다. SpeedTree처럼 동시에 하나만
 실행되는 프로세스는 해당 작업의 affinity 범위를 사용한다.
 
+전체 실행은 에셋마다 Assembly→Export→Unreal을 반복하지 않고, 의존성 wave별 전체
+Assembly→전체 Send2UE export→combined Unreal ingest 순서로 처리한다. Assembly와
+export worker 수는 현재 사용 가능한 RAM, 8 GiB 시스템 reserve, 단계별 peak 추정치로
+추가 제한된다. Unreal commandlet은 `-NullRHI`, item별 compiler drain/GC, 6-item 정상
+process recycle을 사용한다. 구조 비교와 first-run 합성 측정은
+[`docs/FIRST_RUN_PERFORMANCE.md`](docs/FIRST_RUN_PERFORMANCE.md)에 있다.
+
 ## 캐시와 영수증
 
 - 영수증 JSON 자체는 작다. 이전 구현은 영수증이 참조한 대용량 FBX/XML/Atlas를

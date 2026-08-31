@@ -43,6 +43,7 @@ sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(TOOL_DIR))
 
 from process_lifecycle import owned_run, shutdown_process_supervisor
+from stage_batch_policy import run_memory_bounded_stage, stage_worker_policy
 
 from code_compile_gate import (
     CODE_REVISION_RESTART_ROUTE,
@@ -10477,7 +10478,24 @@ class App:
         if phase == "check":
             workers = self.cfg.get("check_parallel_jobs", 8)
         elif phase == "blender":
-            workers = self.cfg.get("blender_parallel_jobs", 2)
+            requested_workers = self.cfg.get("blender_parallel_jobs", 2)
+            worker_policy = stage_worker_policy(
+                "assembly",
+                requested_workers,
+                total,
+            )
+            workers = requested_workers
+            if worker_policy["memory_limited"]:
+                self.log(
+                    "Blender Assembly initial memory cap: "
+                    f"{worker_policy['requested_workers']}→"
+                    f"{worker_policy['selected_workers']} "
+                    f"(available={worker_policy['available_memory_bytes']}, "
+                    f"reserve={worker_policy['reserve_bytes']}, "
+                    f"per-worker={worker_policy['per_worker_peak_bytes']}, "
+                    f"limit={worker_policy['limiting_resource']}); "
+                    "later launches recheck current memory"
+                )
         else:
             workers = 1
         workers = max(1, min(int(workers), total))
@@ -10525,11 +10543,24 @@ class App:
                         break
                     run_one(unit_item)
 
-            if wave_workers > 1:
+            if wave_workers > 1 and phase == "blender":
                 self.log(
-                    f"{title}: {wave_workers}개 동시 실행 "
+                    f"{title}: 최대 {wave_workers}개 동시 실행 "
                     f"(wave {wave_index + 1}/{len(waves)})"
                 )
+                _results, dynamic_policy = run_memory_bounded_stage(
+                    "assembly",
+                    execution_units,
+                    wave_workers,
+                    run_unit,
+                )
+                if dynamic_policy["memory_limited"]:
+                    self.log(
+                        f"{title}: memory admission peak "
+                        f"{dynamic_policy['max_concurrent_workers']}/"
+                        f"{dynamic_policy['selected_worker_ceiling']} workers"
+                    )
+            elif wave_workers > 1:
                 with ThreadPoolExecutor(max_workers=wave_workers) as pool:
                     list(pool.map(run_unit, execution_units))
             else:
@@ -17023,12 +17054,25 @@ class App:
         self.ui_queue.put(("batch_progress", (0, total)))
         exported_by_index = {}
         failed_items = set(getattr(self, "_phase_failed_items", set()))
-        workers = max(
-            1,
-            min(int(self.cfg.get("blender_parallel_jobs", 2)), total),
+        export_worker_policy = stage_worker_policy(
+            "blender_export",
+            self.cfg.get("blender_parallel_jobs", 2),
+            total,
         )
+        workers = export_worker_policy["requested_workers"]
+        if export_worker_policy["memory_limited"]:
+            self.log(
+                "Send2UE export initial memory cap: "
+                f"{export_worker_policy['requested_workers']}→"
+                f"{export_worker_policy['selected_workers']} "
+                f"(available={export_worker_policy['available_memory_bytes']}, "
+                f"reserve={export_worker_policy['reserve_bytes']}, "
+                f"per-worker={export_worker_policy['per_worker_peak_bytes']}, "
+                f"limit={export_worker_policy['limiting_resource']}); "
+                "later launches recheck current memory"
+            )
         if workers > 1:
-            self.log(f"Send2UE export: {workers}개 동시 실행")
+            self.log(f"Send2UE export: 최대 {workers}개 동시 실행")
 
         def export_one(index, item):
             if self.stop_flag.is_set():
@@ -17087,24 +17131,35 @@ class App:
                     retry_context.stage = None
 
         completed = 0
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(export_one, index, item): item
-                for index, item in enumerate(targets)
-            }
-            for future in as_completed(futures):
-                index, exported_item = future.result()
-                if exported_item is not None:
-                    exported_by_index[index] = exported_item
-                completed += 1
-                self.ui_queue.put(("batch_progress", (completed, total)))
-                self.ui_queue.put(
-                    (
-                        "progress",
-                        f"{progress_label} export {completed}/{total} · "
-                        "headless 준비",
-                    )
+
+        def accept_export(_position, _entry, outcome):
+            nonlocal completed
+            index, exported_item = outcome
+            if exported_item is not None:
+                exported_by_index[index] = exported_item
+            completed += 1
+            self.ui_queue.put(("batch_progress", (completed, total)))
+            self.ui_queue.put(
+                (
+                    "progress",
+                    f"{progress_label} export {completed}/{total} · "
+                    "headless 준비",
                 )
+            )
+
+        _export_results, dynamic_export_policy = run_memory_bounded_stage(
+            "blender_export",
+            list(enumerate(targets)),
+            workers,
+            lambda entry: export_one(*entry),
+            on_complete=accept_export,
+        )
+        if dynamic_export_policy["memory_limited"]:
+            self.log(
+                "Send2UE export memory admission peak "
+                f"{dynamic_export_policy['max_concurrent_workers']}/"
+                f"{dynamic_export_policy['selected_worker_ceiling']} workers"
+            )
 
         exported = [exported_by_index[index] for index in sorted(exported_by_index)]
         exported_ids = {

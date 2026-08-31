@@ -130,6 +130,283 @@ class ProcessLifecycleWindowsTests(unittest.TestCase):
     def _start(self, source="sanitized:unittest"):
         return start_process_supervisor(source, receipt_dir=self.receipts)
 
+    def test_owned_spawn_writes_one_pre_resume_receipt_not_duplicate_running_state(self):
+        supervisor = self._start()
+
+        class FakeProcess:
+            pid = 987654
+
+            def __init__(self):
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+        process = FakeProcess()
+        with mock.patch.object(supervisor, "_write_receipt") as write_receipt:
+            actual = supervisor._spawn_owned_locked(
+                ["fake.exe", "--first-run"],
+                source="tests.receipt_write_count",
+                popen_factory=lambda *_args, **_kwargs: process,
+            )
+
+            self.assertIs(actual, process)
+            self.assertEqual(write_receipt.call_count, 1)
+            self.assertEqual(supervisor.entry_for(process)["state"], "running")
+
+            process.returncode = 0
+            supervisor.complete_owned(process)
+            self.assertEqual(write_receipt.call_count, 2)
+
+    def test_parallel_receipt_writes_serialize_atomic_replace(self):
+        supervisor = self._start()
+        original_replace = process_lifecycle.os.replace
+        first_replace_entered = threading.Event()
+        release_first_replace = threading.Event()
+        counter_lock = threading.Lock()
+        receipt_replace_calls = 0
+        active_replaces = 0
+        maximum_active_replaces = 0
+        errors = []
+
+        def slow_replace(source, target):
+            nonlocal receipt_replace_calls
+            nonlocal active_replaces
+            nonlocal maximum_active_replaces
+            if Path(target) != supervisor.receipt_path:
+                return original_replace(source, target)
+            with counter_lock:
+                receipt_replace_calls += 1
+                call_number = receipt_replace_calls
+                active_replaces += 1
+                maximum_active_replaces = max(
+                    maximum_active_replaces,
+                    active_replaces,
+                )
+            try:
+                if call_number == 1:
+                    first_replace_entered.set()
+                    self.assertTrue(release_first_replace.wait(3.0))
+                return original_replace(source, target)
+            finally:
+                with counter_lock:
+                    active_replaces -= 1
+
+        def write_receipt():
+            try:
+                supervisor._write_receipt()
+            except BaseException as exc:
+                errors.append(exc)
+
+        with mock.patch.object(
+            process_lifecycle.os,
+            "replace",
+            side_effect=slow_replace,
+        ):
+            first = threading.Thread(target=write_receipt)
+            second = threading.Thread(target=write_receipt)
+            first.start()
+            self.assertTrue(first_replace_entered.wait(3.0))
+            second.start()
+            time.sleep(0.05)
+            with counter_lock:
+                self.assertEqual(receipt_replace_calls, 1)
+            release_first_replace.set()
+            first.join(3.0)
+            second.join(3.0)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(receipt_replace_calls, 2)
+        self.assertEqual(maximum_active_replaces, 1)
+
+    def test_receipt_write_lock_is_held_through_active_marker_publish(self):
+        supervisor = self._start()
+        marker = (
+            supervisor.receipt_dir
+            / process_lifecycle.ACTIVE_RECEIPT_DIRECTORY_NAME
+            / f"{supervisor.run_id}.active"
+        )
+        marker.unlink()
+        original_publish = process_lifecycle._publish_active_receipt_marker
+        marker_entered = threading.Event()
+        release_marker = threading.Event()
+        replacement_lock = threading.Lock()
+        receipt_replacements = 0
+        errors = []
+
+        def blocked_publish(directory, run_id):
+            marker_entered.set()
+            self.assertTrue(release_marker.wait(3.0))
+            return original_publish(directory, run_id)
+
+        def observe_replace(source, target):
+            nonlocal receipt_replacements
+            if Path(target) == supervisor.receipt_path:
+                with replacement_lock:
+                    receipt_replacements += 1
+            return os.replace(source, target)
+
+        def write_receipt():
+            try:
+                supervisor._write_receipt()
+            except BaseException as exc:
+                errors.append(exc)
+
+        with (
+            mock.patch.object(
+                process_lifecycle,
+                "_publish_active_receipt_marker",
+                side_effect=blocked_publish,
+            ),
+            mock.patch.object(
+                process_lifecycle,
+                "_replace_path_with_windows_retry",
+                side_effect=observe_replace,
+            ),
+        ):
+            first = threading.Thread(target=write_receipt)
+            second = threading.Thread(target=write_receipt)
+            first.start()
+            self.assertTrue(marker_entered.wait(3.0))
+            second.start()
+            time.sleep(0.05)
+            with replacement_lock:
+                self.assertEqual(receipt_replacements, 1)
+            release_marker.set()
+            first.join(3.0)
+            second.join(3.0)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(receipt_replacements, 2)
+        self.assertTrue(marker.is_file())
+
+    def test_receipt_replace_retries_winerror_5_and_32_then_cleans_temp(self):
+        supervisor = self._start()
+        original_replace = process_lifecycle.os.replace
+        retry_errors = [5, 32]
+        receipt_attempts = []
+
+        def flaky_replace(source, target):
+            if Path(target) != supervisor.receipt_path:
+                return original_replace(source, target)
+            receipt_attempts.append(Path(source))
+            if retry_errors:
+                winerror = retry_errors.pop(0)
+                exc = OSError(f"transient WinError {winerror}")
+                exc.winerror = winerror
+                raise exc
+            return original_replace(source, target)
+
+        with (
+            mock.patch.object(
+                process_lifecycle.os,
+                "replace",
+                side_effect=flaky_replace,
+            ),
+            mock.patch.object(process_lifecycle.time, "sleep") as sleep,
+        ):
+            supervisor._write_receipt()
+
+        self.assertEqual(len(receipt_attempts), 3)
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list],
+            list(
+                process_lifecycle
+                .PROCESS_RECEIPT_REPLACE_RETRY_DELAYS_SECONDS[:2]
+            ),
+        )
+        self.assertEqual(
+            list(supervisor.receipt_dir.glob(f".{supervisor.run_id}.json.*.tmp")),
+            [],
+        )
+        self.assertEqual(
+            json.loads(supervisor.receipt_path.read_text(encoding="utf-8"))[
+                "run_id"
+            ],
+            supervisor.run_id,
+        )
+
+    def test_receipt_replace_retry_is_bounded_and_cleans_failed_temp(self):
+        supervisor = self._start()
+        attempts = []
+
+        def denied_replace(source, target):
+            attempts.append((Path(source), Path(target)))
+            exc = OSError("persistent sharing violation")
+            exc.winerror = 32
+            raise exc
+
+        with (
+            mock.patch.object(
+                process_lifecycle.os,
+                "replace",
+                side_effect=denied_replace,
+            ),
+            mock.patch.object(process_lifecycle.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(
+                ProcessLifecycleError,
+                "process_receipt_write_failed",
+            ):
+                supervisor._write_receipt()
+
+        self.assertEqual(
+            len(attempts),
+            len(
+                process_lifecycle
+                .PROCESS_RECEIPT_REPLACE_RETRY_DELAYS_SECONDS
+            )
+            + 1,
+        )
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list],
+            list(
+                process_lifecycle
+                .PROCESS_RECEIPT_REPLACE_RETRY_DELAYS_SECONDS
+            ),
+        )
+        self.assertEqual(
+            list(supervisor.receipt_dir.glob(f".{supervisor.run_id}.json.*.tmp")),
+            [],
+        )
+
+    def test_failed_owned_registration_rolls_back_phantom_entry(self):
+        supervisor = self._start()
+
+        class FakeProcess:
+            pid = 987655
+
+            def poll(self):
+                return None
+
+        process = FakeProcess()
+        failure = ProcessLifecycleError("process_receipt_write_failed")
+        with mock.patch.object(
+            supervisor,
+            "_write_receipt",
+            side_effect=failure,
+        ):
+            with self.assertRaises(ProcessLifecycleError) as raised:
+                supervisor._register_owned(
+                    process,
+                    None,
+                    ["fake.exe", "--registration-failure"],
+                    "tests.registration_failure",
+                    identity_required=False,
+                )
+
+        self.assertIs(raised.exception, failure)
+        self.assertIsNone(supervisor.entry_for(process))
+        self.assertEqual(supervisor.entries, [])
+        persisted = json.loads(
+            supervisor.receipt_path.read_text(encoding="utf-8")
+        )
+        self.assertEqual(persisted["owned_processes"], [])
+
     def test_normal_exit_leaves_zero_owned_descendants_and_receipt(self):
         supervisor = self._start()
         ready = self.root / "normal.json"
@@ -145,6 +422,11 @@ class ProcessLifecycleWindowsTests(unittest.TestCase):
         )
         evidence = _wait_for_json(ready)
         self.assertEqual(completed.returncode, 0)
+        self.assertIsInstance(completed.resource_usage, dict)
+        self.assertGreater(
+            completed.resource_usage["peak_job_memory_bytes"],
+            0,
+        )
         self.assertTrue(
             _wait_identity_gone(
                 evidence["parent_pid"], evidence["parent_start_identity"]
@@ -158,6 +440,10 @@ class ProcessLifecycleWindowsTests(unittest.TestCase):
         )
         receipt = supervisor.receipt()
         self.assertEqual(receipt["survivors"], [])
+        self.assertEqual(
+            receipt["owned_processes"][0]["resource_usage"],
+            completed.resource_usage,
+        )
         self.assertEqual(
             receipt["owned_processes"][0]["cleanup_state"],
             "process_tree_clean",

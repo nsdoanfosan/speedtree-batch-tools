@@ -4,6 +4,7 @@ The production job imports ``bpy`` at module load, so extract the small helper
 from its AST and execute that exact function with a fake Blender module.
 """
 import ast
+import hashlib
 import tempfile
 import types
 import unittest
@@ -83,6 +84,227 @@ class FakeBlender:
 
 
 class ClusterSavePolicyTests(unittest.TestCase):
+    def test_speedtree_export_timeout_layering_is_fail_closed(self):
+        helper = load_job_functions(
+            ["validate_speedtree_export_timeout_layering"]
+        )["validate_speedtree_export_timeout_layering"]
+
+        policy = helper(1200, "840000")
+        self.assertTrue(policy["layering_validated"])
+        self.assertEqual(policy["wrapper_timeout_ms"], 840000)
+        self.assertEqual(policy["wrapper_timeout_source"], "environment")
+        defaulted = helper(1200, None)
+        self.assertTrue(defaulted["layering_validated"])
+        self.assertEqual(defaulted["wrapper_timeout_ms"], 840000)
+        self.assertEqual(
+            defaulted["wrapper_timeout_source"],
+            "assembly_job_default",
+        )
+        with self.assertRaisesRegex(RuntimeError, "smaller"):
+            helper(840, "840000")
+        with self.assertRaisesRegex(RuntimeError, "smaller"):
+            helper(840, None)
+        with self.assertRaisesRegex(RuntimeError, "positive integer"):
+            helper(1200, "not-a-number")
+        with self.assertRaisesRegex(RuntimeError, "positive integer"):
+            helper(0, "840000")
+
+    def test_normal_collision_export_rejects_any_verification_fallback(self):
+        helper = load_job_functions(
+            ["validate_normal_collision_export_result"]
+        )["validate_normal_collision_export_result"]
+
+        def export_row():
+            return {
+                "exists": True,
+                "returncode": 0,
+                "cache_hit": False,
+                "force_reexport_requested": True,
+                "verification_only": False,
+                "bundled_process": True,
+                "bundle_fallback": False,
+                "stdout": "Post-collision export completed.",
+                "export_attempts": [{"attempt": 1, "returncode": 0}],
+            }
+
+        result = {
+            "force_reexport_requested": True,
+            "exports": {"fbx": export_row(), "xml": export_row()},
+        }
+        policy = helper(result)
+        self.assertEqual(policy["status"], "validated")
+
+        for field, value in (
+            ("verification_only", True),
+            ("verification_only", None),
+            ("bundle_fallback", True),
+            ("bundle_fallback", None),
+            ("bundled_process", False),
+            ("cache_hit", True),
+        ):
+            with self.subTest(field=field, value=value):
+                broken = {
+                    "force_reexport_requested": True,
+                    "exports": {"fbx": export_row(), "xml": export_row()},
+                }
+                if value is None:
+                    broken["exports"]["fbx"].pop(field)
+                else:
+                    broken["exports"]["fbx"][field] = value
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "evidence is invalid",
+                ):
+                    helper(broken)
+
+    def test_normal_collision_export_requires_one_success_and_marker(self):
+        helper = load_job_functions(
+            ["validate_normal_collision_export_result"]
+        )["validate_normal_collision_export_result"]
+        row = {
+            "exists": True,
+            "returncode": 0,
+            "cache_hit": False,
+            "force_reexport_requested": True,
+            "verification_only": False,
+            "bundled_process": True,
+            "bundle_fallback": False,
+            "stdout": "Post-collision export completed.",
+            "export_attempts": [{"attempt": 1, "returncode": 0}],
+        }
+        result = {
+            "force_reexport_requested": True,
+            "exports": {"fbx": dict(row), "xml": dict(row)},
+        }
+        result["exports"]["fbx"]["export_attempts"] = []
+        with self.assertRaisesRegex(RuntimeError, "one exact successful"):
+            helper(result)
+
+        result["exports"]["fbx"] = dict(row)
+        result["exports"]["fbx"]["stdout"] = ""
+        with self.assertRaisesRegex(RuntimeError, "completion marker"):
+            helper(result)
+
+    def test_fresh_verification_mode_requires_force_and_exact_pair(self):
+        helper = load_job_functions(
+            ["validate_native_export_mode_arguments"]
+        )["validate_native_export_mode_arguments"]
+
+        helper(True, True, export_fbx=True, export_xml=True)
+        helper(False, False, export_fbx=False, export_xml=False)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "requires --force-native-export",
+        ):
+            helper(False, True)
+        with self.assertRaisesRegex(RuntimeError, "exact FBX and XML"):
+            helper(True, True, export_fbx=True, export_xml=False)
+
+    def test_fresh_verification_result_proves_zero_normal_attempts_and_exact_files(self):
+        marker = "SPEEDTREE_FRESH_VERIFICATION_EXPORT_SEALED=1"
+        helper = load_job_functions(
+            ["validate_fresh_verification_export_result"],
+            {
+                "hashlib": hashlib,
+                "FRESH_VERIFICATION_SEALED_MARKER": marker,
+            },
+        )["validate_fresh_verification_export_result"]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fbx = root / "fbx" / "tree.fbx"
+            stmat = fbx.with_suffix(".stmat")
+            receipt = root / "fbx" / "tree.speedtree_native_receipt.json"
+            xml = root / "xml" / "tree.xml"
+            for path, payload in (
+                (fbx, b"exact-fbx"),
+                (stmat, b"exact-stmat"),
+                (receipt, b'{"exact":true}'),
+                (xml, b"<SpeedTree />"),
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(payload)
+
+            def record(path):
+                return {
+                    "path": str(path.resolve()),
+                    "size": path.stat().st_size,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+
+            attempts = [{"attempt": 1, "returncode": 0}]
+
+            def export_row(path):
+                return {
+                    "path": str(path.resolve()),
+                    "exists": True,
+                    "cache_hit": False,
+                    "force_reexport_requested": True,
+                    "verification_only": True,
+                    "bundled_process": True,
+                    "bundle_fallback": False,
+                    "stdout": marker,
+                    "export_attempts": attempts,
+                }
+
+            evidence = {
+                "status": "sealed",
+                "policy": "fresh_verification_only_as_sole_export_v1",
+                "explicit_opt_in_required": True,
+                "force_reexport": True,
+                "collision_prune_bundle_attempt_count": 0,
+                "verification_bundle_attempt_count": 1,
+                "independent_fallback_attempt_count": 0,
+                "launcher_sealed_completion": {
+                    "status": "observed",
+                    "marker": marker,
+                },
+                "native_receipt": str(receipt.resolve()),
+                "sealed_artifacts": {
+                    "fbx": [record(fbx), record(stmat), record(receipt)],
+                    "xml": [record(xml)],
+                },
+            }
+            result = {
+                "force_reexport_requested": True,
+                "native_receipt": str(receipt.resolve()),
+                "fresh_verification_only_export": evidence,
+                "exports": {
+                    "fbx": export_row(fbx),
+                    "xml": export_row(xml),
+                },
+            }
+
+            self.assertIs(helper(result), evidence)
+            fbx.write_bytes(b"drifted-fbx")
+            with self.assertRaisesRegex(RuntimeError, "artifact drifted"):
+                helper(result)
+
+    def test_fresh_verification_result_fails_without_launcher_marker(self):
+        marker = "SPEEDTREE_FRESH_VERIFICATION_EXPORT_SEALED=1"
+        helper = load_job_functions(
+            ["validate_fresh_verification_export_result"],
+            {
+                "hashlib": hashlib,
+                "FRESH_VERIFICATION_SEALED_MARKER": marker,
+            },
+        )["validate_fresh_verification_export_result"]
+        result = {
+            "force_reexport_requested": True,
+            "fresh_verification_only_export": {
+                "status": "sealed",
+                "policy": "fresh_verification_only_as_sole_export_v1",
+                "explicit_opt_in_required": True,
+                "force_reexport": True,
+                "collision_prune_bundle_attempt_count": 0,
+                "verification_bundle_attempt_count": 1,
+                "independent_fallback_attempt_count": 0,
+                "launcher_sealed_completion": {"status": "missing"},
+            },
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "launcher-sealed"):
+            helper(result)
+
     def test_single_import_requires_the_same_exact_resolved_fbx(self):
         helper = load_job_functions(
             ["same_resolved_fbx_source"]
@@ -304,6 +526,104 @@ class ClusterSavePolicyTests(unittest.TestCase):
         helper(True, "")
         helper(False, "live_assembly.json")
 
+    def test_provider_no_owner_receipt_mode_is_fail_closed_and_distinct(self):
+        helpers = load_job_functions([
+            "is_cluster_normalization_spm",
+            "validate_cluster_job_mode_arguments",
+        ])
+        helper = helpers["validate_cluster_job_mode_arguments"]
+        provider = Path("C:/trees/tree/cluster/SK_branch_01.spm")
+
+        helper(False, "", True, provider)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "cannot be combined with --cluster-assembly-contract",
+        ):
+            helper(False, "live_assembly.json", True, provider)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "cannot be combined with --cluster-source-build-only",
+        ):
+            helper(True, "", True, provider)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "requires a canonical Cluster dependency-provider SPM",
+        ):
+            helper(
+                False,
+                "",
+                True,
+                Path("C:/trees/tree/SK_tree_01.spm"),
+            )
+
+    def test_provider_no_owner_receipt_never_calls_global_resolution(self):
+        calls = []
+
+        def resolve(*args, **kwargs):
+            calls.append((args, kwargs))
+            return Path("C:/receipt.json"), {"policy": "resolved"}
+
+        helper = load_job_functions(
+            ["resolve_job_cluster_receipt_path"],
+            {"resolve_cluster_receipt_path": resolve},
+        )["resolve_job_cluster_receipt_path"]
+        provider = Path("C:/trees/tree/cluster/SK_branch_01.spm")
+
+        path, evidence = helper(
+            provider,
+            "material.json",
+            provider_no_owner_receipt=True,
+        )
+
+        self.assertIsNone(path)
+        self.assertEqual(calls, [])
+        self.assertEqual(
+            evidence["policy"],
+            "fleet_provider_dependency_no_owner_receipt",
+        )
+        self.assertEqual(
+            evidence["skipped_global_discovery"],
+            {
+                "status": "not_run",
+                "operation": "cluster_assembly_receipt_resolution",
+                "authority": "cluster_fleet_provider_dependency_v1",
+                "reason": (
+                    "provider invocation has no root-owner receipt contract"
+                ),
+                "candidate_files_read": 0,
+            },
+        )
+
+        source_path, source_evidence = helper(
+            provider,
+            "material.json",
+            cluster_source_build_only=True,
+        )
+        self.assertIsNone(source_path)
+        self.assertEqual(
+            source_evidence["policy"],
+            "cluster_source_provider_no_owner_receipt",
+        )
+        self.assertNotIn("skipped_global_discovery", source_evidence)
+        self.assertEqual(calls, [])
+
+        resolved_path, resolved_evidence = helper(
+            provider,
+            "live.json",
+            require_embedded_live_audit=True,
+        )
+        self.assertEqual(resolved_path, Path("C:/receipt.json"))
+        self.assertEqual(resolved_evidence, {"policy": "resolved"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], (provider, "live.json"))
+        self.assertEqual(
+            calls[0][1],
+            {
+                "include_resolution": True,
+                "require_embedded_live_audit": True,
+            },
+        )
+
     def test_contract_snapshot_rechecks_live_authority(self):
         contract = {"handoff": {"status": "pass_through"}}
         payload = {
@@ -349,6 +669,150 @@ class ClusterSavePolicyTests(unittest.TestCase):
 
         mode, selected = helper(
             {"handoff": receipt_handoff}, inspected_handoff
+        )
+
+        self.assertEqual(mode, "build")
+        self.assertIs(selected, inspected_handoff)
+
+    def test_ready_fbx_handoff_merges_only_spm_only_recovery_candidates(self):
+        helper = load_assembly_selection_helper()
+        inspected_handoff = {
+            "status": "ready",
+            "assembly": {
+                "part_builder_inputs": [{
+                    "provider_key": "leaf_side:side_01",
+                    "source": "live_fbx",
+                }],
+            },
+        }
+        current_handoff = {
+            "status": "ready",
+            "assembly": {
+                "part_builder_inputs": [
+                    {
+                        "provider_key": "leaf_side:side_01",
+                        "source": "persisted_concrete",
+                    },
+                    {
+                        "provider_key": "branch:branch_03",
+                        "speculative_provider_expansion": True,
+                    },
+                    {
+                        "provider_key": "branch:branch_04",
+                        "speculative_provider_expansion": True,
+                    },
+                ],
+            },
+        }
+
+        mode, selected = helper(
+            None,
+            inspected_handoff,
+            current_handoff,
+        )
+
+        self.assertEqual(mode, "build")
+        inputs = selected["assembly"]["part_builder_inputs"]
+        self.assertEqual(
+            [row["provider_key"] for row in inputs],
+            [
+                "leaf_side:side_01",
+                "branch:branch_03",
+                "branch:branch_04",
+            ],
+        )
+        self.assertEqual(inputs[0]["source"], "live_fbx")
+        self.assertEqual(
+            selected["current_manifest_provider_expansion"][
+                "selection_authority"
+            ],
+            "current_blender_topology_matcher",
+        )
+
+    def test_current_receipt_reference_candidates_remove_one_run_lag(self):
+        helper = load_assembly_selection_helper()
+        inspected_handoff = {
+            "status": "ready",
+            "assembly": {
+                "part_builder_inputs": [{
+                    "provider_key": "branch:branch_01",
+                    "source": "live_fbx",
+                }],
+            },
+        }
+        current_receipt_inputs = [
+            {
+                "provider_key": "branch:branch_03",
+                "speculative_provider_expansion": True,
+                "source": "current_receipt",
+            },
+            {
+                "provider_key": "branch:branch_04",
+                "speculative_provider_expansion": True,
+                "source": "current_receipt",
+            },
+        ]
+        stale_manifest = {
+            "status": "ready",
+            "assembly": {
+                "part_builder_inputs": [
+                    {
+                        "provider_key": "branch:branch_03",
+                        "speculative_provider_expansion": True,
+                        "source": "previous_manifest",
+                    },
+                ],
+            },
+        }
+
+        mode, selected = helper(
+            None,
+            inspected_handoff,
+            stale_manifest,
+            current_receipt_reference_inputs=current_receipt_inputs,
+        )
+
+        self.assertEqual(mode, "build")
+        inputs = selected["assembly"]["part_builder_inputs"]
+        self.assertEqual(
+            [row["provider_key"] for row in inputs],
+            [
+                "branch:branch_01",
+                "branch:branch_03",
+                "branch:branch_04",
+            ],
+        )
+        self.assertEqual(inputs[1]["source"], "current_receipt")
+        self.assertEqual(
+            selected["current_receipt_provider_expansion"][
+                "candidate_count"
+            ],
+            2,
+        )
+        self.assertNotIn(
+            "current_manifest_provider_expansion", selected
+        )
+
+    def test_ready_fbx_handoff_does_not_merge_persisted_concrete_roles(self):
+        helper = load_assembly_selection_helper()
+        inspected_handoff = {
+            "status": "ready",
+            "assembly": {"part_builder_inputs": []},
+        }
+        current_handoff = {
+            "status": "ready",
+            "assembly": {
+                "part_builder_inputs": [{
+                    "provider_key": "branch:stale_01",
+                    "speculative_provider_expansion": False,
+                }],
+            },
+        }
+
+        mode, selected = helper(
+            None,
+            inspected_handoff,
+            current_handoff,
         )
 
         self.assertEqual(mode, "build")

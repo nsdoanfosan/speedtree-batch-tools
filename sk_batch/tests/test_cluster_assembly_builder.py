@@ -5,6 +5,7 @@ import math
 import sys
 import tempfile
 import unittest
+from array import array
 from collections import Counter, namedtuple
 from pathlib import Path
 from types import SimpleNamespace
@@ -50,12 +51,14 @@ from cluster_assembly_builder import (  # noqa: E402
     _exact_native_attachment_influences,
     _export_selected_fbx,
     _configure_final_assembly_preserve_area,
+    _clear_post_finish_native_reference_collections,
     _validate_final_assembly_preserve_area,
     _generated_material_sidecar,
     _normalized_prototype_for_component,
     _ordered_cross_object_correspondence,
     _partition_components_by_native_runtime_owner,
     _partition_normalized_render_components,
+    _prepare_uv_correspondence,
     _prepare_exact_source_plan_line,
     _role_geometry_sources,
     _role_material_polygons,
@@ -86,6 +89,26 @@ class FakeEditorProperties:
 
     def set_editor_property(self, name, value):
         self.values[name] = value
+
+
+class DenseIntAttributeData:
+    def __init__(self, values):
+        self.values = [int(value) for value in values]
+        self.foreach_get_calls = []
+        self.scalar_reads = 0
+
+    def foreach_get(self, name, destination):
+        self.foreach_get_calls.append(name)
+        if name != "value":
+            raise ValueError(name)
+        if not isinstance(destination, array):
+            raise TypeError(type(destination))
+        for index, value in enumerate(self.values):
+            destination[index] = value
+
+    def __getitem__(self, index):
+        self.scalar_reads += 1
+        raise AssertionError(f"unexpected scalar read at {index}")
 
 
 class UnrealNaniteAssemblyCompilationTests(unittest.TestCase):
@@ -149,6 +172,37 @@ class UnrealNaniteAssemblyCompilationTests(unittest.TestCase):
 
         self.assertEqual(self.FakeSystemLibrary.value, 2)
 
+    def test_post_finish_release_clears_only_temporary_native_collections(self):
+        report_copy = [{"prototype_id": "leaf", "bindings": 2}]
+        part_assets = {"leaf": object()}
+        bindings = [object(), object()]
+        native_influences = [object()]
+        bone_indices = {"Root": 0}
+        bone_names = {"Root": "Root"}
+        skeleton_by_name = {"Root": {"parent": None}}
+        authored_bones = {"Root"}
+
+        _clear_post_finish_native_reference_collections(
+            part_assets,
+            bindings,
+            native_influences,
+            bone_indices,
+            bone_names,
+            skeleton_by_name,
+            authored_bones,
+        )
+
+        self.assertEqual(part_assets, {})
+        self.assertEqual(bindings, [])
+        self.assertEqual(native_influences, [])
+        self.assertEqual(bone_indices, {})
+        self.assertEqual(bone_names, {})
+        self.assertEqual(skeleton_by_name, {})
+        self.assertEqual(authored_bones, set())
+        self.assertEqual(
+            report_copy,
+            [{"prototype_id": "leaf", "bindings": 2}],
+        )
 
 class FinalAssemblyNanitePolicyTests(unittest.TestCase):
     def make_policy_subjects(self):
@@ -648,13 +702,18 @@ class ExactNativeAttachmentInfluenceTests(unittest.TestCase):
         }
 
     @staticmethod
-    def _object(ordinals, native_indices):
+    def _object(ordinals, native_indices, *, dense=False):
+        def attribute_data(values):
+            if dense:
+                return DenseIntAttributeData(values)
+            return [SimpleNamespace(value=value) for value in values]
+
         attributes = {
             "speedtree_native_geometry_ordinal": SimpleNamespace(
-                data=[SimpleNamespace(value=value) for value in ordinals]
+                data=attribute_data(ordinals)
             ),
             "speedtree_native_vertex_index": SimpleNamespace(
-                data=[SimpleNamespace(value=value) for value in native_indices]
+                data=attribute_data(native_indices)
             ),
         }
         return SimpleNamespace(
@@ -693,6 +752,34 @@ class ExactNativeAttachmentInfluenceTests(unittest.TestCase):
             source["owner_selection_policy"],
             "sole_exact_native_runtime_owner_range_intersection_v3",
         )
+
+    def test_dense_native_attributes_use_foreach_get_with_exact_result(self):
+        receipt = self._receipt()
+        receipt_index = build_exact_native_receipt_index(receipt)
+        scalar = _exact_native_attachment_influences(
+            self._object([4, 4, 4], [2, 3, 4]),
+            {"vertices": [0, 1, 2]},
+            1,
+            receipt,
+            self._skeleton(),
+            "scalar native component",
+            native_receipt_index=receipt_index,
+        )
+        dense_obj = self._object([4, 4, 4], [2, 3, 4], dense=True)
+        dense = _exact_native_attachment_influences(
+            dense_obj,
+            {"vertices": [0, 1, 2]},
+            1,
+            receipt,
+            self._skeleton(),
+            "dense native component",
+            native_receipt_index=receipt_index,
+        )
+
+        self.assertEqual(dense, scalar)
+        for attribute in dense_obj.data.attributes.values():
+            self.assertEqual(attribute.data.foreach_get_calls, ["value"])
+            self.assertEqual(attribute.data.scalar_reads, 0)
 
     def test_clipped_attachment_uses_sole_exact_component_intersection(self):
         obj = self._object([4, 4, 4], [0, 3, 11])
@@ -1108,6 +1195,46 @@ class ComponentTopologyTests(unittest.TestCase):
             partitioned[0]["native_runtime_owner_island_count"], 1
         )
 
+    def test_native_owner_lookup_is_memoized_per_dense_vertex(self):
+        target = seam_split_test_mesh(False)
+        target.attributes = {
+            "speedtree_native_geometry_ordinal": SimpleNamespace(
+                data=DenseIntAttributeData([3] * len(target.vertices))
+            ),
+            "speedtree_native_vertex_index": SimpleNamespace(
+                data=DenseIntAttributeData(range(len(target.vertices)))
+            ),
+        }
+        components = _component_groups(target, [0, 1])
+        receipt = {"generated_instances": [{
+            "geometry_ordinal": 3,
+            "node_guid": "same-node",
+            "vertex_ranges": [(0, len(target.vertices) - 1)],
+        }]}
+        actual_index = build_exact_native_receipt_index(receipt)
+        owner_keys_at = mock.Mock(side_effect=actual_index.owner_keys_at)
+        counting_index = SimpleNamespace(
+            belongs_to=actual_index.belongs_to,
+            owner_keys_at=owner_keys_at,
+        )
+
+        partitioned = _partition_components_by_native_runtime_owner(
+            SimpleNamespace(name="target", data=target),
+            components,
+            receipt,
+            receipt_index=counting_index,
+        )
+
+        self.assertEqual(len(partitioned), 1)
+        self.assertEqual(owner_keys_at.call_count, len(target.vertices))
+        self.assertEqual(
+            sorted(call.args[1] for call in owner_keys_at.call_args_list),
+            list(range(len(target.vertices))),
+        )
+        for attribute in target.attributes.values():
+            self.assertEqual(attribute.data.foreach_get_calls, ["value"])
+            self.assertEqual(attribute.data.scalar_reads, 0)
+
     def test_same_native_owner_rejoins_disconnected_clipped_islands(self):
         target = seam_split_test_mesh(False)
         target.attributes = {
@@ -1173,6 +1300,128 @@ class ComponentTopologyTests(unittest.TestCase):
         )
         self.assertEqual(len(source_indices), 3)
         self.assertEqual(len(target_indices), 3)
+
+    def test_fake_prototype_face_counters_are_lazily_reused_in_order(self):
+        source_component_a = object()
+        source_component_b = object()
+        target_component = object()
+        source_data_a = SimpleNamespace(
+            uv_layers=SimpleNamespace(active=None)
+        )
+        source_data_b = SimpleNamespace(
+            uv_layers=SimpleNamespace(active=None)
+        )
+        prototypes = {
+            "a": {
+                "object": SimpleNamespace(data=source_data_a),
+                "component": source_component_a,
+            },
+            "b": {
+                "object": SimpleNamespace(data=source_data_b),
+                "component": source_component_b,
+            },
+        }
+        faces = Counter({("face", 1): 1})
+        counter_components = []
+
+        def select_counter(_mesh, component):
+            counter_components.append(component)
+            return faces
+
+        with mock.patch(
+            "cluster_assembly_builder._component_signature",
+            return_value="target",
+        ), mock.patch(
+            "cluster_assembly_builder._component_uv_face_counter",
+            side_effect=select_counter,
+        ), mock.patch(
+            "cluster_assembly_builder._ordered_cross_object_correspondence",
+            side_effect=ClusterAssemblyBuildError("no exact match"),
+        ) as correspondence:
+            first = _normalized_prototype_for_component(
+                prototypes,
+                object(),
+                target_component,
+            )
+            second = _normalized_prototype_for_component(
+                prototypes,
+                object(),
+                target_component,
+            )
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        self.assertEqual(
+            counter_components,
+            [
+                target_component,
+                source_component_a,
+                source_component_b,
+                target_component,
+            ],
+        )
+        self.assertEqual(
+            [call.args[0] for call in correspondence.call_args_list],
+            [
+                prototypes["a"]["object"],
+                prototypes["b"]["object"],
+                prototypes["a"]["object"],
+                prototypes["b"]["object"],
+            ],
+        )
+        self.assertEqual(
+            prototypes["a"]["component_uv_face_counter"],
+            faces,
+        )
+        self.assertEqual(
+            prototypes["b"]["component_uv_face_counter"],
+            faces,
+        )
+
+    def test_prepared_uv_target_is_reused_without_changing_ambiguity(self):
+        source = seam_split_test_mesh(False)
+        target = seam_split_test_mesh(False)
+        source_component = _component_groups(source, [0, 1])[0]
+        target_component = _component_groups(target, [0, 1])[0]
+        source_obj = SimpleNamespace(name="source", data=source)
+        source_prepared = _prepare_uv_correspondence(
+            source_obj,
+            source_component,
+        )
+        prototypes = {
+            "a": {
+                "object": source_obj,
+                "component": source_component,
+                "prepared_uv_correspondence": source_prepared,
+            },
+            "b": {
+                "object": source_obj,
+                "component": source_component,
+                "prepared_uv_correspondence": source_prepared,
+            },
+        }
+
+        with mock.patch(
+            "cluster_assembly_builder._component_signature",
+            return_value="forced-target-signature",
+        ), mock.patch(
+            "cluster_assembly_builder._prepare_uv_correspondence",
+            wraps=_prepare_uv_correspondence,
+        ) as prepare:
+            with self.assertRaisesRegex(
+                ClusterAssemblyBuildError,
+                "normalized plan exact UV identity is ambiguous for component: "
+                "forced-target-signature",
+            ):
+                _normalized_prototype_for_component(
+                    prototypes,
+                    target,
+                    target_component,
+                )
+
+        self.assertEqual(prepare.call_count, 1)
+        self.assertIs(prepare.call_args.args[0].data, target)
+        self.assertIs(prepare.call_args.args[1], target_component)
 
     def test_speedtree_boundary_clipping_accepts_unique_final_fbx_subset(self):
         source_component = object()
@@ -2429,6 +2678,73 @@ class PhysicalProductionContractTests(unittest.TestCase):
         )
         self.assertEqual(report["instance_fit"], "uniform_similarity_3d")
         self.assertFalse(report["role_specific_scale_patch"])
+
+    def test_semantically_identical_unit_probes_allow_evidence_metadata_differences(self):
+        manifest = physical_production_manifest()
+        primary = manifest["unit_probe_contract"]
+        primary["candidates"] = [{
+            "name": "identity_probe",
+            "evidence_fingerprint": "primary-evidence-sha256",
+        }]
+        for row in primary["generator_results"]:
+            row["evidence"] = {
+                "evidence_fingerprint": (
+                    "primary-" + row["generator_type"].casefold().replace(" ", "-")
+                ),
+            }
+
+        secondary = json.loads(json.dumps(primary))
+        secondary["candidates"] = [{
+            "name": "identity_probe",
+            "exists": False,
+            "evidence_fingerprint": None,
+        }]
+        for row in secondary["generator_results"]:
+            row["evidence"] = {
+                "exists": False,
+                "evidence_fingerprint": None,
+            }
+        manifest["secondary_unit_probe_contract"] = secondary
+
+        report = validate_normalized_prototype_unit_contract(manifest)
+
+        self.assertEqual(report["status"], "verified")
+        self.assertEqual(report["downstream_unit_scale"], 1.0)
+        self.assertEqual(report["scale_location"], "IDENTITY")
+
+    def test_valid_unit_probes_with_different_selected_contracts_are_rejected(self):
+        manifest = physical_production_manifest()
+        secondary = json.loads(json.dumps(manifest["unit_probe_contract"]))
+        secondary["selected"].update({
+            "mesh_geometry_scale": 1.0,
+            "mesh_asset_scale": 0.01,
+            "generator_scale": 1.0,
+            "scale_location": "SPM_MESH_ASSET",
+            "effective_scale": 0.01,
+        })
+        manifest["secondary_unit_probe_contract"] = secondary
+
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "requires one common unit-probe contract",
+        ):
+            validate_normalized_prototype_unit_contract(manifest)
+
+    def test_each_semantic_unit_probe_is_still_strictly_validated(self):
+        manifest = physical_production_manifest()
+        secondary = json.loads(json.dumps(manifest["unit_probe_contract"]))
+        secondary["generator_results"] = [
+            row
+            for row in secondary["generator_results"]
+            if row["generator_type"] != "Leaf Mesh"
+        ]
+        manifest["secondary_unit_probe_contract"] = secondary
+
+        with self.assertRaisesRegex(
+            ClusterAssemblyBuildError,
+            "did not verify one common contract for: Leaf Mesh",
+        ):
+            validate_normalized_prototype_unit_contract(manifest)
 
     def test_same_role_providers_keep_independent_variant_ordinals(self):
         manifest = physical_production_manifest()

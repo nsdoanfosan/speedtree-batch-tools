@@ -291,8 +291,13 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                 yield
                 events.append("gate_exit")
 
-            def export_bundle(**kwargs):
+            def export_transaction(**kwargs):
                 with helper.speedtree_export_gate():
+                    events.append("spm_policy")
+                    if kwargs.get("policy_report") is not None:
+                        kwargs["policy_report"]["spm_bone_policy"] = {
+                            "status": "already_compliant",
+                        }
                     events.append("export")
                     events.append(os.environ.get(
                         "SPEEDTREE_COLLISION_WRAPPER_TIMEOUT_MS"
@@ -303,8 +308,11 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                 }
 
             helper.speedtree_export_gate = original_gate
-            helper.export_bundle = export_bundle
+            helper.export_bundle_with_minimum_bone_policy = (
+                export_transaction
+            )
             output = io.StringIO()
+            policy_report = {}
             with mock.patch.object(
                 preflight,
                 "require_texture_skip_writing",
@@ -312,14 +320,28 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
                 os.environ,
                 {"SPEEDTREE_COLLISION_WRAPPER_TIMEOUT_MS": "existing"},
             ), redirect_stdout(output):
-                result = preflight.run_export(args, helper)
+                result = preflight.run_export(
+                    args,
+                    helper,
+                    policy_report=policy_report,
+                )
                 restored_timeout = os.environ.get(
                     "SPEEDTREE_COLLISION_WRAPPER_TIMEOUT_MS"
                 )
 
             self.assertEqual(
                 events,
-                ["gate_enter", "export", "180000", "gate_exit"],
+                [
+                    "gate_enter",
+                    "spm_policy",
+                    "export",
+                    "180000",
+                    "gate_exit",
+                ],
+            )
+            self.assertEqual(
+                policy_report["spm_bone_policy"]["status"],
+                "already_compliant",
             )
             self.assertEqual(
                 restored_timeout,
@@ -347,9 +369,52 @@ class SpeedTreeMaterialPreflightTests(unittest.TestCase):
             self.assertEqual(result["fbx"]["status"], "ok")
             self.assertEqual(
                 events,
-                ["gate_enter", "export", "180000", "gate_exit"],
+                [
+                    "gate_enter",
+                    "spm_policy",
+                    "export",
+                    "180000",
+                    "gate_exit",
+                ],
             )
             self.assertIs(helper.speedtree_export_gate, original_gate)
+
+    def test_export_requires_persistent_spm_bone_policy_before_mutation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "SK_tree_test.spm"
+            options = root / "Options.ini"
+            xml_options = root / "OptionsXml.ini"
+            spm.write_bytes(b"spm")
+            options.write_text("[Export]", encoding="utf-8")
+            xml_options.write_text("[Export]", encoding="utf-8")
+            args = argparse.Namespace(
+                spm=str(spm),
+                fbx_ini=str(options),
+                xml_ini=str(xml_options),
+                speedtree_exe=str(root / "SpeedTree.exe"),
+                timeout=900,
+                native_process_timeout=180,
+            )
+            helper = mock.Mock()
+            helper.export_bundle_with_minimum_bone_policy = (
+                lambda **_kwargs: {}
+            )
+
+            @contextmanager
+            def original_gate():
+                yield
+
+            helper.speedtree_export_gate = original_gate
+            del helper.export_bundle_with_minimum_bone_policy
+            with mock.patch.object(
+                preflight,
+                "require_texture_skip_writing",
+            ), self.assertRaisesRegex(
+                RuntimeError,
+                "sealed minimum-bone FBX/XML transaction",
+            ):
+                preflight.run_export(args, helper)
 
     def test_raw_source_is_structured_provisional_until_pcg_generation(self):
         with tempfile.TemporaryDirectory() as temporary:

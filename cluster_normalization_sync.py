@@ -354,7 +354,7 @@ def inspect_normalization_source_identity(blend):
     }
 
 
-def _role_contract(blend):
+def cluster_role_contract(blend):
     stem = Path(blend).stem
     base = stem[3:] if stem.casefold().startswith("sk_") else stem
     tokens = {token for token in base.casefold().split("_") if token}
@@ -1518,7 +1518,7 @@ def resolve_normalization_recipe(
         source_xml,
         canonical,
     )
-    role = _role_contract(blend)
+    role = cluster_role_contract(blend)
     target_material_bindings = [
         _resolve_target_role_material(
             target,

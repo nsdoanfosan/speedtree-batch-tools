@@ -44,6 +44,8 @@ ACTIVE_RECEIPT_INDEX_VERSION = 1
 ACTIVE_RECEIPT_DIRECTORY_NAME = "active_v1"
 ACTIVE_RECEIPT_MIGRATION_MARKER = ".active_index_v1_complete"
 MAX_TERMINAL_RECEIPTS = 512
+PROCESS_RECEIPT_REPLACE_RETRY_DELAYS_SECONDS = (0.01, 0.025, 0.05, 0.1)
+PROCESS_RECEIPT_RETRYABLE_WINERRORS = frozenset({5, 32})
 _DEFAULT_POPEN = subprocess.Popen
 _DEFAULT_RUN = subprocess.run
 _SUPERVISOR_LOCK = threading.RLock()
@@ -52,6 +54,27 @@ _SUPERVISOR = None
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _replace_path_with_windows_retry(source, target):
+    """Bound transient Windows sharing/access races without hiding failures."""
+    for attempt in range(
+        len(PROCESS_RECEIPT_REPLACE_RETRY_DELAYS_SECONDS) + 1
+    ):
+        try:
+            os.replace(source, target)
+            return
+        except OSError as exc:
+            retryable = (
+                getattr(exc, "winerror", None)
+                in PROCESS_RECEIPT_RETRYABLE_WINERRORS
+            )
+            if (
+                not retryable
+                or attempt >= len(PROCESS_RECEIPT_REPLACE_RETRY_DELAYS_SECONDS)
+            ):
+                raise
+            time.sleep(PROCESS_RECEIPT_REPLACE_RETRY_DELAYS_SECONDS[attempt])
 
 
 class ProcessLifecycleError(RuntimeError):
@@ -338,6 +361,46 @@ class _WindowsJob:
     def is_empty(self):
         return self.active_process_count() == 0
 
+    def resource_usage(self):
+        """Return cumulative CPU and peak commit for this exact process tree."""
+        with self._handle_lock:
+            if self._closed or not self._handle:
+                return None
+            accounting = self._accounting_type()
+            if not self.kernel32.QueryInformationJobObject(
+                self._handle,
+                self.JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION,
+                self.ctypes.byref(accounting),
+                self.ctypes.sizeof(accounting),
+                None,
+            ):
+                self._raise_last_error("process_job_accounting_query_failed")
+            extended = self._extended_type()
+            if not self.kernel32.QueryInformationJobObject(
+                self._handle,
+                self.JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                self.ctypes.byref(extended),
+                self.ctypes.sizeof(extended),
+                None,
+            ):
+                self._raise_last_error("process_job_memory_query_failed")
+            return {
+                "user_cpu_seconds": round(
+                    int(accounting.TotalUserTime) / 10_000_000.0,
+                    6,
+                ),
+                "kernel_cpu_seconds": round(
+                    int(accounting.TotalKernelTime) / 10_000_000.0,
+                    6,
+                ),
+                "page_fault_count": int(accounting.TotalPageFaultCount),
+                "total_processes": int(accounting.TotalProcesses),
+                "peak_process_memory_bytes": int(
+                    extended.PeakProcessMemoryUsed
+                ),
+                "peak_job_memory_bytes": int(extended.PeakJobMemoryUsed),
+            }
+
     def wait_empty(self, timeout):
         deadline = time.monotonic() + max(0.0, float(timeout))
         while True:
@@ -492,7 +555,7 @@ def _publish_active_receipt_marker(directory, run_id):
             f"active_receipt_index_v{ACTIVE_RECEIPT_INDEX_VERSION}\n",
             encoding="ascii",
         )
-        os.replace(temporary, marker)
+        _replace_path_with_windows_retry(temporary, marker)
     finally:
         try:
             temporary.unlink()
@@ -745,33 +808,55 @@ class ProcessSupervisor:
             }
 
     def _write_receipt(self):
-        payload = self.receipt()
-        try:
-            self.receipt_dir.mkdir(parents=True, exist_ok=True)
+        # Every caller, including parallel worker completions, shares this
+        # per-supervisor RLock.  Keep the snapshot, temporary write, atomic
+        # replacement, and active-index transition in one ordered boundary so
+        # an older snapshot cannot replace a newer one after a racing writer.
+        with self._lock:
+            payload = self.receipt()
             temporary = self.receipt_path.with_name(
-                f".{self.receipt_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+                f".{self.receipt_path.name}.{os.getpid()}."
+                f"{threading.get_ident()}.tmp"
             )
-            temporary.write_text(
-                json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True)
-                + "\n",
-                encoding="utf-8",
-            )
-            os.replace(temporary, self.receipt_path)
-            if self.status in {"running", "shutting_down"}:
-                _publish_active_receipt_marker(
-                    self.receipt_dir,
-                    self.run_id,
+            try:
+                self.receipt_dir.mkdir(parents=True, exist_ok=True)
+                temporary.write_text(
+                    json.dumps(
+                        payload,
+                        indent=2,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
                 )
-            else:
-                _remove_active_receipt_marker(
-                    self.receipt_dir,
-                    self.run_id,
+                _replace_path_with_windows_retry(
+                    temporary,
+                    self.receipt_path,
                 )
-        except OSError as exc:
-            raise ProcessLifecycleError(
-                "process_receipt_write_failed",
-                evidence={"path": str(self.receipt_path), "error": str(exc)},
-            ) from exc
+                if self.status in {"running", "shutting_down"}:
+                    _publish_active_receipt_marker(
+                        self.receipt_dir,
+                        self.run_id,
+                    )
+                else:
+                    _remove_active_receipt_marker(
+                        self.receipt_dir,
+                        self.run_id,
+                    )
+            except OSError as exc:
+                raise ProcessLifecycleError(
+                    "process_receipt_write_failed",
+                    evidence={
+                        "path": str(self.receipt_path),
+                        "error": str(exc),
+                    },
+                ) from exc
+            finally:
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
 
     def _register_owned(
         self,
@@ -811,7 +896,16 @@ class ProcessSupervisor:
         with self._lock:
             self.entries.append(entry)
             self._entry_by_process_id[id(process)] = entry
-            self._write_receipt()
+            try:
+                self._write_receipt()
+            except BaseException:
+                if self._entry_by_process_id.get(id(process)) is entry:
+                    self._entry_by_process_id.pop(id(process), None)
+                try:
+                    self.entries.remove(entry)
+                except ValueError:
+                    pass
+                raise
         process.speedtree_lifecycle_launch_id = entry["launch_id"]
         process.speedtree_lifecycle_tree_job = tree_job
         return entry
@@ -904,7 +998,13 @@ class ProcessSupervisor:
             if real_windows_launch:
                 tree_job.resume(process)
             entry["state"] = "running"
-            self._write_receipt()
+            # The pre-resume receipt written by ``_register_owned`` is already
+            # the durable ownership proof.  Rewriting the entire cumulative
+            # session receipt immediately after resume adds O(processes^2)
+            # JSON and ReplaceFile work to large first-run batches without
+            # strengthening recovery: every nonterminal recorded state is
+            # terminated with the owner.  Keep the live state in memory and
+            # persist it with the next meaningful transition/completion.
             return process
         except BaseException:
             if process is not None and process.poll() is None:
@@ -1026,6 +1126,9 @@ class ProcessSupervisor:
         if forced:
             entry["forced_result"] = str(reason)
         if tree_job is not None:
+            resource_usage = getattr(tree_job, "resource_usage", None)
+            if callable(resource_usage):
+                entry["resource_usage"] = resource_usage()
             tree_job.close()
         self._write_receipt()
         return entry["cleanup_state"]
@@ -1391,6 +1494,10 @@ def owned_run(*popenargs, source, input=None, capture_output=False, timeout=None
         returncode,
         stdout,
         stderr,
+    )
+    entry = get_process_supervisor().entry_for(process)
+    completed.resource_usage = copy.deepcopy(
+        (entry or {}).get("resource_usage")
     )
     if check:
         completed.check_returncode()

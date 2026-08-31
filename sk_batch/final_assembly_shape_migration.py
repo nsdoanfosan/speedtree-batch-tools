@@ -106,6 +106,17 @@ def _migrate_target(unreal, target, preserve_area):
     rebuild_trigger = None
     checked_out = False
     if changed:
+        library = getattr(unreal, "CodexMaterialToolsLibrary", None)
+        saver = getattr(
+            library,
+            "save_asset_package_without_thumbnail",
+            None,
+        )
+        if not callable(saver):
+            raise RuntimeError(
+                "CodexMaterialToolsLibrary thumbnail-free package save API is "
+                "unavailable"
+            )
         subsystem = unreal.get_editor_subsystem(unreal.EditorAssetSubsystem)
         if not subsystem.checkout_asset(asset_path):
             raise RuntimeError("source-control checkout failed")
@@ -121,11 +132,10 @@ def _migrate_target(unreal, target, preserve_area):
         # notify method in UE 5.8 Python.
         mesh.set_editor_property("nanite_settings", nanite)
         rebuild_trigger = "nanite_settings_property_assignment"
-        if not unreal.EditorAssetLibrary.save_loaded_asset(
-            mesh,
-            only_if_is_dirty=False,
-        ):
-            raise RuntimeError("failed to save migrated final Assembly")
+        if not saver(mesh):
+            raise RuntimeError(
+                "failed to save migrated final Assembly without thumbnail rendering"
+            )
     after = (
         mesh.get_editor_property("nanite_settings")
         .get_editor_property("shape_preservation")

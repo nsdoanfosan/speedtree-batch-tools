@@ -1,4 +1,4 @@
-"""Audit and force-refresh assets affected by native Leaf Mesh export changes."""
+"""Audit and force-refresh assets covered by the native BaseRef/ID-0 contract."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ LOG_DIR = cluster_fleet_push.LOG_DIR
 LEAF_MESH_RTTI = ".?AVCLeafMeshNode@@"
 BRANCH_RTTI = ".?AVCBranchNode@@"
 BASE_RTTI = ".?AVCBaseNode@@"
+START_RTTI = ".?AVCStartNode@@"
 
 # The Assembly builder refuses any manifest that is not on the current
 # placement contract, so an older manifest can never describe the geometry the
@@ -48,6 +49,18 @@ def deployment_receipt_path(target):
     return spm.parent / "fbx" / f"{target['stem']}.unreal_deployment_receipt.json"
 
 
+def _schema2_deployment_receipt_is_committed(path, payload):
+    """Require the global commit ledger for transactional schema-2 receipts."""
+
+    if payload.get("schema_version") != 2:
+        return True
+    try:
+        import finalize_affected_refresh as finalizer
+    except ModuleNotFoundError:  # Package import used by external callers/tests.
+        from sk_batch import finalize_affected_refresh as finalizer
+    return finalizer.schema2_receipt_is_committed(path)
+
+
 def _sha256(path):
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -77,6 +90,32 @@ def _vertex_ranges_are_exact_and_ordered(row):
     return True
 
 
+def _is_intentional_direct_base_native_root(row):
+    """Recognize the exact direct-Base Root ownership used by some trees."""
+    ancestor_types = [
+        ancestor.get("source_rtti")
+        for ancestor in row.get("ancestor_chain") or []
+    ]
+    if ancestor_types != [BASE_RTTI, START_RTTI]:
+        return False
+    if row.get("parent_rtti") != BASE_RTTI:
+        return False
+    influences = row.get("authored_position_influences") or []
+    if len(influences) != 1:
+        return False
+    influence = influences[0]
+    try:
+        weight = float(influence.get("weight"))
+        bone_id = int(influence.get("bone_id"))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return (
+        bone_id == 0
+        and influence.get("native_root") is True
+        and abs(weight - 1.0) <= 2.0e-6
+    )
+
+
 def audit_target(target):
     receipt_path = native_receipt_path(target)
     reasons = []
@@ -90,6 +129,7 @@ def audit_target(target):
 
     leaf_instances = []
     zero_bone_leaf_instances = []
+    intentional_direct_base_root_leaf_instances = []
     base_ref_branch_leaf_instances = []
     base_ref_branch_zero_bone_leaf_instances = []
     native_bone_count = None
@@ -102,8 +142,17 @@ def audit_target(target):
             for row in generated_instances
             if row.get("source_rtti") == LEAF_MESH_RTTI
         ]
+        intentional_direct_base_root_leaf_instances = [
+            row
+            for row in leaf_instances
+            if row.get("source_bone_id") == 0
+            and _is_intentional_direct_base_native_root(row)
+        ]
         zero_bone_leaf_instances = [
-            row for row in leaf_instances if row.get("source_bone_id") == 0
+            row
+            for row in leaf_instances
+            if row.get("source_bone_id") == 0
+            and not _is_intentional_direct_base_native_root(row)
         ]
         base_ref_branch_leaf_instances = [
             row
@@ -129,15 +178,15 @@ def audit_target(target):
             for row in generated_instances
         )
         if missing_source_object_identity_count:
-            # v15 records the serializer's actual runtime source-object
+            # v22 records the serializer's actual runtime source-object
             # identity.  node_guid and native_instance_id both collide in real
             # receipts, so an older row cannot safely prove which per-bone
             # records belong to one node.
             reasons.append("native_source_object_identity_missing")
         if zero_bone_leaf_instances:
-            # The permanent rule is that no exported Leaf Mesh keeps bone id 0.
-            # A receipt that still carries them was written before the rule
-            # existed, whatever its other counts look like.
+            # BaseRef/root-zone/grass Leaf Mesh must not keep bone id 0. Exact
+            # direct Base > Start ownership with one native Root influence is
+            # an intentional stock path and is excluded above.
             reasons.append("zero_bone_leaf_mesh_present")
         invalid_range_instances = [
             row
@@ -211,6 +260,13 @@ def audit_target(target):
             deployment = json.loads(deployment_path.read_text(encoding="utf-8"))
             if deployment.get("status") != "imported_ok":
                 raise ValueError("deployment status is not imported_ok")
+            if not _schema2_deployment_receipt_is_committed(
+                deployment_path,
+                deployment,
+            ):
+                raise ValueError(
+                    "schema-2 deployment receipt is not globally committed"
+                )
             if deployment.get("native_receipt_sha256") != _sha256(receipt_path):
                 raise ValueError("native receipt hash changed after Unreal import")
             if deployment.get("assembly_manifest_sha256") != _sha256(manifest_path):
@@ -241,6 +297,9 @@ def audit_target(target):
         ),
         "leaf_mesh_instance_count": len(leaf_instances),
         "zero_bone_leaf_mesh_instance_count": len(zero_bone_leaf_instances),
+        "intentional_direct_base_root_leaf_mesh_instance_count": len(
+            intentional_direct_base_root_leaf_instances
+        ),
         "baseref_branch_zero_bone_leaf_mesh_instance_count": len(
             base_ref_branch_zero_bone_leaf_instances
         ),
@@ -263,13 +322,43 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description=(
             "Audit current production Assemblies and force-refresh every asset "
-            "affected by the native root-zone Leaf Mesh bone fix, including "
+            "covered by the native BaseRef/ID-0 export contract, including "
             "the complete grass verification scope, without GUI control"
         )
     )
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--log-dir", type=Path, default=LOG_DIR)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--all-current-targets",
+        action="store_true",
+        help=(
+            "force-refresh every current production Assembly target found by "
+            "the audit, including targets whose receipts are already current"
+        ),
+    )
+    parser.add_argument(
+        "--force-cluster-assembly-rebuild",
+        action="store_true",
+        help="bypass reusable Cluster Assembly computation for every target",
+    )
+    parser.add_argument(
+        "--transport",
+        choices=("headless", "rpc"),
+        default="headless",
+        help=(
+            "use a new Unreal commandlet or the currently open Unreal "
+            "Editor's Send2UE RPC endpoint"
+        ),
+    )
+    parser.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help=(
+            "regenerate and validate native/Assembly FBX outputs without "
+            "launching an Unreal commandlet"
+        ),
+    )
     parser.add_argument(
         "--resume-run-id",
         help=(
@@ -292,6 +381,8 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.prepare_only and args.transport == "rpc":
+        raise SystemExit("--prepare-only cannot be combined with --transport rpc")
     args.log_dir.mkdir(parents=True, exist_ok=True)
     run_id = args.resume_run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
     inventory_path = args.log_dir / f"affected_headless_refresh_{run_id}.json"
@@ -305,10 +396,18 @@ def main(argv=None):
         inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
         originally_selected = inventory.get("selected") or []
         resume_audits = [audit_target(target) for target in originally_selected]
-        selected = [row for row in resume_audits if row["selected"]]
-        inventory["resume_skipped_current"] = [
-            row["spm"] for row in resume_audits if not row["selected"]
-        ]
+        if inventory.get("all_current_targets"):
+            # An explicit full-fleet run remains a full-fleet run on resume.
+            # Re-filtering it through the converging stale audit silently drops
+            # targets that have not yet run merely because an older receipt is
+            # currently readable.
+            selected = resume_audits
+            inventory["resume_skipped_current"] = []
+        else:
+            selected = [row for row in resume_audits if row["selected"]]
+            inventory["resume_skipped_current"] = [
+                row["spm"] for row in resume_audits if not row["selected"]
+            ]
         inventory["selected"] = selected
         audited = inventory.get("audited") or []
         missing = inventory.get("discovery_missing") or []
@@ -316,6 +415,8 @@ def main(argv=None):
         inventory["resumed_at"] = datetime.now().isoformat(timespec="seconds")
     else:
         selected, audited, missing = discover_affected_targets(args.root)
+        if args.all_current_targets:
+            selected = list(audited)
         inventory = {
             "schema_version": 1,
             "status": "dry_run" if args.dry_run else "selected",
@@ -334,6 +435,11 @@ def main(argv=None):
             ],
             "selection_is_converging": True,
             "force_native_export": True,
+            "force_cluster_assembly_rebuild": bool(
+                args.force_cluster_assembly_rebuild
+            ),
+            "all_current_targets": bool(args.all_current_targets),
+            "transport": args.transport,
             "selected": selected,
             "audited": audited,
             "discovery_missing": missing,
@@ -373,6 +479,11 @@ def main(argv=None):
         fleet_args.append("--reset-item-retries")
     if args.resume_run_id:
         fleet_args.append("--resume-prepared")
+    if args.prepare_only:
+        fleet_args.append("--prepare-only")
+    if args.force_cluster_assembly_rebuild:
+        fleet_args.append("--force-cluster-assembly-rebuild")
+    fleet_args.extend(["--transport", args.transport])
     returncode = cluster_fleet_push.main(fleet_args)
     fleet_report_path = args.log_dir / f"cluster_fleet_push_{run_id}.json"
     fleet = json.loads(fleet_report_path.read_text(encoding="utf-8"))
@@ -409,7 +520,13 @@ def main(argv=None):
         )
         temporary.replace(marker_path)
     inventory["execution_policy"] = (
-        "dependency_aware_cluster_providers_then_roots_single_unreal_batch"
+        "dependency_aware_cluster_providers_then_roots_fbx_only"
+        if args.prepare_only
+        else (
+            "dependency_aware_cluster_providers_then_roots_open_editor_rpc"
+            if args.transport == "rpc"
+            else "dependency_aware_cluster_providers_then_roots_single_unreal_batch"
+        )
     )
     inventory["cluster_fleet_report"] = str(fleet_report_path.resolve())
     inventory["provider_dependencies"] = fleet.get("provider_dependencies") or []
@@ -424,10 +541,15 @@ def main(argv=None):
         json.dumps(inventory, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     print(f"SK_AFFECTED_HEADLESS_VERIFIED={fleet.get('verified_count', 0)}")
+    print(f"SK_AFFECTED_HEADLESS_PREPARED={fleet.get('prepared_count', 0)}")
     print(f"SK_AFFECTED_HEADLESS_FAILED={inventory['failed_count']}")
     print(
         "SK_AFFECTED_HEADLESS_PROVIDER_FAILED="
         f"{inventory['provider_failed_count']}"
+    )
+    print(
+        "SK_AFFECTED_HEADLESS_PROVIDER_PREPARED="
+        f"{fleet.get('provider_prepared_count', 0)}"
     )
     return returncode
 

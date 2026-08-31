@@ -39,6 +39,9 @@ DEFAULT_SPEEDTREE_COLLISION_CLI = (
     / "bin"
     / "speedtree_collision_cli.exe"
 )
+FRESH_VERIFICATION_SEALED_MARKER = (
+    "SPEEDTREE_FRESH_VERIFICATION_EXPORT_SEALED=1"
+)
 
 
 def resolve_speedtree_collision_cli():
@@ -72,12 +75,14 @@ from cluster_assembly_handoff_contract import (
     build_assembly_handoff,
     build_blender_fbx_inventory,
     current_assembly_manifest_handoff,
+    current_receipt_reference_provider_inputs,
     file_fingerprint,
     load_cluster_contract,
     resolve_cluster_receipt_path,
     role_identity_aliases_from_contract,
 )
 from cluster_assembly_builder import build_blender_assembly_inputs
+from cluster_normalization_sync import cluster_role_contract
 from job_report_contract import mark_job_failed
 from assembly_runtime_contract import (
     ASSEMBLY_OUTPUT_CONTRACT_VERSION,
@@ -135,11 +140,40 @@ def parse_args():
     parser.add_argument("--bark-normalization-manifest", default="")
     parser.add_argument("--cluster-source-build-only", action="store_true")
     parser.add_argument(
+        "--provider-no-owner-receipt",
+        action="store_true",
+        help=(
+            "declare a fleet dependency-provider invocation that cannot own "
+            "a root Cluster Assembly receipt; only the unrelated global "
+            "receipt discovery is omitted"
+        ),
+    )
+    parser.add_argument(
         "--force-native-export",
         action="store_true",
         help=(
             "bypass a reusable material-preflight FBX bundle and serialize "
             "a fresh native SpeedTree FBX/XML/receipt with the installed hook"
+        ),
+    )
+    parser.add_argument(
+        "--fresh-collision-prune-export",
+        "--fresh-verification-only-export",
+        dest="fresh_verification_only_export",
+        action="store_true",
+        help=(
+            "run one forced fresh normal Collision/Prune FBX/XML/native-"
+            "receipt transaction; the old fresh-verification-only spelling "
+            "is a compatibility alias and no longer skips Collision/Prune"
+        ),
+    )
+    parser.add_argument(
+        "--speedtree-export-timeout",
+        type=int,
+        default=1200,
+        help=(
+            "outer timeout in seconds for one normal bundled SpeedTree "
+            "FBX/XML export; the native wrapper must use a smaller timeout"
         ),
     )
     parser.add_argument(
@@ -745,6 +779,7 @@ def select_cluster_assembly_build_handoff(
     current_manifest_handoff=None,
     *,
     explicit_live_authority=False,
+    current_receipt_reference_inputs=None,
 ):
     """Prefer every conclusive current-FBX result over persisted fallbacks.
 
@@ -758,7 +793,75 @@ def select_cluster_assembly_build_handoff(
         isinstance(inspected_handoff, dict)
         and inspected_handoff.get("status") == "ready"
     ):
-        return "build", inspected_handoff
+        # A live FBX inspection can be conclusive for one connected provider
+        # while exact Base-Reference providers are intentionally absent from
+        # the Full FBX named-pair inventory.  Keep the live roles authoritative
+        # and merge only strict SPM-only recovery candidates from the current
+        # receipt and then (for backward compatibility) the current manifest;
+        # Blender's topology matcher remains the fail-closed authority that
+        # decides which of those candidates are actually rendered.
+        selected = inspected_handoff
+        live_assembly = inspected_handoff.get("assembly") or {}
+        live_inputs = list(live_assembly.get("part_builder_inputs") or [])
+        existing_provider_keys = {
+            str(row.get("provider_key") or "").casefold()
+            for row in live_inputs
+            if isinstance(row, dict)
+        }
+        recovered_by_source = []
+        recovery_sources = [
+            (
+                "current_receipt_provider_expansion",
+                list(current_receipt_reference_inputs or []),
+            ),
+        ]
+        if (
+            isinstance(current_manifest_handoff, dict)
+            and current_manifest_handoff.get("status") == "ready"
+        ):
+            recovery_sources.append((
+                "current_manifest_provider_expansion",
+                list(
+                    (current_manifest_handoff.get("assembly") or {}).get(
+                        "part_builder_inputs"
+                    )
+                    or []
+                ),
+            ))
+        for metadata_key, candidates in recovery_sources:
+            recovered_inputs = []
+            for row in candidates:
+                if not isinstance(row, dict):
+                    continue
+                provider_key = str(row.get("provider_key") or "")
+                if (
+                    row.get("speculative_provider_expansion") is not True
+                    or not provider_key
+                    or provider_key.casefold() in existing_provider_keys
+                ):
+                    continue
+                recovered_inputs.append(dict(row))
+                existing_provider_keys.add(provider_key.casefold())
+            if recovered_inputs:
+                recovered_by_source.append((metadata_key, recovered_inputs))
+                live_inputs.extend(recovered_inputs)
+        if recovered_by_source:
+            selected = dict(inspected_handoff)
+            selected_assembly = dict(live_assembly)
+            selected_assembly["part_builder_inputs"] = live_inputs
+            selected["assembly"] = selected_assembly
+            for metadata_key, recovered_inputs in recovered_by_source:
+                selected[metadata_key] = {
+                    "status": "merged",
+                    "candidate_count": len(recovered_inputs),
+                    "provider_keys": [
+                        row["provider_key"] for row in recovered_inputs
+                    ],
+                    "selection_authority": (
+                        "current_blender_topology_matcher"
+                    ),
+                }
+        return "build", selected
     if (
         isinstance(inspected_handoff, dict)
         and inspected_handoff.get("status") == "pass_through"
@@ -822,13 +925,314 @@ def cluster_assembly_contract_from_material_contract(
 def validate_cluster_job_mode_arguments(
     cluster_source_build_only,
     cluster_assembly_contract,
+    provider_no_owner_receipt=False,
+    canonical_spm=None,
 ):
-    """Reject an explicit Assembly authority that source-only mode ignores."""
+    """Reject contradictory Cluster invocation authorities before Blender I/O."""
     if cluster_source_build_only and cluster_assembly_contract:
         raise RuntimeError(
             "--cluster-source-build-only cannot be combined with "
             "--cluster-assembly-contract"
         )
+    if provider_no_owner_receipt and cluster_assembly_contract:
+        raise RuntimeError(
+            "--provider-no-owner-receipt cannot be combined with "
+            "--cluster-assembly-contract"
+        )
+    if provider_no_owner_receipt and cluster_source_build_only:
+        raise RuntimeError(
+            "--provider-no-owner-receipt cannot be combined with "
+            "--cluster-source-build-only"
+        )
+    if provider_no_owner_receipt and (
+        canonical_spm is None
+        or not is_cluster_normalization_spm(canonical_spm)
+    ):
+        raise RuntimeError(
+            "--provider-no-owner-receipt requires a canonical Cluster "
+            "dependency-provider SPM"
+        )
+
+
+def validate_native_export_mode_arguments(
+    force_native_export,
+    fresh_verification_only_export,
+    *,
+    export_fbx=None,
+    export_xml=None,
+):
+    """Reject an incomplete fresh Collision/Prune opt-in before execution."""
+    if fresh_verification_only_export and not force_native_export:
+        raise RuntimeError(
+            "--fresh-collision-prune-export requires "
+            "--force-native-export"
+        )
+    if fresh_verification_only_export and (
+        export_fbx is not None or export_xml is not None
+    ) and (export_fbx is not True or export_xml is not True):
+        raise RuntimeError(
+            "--fresh-collision-prune-export requires exact FBX and XML "
+            "export targets"
+        )
+
+
+def validate_speedtree_export_timeout_layering(
+    outer_timeout_seconds,
+    wrapper_timeout_ms,
+):
+    """Keep native wrapper cleanup inside the owning Python timeout."""
+
+    if (
+        isinstance(outer_timeout_seconds, bool)
+        or not isinstance(outer_timeout_seconds, int)
+        or outer_timeout_seconds <= 0
+    ):
+        raise RuntimeError("SpeedTree outer export timeout must be a positive integer")
+    timeout_source = "environment"
+    if wrapper_timeout_ms in (None, ""):
+        # Direct Python/fleet entry points do not pass through SK_Exact_Push.bat,
+        # so apply the same native-wrapper budget here instead of silently
+        # falling back to the launcher's 600-second default.
+        wrapper_timeout_ms = 840000
+        timeout_source = "assembly_job_default"
+    try:
+        wrapper_ms = int(wrapper_timeout_ms)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "SPEEDTREE_COLLISION_WRAPPER_TIMEOUT_MS must be a positive integer"
+        ) from exc
+    if wrapper_ms <= 0 or wrapper_ms >= outer_timeout_seconds * 1000:
+        raise RuntimeError(
+            "SpeedTree native wrapper timeout must be positive and smaller "
+            "than the outer export timeout"
+        )
+    return {
+        "outer_timeout_seconds": outer_timeout_seconds,
+        "wrapper_timeout_ms": wrapper_ms,
+        "layering_validated": True,
+        "wrapper_timeout_source": timeout_source,
+    }
+
+
+def validate_fresh_verification_export_result(result):
+    """Verify the add-on's sealed sole-export evidence and exact artifacts."""
+    if not isinstance(result, dict):
+        raise RuntimeError("Fresh verification-only export result is missing")
+    evidence = result.get("fresh_verification_only_export")
+    if not isinstance(evidence, dict):
+        raise RuntimeError(
+            "Fresh verification-only export evidence is missing"
+        )
+    expected = {
+        "status": "sealed",
+        "policy": "fresh_verification_only_as_sole_export_v1",
+        "explicit_opt_in_required": True,
+        "force_reexport": True,
+        "collision_prune_bundle_attempt_count": 0,
+        "verification_bundle_attempt_count": 1,
+        "independent_fallback_attempt_count": 0,
+    }
+    for field, value in expected.items():
+        if evidence.get(field) != value:
+            raise RuntimeError(
+                "Fresh verification-only export evidence is invalid: "
+                f"{field}={evidence.get(field)!r}"
+            )
+    launcher = evidence.get("launcher_sealed_completion") or {}
+    if (
+        launcher.get("status") != "observed"
+        or launcher.get("marker") != FRESH_VERIFICATION_SEALED_MARKER
+    ):
+        raise RuntimeError(
+            "Fresh verification-only export lacks launcher-sealed completion"
+        )
+    if result.get("force_reexport_requested") is not True:
+        raise RuntimeError(
+            "Fresh verification-only export lost forced-export authority"
+        )
+
+    exports = result.get("exports") or {}
+    sealed = evidence.get("sealed_artifacts") or {}
+    if set(exports) != {"fbx", "xml"} or set(sealed) != {"fbx", "xml"}:
+        raise RuntimeError(
+            "Fresh verification-only export requires exact FBX/XML evidence"
+        )
+    receipt_value = str(result.get("native_receipt") or "").strip()
+    if not receipt_value:
+        raise RuntimeError(
+            "Fresh verification-only export has no native receipt"
+        )
+    receipt = Path(receipt_value).resolve()
+    if Path(str(evidence.get("native_receipt") or "")).resolve() != receipt:
+        raise RuntimeError(
+            "Fresh verification-only native receipt identity disagrees"
+        )
+
+    for kind in ("fbx", "xml"):
+        row = exports[kind]
+        if (
+            row.get("exists") is not True
+            or row.get("cache_hit") is not False
+            or row.get("force_reexport_requested") is not True
+            or row.get("verification_only") is not True
+            or row.get("bundled_process") is not True
+            or row.get("bundle_fallback") is not False
+            or FRESH_VERIFICATION_SEALED_MARKER
+            not in str(row.get("stdout") or "")
+        ):
+            raise RuntimeError(
+                "Fresh verification-only export row is not one sealed "
+                f"bundle: {kind}"
+            )
+        attempts = row.get("export_attempts") or []
+        if (
+            len(attempts) != 1
+            or attempts[0].get("attempt") != 1
+            or attempts[0].get("returncode") != 0
+        ):
+            raise RuntimeError(
+                "Fresh verification-only export did not complete in exactly "
+                f"one process attempt: {kind}"
+            )
+        target = Path(str(row.get("path") or "")).resolve()
+        required = [target]
+        if kind == "fbx":
+            required.extend([target.with_suffix(".stmat"), receipt])
+        records = sealed[kind]
+        if not isinstance(records, list):
+            raise RuntimeError(
+                f"Fresh verification-only sealed artifacts are invalid: {kind}"
+            )
+        by_path = {
+            Path(str(record.get("path") or "")).resolve(): record
+            for record in records
+            if isinstance(record, dict)
+        }
+        if set(by_path) != set(required):
+            raise RuntimeError(
+                "Fresh verification-only sealed artifact set disagrees: "
+                f"{kind}"
+            )
+        for path in required:
+            record = by_path[path]
+            if not path.is_file():
+                raise RuntimeError(
+                    "Fresh verification-only sealed artifact is missing: "
+                    + str(path)
+                )
+            stat = path.stat()
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            if (
+                int(record.get("size") or -1) != stat.st_size
+                or str(record.get("sha256") or "").casefold()
+                != digest.hexdigest().casefold()
+            ):
+                raise RuntimeError(
+                    "Fresh verification-only sealed artifact drifted: "
+                    + str(path)
+                )
+    return evidence
+
+
+def validate_normal_collision_export_result(result):
+    """Reject any silent verification fallback before Blender/Unreal ingest."""
+
+    if not isinstance(result, dict):
+        raise RuntimeError("Normal SpeedTree export result is missing")
+    if result.get("force_reexport_requested") is not True:
+        raise RuntimeError("Normal SpeedTree export lost forced-export authority")
+    exports = result.get("exports")
+    if not isinstance(exports, dict) or set(exports) != {"fbx", "xml"}:
+        raise RuntimeError("Normal SpeedTree export requires exact FBX/XML results")
+
+    for kind in ("fbx", "xml"):
+        row = exports.get(kind)
+        if not isinstance(row, dict):
+            raise RuntimeError(f"Normal SpeedTree {kind.upper()} result is missing")
+        exact = {
+            "exists": True,
+            "returncode": 0,
+            "cache_hit": False,
+            "force_reexport_requested": True,
+            "verification_only": False,
+            "bundled_process": True,
+            "bundle_fallback": False,
+        }
+        for field, expected in exact.items():
+            if row.get(field) != expected or type(row.get(field)) is not type(expected):
+                raise RuntimeError(
+                    "Normal SpeedTree export evidence is invalid: "
+                    f"kind={kind}, {field}={row.get(field)!r}"
+                )
+        attempts = row.get("export_attempts")
+        if (
+            not isinstance(attempts, list)
+            or len(attempts) != 1
+            or attempts[0].get("attempt") != 1
+            or attempts[0].get("returncode") != 0
+        ):
+            raise RuntimeError(
+                f"Normal SpeedTree {kind.upper()} export lacks one exact "
+                "successful bundled attempt"
+            )
+        if "Post-collision export completed." not in str(row.get("stdout") or ""):
+            raise RuntimeError(
+                f"Normal SpeedTree {kind.upper()} export lacks the "
+                "post-collision completion marker"
+            )
+    return {
+        "status": "validated",
+        "policy": "normal_collision_export_fail_closed_v1",
+        "explicit_opt_in": False,
+        "verification_fallback_allowed": False,
+    }
+
+
+def resolve_job_cluster_receipt_path(
+    spm_path,
+    embedded_contract_path=None,
+    *,
+    cluster_source_build_only=False,
+    provider_no_owner_receipt=False,
+    require_embedded_live_audit=False,
+):
+    """Resolve root authority without scanning it for provider-only jobs."""
+    if cluster_source_build_only:
+        return None, {
+            "policy": "cluster_source_provider_no_owner_receipt",
+            "requested_spm": str(spm_path),
+            "selected_receipt": None,
+            "current_candidates": [],
+            "superseded_current_receipts": [],
+            "ignored_stale_candidates": [],
+        }
+    if provider_no_owner_receipt:
+        return None, {
+            "policy": "fleet_provider_dependency_no_owner_receipt",
+            "requested_spm": str(spm_path),
+            "selected_receipt": None,
+            "current_candidates": [],
+            "superseded_current_receipts": [],
+            "ignored_stale_candidates": [],
+            "skipped_global_discovery": {
+                "status": "not_run",
+                "operation": "cluster_assembly_receipt_resolution",
+                "authority": "cluster_fleet_provider_dependency_v1",
+                "reason": (
+                    "provider invocation has no root-owner receipt contract"
+                ),
+                "candidate_files_read": 0,
+            },
+        }
+    return resolve_cluster_receipt_path(
+        spm_path,
+        embedded_contract_path,
+        include_resolution=True,
+        require_embedded_live_audit=bool(require_embedded_live_audit),
+    )
 
 
 def main():
@@ -836,11 +1240,19 @@ def main():
     args = parse_args()
     canonical_spm = Path(args.spm).resolve()
     speedtree_spm = Path(args.speedtree_spm or args.spm).resolve()
+    timeout_layering = validate_speedtree_export_timeout_layering(
+        args.speedtree_export_timeout,
+        os.environ.get("SPEEDTREE_COLLISION_WRAPPER_TIMEOUT_MS"),
+    )
+    os.environ["SPEEDTREE_COLLISION_WRAPPER_TIMEOUT_MS"] = str(
+        timeout_layering["wrapper_timeout_ms"]
+    )
     report = {
         "spm": str(canonical_spm),
         "speedtree_spm": str(speedtree_spm),
         "blend": args.blend,
         "wind": args.wind,
+        "speedtree_export_timeout_layering": timeout_layering,
         "status": "failed",
     }
     # Cluster rows reach this job under their canonical SK_ output identity.
@@ -864,6 +1276,12 @@ def main():
         validate_cluster_job_mode_arguments(
             args.cluster_source_build_only,
             args.cluster_assembly_contract,
+            args.provider_no_owner_receipt,
+            canonical_spm,
+        )
+        validate_native_export_mode_arguments(
+            args.force_native_export,
+            args.fresh_verification_only_export,
         )
         preflight_started = perf_counter()
         bark_normalization_manifest = None
@@ -896,28 +1314,21 @@ def main():
                 "production_source_mutated": False,
             }
         material_preflight = None
-        if args.material_contract:
-            # Validate the exact SPM/STMAT hashes before Blender or the add-on
-            # can mutate a scene.  The add-on still receives the same report
-            # path for its existing texture-binding loader.
-            material_preflight = validate_preflight_report(
-                args.material_contract,
-                speedtree_spm,
-                require_ok=True,
-            )
-            report["speedtree_pipeline_contract"] = material_preflight[
-                "speedtree_pipeline_contract"
-            ]
-            report["speedtree_pipeline_contract_required"] = True
-        record_stage_duration(report, "input_preflight", preflight_started)
         addon_runtime_started = perf_counter()
+        required_speedtree_capabilities = [
+            "speedtree_export_v1",
+            "assembly_pipeline_v1",
+            "atlas_manifest_consumer_v1",
+        ]
+        if args.fresh_verification_only_export:
+            required_speedtree_capabilities.append(
+                "fresh_collision_prune_export_v1"
+            )
         addon_runtime = prepare_runtime(
             "sk_batch.jobs.assembly_headless_job",
             {
                 "speedtree_bone_weight_repair": (
-                    "speedtree_export_v1",
-                    "assembly_pipeline_v1",
-                    "atlas_manifest_consumer_v1",
+                    *required_speedtree_capabilities,
                 ),
             },
         )
@@ -946,14 +1357,45 @@ def main():
             "addon_runtime_prepare",
             addon_runtime_started,
         )
-        run_speedtree_cli_export = addon_runtime.operation(
+        run_selected_speedtree_export = addon_runtime.operation(
             "speedtree_bone_weight_repair",
-            "run_speedtree_cli_export",
+            (
+                "run_fresh_collision_prune_export"
+                if args.fresh_verification_only_export
+                else "run_speedtree_cli_export"
+            ),
         )
         run_import_and_assemble = addon_runtime.operation(
             "speedtree_bone_weight_repair",
             "run_import_and_assemble",
         )
+        ensure_minimum_branch_bones = addon_runtime.operation(
+            "speedtree_bone_weight_repair",
+            "ensure_minimum_absolute_branch_bones",
+        )
+        source_policy_started = perf_counter()
+        report["spm_bone_policy_preflight"] = (
+            ensure_minimum_branch_bones(str(speedtree_spm))
+        )
+        record_stage_duration(
+            report,
+            "spm_bone_policy_preflight",
+            source_policy_started,
+        )
+        if args.material_contract:
+            # Historical wrappers are rebound only after the persistent source
+            # policy is complete. The resulting contract therefore seals the
+            # post-policy SPM, while export-time drift remains fail-closed.
+            material_preflight = validate_preflight_report(
+                args.material_contract,
+                speedtree_spm,
+                require_ok=True,
+            )
+            report["speedtree_pipeline_contract"] = material_preflight[
+                "speedtree_pipeline_contract"
+            ]
+            report["speedtree_pipeline_contract_required"] = True
+        record_stage_duration(report, "input_preflight", preflight_started)
 
         blend_path = os.path.abspath(args.blend)
         blend_exists = os.path.exists(blend_path)
@@ -976,36 +1418,22 @@ def main():
         cluster_assembly_raw_import_state = None
         cluster_assembly_receipt_payload = None
         cluster_assembly_source_resolution = None
-        if args.cluster_source_build_only:
-            # This SPM is a raw provider consumed by another owner's
-            # Normalizer transaction. It cannot own a content-driven Assembly
-            # receipt under its own path, so scanning historical receipt
-            # candidates is pure delay and previously cost 10-20 seconds.
-            cluster_receipt_path = None
-            cluster_receipt_resolution = {
-                "policy": "cluster_source_provider_no_owner_receipt",
-                "requested_spm": str(speedtree_spm),
-                "selected_receipt": None,
-                "current_candidates": [],
-                "superseded_current_receipts": [],
-                "ignored_stale_candidates": [],
-            }
-        else:
-            embedded_cluster_contract = (
-                args.cluster_assembly_contract
-                or args.material_contract
-                or None
+        embedded_cluster_contract = (
+            args.cluster_assembly_contract
+            or args.material_contract
+            or None
+        )
+        cluster_receipt_path, cluster_receipt_resolution = (
+            resolve_job_cluster_receipt_path(
+                speedtree_spm,
+                embedded_cluster_contract,
+                cluster_source_build_only=args.cluster_source_build_only,
+                provider_no_owner_receipt=args.provider_no_owner_receipt,
+                require_embedded_live_audit=bool(
+                    args.cluster_assembly_contract
+                ),
             )
-            cluster_receipt_path, cluster_receipt_resolution = (
-                resolve_cluster_receipt_path(
-                    speedtree_spm,
-                    embedded_cluster_contract,
-                    include_resolution=True,
-                    require_embedded_live_audit=bool(
-                        args.cluster_assembly_contract
-                    ),
-                )
-            )
+        )
         report["cluster_assembly_receipt_resolution"] = (
             cluster_receipt_resolution
         )
@@ -1100,6 +1528,12 @@ def main():
         )
 
         export_settings = settings.as_dict()
+        validate_native_export_mode_arguments(
+            args.force_native_export,
+            args.fresh_verification_only_export,
+            export_fbx=export_settings["speedtree_export_fbx"],
+            export_xml=export_settings["speedtree_export_xml"],
+        )
         speedtree_export_started = perf_counter()
         speedtree_export = None
         if not args.force_native_export:
@@ -1110,7 +1544,11 @@ def main():
                 collision_hook,
             )
         if speedtree_export is None:
-            speedtree_export = run_speedtree_cli_export(
+            export_kwargs = {
+                "timeout_seconds": args.speedtree_export_timeout,
+                "allow_verification_fallback": False,
+            }
+            speedtree_export = run_selected_speedtree_export(
                 str(speedtree_spm),
                 speedtree_exe_path=export_settings["speedtree_exe_path"],
                 export_options_path=export_settings[
@@ -1127,11 +1565,16 @@ def main():
                 export_fbx=export_settings["speedtree_export_fbx"],
                 export_xml=export_settings["speedtree_export_xml"],
                 force_reexport=args.force_native_export,
+                **export_kwargs,
             )
             report["speedtree_export_source"] = (
                 "forced_export_helper"
-                if args.force_native_export
-                else "export_helper"
+                if args.fresh_verification_only_export
+                else (
+                    "forced_export_helper"
+                    if args.force_native_export
+                    else "export_helper"
+                )
             )
         else:
             report["speedtree_export_source"] = "validated_material_preflight"
@@ -1139,6 +1582,15 @@ def main():
             report,
             "speedtree_export_bundle",
             speedtree_export_started,
+        )
+        report["speedtree_export_execution_policy"] = (
+            validate_normal_collision_export_result(speedtree_export)
+            if args.force_native_export
+            else {
+                "status": "not_requested",
+                "policy": "normal_collision_export_path",
+                "explicit_opt_in": False,
+            }
         )
         fbx_export = speedtree_export["exports"].get("fbx", {})
         xml_export = speedtree_export["exports"].get("xml", {})
@@ -1201,7 +1653,11 @@ def main():
             if source_spm_path == speedtree_spm:
                 assembly_source_export = speedtree_export
             else:
-                assembly_source_export = run_speedtree_cli_export(
+                source_export_kwargs = {
+                    "timeout_seconds": args.speedtree_export_timeout,
+                    "allow_verification_fallback": False,
+                }
+                assembly_source_export = run_selected_speedtree_export(
                     str(source_spm_path),
                     speedtree_exe_path=export_settings[
                         "speedtree_exe_path"
@@ -1220,10 +1676,17 @@ def main():
                     export_fbx=export_settings["speedtree_export_fbx"],
                     export_xml=export_settings["speedtree_export_xml"],
                     force_reexport=args.force_native_export,
+                    **source_export_kwargs,
                     # This secondary SPM contributes Assembly geometry through
                     # the same exact native FBX/XML serialization contract.
                 )
             report["cluster_assembly_source_export"] = assembly_source_export
+            if args.force_native_export:
+                report[
+                    "cluster_assembly_source_export_execution_policy"
+                ] = validate_normal_collision_export_result(
+                    assembly_source_export
+                )
             assembly_fbx_export = (
                 assembly_source_export.get("exports", {}).get("fbx", {})
             )
@@ -1374,6 +1837,16 @@ def main():
             args.cluster_source_build_only
         )
         assembly_settings["source_identity_path"] = str(canonical_spm)
+        if is_cluster_source:
+            role_contract = cluster_role_contract(canonical_spm)
+            assembly_settings["authoritative_cluster_material_names"] = [
+                role_contract["material_name"]
+            ]
+            report["cluster_role_material_identity"] = {
+                "role": role_contract["role"],
+                "material": role_contract["material_name"],
+                "policy": "exact_cluster_normalizer_role_identity",
+            }
         canonical_source_fbx = (
             canonical_spm.parent
             / "fbx"
@@ -1778,16 +2251,46 @@ def main():
         assembly_manifest = None
         assembly_manifest_summary = None
         current_handoff = None
+        current_receipt_reference_inputs = []
         if (
             preflight["status"] == "ok"
             and (
                 not isinstance(cluster_assembly_handoff, dict)
                 or cluster_assembly_handoff.get("status")
-                not in {"ready", "pass_through"}
+                != "pass_through"
             )
             and pipeline_data is not None
             and merged_object is not None
         ):
+            current_receipt_reference_inputs = (
+                current_receipt_reference_provider_inputs(
+                    speedtree_spm,
+                    cluster_assembly_contract,
+                    authority={
+                        "status": "current",
+                        "source": "current_cluster_assembly_contract",
+                        "pcg_receipt": file_fingerprint(
+                            cluster_receipt_path
+                        ),
+                    },
+                )
+                if cluster_assembly_contract is not None
+                else []
+            )
+            if current_receipt_reference_inputs:
+                report["cluster_assembly_current_reference_candidates"] = {
+                    "status": "ready",
+                    "candidate_count": len(
+                        current_receipt_reference_inputs
+                    ),
+                    "provider_keys": [
+                        row["provider_key"]
+                        for row in current_receipt_reference_inputs
+                    ],
+                    "selection_authority": (
+                        "current_blender_topology_matcher"
+                    ),
+                }
             current_full_fbx = str(
                 (pipeline_data.get("paths") or {}).get("fbx") or ""
             )
@@ -1806,6 +2309,9 @@ def main():
                 current_handoff,
                 explicit_live_authority=(
                     explicit_live_assembly_authority
+                ),
+                current_receipt_reference_inputs=(
+                    current_receipt_reference_inputs
                 ),
             )
         )

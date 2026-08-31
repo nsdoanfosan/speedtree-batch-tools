@@ -26,6 +26,7 @@ import re
 import statistics
 import subprocess
 import sys
+from array import array
 from contextlib import contextmanager
 from copy import deepcopy
 from collections import Counter, defaultdict
@@ -1371,17 +1372,17 @@ def validate_normalized_prototype_unit_contract(manifest):
         raise ClusterAssemblyBuildError(
             "physical normalized production manifest has no native prototypes/variants"
         )
-    unit_probe_receipts = {
-        _canonical_json(payload): payload
-        for _role, payload in receipts["unit_probe"]
-    }
-    if len(unit_probe_receipts) != 1:
+    validated_unit_probe_contracts = {}
+    for _role, payload in receipts["unit_probe"]:
+        semantic_contract = _validate_unit_probe_receipt(payload)
+        validated_unit_probe_contracts[
+            _canonical_json(semantic_contract)
+        ] = semantic_contract
+    if len(validated_unit_probe_contracts) != 1:
         raise ClusterAssemblyBuildError(
             "physical normalized production requires one common unit-probe contract"
         )
-    unit_probe = _validate_unit_probe_receipt(
-        next(iter(unit_probe_receipts.values()))
-    )
+    unit_probe = next(iter(validated_unit_probe_contracts.values()))
 
     prototype_rows = {}
     prototype_ids = set()
@@ -2950,12 +2951,56 @@ class _NativeRuntimeOwnerGroups:
         return min(self._find(owner) for owner in owners)
 
 
+def _dense_int_attribute_values(attribute, count):
+    """Read one dense Blender integer attribute with an exact scalar fallback."""
+
+    values = array("i", [0]) * int(count)
+    foreach_get = getattr(getattr(attribute, "data", None), "foreach_get", None)
+    if callable(foreach_get):
+        try:
+            foreach_get("value", values)
+            return values
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            # Ordinary unit fakes and older Blender collection shims may expose
+            # an incomplete foreach_get.  Scalar access below is the existing
+            # exact behavior, not an alternate identity policy.
+            pass
+    return array(
+        "i",
+        (
+            int(attribute.data[index].value)
+            for index in range(int(count))
+        ),
+    )
+
+
+def _native_point_identity_arrays(obj):
+    ordinal_attribute = obj.data.attributes.get(
+        "speedtree_native_geometry_ordinal"
+    )
+    vertex_attribute = obj.data.attributes.get("speedtree_native_vertex_index")
+    if ordinal_attribute is None or vertex_attribute is None:
+        return None
+    vertex_count = len(obj.data.vertices)
+    return {
+        "geometry_ordinals": _dense_int_attribute_values(
+            ordinal_attribute,
+            vertex_count,
+        ),
+        "native_vertex_indices": _dense_int_attribute_values(
+            vertex_attribute,
+            vertex_count,
+        ),
+    }
+
+
 def _partition_components_by_native_runtime_owner(
     obj,
     components,
     receipt,
     *,
     receipt_index=None,
+    native_point_identity=None,
 ):
     """Split accidentally welded render components by exact runtime Node identity.
 
@@ -2978,11 +3023,9 @@ def _partition_components_by_native_runtime_owner(
     instead of rejected.
     """
 
-    ordinal_attribute = obj.data.attributes.get(
-        "speedtree_native_geometry_ordinal"
-    )
-    vertex_attribute = obj.data.attributes.get("speedtree_native_vertex_index")
-    if ordinal_attribute is None or vertex_attribute is None:
+    if native_point_identity is None:
+        native_point_identity = _native_point_identity_arrays(obj)
+    if native_point_identity is None:
         return list(components)
     if receipt_index is None:
         receipt_index = build_exact_native_receipt_index(receipt)
@@ -2991,11 +3034,20 @@ def _partition_components_by_native_runtime_owner(
             "native runtime owner index belongs to a different receipt"
         )
 
+    geometry_ordinals = native_point_identity["geometry_ordinals"]
+    native_vertex_indices = native_point_identity["native_vertex_indices"]
+    owner_lookup = {}
+
     def vertex_owners(vertex_index):
-        return receipt_index.owner_keys_at(
-            int(ordinal_attribute.data[int(vertex_index)].value),
-            int(vertex_attribute.data[int(vertex_index)].value),
-        )
+        vertex_index = int(vertex_index)
+        owners = owner_lookup.get(vertex_index)
+        if owners is None:
+            owners = receipt_index.owner_keys_at(
+                int(geometry_ordinals[vertex_index]),
+                int(native_vertex_indices[vertex_index]),
+            )
+            owner_lookup[vertex_index] = owners
+        return owners
 
     partitioned = []
     for component in components:
@@ -3132,6 +3184,18 @@ def _component_uv_face_counter(mesh, component):
     return Counter(faces)
 
 
+def _prototype_uv_face_counter(prototype):
+    """Return the immutable source-component counter, lazily for test fakes."""
+
+    key = "component_uv_face_counter"
+    if key not in prototype:
+        prototype[key] = _component_uv_face_counter(
+            prototype["object"].data,
+            prototype["component"],
+        )
+    return prototype[key]
+
+
 def _uv_vertex_candidates(obj, component):
     uv_layer = obj.data.uv_layers.active
     if uv_layer is None:
@@ -3244,6 +3308,18 @@ def _prepare_uv_correspondence(obj, component):
             for key, by_index in candidates.items()
         },
     }
+
+
+def _prototype_prepared_uv_correspondence(prototype):
+    """Return immutable source UV groups, lazily preparing legacy test fakes."""
+
+    key = "prepared_uv_correspondence"
+    if key not in prototype:
+        prototype[key] = _prepare_uv_correspondence(
+            prototype["object"],
+            prototype["component"],
+        )
+    return prototype[key]
 
 
 def _counter_subset(left, right):
@@ -3465,10 +3541,7 @@ def _normalized_prototype_for_component(prototypes, target_mesh, target_componen
         return None
     face_subset_candidates = []
     for prototype in prototypes.values():
-        source_faces = _component_uv_face_counter(
-            prototype["object"].data,
-            prototype["component"],
-        )
+        source_faces = _prototype_uv_face_counter(prototype)
         if source_faces is None or not _counter_subset(
             target_faces, source_faces
         ):
@@ -3485,10 +3558,7 @@ def _normalized_prototype_for_component(prototypes, target_mesh, target_componen
     # best-candidate rank; zero or multiple candidates remain unresolved.
     shared_face_identity_candidates = []
     for prototype in prototypes.values():
-        source_faces = _component_uv_face_counter(
-            prototype["object"].data,
-            prototype["component"],
-        )
+        source_faces = _prototype_uv_face_counter(prototype)
         if source_faces is None:
             continue
         shared_keys = set(source_faces).intersection(target_faces)
@@ -3511,13 +3581,26 @@ def _normalized_prototype_for_component(prototypes, target_mesh, target_componen
         or list(prototypes.values())
     )
     target_obj = SimpleNamespace(data=target_mesh)
+    target_prepared = None
+    target_prepared_ready = False
     for prototype in candidates_to_check:
         try:
+            source_prepared = _prototype_prepared_uv_correspondence(
+                prototype
+            )
+            if source_prepared is not None and not target_prepared_ready:
+                target_prepared = _prepare_uv_correspondence(
+                    target_obj,
+                    target_component,
+                )
+                target_prepared_ready = True
             _ordered_cross_object_correspondence(
                 prototype["object"],
                 prototype["component"],
                 target_obj,
                 target_component,
+                source_prepared=source_prepared,
+                target_prepared=target_prepared,
             )
         except (AttributeError, ClusterAssemblyBuildError):
             continue
@@ -3540,10 +3623,7 @@ def _normalized_prototype_match_diagnostics(
         return [{"reason": "target_has_no_active_uv"}]
     rows = []
     for signature, prototype in prototypes.items():
-        source_faces = _component_uv_face_counter(
-            prototype["object"].data,
-            prototype["component"],
-        )
+        source_faces = _prototype_uv_face_counter(prototype)
         if source_faces is None:
             rows.append({
                 "prototype_signature": signature,
@@ -3945,6 +4025,14 @@ def _import_normalized_plan_prototypes(bpy, contract):
             "object": source_obj,
             "component": component,
             "signature": signature,
+            "component_uv_face_counter": _component_uv_face_counter(
+                source_obj.data,
+                component,
+            ),
+            "prepared_uv_correspondence": _prepare_uv_correspondence(
+                source_obj,
+                component,
+            ),
         }
     if not prototypes:
         raise ClusterAssemblyBuildError(
@@ -4490,6 +4578,7 @@ def _exact_native_attachment_influences(
     context,
     skeleton_identity=None,
     native_receipt_index=None,
+    native_point_identity=None,
 ):
     """Read authored proxy weights captured inside Modeler's FBX serializer."""
 
@@ -4502,13 +4591,13 @@ def _exact_native_attachment_influences(
             raise ClusterAssemblyBuildError(
                 f"{context} attachment vertex is outside its target component"
             )
-    ordinal_attribute = obj.data.attributes.get(
-        "speedtree_native_geometry_ordinal"
-    )
-    vertex_attribute = obj.data.attributes.get("speedtree_native_vertex_index")
-    if ordinal_attribute is not None and vertex_attribute is not None:
+    if native_point_identity is None:
+        native_point_identity = _native_point_identity_arrays(obj)
+    if native_point_identity is not None:
+        geometry_ordinals = native_point_identity["geometry_ordinals"]
+        native_vertex_indices = native_point_identity["native_vertex_indices"]
         ordinals = {
-            int(ordinal_attribute.data[index].value)
+            int(geometry_ordinals[index])
             for index in vertices
         }
         if len(ordinals) != 1:
@@ -4517,7 +4606,7 @@ def _exact_native_attachment_influences(
             )
         geometry_ordinal = ordinals.pop()
         native_vertices = [
-            int(vertex_attribute.data[index].value)
+            int(native_vertex_indices[index])
             for index in (
                 [target_attachment_vertex]
                 if target_attachment_vertex is not None
@@ -5935,7 +6024,7 @@ def build_blender_assembly_inputs(
     exact_attachment_binding_count = 0
     exact_fbx_attachment_binding_count = 0
     native_clipped_origin_attachment_binding_count = 0
-    source_correspondence_cache = {}
+    native_point_identity_cache = {}
     base_obj = None
     base_armature = None
     scene_units = bpy.context.scene.unit_settings
@@ -5987,6 +6076,14 @@ def build_blender_assembly_inputs(
             role_row = roles[provider_key]
             role = role_row["role"]
             target_object = role_targets[provider_key]
+            target_mesh_identity = _mesh_runtime_identity(target_object.data)
+            if target_mesh_identity not in native_point_identity_cache:
+                native_point_identity_cache[
+                    target_mesh_identity
+                ] = _native_point_identity_arrays(target_object)
+            native_point_identity = native_point_identity_cache[
+                target_mesh_identity
+            ]
             normalized_contract = role_row.get("normalized_variants")
             if not normalized_contract:
                 raise ClusterAssemblyBuildError(
@@ -6017,6 +6114,7 @@ def build_blender_assembly_inputs(
                 components,
                 native_receipt,
                 receipt_index=native_receipt_index,
+                native_point_identity=native_point_identity,
             )
             matched, preserved = _partition_normalized_render_components(
                 prototypes,
@@ -6035,6 +6133,7 @@ def build_blender_assembly_inputs(
                 "target_object": target_object,
                 "matched": matched,
                 "preserved": preserved,
+                "native_point_identity": native_point_identity,
                 "speculative_provider_expansion": (
                     role_row.get("speculative_provider_expansion") is True
                 ),
@@ -6155,22 +6254,9 @@ def build_blender_assembly_inputs(
                     composite_parts = list(
                         variant.get("composite_parts") or []
                     )
-                    source_correspondence_key = (
-                        id(source_obj.data),
-                        tuple(source_component["polygons"]),
+                    source_prepared = (
+                        _prototype_prepared_uv_correspondence(prototype)
                     )
-                    if source_correspondence_key not in (
-                        source_correspondence_cache
-                    ):
-                        source_correspondence_cache[
-                            source_correspondence_key
-                        ] = _prepare_uv_correspondence(
-                            source_obj,
-                            source_component,
-                        )
-                    source_prepared = source_correspondence_cache[
-                        source_correspondence_key
-                    ]
                     authored_line = _exact_normalized_authored_line(
                         normalized_contract,
                         variant,
@@ -6284,6 +6370,9 @@ def build_blender_assembly_inputs(
                                 ),
                                 skeleton_identity=native_skeleton_identity,
                                 native_receipt_index=native_receipt_index,
+                                native_point_identity=role_build_plans[
+                                    provider_key
+                                ]["native_point_identity"],
                             )
                         )
                         source_attachment = tuple(
@@ -8668,6 +8757,21 @@ def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
     return result
 
 
+def _clear_post_finish_native_reference_collections(*collections):
+    """Drop Python owners of native Assembly inputs after Finish completes.
+
+    ``AddAssemblyParts`` has consumed these arrays by the time
+    ``FinishAssemblyBuild`` returns.  Keeping their Python wrappers alive while
+    material normalization, wind import, and provenance validation run can
+    unnecessarily overlap the completed builder's large input graph with the
+    finished Assembly.  This helper deliberately accepts only temporary
+    containers; report/manifest data is never passed to it.
+    """
+    for collection in collections:
+        if collection is not None:
+            collection.clear()
+
+
 def _build_unreal_nanite_assembly_synchronous(unreal, manifest, asset_contract):
     """Build and save the separate UE 5.8 Assembly from imported inputs.
 
@@ -8788,6 +8892,14 @@ def _build_unreal_nanite_assembly_synchronous(unreal, manifest, asset_contract):
         builder,
     )
     built_parts = []
+    bindings = []
+    native_influences = []
+    influences = []
+    native_influence = None
+    binding = None
+    influence = None
+    row = None
+    part = None
     for part in manifest.get("parts") or []:
         bindings = []
         for row in part.get("bindings") or []:
@@ -8847,10 +8959,55 @@ def _build_unreal_nanite_assembly_synchronous(unreal, manifest, asset_contract):
                 "bindings": len(bindings),
             }
         )
-    finish = builder.finish_assembly_build()
-    success, assembly = _unwrap_struct_result(finish, unreal.SkeletalMesh)
+    # Copy every scalar needed by the result before releasing native input
+    # wrappers.  The final Assembly and its Skeleton remain live; only the
+    # completed builder, source-mesh wrapper map, and binding construction
+    # temporaries are released here.
+    final_skeleton_bone_count = len(actual_bones)
+    base_weighted_bone_count = len(base_weighted_bones)
+    binding_count = sum(row["bindings"] for row in built_parts)
+    finish = None
+    success = False
+    assembly = None
+    finish_failure = None
+    try:
+        finish = builder.finish_assembly_build()
+        success, assembly = _unwrap_struct_result(finish, unreal.SkeletalMesh)
+        if not success or assembly is None:
+            finish_failure = repr(finish)
+    finally:
+        # ``finish_assembly_build`` is the ownership boundary.  Clear all
+        # Python-side owners even when native finish raises so a failed item
+        # does not retain its multi-gigabyte source graph until process exit.
+        builder = None
+        finish = None
+        _clear_post_finish_native_reference_collections(
+            part_assets,
+            bindings,
+            native_influences,
+            actual_bone_indices,
+            unreal_bone_name_map,
+            skeleton_by_name,
+            authored_bones,
+        )
+        full = None
+        base = None
+        base_skeleton = None
+        parameters = None
+        expected_bones = None
+        actual_bones = None
+        base_contract = None
+        base_weighted_bones = None
+        influences = None
+        native_influence = None
+        binding = None
+        influence = None
+        row = None
+        part = None
     if not success or assembly is None:
-        raise ClusterAssemblyBuildError(f"FinishAssemblyBuild failed: {finish!r}")
+        raise ClusterAssemblyBuildError(
+            f"FinishAssemblyBuild failed: {finish_failure}"
+        )
     _validate_final_assembly_preserve_area(
         unreal,
         assembly,
@@ -8933,14 +9090,13 @@ def _build_unreal_nanite_assembly_synchronous(unreal, manifest, asset_contract):
             "Assembly provenance could not be attached: "
             + str(provenance.get("error") or provenance)
         )
-    unreal.EditorAssetLibrary.save_loaded_asset(assembly, only_if_is_dirty=False)
     return {
         "status": "ok",
         "full_skeletal_mesh": paths["full_skeletal_mesh"],
         "full_skeletal_mesh_preserved": True,
         "assembly": assembly.get_path_name(),
         "final_skeleton": full_skeleton.get_path_name(),
-        "final_skeleton_bones": len(actual_bones),
+        "final_skeleton_bones": final_skeleton_bone_count,
         "manifest_skeleton_diagnostic": skeleton_snapshot_diagnostic,
         "unreal_bone_name_map": unreal_bone_name_map_diagnostic,
         "native_binding_contract": {
@@ -8950,8 +9106,8 @@ def _build_unreal_nanite_assembly_synchronous(unreal, manifest, asset_contract):
         },
         "production_skeleton_required": False,
         "parts": built_parts,
-        "binding_count": sum(row["bindings"] for row in built_parts),
-        "base_weighted_bone_count": len(base_weighted_bones),
+        "binding_count": binding_count,
+        "base_weighted_bone_count": base_weighted_bone_count,
         "base_weight_manifest_diagnostic": base_weight_manifest_diagnostic,
         "base_weights_in_final_wind": True,
         "final_nanite_shape_preservation": final_nanite_shape_preservation,

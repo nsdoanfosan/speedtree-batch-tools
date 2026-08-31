@@ -10,6 +10,7 @@ per-poly collision, and ray-tracing geometry while enforcing Nanite Voxelize.
 from __future__ import annotations
 
 import gc
+import hashlib
 import importlib.util
 import json
 import os
@@ -41,6 +42,8 @@ from nanite_assembly_materials import (  # noqa: E402
 
 
 SCHEMA_VERSION = 1
+SUPPORTED_MANIFEST_SCHEMA_VERSIONS = {1, 2}
+EXTERNAL_ITEM_STORAGE_SCHEMA_VERSION = 1
 TERMINAL_STATES = {"imported_ok", "data_error", "manual_required", "not_run"}
 _SEND2UE_UNREAL_MODULES = {}
 PLACEHOLDER_SKELETON_NAME = "SK_PlaceholderCube_Skeleton"
@@ -48,6 +51,7 @@ FINAL_SKELETON_HASH_METADATA = (
     "SKBatchFinalSkeletonBoneNameIndexParentSha1"
 )
 FINAL_SKELETON_BONE_COUNT_METADATA = "SKBatchFinalSkeletonBoneCount"
+DURABLE_SAVE_SCHEMA_VERSION = 1
 
 
 def _now():
@@ -57,6 +61,19 @@ def _now():
 def _is_headless_manifest_runtime():
     """Return whether this module is running as the batch commandlet script."""
     return bool(os.environ.get("SK_BATCH_MANIFEST_PATH"))
+
+
+def _is_null_rhi_runtime():
+    """Return whether Unreal was intentionally started without a renderer."""
+    system_library = getattr(unreal, "SystemLibrary", None)
+    get_command_line = getattr(system_library, "get_command_line", None)
+    parse_param = getattr(system_library, "parse_param", None)
+    if not callable(get_command_line) or not callable(parse_param):
+        return False
+    try:
+        return bool(parse_param(str(get_command_line()), "nullrhi"))
+    except Exception:
+        return False
 
 
 def _defer_headless_runtime_validation(assembly, recovered_from_pending=False):
@@ -78,11 +95,200 @@ def _defer_headless_runtime_validation(assembly, recovered_from_pending=False):
     return assembly
 
 
+def _validate_null_rhi_dynamic_wind_runtime(mesh_path):
+    """Fail closed on CPU/runtime setup while deferring renderer-only residency."""
+    begin = _begin_instanced_dynamic_wind_runtime(mesh_path)
+    token = begin.get("probe_token")
+    checks = {}
+    validation_error = None
+    try:
+        validation = begin.get("validation")
+        if not isinstance(validation, dict):
+            raise RuntimeError("NullRHI DynamicWind validation payload is not an object")
+        checks = {
+            "begin_success": begin.get("success") is True,
+            "begin_pending": begin.get("status") == "pending",
+            "probe_token_present": bool(token),
+            "begin_cpu_runtime_contract": begin.get("begin_cpu_runtime_contract") is True,
+            "crud_add": begin.get("crud_add") is True,
+            "crud_update": begin.get("crud_update") is True,
+            "crud_read_back": begin.get("crud_read_back") is True,
+            "crud_remove": begin.get("crud_remove") is True,
+            "crud_readd": begin.get("crud_readd") is True,
+            "owner_actor_is_transient": begin.get("owner_actor_is_transient") is True,
+            "persistent_level_dirty_state_preserved": (
+                begin.get("persistent_level_dirty_state_preserved") is True
+            ),
+            "subsystem_exists": validation.get("subsystem_exists") is True,
+            "subsystem_provider_ready": validation.get("subsystem_provider_ready") is True,
+            "mesh_skeleton_identity_matches": (
+                validation.get("mesh_skeleton_identity_matches") is True
+            ),
+            "reference_bone_counts_match": (
+                isinstance(validation.get("ref_bones"), int)
+                and validation.get("ref_bones") > 0
+                and validation.get("ref_bones") == validation.get("skeleton_ref_bones")
+            ),
+            "skeleton_bind_pose_matches": (
+                validation.get("skeleton_bind_pose_mismatch") is False
+            ),
+            "wind_bones_valid": (
+                isinstance(validation.get("wind_bones"), int)
+                and validation.get("wind_bones") > 0
+                and validation.get("invalid_wind_bones") == 0
+            ),
+            "skeletal_data_ready": validation.get("skeletal_data_ready") is True,
+            "component_mesh_matches": validation.get("component_mesh_matches") is True,
+            "component_instance_created": validation.get("component_instances") == 1,
+            "component_registered": validation.get("component_registered") is True,
+            "component_visible": validation.get("component_visible") is True,
+            "component_enabled": validation.get("component_enabled") is True,
+            "mesh_not_compiling": validation.get("mesh_compiling") is False,
+            "provider_not_compiling": validation.get("provider_compiling") is False,
+            "provider_is_dynamic_wind_data": (
+                validation.get("provider_is_dynamic_wind_data") is True
+            ),
+        }
+        failed = sorted(name for name, passed in checks.items() if not passed)
+        if failed:
+            raise RuntimeError(
+                "NullRHI DynamicWind CPU/static contract failed: "
+                + ", ".join(failed)
+            )
+    except Exception as exc:
+        validation_error = exc
+    cleanup = _best_effort_cancel_instanced_dynamic_wind_runtime(token)
+    if validation_error is not None:
+        if not cleanup.get("cleanup_confirmed"):
+            raise RuntimeError(
+                f"{validation_error}; NullRHI DynamicWind probe cleanup also failed"
+            ) from validation_error
+        raise validation_error
+    if not cleanup.get("cleanup_confirmed"):
+        raise RuntimeError("NullRHI DynamicWind CPU/static probe cleanup failed")
+    return {
+        "success": True,
+        "status": "null_rhi_cpu_static_passed_render_deferred",
+        "render_frame_validation_performed": False,
+        "render_frame_validation_deferred": True,
+        "reason": (
+            "Unreal was intentionally started with -NullRHI, so no scene proxy "
+            "or render-thread frame can exist"
+        ),
+        "cpu_static_checks": checks,
+        "begin": begin,
+        "cleanup": cleanup,
+    }
+
+
+def _validate_null_rhi_assembly_static_contract(assembly):
+    """Re-assert every non-render Assembly contract before accepting NullRHI."""
+    build = assembly.get("build") or {}
+    skeleton = build.get("manifest_skeleton_diagnostic") or {}
+    bone_map = build.get("unreal_bone_name_map") or {}
+    binding = build.get("native_binding_contract") or {}
+    preserve = build.get("final_nanite_shape_preservation") or {}
+    completion = build.get("bounds_completion") or {}
+    wind = build.get("dynamic_wind") or {}
+    provenance = build.get("provenance") or {}
+    material_normalization = build.get("material_normalization") or {}
+    materials = assembly.get("materials") or {}
+    parts = build.get("parts") or []
+    assembly_path = str(build.get("assembly") or "").split(".")[0]
+    save_writability = assembly.get("save_writability") or []
+    checks = {
+        "build_status": build.get("status") == "ok",
+        "full_skeletal_mesh_preserved": build.get("full_skeletal_mesh_preserved") is True,
+        "skeleton_current_authority": (
+            skeleton.get("current_unreal_skeleton_is_authoritative") is True
+            and isinstance(skeleton.get("actual_bone_count"), int)
+            and skeleton.get("actual_bone_count") > 0
+        ),
+        "bone_map_exact_without_approximation": (
+            str(bone_map.get("status") or "").startswith("exact")
+            and bone_map.get("approximation_used") is False
+        ),
+        "native_binding_exact": (
+            binding.get("construction") == "direct_exact_reference_skeleton_indices"
+            and binding.get("all_authored_influences_preserved") is True
+            and binding.get("weights_sum_to_one") is True
+            and isinstance(build.get("binding_count"), int)
+            and build.get("binding_count") > 0
+        ),
+        "base_weights_in_final_wind": (
+            build.get("base_weights_in_final_wind") is True
+        ),
+        "final_preserve_area": (
+            preserve.get("policy") == "preserve_area"
+            and preserve.get("applied_before_finish") is True
+            and preserve.get("base_and_parts_unchanged") is True
+            and preserve.get("preserved_through_finish") is True
+        ),
+        "assembly_bounds_complete": completion.get("status") == "complete",
+        "dynamic_wind_exact": (
+            wind.get("success") is True
+            and isinstance(build.get("final_skeleton_bones"), int)
+            and build.get("final_skeleton_bones") > 0
+            and skeleton.get("actual_bone_count") == build.get("final_skeleton_bones")
+            and wind.get("declared_bones") == build.get("final_skeleton_bones")
+            and wind.get("final_bones") == build.get("final_skeleton_bones")
+            and wind.get("skeleton_asset_ref_bones") == build.get("final_skeleton_bones")
+            and wind.get("skeleton_asset_matches_final_mesh") is True
+            and wind.get("skeleton_bind_pose_matches") is True
+            and wind.get("missing_current_joints") == 0
+            and wind.get("remapped_joint_records") == 0
+            and wind.get("bone_group_mapping_matches_json") is True
+        ),
+        "provenance_counts_exact": (
+            provenance.get("success") is True
+            and provenance.get("part_count") == len(parts)
+            and provenance.get("instance_count") == build.get("binding_count")
+        ),
+        "material_normalization_exact": (
+            (material_normalization.get("assembly_section_audit") or {}).get("status")
+            == "ok"
+            and len(material_normalization.get("part_section_audits") or [])
+            == len(parts)
+            and all(
+                audit.get("status") == "ok"
+                for audit in material_normalization.get("part_section_audits") or []
+            )
+        ),
+        "final_material_sections_exact": (
+            (materials.get("section_material_validation") or {}).get("status") == "ok"
+            and bool(materials.get("slots"))
+            and all(slot.get("material") for slot in materials.get("slots") or [])
+        ),
+        "assembly_writable": any(
+            str(row.get("asset") or "").split(".")[0] == assembly_path
+            and row.get("status") in {"writable", "new_package"}
+            for row in save_writability
+        ),
+        "thumbnail_free_save_completed": (
+            (assembly.get("thumbnail_free_save") or {}).get("status") == "ok"
+            and (assembly.get("thumbnail_free_save") or {}).get("asset") == assembly_path
+        ),
+    }
+    failed = sorted(name for name, passed in checks.items() if not passed)
+    if failed:
+        raise RuntimeError(
+            "NullRHI Assembly static contract failed: " + ", ".join(failed)
+        )
+    return checks
+
+
 def _prepare_assembly_runtime_validation(assembly):
     if assembly.get("status") != "ready_for_runtime":
         return "imported_ok"
     if _is_headless_manifest_runtime():
         _defer_headless_runtime_validation(assembly)
+        return "imported_ok"
+    if _is_null_rhi_runtime():
+        assembly_path = (assembly.get("build") or {}).get("assembly")
+        assembly_static_checks = _validate_null_rhi_assembly_static_contract(assembly)
+        assembly["runtime"] = _validate_null_rhi_dynamic_wind_runtime(assembly_path)
+        assembly["runtime"]["assembly_static_checks"] = assembly_static_checks
+        assembly["status"] = "ok"
         return "imported_ok"
     assembly_path = (assembly.get("build") or {}).get("assembly")
     runtime = _begin_instanced_dynamic_wind_runtime(assembly_path)
@@ -91,12 +297,16 @@ def _prepare_assembly_runtime_validation(assembly):
     return "runtime_pending"
 
 
-def _atomic_write_json(path, data):
+def _atomic_write_json(path, data, *, compact=False):
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
     temporary.write_text(
-        json.dumps(data, indent=2, ensure_ascii=False),
+        json.dumps(
+            data,
+            ensure_ascii=False,
+            **({"separators": (",", ":")} if compact else {"indent": 2}),
+        ),
         encoding="utf-8",
     )
     os.replace(temporary, target)
@@ -108,6 +318,121 @@ def _load_json(path, default=None):
     except (OSError, ValueError):
         return {} if default is None else default
     return value
+
+
+def _manifest_item_refs(manifest):
+    schema_version = manifest.get("schema_version")
+    if schema_version not in SUPPORTED_MANIFEST_SCHEMA_VERSIONS:
+        raise RuntimeError(
+            f"unsupported SK Batch manifest schema: {schema_version}"
+        )
+    items = manifest.get("items") or []
+    if not isinstance(items, list) or not all(
+        isinstance(item, dict) for item in items
+    ):
+        raise RuntimeError("SK Batch manifest items must be JSON objects")
+    if schema_version == 2:
+        storage = manifest.get("item_storage") or {}
+        expected = {
+            "kind": "external_json",
+            "schema_version": EXTERNAL_ITEM_STORAGE_SCHEMA_VERSION,
+            "integrity": "sha256",
+        }
+        if any(storage.get(key) != value for key, value in expected.items()):
+            raise RuntimeError("unsupported SK Batch external item storage contract")
+        if not str(storage.get("base_relpath") or ""):
+            raise RuntimeError("external item storage has no base path")
+        required = {
+            "schema_version",
+            "queue_id",
+            "fingerprint",
+            "payload_relpath",
+            "payload_size",
+            "payload_sha256",
+        }
+        for item in items:
+            missing = sorted(required - set(item))
+            if missing:
+                raise RuntimeError(
+                    "external manifest item is missing fields: "
+                    + ", ".join(missing)
+                )
+            if item.get("schema_version") != 1:
+                raise RuntimeError("external manifest item index schema is incompatible")
+    return items
+
+
+def _item_reference_projection(item):
+    return {
+        "queue_id": str(item.get("queue_id") or ""),
+        "fingerprint": str(item.get("fingerprint") or ""),
+        "depends_on_queue_ids": [
+            str(value) for value in item.get("depends_on_queue_ids") or []
+        ],
+        "report_path": item.get("report_path"),
+        "checkout_asset_paths": list(item.get("checkout_asset_paths") or []),
+    }
+
+
+def _load_manifest_item(manifest_path, manifest, item_ref):
+    if manifest.get("schema_version") == 1:
+        return item_ref
+
+    manifest_dir = Path(manifest_path).resolve().parent
+    storage = manifest.get("item_storage") or {}
+    base_relpath = Path(str(storage.get("base_relpath") or ""))
+    payload_relpath = Path(str(item_ref.get("payload_relpath") or ""))
+    if base_relpath.is_absolute() or payload_relpath.is_absolute():
+        raise RuntimeError("external manifest item paths must be relative")
+    base_path = (manifest_dir / base_relpath).resolve()
+    payload_path = (manifest_dir / payload_relpath).resolve()
+    try:
+        base_path.relative_to(manifest_dir)
+    except ValueError as exc:
+        raise RuntimeError(
+            "external manifest item storage directory escapes its manifest directory"
+        ) from exc
+    try:
+        payload_path.relative_to(base_path)
+    except ValueError as exc:
+        raise RuntimeError(
+            "external manifest item path escapes its storage directory"
+        ) from exc
+
+    try:
+        payload_bytes = payload_path.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(
+            f"external manifest item could not be read: {payload_path}: {exc}"
+        ) from exc
+    expected_size = item_ref.get("payload_size")
+    if type(expected_size) is not int or expected_size < 0:
+        raise RuntimeError("external manifest item payload size is invalid")
+    if len(payload_bytes) != expected_size:
+        raise RuntimeError(
+            f"external manifest item size mismatch: {payload_path}"
+        )
+    expected_sha256 = str(item_ref.get("payload_sha256") or "").casefold()
+    actual_sha256 = hashlib.sha256(payload_bytes).hexdigest()
+    if expected_sha256 != actual_sha256:
+        raise RuntimeError(
+            f"external manifest item SHA-256 mismatch: {payload_path}"
+        )
+    try:
+        item = json.loads(payload_bytes)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"external manifest item is invalid JSON: {payload_path}: {exc}"
+        ) from exc
+    if not isinstance(item, dict) or item.get("schema_version") != 1:
+        raise RuntimeError(
+            f"external manifest item schema is incompatible: {payload_path}"
+        )
+    if _item_reference_projection(item) != _item_reference_projection(item_ref):
+        raise RuntimeError(
+            f"external manifest item identity differs from its index: {payload_path}"
+        )
+    return item
 
 
 def _load_send2ue_unreal(file_path):
@@ -1468,13 +1793,13 @@ def _finish_pending_asset_compilation_for_publish():
     except Exception as exc:
         commands.append(f"compile-finish unavailable: {exc}")
 
-    collector = getattr(
-        getattr(unreal, "SystemLibrary", None),
-        "collect_garbage",
-        None,
-    )
+    collector = getattr(unreal, "collect_garbage", None)
     if not callable(collector):
-        collector = getattr(unreal, "collect_garbage", None)
+        collector = getattr(
+            getattr(unreal, "SystemLibrary", None),
+            "collect_garbage",
+            None,
+        )
     if callable(collector):
         try:
             collector()
@@ -1482,6 +1807,119 @@ def _finish_pending_asset_compilation_for_publish():
         except Exception as exc:
             commands.append(f"collect-garbage unavailable: {exc}")
     return commands
+
+
+@contextmanager
+def _bounded_item_skinned_asset_compilation():
+    """Serialize skeletal builds for one item and release them before return.
+
+    UE estimates each large vegetation skeletal build at 4-4.5 GiB.  With the
+    editor default enabled, FBX import, material normalization, Nanite base,
+    and final Assembly rebuilds can overlap in the same RPC session even when
+    the Python calls are sequential.  Keep the setting disabled for the whole
+    item, rather than only the final Assembly builder, and drain all compilers
+    before restoring the user's editor setting.
+    """
+    report = {
+        "cvar": "Editor.AsyncSkinnedAssetCompilation",
+        "available": False,
+        "previous": None,
+        "during_item": None,
+        "finish_commands": [],
+    }
+    system_library = getattr(unreal, "SystemLibrary", None)
+    if system_library is None:
+        # Unit-test stubs do not expose the editor runtime.  A real Unreal
+        # runtime always has SystemLibrary, so missing methods below are an
+        # unsafe engine/API mismatch rather than an optional optimization.
+        yield report
+        return
+
+    get_int = getattr(system_library, "get_console_variable_int_value", None)
+    execute = getattr(system_library, "execute_console_command", None)
+    if not callable(get_int) or not callable(execute):
+        raise RuntimeError(
+            "Unreal SystemLibrary cannot control synchronous asset compilation"
+        )
+
+    previous = None
+    active_error = None
+    cleanup_errors = []
+    try:
+        previous = int(get_int(report["cvar"]))
+        report.update({"available": True, "previous": previous})
+        execute(None, "Editor.AsyncSkinnedAssetCompilationFinishAll")
+        report["finish_commands"].append(
+            "Editor.AsyncSkinnedAssetCompilationFinishAll"
+        )
+        if previous != 0:
+            execute(None, f'{report["cvar"]} 0')
+        report["during_item"] = int(get_int(report["cvar"]))
+        if report["during_item"] != 0:
+            raise RuntimeError(
+                "Editor.AsyncSkinnedAssetCompilation did not enter synchronous mode"
+            )
+        yield report
+    except BaseException as exc:
+        active_error = exc
+        raise
+    finally:
+        for command in (
+            "Editor.AsyncSkinnedAssetCompilationFinishAll",
+            "Editor.AsyncAssetCompilationFinishAll",
+        ):
+            try:
+                execute(None, command)
+                report["finish_commands"].append(command)
+            except Exception as exc:
+                cleanup_errors.append(f"{command}: {exc}")
+        if previous is not None:
+            try:
+                if previous != 0:
+                    execute(None, f'{report["cvar"]} {previous}')
+                report["restored"] = int(get_int(report["cvar"]))
+                if report["restored"] != previous:
+                    cleanup_errors.append(
+                        f'{report["cvar"]} restored to '
+                        f'{report["restored"]}, expected {previous}'
+                    )
+            except Exception as exc:
+                cleanup_errors.append(f"restore {report['cvar']}: {exc}")
+        if cleanup_errors:
+            report["cleanup_errors"] = cleanup_errors
+            if active_error is None:
+                raise RuntimeError("; ".join(cleanup_errors))
+
+
+def _release_item_unreal_resources():
+    """Release Python and Unreal objects after item-local compilers drained."""
+    report = {
+        "python_gc": False,
+        "immediate_unreal_gc": False,
+        "scheduled_unreal_gc": False,
+    }
+    system_library = getattr(unreal, "SystemLibrary", None)
+    gc.collect()
+    report["python_gc"] = True
+    immediate_collector = getattr(unreal, "collect_garbage", None)
+    if callable(immediate_collector):
+        try:
+            immediate_collector()
+            report["immediate_unreal_gc"] = True
+        except Exception as exc:
+            report.setdefault("warnings", []).append(
+                f"unreal.collect_garbage: {exc}"
+            )
+    scheduled_collector = getattr(system_library, "collect_garbage", None)
+    if not callable(immediate_collector) and callable(scheduled_collector):
+        try:
+            scheduled_collector()
+            report["scheduled_unreal_gc"] = True
+        except Exception as exc:
+            report.setdefault("warnings", []).append(
+                f"SystemLibrary.collect_garbage: {exc}"
+            )
+    return report
 
 
 def _publish_move_observation(asset, source_path, target_path):
@@ -1960,7 +2398,231 @@ def _apply_dynamic_wind(item):
     }
 
 
-def _save_final_skeleton_contract_assets(full_mesh):
+def _normalize_durable_package(asset_path):
+    package = _normalized_unreal_asset_path(asset_path).replace("\\", "/")
+    if not package.casefold().startswith("/game/"):
+        raise RuntimeError(f"durable save package is outside /Game: {package}")
+    return package
+
+
+def _durable_package_file(asset_path):
+    package = _normalize_durable_package(asset_path)
+    paths = getattr(unreal, "Paths", None)
+    project_content_dir = getattr(paths, "project_content_dir", None)
+    convert_to_full = getattr(paths, "convert_relative_path_to_full", None)
+    if not callable(project_content_dir):
+        raise RuntimeError(
+            "cannot resolve durable save package filename through Unreal Paths: "
+            + package
+        )
+    content_dir = project_content_dir()
+    if callable(convert_to_full):
+        content_dir = convert_to_full(content_dir)
+    return Path(str(content_dir)).joinpath(
+        *package[len("/Game/") :].split("/")
+    ).with_suffix(".uasset")
+
+
+def _new_durable_save_ledger():
+    return {
+        "schema_version": DURABLE_SAVE_SCHEMA_VERSION,
+        "records": [],
+    }
+
+
+def _durable_save_records(ledger):
+    if not isinstance(ledger, dict):
+        raise RuntimeError("durable save ledger is missing")
+    if ledger.get("schema_version") != DURABLE_SAVE_SCHEMA_VERSION:
+        raise RuntimeError(
+            "durable save ledger schema mismatch: "
+            f"expected={DURABLE_SAVE_SCHEMA_VERSION}, "
+            f"actual={ledger.get('schema_version')!r}"
+        )
+    records = ledger.get("records")
+    if not isinstance(records, list):
+        raise RuntimeError("durable save ledger records are malformed")
+    return records
+
+
+def _find_durable_save(ledger, asset_path):
+    key = _normalize_durable_package(asset_path).casefold()
+    matches = [
+        record
+        for record in _durable_save_records(ledger)
+        if str(record.get("package") or "").casefold() == key
+    ]
+    if len(matches) > 1:
+        raise RuntimeError(
+            "durable save ledger has duplicate package ownership: "
+            + _normalize_durable_package(asset_path)
+        )
+    return matches[0] if matches else None
+
+
+def _dirty_content_packages():
+    utilities = getattr(unreal, "EditorLoadingAndSavingUtils", None)
+    get_dirty = getattr(utilities, "get_dirty_content_packages", None)
+    if not callable(get_dirty):
+        raise RuntimeError("Unreal dirty-content package query is unavailable")
+    result = {}
+    for package in get_dirty() or []:
+        getter = getattr(package, "get_path_name", None)
+        value = getter() if callable(getter) else package
+        path = _normalized_unreal_asset_path(value).replace("\\", "/")
+        if path.casefold().startswith("/game/"):
+            result[path.casefold()] = path
+    return result
+
+
+def _assert_durable_save_unowned(ledger, asset_path, owner):
+    existing = _find_durable_save(ledger, asset_path)
+    if existing is not None:
+        raise RuntimeError(
+            "durable save package already has an owner: "
+            f"package={existing.get('package')}, "
+            f"owner={existing.get('owner')}, requested_owner={owner}"
+        )
+
+
+def _record_durable_save(ledger, asset_path, *, owner, role, save_mode):
+    package = _normalize_durable_package(asset_path)
+    _assert_durable_save_unowned(ledger, package, owner)
+    if package.casefold() in _dirty_content_packages():
+        raise RuntimeError(
+            f"durable save left its package dirty: owner={owner}, package={package}"
+        )
+    package_file = _durable_package_file(package)
+    if not package_file.is_file():
+        raise RuntimeError(
+            f"durable save did not create a package file: {package_file}"
+        )
+    stat_result = package_file.stat()
+    if stat_result.st_size <= 0:
+        raise RuntimeError(f"durable save created an empty package: {package_file}")
+    record = {
+        "sequence": len(_durable_save_records(ledger)),
+        "package": package,
+        "asset": package,
+        "owner": str(owner),
+        "role": str(role),
+        "save_mode": str(save_mode),
+        "saved": True,
+        "dirty_after_save": False,
+        "package_file": str(package_file),
+        "size": int(stat_result.st_size),
+        "mtime_ns": int(stat_result.st_mtime_ns),
+    }
+    _durable_save_records(ledger).append(record)
+    return record
+
+
+def _require_durable_save(
+    ledger,
+    asset_path,
+    *,
+    owner=None,
+    role=None,
+    save_mode=None,
+):
+    package = _normalize_durable_package(asset_path)
+    record = _find_durable_save(ledger, package)
+    if record is None:
+        raise RuntimeError(f"durable save receipt is missing: {package}")
+    expected = {
+        "owner": owner,
+        "role": role,
+        "save_mode": save_mode,
+    }
+    mismatches = {
+        field: {"expected": value, "actual": record.get(field)}
+        for field, value in expected.items()
+        if value is not None and record.get(field) != value
+    }
+    if mismatches:
+        raise RuntimeError(
+            f"durable save ownership mismatch: package={package}, "
+            f"mismatches={mismatches}"
+        )
+    if record.get("saved") is not True or record.get("dirty_after_save") is not False:
+        raise RuntimeError(f"durable save receipt is incomplete: {package}")
+    if package.casefold() in _dirty_content_packages():
+        raise RuntimeError(f"owned durable package became dirty: {package}")
+
+    expected_file = _durable_package_file(package)
+    recorded_file = Path(str(record.get("package_file") or ""))
+    expected_key = os.path.normcase(os.path.abspath(str(expected_file)))
+    recorded_key = os.path.normcase(os.path.abspath(str(recorded_file)))
+    if expected_key != recorded_key:
+        raise RuntimeError(
+            "durable save package filename changed: "
+            f"package={package}, expected={expected_file}, recorded={recorded_file}"
+        )
+    if not expected_file.is_file():
+        raise RuntimeError(f"durable save package file disappeared: {expected_file}")
+    stat_result = expected_file.stat()
+    if (
+        stat_result.st_size <= 0
+        or int(stat_result.st_size) != record.get("size")
+        or int(stat_result.st_mtime_ns) != record.get("mtime_ns")
+    ):
+        raise RuntimeError(
+            "durable save package changed after ownership was recorded: "
+            f"package={package}, expected_size={record.get('size')}, "
+            f"actual_size={stat_result.st_size}, "
+            f"expected_mtime_ns={record.get('mtime_ns')}, "
+            f"actual_mtime_ns={stat_result.st_mtime_ns}"
+        )
+    return record
+
+
+def _validate_durable_save_ledger(ledger):
+    records = _durable_save_records(ledger)
+    for sequence, record in enumerate(records):
+        if record.get("sequence") != sequence:
+            raise RuntimeError(
+                "durable save ledger sequence changed: "
+                f"expected={sequence}, actual={record.get('sequence')!r}"
+            )
+        _require_durable_save(ledger, record.get("package"))
+    return True
+
+
+def _durable_save_report(ledger):
+    _validate_durable_save_ledger(ledger)
+    return deepcopy(ledger)
+
+
+def _save_asset_owned(
+    asset_path,
+    durable_saves,
+    *,
+    owner,
+    role,
+    save_mode="editor_asset",
+):
+    package = _normalize_durable_package(asset_path)
+    _validate_durable_save_ledger(durable_saves)
+    _assert_durable_save_unowned(durable_saves, package, owner)
+    if not unreal.EditorAssetLibrary.save_asset(
+        package,
+        only_if_is_dirty=False,
+    ):
+        raise RuntimeError(
+            f"failed to persist owned asset: owner={owner}, package={package}"
+        )
+    record = _record_durable_save(
+        durable_saves,
+        package,
+        owner=owner,
+        role=role,
+        save_mode=save_mode,
+    )
+    _validate_durable_save_ledger(durable_saves)
+    return record
+
+
+def _save_final_skeleton_contract_assets(full_mesh, *, durable_saves):
     """Persist the Full mesh, generated USkeleton, and imported wind together.
 
     Send2UE creates the dedicated Skeleton as a separate package. Saving only the
@@ -1980,22 +2642,114 @@ def _save_final_skeleton_contract_assets(full_mesh):
         )
     # Save the referenced dependency first, then the referring mesh package.
     asset_paths = [skeleton.get_path_name(), full_mesh.get_path_name()]
-    saved = []
-    for object_path in asset_paths:
-        asset_path = str(object_path).split(".")[0]
-        if not unreal.EditorAssetLibrary.save_asset(
-            asset_path,
-            only_if_is_dirty=False,
-        ):
-            raise RuntimeError(
-                f"failed to persist final Skeleton contract asset: {asset_path}"
-            )
-        saved.append(asset_path)
+    saved = [str(object_path).split(".")[0] for object_path in asset_paths]
+    _save_asset_owned(
+        saved[0],
+        durable_saves,
+        owner="final_skeleton_contract",
+        role="skeleton",
+    )
+    _save_asset_owned(
+        saved[1],
+        durable_saves,
+        owner="final_skeleton_contract",
+        role="mesh",
+    )
     return {
         "mesh": saved[1],
         "skeleton": saved[0],
         "saved": saved,
     }
+
+
+def _verify_final_skeleton_contract_receipt(
+    full_mesh,
+    receipt,
+    *,
+    durable_saves,
+):
+    if full_mesh is None:
+        raise RuntimeError("cannot verify a missing Full SK final mesh")
+    skeleton = full_mesh.get_editor_property("skeleton")
+    if skeleton is None:
+        raise RuntimeError("cannot verify Full SK without its final Skeleton")
+    skeleton_path = _normalized_unreal_asset_path(skeleton.get_path_name())
+    mesh_path = _normalized_unreal_asset_path(full_mesh.get_path_name())
+    expected = {
+        "mesh": mesh_path,
+        "skeleton": skeleton_path,
+        "saved": [skeleton_path, mesh_path],
+    }
+    if not isinstance(receipt, dict) or any(
+        receipt.get(field) != value for field, value in expected.items()
+    ):
+        raise RuntimeError(
+            "final Skeleton durable receipt does not match the live Full mesh: "
+            f"expected={expected}, actual={receipt}"
+        )
+    _require_durable_save(
+        durable_saves,
+        skeleton_path,
+        owner="final_skeleton_contract",
+        role="skeleton",
+        save_mode="editor_asset",
+    )
+    _require_durable_save(
+        durable_saves,
+        mesh_path,
+        owner="final_skeleton_contract",
+        role="mesh",
+        save_mode="editor_asset",
+    )
+    return expected
+
+
+def _save_large_assembly_without_thumbnail(asset_path, *, durable_saves):
+    """Persist a built Nanite Assembly without rendering its thumbnail.
+
+    UE 5.8's normal editor save path renders a missing SkeletalMesh thumbnail.
+    A production Assembly can exceed the practical preview-GPU budget even
+    though its Nanite build itself completed successfully.  The project plugin
+    exposes the same direct UPackage::SavePackage path already used for other
+    renderer-sensitive assets, so fail closed if that exact API is unavailable.
+    """
+    candidate = str(asset_path or "").split(".")[0]
+    asset = unreal.EditorAssetLibrary.load_asset(candidate) if candidate else None
+    library = getattr(unreal, "CodexMaterialToolsLibrary", None)
+    saver = getattr(
+        library,
+        "save_asset_package_without_thumbnail",
+        None,
+    )
+    if asset is None:
+        raise RuntimeError(
+            f"cannot save missing Cluster Assembly asset: {candidate}"
+        )
+    if not callable(saver):
+        raise RuntimeError(
+            "CodexMaterialToolsLibrary thumbnail-free package save API is "
+            "unavailable"
+        )
+    _validate_durable_save_ledger(durable_saves)
+    _assert_durable_save_unowned(
+        durable_saves,
+        candidate,
+        "final_nanite_assembly",
+    )
+    if not saver(asset):
+        raise RuntimeError(
+            "failed to persist Cluster Assembly without thumbnail rendering: "
+            + candidate
+        )
+    _record_durable_save(
+        durable_saves,
+        candidate,
+        owner="final_nanite_assembly",
+        role="assembly",
+        save_mode="thumbnail_free",
+    )
+    _validate_durable_save_ledger(durable_saves)
+    return candidate
 
 
 def _clear_generated_mesh_with_mismatched_skeleton(asset_path, expected_skeleton):
@@ -2182,7 +2936,16 @@ def _best_effort_cancel_instanced_dynamic_wind_runtime(probe_token):
         }
 
 
-def _ingest_cluster_assembly(send2ue_unreal, item, full_wind):
+def _ingest_cluster_assembly(
+    send2ue_unreal,
+    item,
+    full_wind,
+    *,
+    durable_saves=None,
+    final_skeleton_receipt=None,
+    prebuild_materials=None,
+    prebuilt_material_paths=None,
+):
     payload = item.get("cluster_assembly")
     if not payload:
         return {"status": "skipped", "reason": "no content-driven Assembly manifest"}
@@ -2194,6 +2957,11 @@ def _ingest_cluster_assembly(send2ue_unreal, item, full_wind):
     if (full_wind or {}).get("status") != "ok":
         raise RuntimeError(
             "Cluster Assembly requires successful Full SK final-skeleton wind import"
+        )
+    if durable_saves is None or final_skeleton_receipt is None:
+        raise RuntimeError(
+            "Cluster Assembly requires the authoritative final Skeleton durable "
+            "save receipt"
         )
     manifest = payload.get("manifest") or {}
     validate_manifest_artifacts(manifest)
@@ -2210,7 +2978,20 @@ def _ingest_cluster_assembly(send2ue_unreal, item, full_wind):
     if full_skeleton is None:
         raise RuntimeError("Cluster Assembly Full SK has no final Skeleton")
     full_skeleton_path = full_skeleton.get_path_name()
-    persisted_final_contract = _save_final_skeleton_contract_assets(full_mesh)
+    persisted_final_contract = _verify_final_skeleton_contract_receipt(
+        full_mesh,
+        final_skeleton_receipt,
+        durable_saves=durable_saves,
+    )
+    if prebuild_materials is None:
+        prebuild_materials = []
+    if prebuilt_material_paths is None:
+        prebuilt_material_paths = set()
+    _prebuild_material_path_once(
+        asset_contract.get("full_skeletal_mesh"),
+        prebuild_materials,
+        prebuilt_material_paths,
+    )
 
     generated_assets = []
     optimizations = []
@@ -2250,6 +3031,11 @@ def _ingest_cluster_assembly(send2ue_unreal, item, full_wind):
             preexisting = _default_physics_asset_preexisting(asset_path)
             imported = _import_manifest_asset(send2ue_unreal, manifest_asset)
             generated_assets.append(imported)
+            _prebuild_material_path_once(
+                asset_path,
+                prebuild_materials,
+                prebuilt_material_paths,
+            )
             optimization = _prepare_speedtree_skeletal_optimization(
                 asset_path,
                 preexisting,
@@ -2267,29 +3053,52 @@ def _ingest_cluster_assembly(send2ue_unreal, item, full_wind):
             save_writability.append(
                 _ensure_declared_package_writable(item, asset_path)
             )
-            if not unreal.EditorAssetLibrary.save_asset(
+            _save_asset_owned(
                 asset_path,
-                only_if_is_dirty=False,
-            ):
-                raise RuntimeError(
-                    f"failed to persist Assembly prototype before build: {asset_path}"
-                )
+                durable_saves,
+                owner="assembly_prototype_prebuild",
+                role="prototype",
+            )
             persisted_generated_assets.append(asset_path)
+    generated_path_keys = {
+        _normalized_unreal_asset_path(
+            (source.get("asset_data") or {}).get("asset_path")
+        ).casefold()
+        for source in plan.get("assets") or []
+    }
+    external_paths = [
+        row.get("asset_path")
+        for row in plan.get("external_assets") or []
+        if isinstance(row, dict)
+    ]
+    external_paths.extend(
+        path
+        for path in (asset_contract.get("parts") or {}).values()
+        if _normalized_unreal_asset_path(path).casefold()
+        not in generated_path_keys
+    )
+    for external_path in external_paths:
+        _prebuild_material_path_once(
+            external_path,
+            prebuild_materials,
+            prebuilt_material_paths,
+        )
     result = build_unreal_nanite_assembly(unreal, manifest, asset_contract)
     assembly_path = result.get("assembly")
     if assembly_path:
         save_writability.append(
             _ensure_declared_package_writable(item, assembly_path)
         )
-    if assembly_path and not unreal.EditorAssetLibrary.save_asset(
-        assembly_path,
-        only_if_is_dirty=False,
-    ):
-        raise RuntimeError(
-            f"failed to persist Cluster Assembly before runtime probe: {assembly_path}"
-        )
     materials = (
-        _material_compile_and_slot_validation(assembly_path)
+        _material_postbuild_slot_audit(assembly_path)
+        if assembly_path
+        else None
+    )
+    thumbnail_free_saved = (
+        _save_large_assembly_without_thumbnail(
+            assembly_path,
+            durable_saves=durable_saves,
+        )
         if assembly_path
         else None
     )
@@ -2302,6 +3111,11 @@ def _ingest_cluster_assembly(send2ue_unreal, item, full_wind):
         "skeleton_reimports": skeleton_reimports,
         "build": result,
         "materials": materials,
+        "prebuild_materials": list(prebuild_materials),
+        "thumbnail_free_save": {
+            "status": "ok",
+            "asset": thumbnail_free_saved,
+        } if thumbnail_free_saved else None,
         "full_final_skeleton": full_skeleton_path,
         "persisted_final_contract": persisted_final_contract,
         "wind_contract_comparison": wind_contract_comparison,
@@ -2351,7 +3165,7 @@ def _ensure_nanite_voxel_material_usage(base_material):
     }
 
 
-def _material_compile_and_slot_validation(mesh_path):
+def _material_slot_inventory(mesh_path):
     mesh = unreal.EditorAssetLibrary.load_asset(mesh_path)
     if not mesh:
         raise RuntimeError(f"mesh not found: {mesh_path}")
@@ -2361,9 +3175,7 @@ def _material_compile_and_slot_validation(mesh_path):
 
     details = []
     missing = []
-    compiled_base_materials = set()
-    usage_validation = []
-    compile_errors = []
+    base_materials = {}
     for index, slot in enumerate(slots):
         slot_name = str(slot.get_editor_property("material_slot_name"))
         material = slot.get_editor_property("material_interface")
@@ -2379,9 +3191,24 @@ def _material_compile_and_slot_validation(mesh_path):
         if not base_material:
             continue
         base_path = base_material.get_path_name()
-        if base_path in compiled_base_materials:
-            continue
-        compiled_base_materials.add(base_path)
+        base_materials.setdefault(base_path, base_material)
+
+    if missing:
+        raise RuntimeError("unassigned material slots: " + ", ".join(missing))
+    return {
+        "mesh": mesh_path,
+        "slots": slots,
+        "details": details,
+        "base_materials": base_materials,
+    }
+
+
+def _material_prebuild_compile_and_usage_normalization(mesh_path):
+    """Make source materials build-ready before any Nanite mesh is created."""
+    inventory = _material_slot_inventory(mesh_path)
+    usage_validation = []
+    compile_errors = []
+    for base_path, base_material in inventory["base_materials"].items():
         usage = _ensure_nanite_voxel_material_usage(base_material)
         if usage["changed"]:
             errors = (
@@ -2408,25 +3235,74 @@ def _material_compile_and_slot_validation(mesh_path):
             usage["compile"] = "skipped_unchanged"
         usage_validation.append(usage)
 
-    if missing:
-        raise RuntimeError("unassigned material slots: " + ", ".join(missing))
     if compile_errors:
         raise RuntimeError("material compile failed: " + " | ".join(compile_errors))
+    return {
+        "mesh": mesh_path,
+        "slots": inventory["details"],
+        "compiled_base_materials": sorted(inventory["base_materials"]),
+        "nanite_voxel_material_usage": usage_validation,
+    }
+
+
+def _material_postbuild_slot_audit(mesh_path):
+    """Audit the finished mesh without invalidating any Nanite referencer."""
+    inventory = _material_slot_inventory(mesh_path)
+    usage_validation = []
+    invalid_usage = []
+    properties = (
+        "used_with_skeletal_mesh",
+        "used_with_nanite",
+        "used_with_voxels",
+    )
+    for base_path, base_material in inventory["base_materials"].items():
+        current = {
+            name: bool(base_material.get_editor_property(name))
+            for name in properties
+        }
+        missing = [name for name, enabled in current.items() if not enabled]
+        if missing:
+            invalid_usage.append(f"{base_path}: {', '.join(missing)}")
+        usage_validation.append({
+            "material": base_path,
+            "before": current,
+            "after": dict(current),
+            "changed": False,
+            "checked_out": False,
+            "saved": False,
+            "compile": "postbuild_audit_only",
+        })
+    if invalid_usage:
+        raise RuntimeError(
+            "post-build Nanite voxel material usage is incomplete: "
+            + " | ".join(invalid_usage)
+        )
     section_validation = audit_unreal_skeletal_mesh_material_sections(
         unreal,
         mesh_path,
-        len(slots),
+        len(inventory["slots"]),
     )
     return {
         "mesh": mesh_path,
-        "slots": details,
-        "compiled_base_materials": sorted(compiled_base_materials),
+        "slots": inventory["details"],
+        "compiled_base_materials": sorted(inventory["base_materials"]),
         "nanite_voxel_material_usage": usage_validation,
         "section_material_validation": section_validation,
     }
 
 
-def _save_item_assets(item, imported_assets):
+def _prebuild_material_path_once(mesh_path, reports, seen_paths):
+    path = _normalized_unreal_asset_path(mesh_path)
+    key = path.casefold()
+    if not path or key in seen_paths:
+        return None
+    report = _material_prebuild_compile_and_usage_normalization(path)
+    seen_paths.add(key)
+    reports.append(report)
+    return report
+
+
+def _save_item_assets(item, imported_assets, *, durable_saves):
     asset_paths = []
     seen_paths = set()
     for value in imported_assets:
@@ -2441,23 +3317,78 @@ def _save_item_assets(item, imported_assets):
 
     saved = []
     for asset_path in asset_paths:
-        if asset_path and unreal.EditorAssetLibrary.does_asset_exist(asset_path):
-            if not unreal.EditorAssetLibrary.save_asset(
-                asset_path,
-                only_if_is_dirty=False,
-            ):
-                raise RuntimeError(f"failed to save imported asset: {asset_path}")
+        if not asset_path:
+            continue
+        existing_receipt = _find_durable_save(durable_saves, asset_path)
+        asset_exists = unreal.EditorAssetLibrary.does_asset_exist(asset_path)
+        if existing_receipt is not None and not asset_exists:
+            raise RuntimeError(
+                "owned durable asset disappeared from the Asset Registry: "
+                + _normalized_unreal_asset_path(asset_path)
+            )
+        if asset_exists:
+            if existing_receipt is not None:
+                _require_durable_save(durable_saves, asset_path)
+            else:
+                _save_asset_owned(
+                    asset_path,
+                    durable_saves,
+                    owner="terminal_item_assets",
+                    role="imported_asset",
+                )
             saved.append(asset_path)
+
     folder = item.get("unreal_folder")
-    if folder and not unreal.EditorAssetLibrary.save_directory(
-        folder,
-        only_if_is_dirty=True,
-    ):
-        raise RuntimeError(f"failed to save imported asset directory: {folder}")
+    if folder:
+        folder_path = str(folder).replace("\\", "/").rstrip("/") + "/"
+        folder_key = folder_path.casefold()
+        _validate_durable_save_ledger(durable_saves)
+        dirty_before = {
+            key: package
+            for key, package in _dirty_content_packages().items()
+            if key.startswith(folder_key)
+        }
+        owned_dirty = [
+            package
+            for key, package in dirty_before.items()
+            if _find_durable_save(durable_saves, package) is not None
+        ]
+        if owned_dirty:
+            raise RuntimeError(
+                "terminal directory save cannot take ownership of dirty durable "
+                "packages: "
+                + ", ".join(sorted(owned_dirty))
+            )
+        if not unreal.EditorAssetLibrary.save_directory(
+            folder,
+            only_if_is_dirty=True,
+        ):
+            raise RuntimeError(f"failed to save imported asset directory: {folder}")
+        dirty_after = _dirty_content_packages()
+        unsaved = [
+            package for key, package in dirty_before.items() if key in dirty_after
+        ]
+        if unsaved:
+            raise RuntimeError(
+                "terminal directory save left packages dirty: "
+                + ", ".join(sorted(unsaved))
+            )
+        for package in dirty_before.values():
+            _record_durable_save(
+                durable_saves,
+                package,
+                owner="terminal_directory",
+                role="auxiliary",
+                save_mode="directory_dirty_only",
+            )
+        _validate_durable_save_ledger(durable_saves)
+    else:
+        _validate_durable_save_ledger(durable_saves)
     return saved
 
 
 def ingest_item(item):
+    durable_saves = _new_durable_save_ledger()
     send2ue_unreal = _load_send2ue_unreal(item["send2ue_unreal_py"])
     checkout = _checkout_existing_assets(item)
     # Source-controlled packages must be writable before stale mesh/Skeleton
@@ -2469,7 +3400,7 @@ def ingest_item(item):
     default_physics_asset_preexisting = _default_physics_asset_preexisting(
         mesh_path
     )
-    primary_mesh_key = mesh_path.casefold()
+    primary_mesh_key = _normalized_unreal_asset_path(mesh_path).casefold()
     skeleton_refresh_plans = {
         primary_mesh_key: {
             "asset_path": mesh_path,
@@ -2518,6 +3449,8 @@ def ingest_item(item):
             )
         return _import_manifest_asset(send2ue_unreal, manifest_asset)
 
+    prebuild_materials = []
+    prebuilt_material_paths = set()
     with (
         _without_generated_physics_assets(
             send2ue_unreal
@@ -2526,10 +3459,34 @@ def ingest_item(item):
             send2ue_unreal
         ) as skeleton_binding_disabled,
     ):
-        imported_assets = [
-            import_asset(manifest_asset)
-            for manifest_asset in item.get("assets") or []
-        ]
+        imported_assets = []
+        for manifest_asset in item.get("assets") or []:
+            imported = import_asset(manifest_asset)
+            imported_assets.append(imported)
+            asset_data = manifest_asset.get("asset_data") or {}
+            imported_path = (
+                imported.get("asset_path")
+                if isinstance(imported, dict)
+                else asset_data.get("asset_path")
+            )
+            if (
+                not (isinstance(imported, dict) and imported.get("skipped"))
+                and (
+                    asset_data.get("_asset_type") == "SkeletalMesh"
+                    or _normalized_unreal_asset_path(imported_path).casefold()
+                    == primary_mesh_key
+                )
+            ):
+                _prebuild_material_path_once(
+                    imported_path,
+                    prebuild_materials,
+                    prebuilt_material_paths,
+                )
+    _prebuild_material_path_once(
+        mesh_path,
+        prebuild_materials,
+        prebuilt_material_paths,
+    )
     optimization = _prepare_speedtree_skeletal_optimization(
         mesh_path,
         default_physics_asset_preexisting,
@@ -2558,13 +3515,26 @@ def ingest_item(item):
         and (item.get("wind_policy") or {}).get("requires_json")
     ):
         final_skeleton_saved = _save_final_skeleton_contract_assets(
-            unreal.EditorAssetLibrary.load_asset(mesh_path)
+            unreal.EditorAssetLibrary.load_asset(mesh_path),
+            durable_saves=durable_saves,
         )
-    assembly = _ingest_cluster_assembly(send2ue_unreal, item, wind)
+    assembly = _ingest_cluster_assembly(
+        send2ue_unreal,
+        item,
+        wind,
+        durable_saves=durable_saves,
+        final_skeleton_receipt=(final_skeleton_saved or None),
+        prebuild_materials=prebuild_materials,
+        prebuilt_material_paths=prebuilt_material_paths,
+    )
     imported_assets.extend(assembly.get("assets") or [])
-    saved = _save_item_assets(item, imported_assets)
+    saved = _save_item_assets(
+        item,
+        imported_assets,
+        durable_saves=durable_saves,
+    )
     optimization = _finalize_speedtree_skeletal_optimization(optimization)
-    materials = _material_compile_and_slot_validation(mesh_path)
+    materials = _material_postbuild_slot_audit(mesh_path)
     item_status = _prepare_assembly_runtime_validation(assembly)
     return {
         "status": item_status,
@@ -2579,8 +3549,10 @@ def ingest_item(item):
         "final_skeleton_saved": final_skeleton_saved,
         "cluster_assembly": assembly,
         "materials": materials,
+        "prebuild_materials": prebuild_materials,
         "optimization": optimization,
         "saved": saved,
+        "durable_saves": _durable_save_report(durable_saves),
     }
 
 
@@ -2643,13 +3615,40 @@ def _recover_interrupted_item(checkpoint, max_item_crash_retries):
     checkpoint["current_item"] = None
 
 
+def _checkpoint_manifest_item_refs(checkpoint):
+    manifest_path = checkpoint.get("manifest")
+    if not manifest_path:
+        raise RuntimeError("checkpoint has no manifest for terminal-state validation")
+    try:
+        manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "checkpoint manifest is unavailable or invalid for terminal-state "
+            f"validation: {manifest_path}"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise RuntimeError(
+            "checkpoint manifest root is not an object for terminal-state validation"
+        )
+    return _manifest_item_refs(manifest)
+
+
+def _checkpoint_all_manifest_items_terminal(checkpoint, manifest_items=None):
+    """Require a terminal state for every manifest item, including unvisited ones."""
+    if manifest_items is None:
+        manifest_items = _checkpoint_manifest_item_refs(checkpoint)
+    expected_ids = [str(item["queue_id"]) for item in manifest_items]
+    states = checkpoint.get("items") or {}
+    return all(
+        queue_id in states and states[queue_id].get("status") in TERMINAL_STATES
+        for queue_id in expected_ids
+    )
+
+
 def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
     manifest_path = str(Path(manifest_path).resolve())
     manifest = _load_json(manifest_path)
-    if manifest.get("schema_version") != SCHEMA_VERSION:
-        raise RuntimeError(
-            f"unsupported SK Batch manifest schema: {manifest.get('schema_version')}"
-        )
+    manifest_item_refs = _manifest_item_refs(manifest)
     manifest["manifest_path"] = manifest_path
     checkpoint_path = str(
         Path(checkpoint_path or manifest["checkpoint_path"]).resolve()
@@ -2658,39 +3657,97 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
     checkpoint = _load_json(checkpoint_path, default=None) or _initial_checkpoint(manifest)
     max_retries = int(manifest.get("max_item_crash_retries", 2))
     manifest_items = _manifest_items_dependency_order(
-        manifest.get("items") or []
+        manifest_item_refs
     )
+    max_items_per_process = 0
+    if _is_headless_manifest_runtime() or _is_null_rhi_runtime():
+        try:
+            max_items_per_process = max(
+                0,
+                int(os.environ.get("SK_BATCH_MAX_ITEMS_PER_PROCESS", "0")),
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                "SK_BATCH_MAX_ITEMS_PER_PROCESS must be an integer"
+            ) from exc
+    processed_this_process = 0
+    process_lifetime_policy = {
+        "transport": (
+            "headless" if _is_headless_manifest_runtime() else "rpc"
+        ),
+        "max_items_per_process": max_items_per_process,
+        "immediate_gc_mode": (
+            "commandlet_full_purge"
+            if _is_headless_manifest_runtime()
+            else "editor_keep_standalone"
+        ),
+    }
+    checkpoint["process_lifetime_policy"] = process_lifetime_policy
+    checkpoint.pop("process_yield", None)
     _recover_interrupted_item(checkpoint, max_retries)
-    _atomic_write_json(checkpoint_path, checkpoint)
+    if not _is_headless_manifest_runtime() and not _is_null_rhi_runtime():
+        # An RPC client can be interrupted between the begin/finish calls of a
+        # two-frame DynamicWind probe.  Clear any survivor before this manifest
+        # starts; the C++ map-load hook is the final safety net if no later
+        # manifest arrives.
+        checkpoint["stale_runtime_probe_cleanup"] = (
+            _best_effort_cancel_instanced_dynamic_wind_runtime("")
+        )
+    _atomic_write_json(checkpoint_path, checkpoint, compact=True)
 
-    for item in manifest_items:
-        queue_id = str(item["queue_id"])
-        fingerprint = item["fingerprint"]
+    for item_ref in manifest_items:
+        queue_id = str(item_ref["queue_id"])
+        fingerprint = item_ref["fingerprint"]
         previous = checkpoint.setdefault("items", {}).get(queue_id, {})
         if (
             previous.get("fingerprint") == fingerprint
             and previous.get("status") == "runtime_pending"
-            and _is_headless_manifest_runtime()
+            and (_is_headless_manifest_runtime() or _is_null_rhi_runtime())
         ):
             assembly = previous.get("cluster_assembly") or {}
-            _defer_headless_runtime_validation(
-                assembly,
-                recovered_from_pending=True,
-            )
+            if _is_headless_manifest_runtime():
+                _defer_headless_runtime_validation(
+                    assembly,
+                    recovered_from_pending=True,
+                )
+            else:
+                previous_begin = assembly.get("runtime")
+                assembly_path = (assembly.get("build") or {}).get("assembly")
+                previous_token = (
+                    previous_begin.get("probe_token")
+                    if isinstance(previous_begin, dict)
+                    else None
+                )
+                previous_cleanup = (
+                    _best_effort_cancel_instanced_dynamic_wind_runtime(previous_token)
+                    if previous_token
+                    else None
+                )
+                assembly_static_checks = _validate_null_rhi_assembly_static_contract(
+                    assembly
+                )
+                assembly["runtime"] = _validate_null_rhi_dynamic_wind_runtime(
+                    assembly_path
+                )
+                assembly["runtime"]["assembly_static_checks"] = assembly_static_checks
+                assembly["runtime"]["recovered_from_pending"] = True
+                assembly["runtime"]["previous_begin"] = previous_begin
+                assembly["runtime"]["previous_cleanup"] = previous_cleanup
+                assembly["status"] = "ok"
             previous["cluster_assembly"] = assembly
             previous["status"] = "imported_ok"
             previous["completed_at"] = _now()
             previous["updated_at"] = _now()
             checkpoint["current_item"] = None
             checkpoint["updated_at"] = _now()
-            _atomic_write_json(checkpoint_path, checkpoint)
+            _atomic_write_json(checkpoint_path, checkpoint, compact=True)
             if previous.get("report"):
                 item_report = dict(previous)
                 item_report["queue_id"] = queue_id
                 item_report["checkpoint"] = checkpoint_path
                 _atomic_write_json(previous["report"], item_report)
             continue
-        dependency_message = _dependency_block_message(item, checkpoint)
+        dependency_message = _dependency_block_message(item_ref, checkpoint)
         if dependency_message:
             state = {
                 "status": "not_run",
@@ -2700,23 +3757,35 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
                 "completed_at": _now(),
                 "updated_at": _now(),
                 "manifest": manifest_path,
-                "report": item.get("report_path"),
+                "report": item_ref.get("report_path"),
             }
             checkpoint["items"][queue_id] = state
             checkpoint["current_item"] = None
             checkpoint["updated_at"] = _now()
-            _atomic_write_json(checkpoint_path, checkpoint)
-            if item.get("report_path"):
+            _atomic_write_json(checkpoint_path, checkpoint, compact=True)
+            if item_ref.get("report_path"):
                 item_report = dict(state)
                 item_report["queue_id"] = queue_id
                 item_report["checkpoint"] = checkpoint_path
-                _atomic_write_json(item["report_path"], item_report)
+                _atomic_write_json(item_ref["report_path"], item_report)
             continue
         if (
             previous.get("fingerprint") == fingerprint
             and previous.get("status") in TERMINAL_STATES
         ):
             continue
+        if (
+            max_items_per_process
+            and processed_this_process >= max_items_per_process
+        ):
+            checkpoint["process_yield"] = {
+                "reason": "item_process_lifetime_limit",
+                "max_items": max_items_per_process,
+                "processed": processed_this_process,
+                "next_queue_id": queue_id,
+                "at": _now(),
+            }
+            break
 
         crash_count = _inherited_crash_count(previous, fingerprint)
         state = {
@@ -2726,28 +3795,33 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
             "started_at": _now(),
             "updated_at": _now(),
             "manifest": manifest_path,
-            "report": item.get("report_path"),
+            "report": item_ref.get("report_path"),
         }
         checkpoint["items"][queue_id] = state
         checkpoint["current_item"] = queue_id
         checkpoint["updated_at"] = _now()
-        _atomic_write_json(checkpoint_path, checkpoint)
+        _atomic_write_json(checkpoint_path, checkpoint, compact=True)
 
         result = None
+        item = None
+        compilation_lifetime = None
         try:
-            asset_cache = None
-            if item.get("verify_existing_assets"):
-                asset_cache = _verify_manifest_assets_exist(item)
-            if asset_cache and asset_cache["complete"]:
-                result = {
-                    "status": "imported_ok",
-                    "asset_cache": asset_cache,
-                }
-            else:
-                result = ingest_item(item)
-                if asset_cache is not None:
-                    result["asset_cache_preflight"] = asset_cache
+            item = _load_manifest_item(manifest_path, manifest, item_ref)
+            with _bounded_item_skinned_asset_compilation() as compilation_lifetime:
+                asset_cache = None
+                if item.get("verify_existing_assets"):
+                    asset_cache = _verify_manifest_assets_exist(item)
+                if asset_cache and asset_cache["complete"]:
+                    result = {
+                        "status": "imported_ok",
+                        "asset_cache": asset_cache,
+                    }
+                else:
+                    result = ingest_item(item)
+                    if asset_cache is not None:
+                        result["asset_cache_preflight"] = asset_cache
             state.update(result)
+            state["compilation_lifetime"] = compilation_lifetime
             state["status"] = result.get("status", "imported_ok")
             if state["status"] == "imported_ok":
                 state["completed_at"] = _now()
@@ -2776,33 +3850,31 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
                 }
             )
         finally:
-            # A headless queue can contain well over one hundred large tree
-            # imports.  Drop per-item Python references before asking Unreal
-            # to release transient import objects; otherwise one commandlet
-            # retains many gigabytes until process exit.
+            # A queue can contain well over one hundred large tree imports.
+            # Drop per-item Python references before asking Unreal to finish
+            # compilers and release transient import/render objects.
             result = None
             asset_cache = None
-            gc.collect()
-            collect_garbage = getattr(unreal, "collect_garbage", None)
-            if callable(collect_garbage):
-                try:
-                    collect_garbage()
-                except Exception as exc:
-                    state["garbage_collection_warning"] = str(exc)
+            item = None
+            if compilation_lifetime is not None:
+                state["compilation_lifetime"] = compilation_lifetime
+            state["resource_release"] = _release_item_unreal_resources()
             checkpoint["current_item"] = None
             checkpoint["updated_at"] = _now()
-            _atomic_write_json(checkpoint_path, checkpoint)
+            _atomic_write_json(checkpoint_path, checkpoint, compact=True)
             item_report = dict(state)
             item_report["queue_id"] = queue_id
             item_report["checkpoint"] = checkpoint_path
-            if item.get("report_path"):
-                _atomic_write_json(item["report_path"], item_report)
+            if item_ref.get("report_path"):
+                _atomic_write_json(item_ref["report_path"], item_report)
+            processed_this_process += 1
 
-    checkpoint["complete"] = all(
-        state.get("status") in TERMINAL_STATES
-        for state in checkpoint.get("items", {}).values()
+    checkpoint["complete"] = _checkpoint_all_manifest_items_terminal(
+        checkpoint,
+        manifest_items,
     )
     if checkpoint["complete"]:
+        checkpoint.pop("process_yield", None)
         checkpoint["completed_at"] = _now()
     checkpoint["updated_at"] = _now()
     counts = {}
@@ -2811,18 +3883,26 @@ def run_manifest(manifest_path, checkpoint_path=None, report_path=None):
         counts[status] = counts.get(status, 0) + 1
     report = {
         "schema_version": SCHEMA_VERSION,
-        "status": "complete" if checkpoint["complete"] else "runtime_pending",
+        "status": (
+            "complete"
+            if checkpoint["complete"]
+            else "process_yield"
+            if checkpoint.get("process_yield")
+            else "runtime_pending"
+        ),
         "manifest": manifest_path,
         "checkpoint": checkpoint_path,
         "completed_at": checkpoint.get("completed_at"),
         "counts": counts,
+        "process_lifetime_policy": process_lifetime_policy,
+        "process_yield": checkpoint.get("process_yield"),
         "items": checkpoint.get("items", {}),
     }
     for metadata_key in ("retry", "recovery"):
         metadata = manifest.get(metadata_key)
         if isinstance(metadata, dict):
             report[metadata_key] = metadata
-    _atomic_write_json(checkpoint_path, checkpoint)
+    _atomic_write_json(checkpoint_path, checkpoint, compact=True)
     _atomic_write_json(report_path, report)
     return report
 
@@ -2833,6 +3913,7 @@ def finish_runtime_probe(checkpoint_path, report_path, queue_id):
     checkpoint = _load_json(checkpoint_path, default=None)
     if not checkpoint:
         raise RuntimeError("runtime checkpoint is missing")
+    manifest_items = _checkpoint_manifest_item_refs(checkpoint)
     state = checkpoint.get("items", {}).get(str(queue_id))
     if not state:
         raise RuntimeError("runtime checkpoint item is missing")
@@ -2848,6 +3929,7 @@ def finish_runtime_probe(checkpoint_path, report_path, queue_id):
     token = begin.get("probe_token")
     if not token:
         raise RuntimeError("runtime checkpoint has no probe token")
+    runtime_cleanup_done = False
     try:
         finish = _finish_instanced_dynamic_wind_runtime(token)
         assembly["runtime_finish"] = finish
@@ -2862,6 +3944,7 @@ def finish_runtime_probe(checkpoint_path, report_path, queue_id):
             }
             state["status"] = "imported_ok"
             state["completed_at"] = _now()
+            runtime_cleanup_done = True
     except Exception as exc:
         original_traceback = traceback.format_exc()
         cancel = _best_effort_cancel_instanced_dynamic_wind_runtime(token)
@@ -2879,15 +3962,22 @@ def finish_runtime_probe(checkpoint_path, report_path, queue_id):
                 "updated_at": _now(),
             }
         )
+        runtime_cleanup_done = True
+
+    if runtime_cleanup_done:
+        # A pending two-frame probe is still rooted and polled again shortly;
+        # full GC here only stalls the editor.  Release once finish/cancel has
+        # actually destroyed the probe owner.
+        state["runtime_resource_release"] = _release_item_unreal_resources()
 
     checkpoint["updated_at"] = _now()
-    checkpoint["complete"] = all(
-        item.get("status") in TERMINAL_STATES
-        for item in checkpoint.get("items", {}).values()
+    checkpoint["complete"] = _checkpoint_all_manifest_items_terminal(
+        checkpoint,
+        manifest_items,
     )
     if checkpoint["complete"]:
         checkpoint["completed_at"] = _now()
-    _atomic_write_json(checkpoint_path, checkpoint)
+    _atomic_write_json(checkpoint_path, checkpoint, compact=True)
 
     if state.get("report"):
         item_report = dict(state)
@@ -2917,6 +4007,7 @@ def cancel_runtime_probe(checkpoint_path, report_path, queue_id, reason):
     checkpoint = _load_json(checkpoint_path, default=None)
     if not checkpoint:
         raise RuntimeError("runtime checkpoint is missing")
+    manifest_items = _checkpoint_manifest_item_refs(checkpoint)
     state = checkpoint.get("items", {}).get(str(queue_id))
     if not state:
         raise RuntimeError("runtime checkpoint item is missing")
@@ -2948,15 +4039,16 @@ def cancel_runtime_probe(checkpoint_path, report_path, queue_id, reason):
             "updated_at": _now(),
         }
     )
+    state["runtime_resource_release"] = _release_item_unreal_resources()
 
     checkpoint["updated_at"] = _now()
-    checkpoint["complete"] = all(
-        item.get("status") in TERMINAL_STATES
-        for item in checkpoint.get("items", {}).values()
+    checkpoint["complete"] = _checkpoint_all_manifest_items_terminal(
+        checkpoint,
+        manifest_items,
     )
     if checkpoint["complete"]:
         checkpoint["completed_at"] = _now()
-    _atomic_write_json(checkpoint_path, checkpoint)
+    _atomic_write_json(checkpoint_path, checkpoint, compact=True)
 
     if state.get("report"):
         item_report = dict(state)

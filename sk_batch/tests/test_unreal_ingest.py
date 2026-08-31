@@ -1,10 +1,13 @@
 import importlib.util
+import hashlib
 import json
 import sys
 import tempfile
 import types
 import unittest
 import stat
+from copy import deepcopy
+from contextlib import nullcontext
 from pathlib import Path
 
 
@@ -54,6 +57,71 @@ def write_manifest(tmp_path, items, max_retries=2):
     return manifest, checkpoint, report
 
 
+def write_manifest_v2(tmp_path, items, max_retries=2):
+    manifest = tmp_path / "manifest_v2.json"
+    checkpoint = tmp_path / "checkpoint_v2.json"
+    report = tmp_path / "report_v2.json"
+    payload_dir = tmp_path / "manifest_v2_items"
+    payload_dir.mkdir()
+    item_refs = []
+    for index, current in enumerate(items):
+        current = dict(current)
+        current.setdefault("schema_version", 1)
+        payload = json.dumps(
+            current,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        digest = hashlib.sha256(payload).hexdigest()
+        payload_path = payload_dir / f"{index:04d}_{digest[:16]}.json"
+        payload_path.write_bytes(payload)
+        item_refs.append({
+            "schema_version": 1,
+            "queue_id": current["queue_id"],
+            "fingerprint": current["fingerprint"],
+            "depends_on_queue_ids": list(
+                current.get("depends_on_queue_ids") or []
+            ),
+            "report_path": current.get("report_path"),
+            "checkout_asset_paths": list(
+                current.get("checkout_asset_paths") or []
+            ),
+            "payload_relpath": payload_path.relative_to(tmp_path).as_posix(),
+            "payload_size": len(payload),
+            "payload_sha256": digest,
+        })
+    manifest.write_text(
+        json.dumps({
+            "schema_version": 2,
+            "item_storage": {
+                "kind": "external_json",
+                "schema_version": 1,
+                "integrity": "sha256",
+                "base_relpath": payload_dir.relative_to(tmp_path).as_posix(),
+            },
+            "checkpoint_path": str(checkpoint),
+            "report_path": str(report),
+            "max_item_crash_retries": max_retries,
+            "items": item_refs,
+        }),
+        encoding="utf-8",
+    )
+    return manifest, checkpoint, report
+
+
+def test_atomic_checkpoint_json_can_use_compact_encoding(tmp_path):
+    runner = load_runner()
+    target = tmp_path / "checkpoint.json"
+    payload = {"items": {"tree": {"status": "imported_ok"}}}
+
+    runner._atomic_write_json(target, payload, compact=True)
+    encoded = target.read_text(encoding="utf-8")
+
+    assert json.loads(encoded) == payload
+    assert "\n" not in encoded
+    assert '": ' not in encoded
+
+
 def item(queue_id, fingerprint):
     return {
         "queue_id": queue_id,
@@ -81,6 +149,73 @@ def test_retry_metadata_is_copied_from_manifest_to_batch_report(tmp_path):
     assert result["retry"] == payload["retry"]
     assert persisted["retry"] == payload["retry"]
     assert persisted["recovery"] == payload["recovery"]
+
+
+def test_item_compilation_mode_restores_cvar_when_setup_read_fails():
+    runner = load_runner()
+    commands = []
+    reads = iter([1, RuntimeError("read failed"), 1])
+
+    def get_int(_name):
+        value = next(reads)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    runner.unreal.SystemLibrary = types.SimpleNamespace(
+        get_console_variable_int_value=get_int,
+        execute_console_command=lambda _world, command: commands.append(command),
+    )
+
+    with unittest.TestCase().assertRaisesRegex(RuntimeError, "read failed"):
+        with runner._bounded_item_skinned_asset_compilation():
+            pass
+
+    assert "Editor.AsyncSkinnedAssetCompilation 0" in commands
+    assert "Editor.AsyncSkinnedAssetCompilation 1" in commands
+
+
+def test_item_resource_release_prefers_immediate_unreal_gc():
+    runner = load_runner()
+    calls = []
+    runner.unreal.collect_garbage = lambda: calls.append("immediate")
+    runner.unreal.SystemLibrary = types.SimpleNamespace(
+        execute_console_command=lambda _world, command: calls.append(command),
+        collect_garbage=lambda: calls.append("scheduled"),
+    )
+
+    report = runner._release_item_unreal_resources()
+
+    assert calls[-1] == "immediate"
+    assert "scheduled" not in calls
+    assert report["immediate_unreal_gc"] is True
+    assert report["scheduled_unreal_gc"] is False
+
+
+def test_headless_item_limit_yields_then_resumes_without_marking_complete(
+    tmp_path,
+    monkeypatch,
+):
+    runner = load_runner(monkeypatch)
+    manifest, checkpoint, report_path = write_manifest(
+        tmp_path,
+        [item("first", "a"), item("second", "b")],
+    )
+    monkeypatch.setenv("SK_BATCH_MANIFEST_PATH", str(manifest))
+    monkeypatch.setenv("SK_BATCH_MAX_ITEMS_PER_PROCESS", "1")
+    runner.ingest_item = lambda _item: {"status": "imported_ok"}
+
+    first = runner.run_manifest(manifest, checkpoint, report_path)
+
+    assert first["status"] == "process_yield"
+    assert first["process_yield"]["next_queue_id"] == "second"
+    assert json.loads(checkpoint.read_text(encoding="utf-8"))["complete"] is False
+
+    second = runner.run_manifest(manifest, checkpoint, report_path)
+
+    assert second["status"] == "complete"
+    assert second["process_yield"] is None
+    assert set(second["items"]) == {"first", "second"}
 
 
 class DynamicWindFinalSkeletonContractTests(unittest.TestCase):
@@ -715,6 +850,257 @@ def test_manifest_dependencies_run_provider_before_tree(tmp_path, monkeypatch):
     assert result["items"]["tree"]["status"] == "imported_ok"
 
 
+def test_manifest_v2_lazy_items_preserve_dependency_order(tmp_path, monkeypatch):
+    runner = load_runner(monkeypatch)
+    from cluster_fleet_push import write_combined_lazy_manifest
+
+    root = item("tree", "tree-v1")
+    root["depends_on_queue_ids"] = ["cluster"]
+    root["schema_version"] = 1
+    provider = item("cluster", "cluster-v1")
+    provider["schema_version"] = 1
+    manifest = tmp_path / "writer_reader_manifest_v2.json"
+    _checkpoint = tmp_path / "writer_reader_checkpoint_v2.json"
+    _report = tmp_path / "writer_reader_report_v2.json"
+    write_combined_lazy_manifest(
+        manifest,
+        {
+            "checkpoint_path": str(_checkpoint),
+            "report_path": str(_report),
+            "max_item_crash_retries": 2,
+        },
+        [{"item": root}, {"item": provider}],
+    )
+    loaded = []
+    ingested = []
+    original_loader = runner._load_manifest_item
+
+    def load_item(*args):
+        current = original_loader(*args)
+        loaded.append(current["queue_id"])
+        return current
+
+    monkeypatch.setattr(runner, "_load_manifest_item", load_item)
+    monkeypatch.setattr(
+        runner,
+        "ingest_item",
+        lambda current: ingested.append(current["queue_id"])
+        or {"status": "imported_ok"},
+    )
+
+    result = runner.run_manifest(manifest)
+
+    assert loaded == ["cluster", "tree"]
+    assert ingested == ["cluster", "tree"]
+    assert result["status"] == "complete"
+    assert result["schema_version"] == 1
+    checkpoint_payload = json.loads(_checkpoint.read_text(encoding="utf-8"))
+    assert checkpoint_payload["schema_version"] == 1
+
+
+def test_manifest_v2_terminal_item_does_not_reload_payload(tmp_path, monkeypatch):
+    runner = load_runner(monkeypatch)
+    manifest, checkpoint, report = write_manifest_v2(
+        tmp_path,
+        [item("tree", "tree-v1")],
+    )
+    monkeypatch.setattr(
+        runner,
+        "ingest_item",
+        lambda _current: {"status": "imported_ok"},
+    )
+    runner.run_manifest(manifest, checkpoint, report)
+    monkeypatch.setattr(
+        runner,
+        "_load_manifest_item",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("terminal payload must remain lazy")
+        ),
+    )
+
+    result = runner.run_manifest(manifest, checkpoint, report)
+
+    assert result["items"]["tree"]["status"] == "imported_ok"
+
+
+def test_manifest_v2_payload_hash_failure_is_item_local(tmp_path, monkeypatch):
+    runner = load_runner(monkeypatch)
+    manifest, _checkpoint, _report = write_manifest_v2(
+        tmp_path,
+        [item("bad", "bad-v1"), item("good", "good-v1")],
+    )
+    root = json.loads(manifest.read_text(encoding="utf-8"))
+    bad_payload = tmp_path / Path(root["items"][0]["payload_relpath"])
+    bad_payload.write_bytes(b"{}")
+    calls = []
+    monkeypatch.setattr(
+        runner,
+        "ingest_item",
+        lambda current: calls.append(current["queue_id"])
+        or {"status": "imported_ok"},
+    )
+
+    result = runner.run_manifest(manifest)
+
+    assert result["items"]["bad"]["status"] == "data_error"
+    assert "size mismatch" in result["items"]["bad"]["message"]
+    assert calls == ["good"]
+
+
+def test_manifest_v2_rejects_payload_identity_drift(tmp_path, monkeypatch):
+    runner = load_runner(monkeypatch)
+    manifest, _checkpoint, _report = write_manifest_v2(
+        tmp_path,
+        [item("tree", "tree-v1")],
+    )
+    root = json.loads(manifest.read_text(encoding="utf-8"))
+    item_ref = root["items"][0]
+    payload_path = tmp_path / Path(item_ref["payload_relpath"])
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    payload["queue_id"] = "different"
+    payload_bytes = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    payload_path.write_bytes(payload_bytes)
+    item_ref["payload_size"] = len(payload_bytes)
+    item_ref["payload_sha256"] = hashlib.sha256(payload_bytes).hexdigest()
+    manifest.write_text(json.dumps(root), encoding="utf-8")
+    monkeypatch.setattr(
+        runner,
+        "ingest_item",
+        lambda _current: (_ for _ in ()).throw(
+            AssertionError("identity-drifted payload must not be ingested")
+        ),
+    )
+
+    result = runner.run_manifest(manifest)
+
+    assert result["items"]["tree"]["status"] == "data_error"
+    assert "identity differs" in result["items"]["tree"]["message"]
+
+
+def test_manifest_v2_rejects_storage_directory_outside_manifest_directory(
+    tmp_path,
+):
+    runner = load_runner()
+    manifest_dir = tmp_path / "inside"
+    manifest_dir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    payload = item("tree", "tree-v1")
+    payload["schema_version"] = 1
+    payload_bytes = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    payload_path = outside / "tree.json"
+    payload_path.write_bytes(payload_bytes)
+    item_ref = {
+        **runner._item_reference_projection(payload),
+        "schema_version": 1,
+        "payload_relpath": "../outside/tree.json",
+        "payload_size": len(payload_bytes),
+        "payload_sha256": hashlib.sha256(payload_bytes).hexdigest(),
+    }
+    manifest = {
+        "schema_version": 2,
+        "item_storage": {
+            "kind": "external_json",
+            "schema_version": 1,
+            "integrity": "sha256",
+            "base_relpath": "../outside",
+        },
+        "items": [item_ref],
+    }
+
+    with unittest.TestCase().assertRaisesRegex(
+        RuntimeError,
+        "storage directory escapes",
+    ):
+        runner._load_manifest_item(
+            manifest_dir / "manifest.json",
+            manifest,
+            item_ref,
+        )
+
+
+def test_checkpoint_terminal_validation_fails_closed_without_valid_manifest(
+    tmp_path,
+):
+    runner = load_runner()
+    missing = tmp_path / "missing.json"
+    corrupt = tmp_path / "corrupt.json"
+    corrupt.write_text("{", encoding="utf-8")
+
+    for manifest_path in (None, missing, corrupt):
+        checkpoint = {"manifest": str(manifest_path) if manifest_path else "", "items": {}}
+        with unittest.TestCase().subTest(manifest=manifest_path):
+            with unittest.TestCase().assertRaisesRegex(
+                RuntimeError,
+                "manifest",
+            ):
+                runner._checkpoint_all_manifest_items_terminal(checkpoint)
+
+
+def test_checkpoint_terminal_validation_allows_explicit_empty_manifest(tmp_path):
+    runner = load_runner()
+    manifest = tmp_path / "empty.json"
+    manifest.write_text(
+        json.dumps({"schema_version": 1, "items": []}),
+        encoding="utf-8",
+    )
+
+    assert runner._checkpoint_all_manifest_items_terminal({
+        "manifest": str(manifest),
+        "items": {},
+    }) is True
+
+
+def test_manifest_v2_releases_payload_reference_before_unreal_gc(
+    tmp_path,
+    monkeypatch,
+):
+    runner = load_runner(monkeypatch)
+    manifest, _checkpoint, _report = write_manifest_v2(
+        tmp_path,
+        [item("tree", "tree-v1")],
+    )
+    events = []
+
+    class TrackedItem(dict):
+        def __del__(self):
+            events.append("payload_released")
+
+    monkeypatch.setattr(
+        runner,
+        "_load_manifest_item",
+        lambda *_args: TrackedItem({
+            "queue_id": "tree",
+            "fingerprint": "tree-v1",
+            "report_path": "",
+        }),
+    )
+    monkeypatch.setattr(
+        runner,
+        "ingest_item",
+        lambda _current: {"status": "imported_ok"},
+    )
+
+    def release():
+        assert events == ["payload_released"]
+        events.append("unreal_gc")
+        return {"python_gc": True}
+
+    monkeypatch.setattr(runner, "_release_item_unreal_resources", release)
+
+    runner.run_manifest(manifest)
+
+    assert events == ["payload_released", "unreal_gc"]
+
+
 def test_failed_cluster_marks_dependent_tree_not_run(tmp_path, monkeypatch):
     runner = load_runner(monkeypatch)
     root = item("tree", "tree-v1")
@@ -964,6 +1350,62 @@ def test_runtime_pending_checkpoint_finishes_without_reimport(tmp_path, monkeypa
     assert json.loads(checkpoint.read_text(encoding="utf-8"))["complete"] is True
 
 
+def test_finish_runtime_probe_validates_manifest_before_probe_side_effect(
+    tmp_path,
+):
+    runner = load_runner()
+    checkpoint = tmp_path / "checkpoint.json"
+    report = tmp_path / "report.json"
+    checkpoint.write_text(json.dumps({
+        "schema_version": 1,
+        "manifest": str(tmp_path / "missing-manifest.json"),
+        "complete": False,
+        "items": {
+            "elm": {
+                "status": "runtime_pending",
+                "cluster_assembly": {
+                    "runtime": {"probe_token": "probe-elm"},
+                },
+            }
+        },
+    }), encoding="utf-8")
+    runner._finish_instanced_dynamic_wind_runtime = lambda _token: (
+        (_ for _ in ()).throw(AssertionError("probe finish must not run"))
+    )
+
+    with unittest.TestCase().assertRaisesRegex(RuntimeError, "manifest"):
+        runner.finish_runtime_probe(checkpoint, report, "elm")
+
+
+def test_cancel_runtime_probe_validates_manifest_before_probe_side_effect(
+    tmp_path,
+):
+    runner = load_runner()
+    corrupt_manifest = tmp_path / "corrupt-manifest.json"
+    corrupt_manifest.write_text("{", encoding="utf-8")
+    checkpoint = tmp_path / "checkpoint.json"
+    report = tmp_path / "report.json"
+    checkpoint.write_text(json.dumps({
+        "schema_version": 1,
+        "manifest": str(corrupt_manifest),
+        "complete": False,
+        "items": {
+            "elm": {
+                "status": "runtime_pending",
+                "cluster_assembly": {
+                    "runtime": {"probe_token": "probe-elm"},
+                },
+            }
+        },
+    }), encoding="utf-8")
+    runner._best_effort_cancel_instanced_dynamic_wind_runtime = lambda _token: (
+        (_ for _ in ()).throw(AssertionError("probe cancel must not run"))
+    )
+
+    with unittest.TestCase().assertRaisesRegex(RuntimeError, "manifest"):
+        runner.cancel_runtime_probe(checkpoint, report, "elm", "timeout")
+
+
 def test_headless_runtime_validation_is_deferred_without_starting_probe(monkeypatch):
     runner = load_runner(monkeypatch)
     monkeypatch.setenv("SK_BATCH_MANIFEST_PATH", "headless-manifest.json")
@@ -983,6 +1425,289 @@ def test_headless_runtime_validation_is_deferred_without_starting_probe(monkeypa
     assert assembly["status"] == "ok"
     assert assembly["runtime"]["status"] == "headless_deferred"
     assert assembly["runtime"]["render_frame_validation_performed"] is False
+
+
+def test_null_rhi_runtime_validation_runs_cpu_checks_without_finish_frame_polling(
+    monkeypatch,
+):
+    runner = load_runner(monkeypatch)
+    runner.unreal.SystemLibrary = types.SimpleNamespace(
+        get_command_line=lambda: (
+            'UnrealEditor.exe "C:/Project/MyProject.uproject" -NullRHI -Unattended'
+        ),
+        parse_param=lambda command_line, name: (
+            name.casefold() == "nullrhi" and "-NullRHI" in command_line
+        ),
+    )
+    seen = []
+    monkeypatch.setattr(
+        runner,
+        "_validate_null_rhi_assembly_static_contract",
+        lambda assembly: {"build_status": assembly["status"] == "ready_for_runtime"},
+    )
+    monkeypatch.setattr(
+        runner,
+        "_validate_null_rhi_dynamic_wind_runtime",
+        lambda path: seen.append(path) or {
+            "success": True,
+            "status": "null_rhi_cpu_static_passed_render_deferred",
+            "render_frame_validation_performed": False,
+        },
+    )
+    assembly = {
+        "status": "ready_for_runtime",
+        "build": {"assembly": "/Game/Meshes/Tree/Assembly"},
+    }
+
+    status = runner._prepare_assembly_runtime_validation(assembly)
+
+    assert status == "imported_ok"
+    assert assembly["status"] == "ok"
+    assert assembly["runtime"]["status"] == (
+        "null_rhi_cpu_static_passed_render_deferred"
+    )
+    assert assembly["runtime"]["render_frame_validation_performed"] is False
+    assert assembly["runtime"]["assembly_static_checks"] == {"build_status": True}
+    assert seen == ["/Game/Meshes/Tree/Assembly"]
+
+
+def test_null_rhi_cpu_static_probe_validates_and_cleans_up(monkeypatch):
+    runner = load_runner(monkeypatch)
+    begin = {
+        "success": True,
+        "status": "pending",
+        "probe_token": "probe-null-rhi",
+        "begin_cpu_runtime_contract": True,
+        "crud_add": True,
+        "crud_update": True,
+        "crud_read_back": True,
+        "crud_remove": True,
+        "crud_readd": True,
+        "owner_actor_is_transient": True,
+        "persistent_level_dirty_state_preserved": True,
+        "validation": {
+            "subsystem_exists": True,
+            "subsystem_provider_ready": True,
+            "ref_bones": 42,
+            "skeleton_ref_bones": 42,
+            "mesh_skeleton_identity_matches": True,
+            "skeleton_bind_pose_mismatch": False,
+            "wind_bones": 42,
+            "invalid_wind_bones": 0,
+            "skeletal_data_ready": True,
+            "component_mesh_matches": True,
+            "component_instances": 1,
+            "component_registered": True,
+            "component_visible": True,
+            "component_enabled": True,
+            "mesh_compiling": False,
+            "provider_compiling": False,
+            "provider_is_dynamic_wind_data": True,
+        },
+    }
+    monkeypatch.setattr(
+        runner,
+        "_begin_instanced_dynamic_wind_runtime",
+        lambda path: begin if path == "/Game/Meshes/Tree/Assembly" else None,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_best_effort_cancel_instanced_dynamic_wind_runtime",
+        lambda token: {
+            "success": token == "probe-null-rhi",
+            "cleanup_confirmed": token == "probe-null-rhi",
+            "result": {"success": True, "cancelled": True},
+        },
+    )
+
+    result = runner._validate_null_rhi_dynamic_wind_runtime(
+        "/Game/Meshes/Tree/Assembly"
+    )
+
+    assert result["success"] is True
+    assert result["status"] == "null_rhi_cpu_static_passed_render_deferred"
+    assert all(result["cpu_static_checks"].values())
+    assert result["cleanup"]["cleanup_confirmed"] is True
+
+
+def test_null_rhi_cpu_static_probe_fails_closed_on_skeleton_mismatch(monkeypatch):
+    runner = load_runner(monkeypatch)
+    begin = {
+        "probe_token": "probe-null-rhi",
+        "begin_cpu_runtime_contract": True,
+        "crud_add": True,
+        "crud_update": True,
+        "crud_read_back": True,
+        "crud_remove": True,
+        "crud_readd": True,
+        "owner_actor_is_transient": True,
+        "persistent_level_dirty_state_preserved": True,
+        "validation": {
+            "subsystem_exists": True,
+            "subsystem_provider_ready": True,
+            "ref_bones": 42,
+            "skeleton_ref_bones": 42,
+            "mesh_skeleton_identity_matches": False,
+            "skeleton_bind_pose_mismatch": False,
+            "wind_bones": 42,
+            "invalid_wind_bones": 0,
+            "skeletal_data_ready": True,
+            "component_mesh_matches": True,
+            "component_instances": 1,
+            "component_registered": True,
+            "component_visible": True,
+            "component_enabled": True,
+            "mesh_compiling": False,
+            "provider_compiling": False,
+            "provider_is_dynamic_wind_data": True,
+        },
+    }
+    monkeypatch.setattr(runner, "_begin_instanced_dynamic_wind_runtime", lambda _p: begin)
+    monkeypatch.setattr(
+        runner,
+        "_best_effort_cancel_instanced_dynamic_wind_runtime",
+        lambda _token: {"cleanup_confirmed": True},
+    )
+
+    with unittest.TestCase().assertRaisesRegex(
+        RuntimeError,
+        "mesh_skeleton_identity_matches",
+    ):
+        runner._validate_null_rhi_dynamic_wind_runtime("/Game/Meshes/Tree/Assembly")
+
+
+def test_null_rhi_cpu_static_probe_cleans_up_malformed_validation(monkeypatch):
+    runner = load_runner(monkeypatch)
+    monkeypatch.setattr(
+        runner,
+        "_begin_instanced_dynamic_wind_runtime",
+        lambda _path: {
+            "success": True,
+            "status": "pending",
+            "probe_token": "probe-malformed",
+            "validation": ["malformed"],
+        },
+    )
+    cancelled = []
+    monkeypatch.setattr(
+        runner,
+        "_best_effort_cancel_instanced_dynamic_wind_runtime",
+        lambda token: cancelled.append(token) or {"cleanup_confirmed": True},
+    )
+
+    with unittest.TestCase().assertRaisesRegex(RuntimeError, "not an object"):
+        runner._validate_null_rhi_dynamic_wind_runtime("/Game/Meshes/Tree/Assembly")
+
+    assert cancelled == ["probe-malformed"]
+
+
+def _null_rhi_static_assembly_fixture(bone_count=9789):
+    assembly_path = "/Game/Meshes/Tree/Assembly/SK_Tree_NaniteAssembly"
+    return {
+        "status": "ready_for_runtime",
+        "save_writability": [
+            {"asset": assembly_path, "status": "writable"},
+        ],
+        "thumbnail_free_save": {"status": "ok", "asset": assembly_path},
+        "materials": {
+            "slots": [{"material": "/Game/Material/MI_Tree.MI_Tree"}],
+            "section_material_validation": {"status": "ok"},
+        },
+        "build": {
+            "status": "ok",
+            "full_skeletal_mesh_preserved": True,
+            "assembly": assembly_path + ".SK_Tree_NaniteAssembly",
+            "final_skeleton_bones": bone_count,
+            "manifest_skeleton_diagnostic": {
+                "current_unreal_skeleton_is_authoritative": True,
+                "actual_bone_count": bone_count,
+            },
+            "unreal_bone_name_map": {
+                "status": "exact_constant_index_offset",
+                "approximation_used": False,
+            },
+            "native_binding_contract": {
+                "construction": "direct_exact_reference_skeleton_indices",
+                "all_authored_influences_preserved": True,
+                "weights_sum_to_one": True,
+            },
+            "binding_count": 4,
+            "base_weights_in_final_wind": True,
+            "final_nanite_shape_preservation": {
+                "policy": "preserve_area",
+                "applied_before_finish": True,
+                "base_and_parts_unchanged": True,
+                "preserved_through_finish": True,
+            },
+            "bounds_completion": {"status": "complete"},
+            "dynamic_wind": {
+                "success": True,
+                "declared_bones": bone_count,
+                "final_bones": bone_count,
+                "skeleton_asset_ref_bones": bone_count,
+                "skeleton_asset_matches_final_mesh": True,
+                "skeleton_bind_pose_matches": True,
+                "missing_current_joints": 0,
+                "remapped_joint_records": 0,
+                "bone_group_mapping_matches_json": True,
+            },
+            "parts": [{"bindings": 4}],
+            "provenance": {
+                "success": True,
+                "part_count": 1,
+                "instance_count": 4,
+            },
+            "material_normalization": {
+                "part_section_audits": [{"status": "ok"}],
+                "assembly_section_audit": {"status": "ok"},
+            },
+        },
+    }
+
+
+def test_null_rhi_assembly_static_contract_accepts_exact_9789_bones():
+    runner = load_runner()
+    checks = runner._validate_null_rhi_assembly_static_contract(
+        _null_rhi_static_assembly_fixture()
+    )
+
+    assert all(checks.values())
+
+
+def test_null_rhi_assembly_static_contract_fails_closed_on_exactness_regressions():
+    runner = load_runner()
+    for case in (
+        "bind_pose",
+        "bone_count",
+        "approximation",
+        "material_audit",
+        "preserve_area",
+    ):
+        payload = deepcopy(_null_rhi_static_assembly_fixture())
+        if case == "bind_pose":
+            payload["build"]["dynamic_wind"]["skeleton_bind_pose_matches"] = False
+        elif case == "bone_count":
+            payload["build"]["dynamic_wind"]["final_bones"] = 9788
+        elif case == "approximation":
+            payload["build"]["unreal_bone_name_map"]["approximation_used"] = True
+        elif case == "material_audit":
+            payload["materials"]["section_material_validation"]["status"] = (
+                "unavailable"
+            )
+        elif case == "preserve_area":
+            payload["build"]["final_nanite_shape_preservation"][
+                "preserved_through_finish"
+            ] = False
+
+        with unittest.TestCase().subTest(case=case):
+            with unittest.TestCase().assertRaises(RuntimeError):
+                runner._validate_null_rhi_assembly_static_contract(payload)
+
+
+def test_null_rhi_detection_fails_closed_without_unreal_command_line_api():
+    runner = load_runner()
+
+    assert runner._is_null_rhi_runtime() is False
 
 
 def test_headless_restart_recovers_pending_without_reimport(tmp_path, monkeypatch):
@@ -1306,11 +2031,7 @@ class NaniteVoxelMaterialUsageTests(unittest.TestCase):
                 "unchanged master material must not be recompiled"
             )
         )
-        runner.audit_unreal_skeletal_mesh_material_sections = (
-            lambda *_args: {"status": "ok"}
-        )
-
-        result = runner._material_compile_and_slot_validation(
+        result = runner._material_prebuild_compile_and_usage_normalization(
             "/Game/Meshes/SK_Tree"
         )
 
@@ -1318,6 +2039,536 @@ class NaniteVoxelMaterialUsageTests(unittest.TestCase):
             result["nanite_voxel_material_usage"][0]["compile"],
             "skipped_unchanged",
         )
+
+    def test_postbuild_audit_never_repairs_or_recompiles_usage(self):
+        runner = load_runner()
+        base = self.FakeMaterial({
+            "used_with_skeletal_mesh": True,
+            "used_with_nanite": True,
+            "used_with_voxels": False,
+        })
+
+        class FakeInterface:
+            def get_path_name(self):
+                return "/Game/Material/MI_Tree.MI_Tree"
+
+            def get_base_material(self):
+                return base
+
+        class FakeSlot:
+            def get_editor_property(self, name):
+                return "M_Tree" if name == "material_slot_name" else FakeInterface()
+
+        class FakeMesh:
+            def get_editor_property(self, name):
+                assert name == "materials"
+                return [FakeSlot()]
+
+        runner.unreal.EditorAssetLibrary = types.SimpleNamespace(
+            load_asset=lambda _path: FakeMesh(),
+            save_asset=lambda *_args, **_kwargs: self.fail(
+                "post-build audit must not save"
+            ),
+        )
+        runner.unreal.MaterialEditingLibrary = types.SimpleNamespace(
+            recompile_material=lambda _material: self.fail(
+                "post-build audit must not recompile"
+            )
+        )
+        runner.unreal.get_editor_subsystem = lambda _type: self.fail(
+            "post-build audit must not check out"
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "post-build.*incomplete"):
+            runner._material_postbuild_slot_audit("/Game/Meshes/SK_Tree")
+
+
+class _DurableSaveFake:
+    def __init__(self, runner, content_dir):
+        self.runner = runner
+        self.content_dir = Path(content_dir)
+        self.assets = {}
+        self.dirty = set()
+        self.save_asset_calls = []
+        self.save_directory_calls = []
+        self.native_save_calls = []
+        self.write_count = 0
+        self.directory_intruder = None
+
+        environment = self
+
+        class FakePackage:
+            def __init__(self, path):
+                self.path = path
+
+            def get_path_name(self):
+                return self.path
+
+        class FakeEditorAssetLibrary:
+            @staticmethod
+            def does_asset_exist(path):
+                return environment.normalize(path) in environment.assets
+
+            @staticmethod
+            def load_asset(path):
+                return environment.assets.get(environment.normalize(path))
+
+            @staticmethod
+            def save_asset(path, only_if_is_dirty=False):
+                package = environment.normalize(path)
+                environment.save_asset_calls.append(
+                    (package, only_if_is_dirty)
+                )
+                environment.write_package(package, "editor")
+                environment.dirty.discard(package.casefold())
+                return True
+
+            @staticmethod
+            def save_directory(path, only_if_is_dirty=True):
+                folder = str(path).replace("\\", "/").rstrip("/") + "/"
+                environment.save_directory_calls.append(
+                    (path, only_if_is_dirty)
+                )
+                for key in list(environment.dirty):
+                    package = environment.package_for_key(key)
+                    if package and package.casefold().startswith(folder.casefold()):
+                        environment.write_package(package, "directory")
+                        environment.dirty.discard(key)
+                if environment.directory_intruder is not None:
+                    environment.directory_intruder()
+                return True
+
+        runner.unreal.Paths = types.SimpleNamespace(
+            project_content_dir=lambda: str(self.content_dir),
+            convert_relative_path_to_full=lambda value: value,
+        )
+        runner.unreal.EditorAssetLibrary = FakeEditorAssetLibrary
+        runner.unreal.EditorLoadingAndSavingUtils = types.SimpleNamespace(
+            get_dirty_content_packages=lambda: [
+                FakePackage(self.package_for_key(key))
+                for key in sorted(self.dirty)
+            ]
+        )
+
+    @staticmethod
+    def normalize(path):
+        return str(path or "").split(".", 1)[0].replace("\\", "/")
+
+    def package_for_key(self, key):
+        return next(
+            (
+                package
+                for package in self.assets
+                if package.casefold() == key
+            ),
+            None,
+        )
+
+    def package_file(self, package):
+        package = self.normalize(package)
+        return self.content_dir.joinpath(
+            *package[len("/Game/") :].split("/")
+        ).with_suffix(".uasset")
+
+    def write_package(self, package, source):
+        package_file = self.package_file(package)
+        package_file.parent.mkdir(parents=True, exist_ok=True)
+        self.write_count += 1
+        package_file.write_bytes(
+            f"{source}-{self.write_count}-{package}".encode("utf-8")
+        )
+        return package_file
+
+    def add_asset(self, package, asset=None):
+        package = self.normalize(package)
+        if asset is None:
+            asset = object()
+        self.assets[package] = asset
+        return asset
+
+    def install_thumbnail_free_saver(self):
+        def save(asset):
+            package = next(
+                path for path, candidate in self.assets.items()
+                if candidate is asset
+            )
+            self.native_save_calls.append(package)
+            self.write_package(package, "thumbnail-free")
+            self.dirty.discard(package.casefold())
+            return True
+
+        self.runner.unreal.CodexMaterialToolsLibrary = types.SimpleNamespace(
+            save_asset_package_without_thumbnail=save,
+        )
+
+
+class DurableSaveOwnershipTests(unittest.TestCase):
+    class FakeSkeleton:
+        def __init__(self, path):
+            self.path = path
+
+        def get_name(self):
+            return self.path.rsplit("/", 1)[-1]
+
+        def get_path_name(self):
+            name = self.path.rsplit("/", 1)[-1]
+            return f"{self.path}.{name}"
+
+    class FakeMesh:
+        def __init__(self, path, skeleton):
+            self.path = path
+            self.skeleton = skeleton
+
+        def get_path_name(self):
+            name = self.path.rsplit("/", 1)[-1]
+            return f"{self.path}.{name}"
+
+        def get_editor_property(self, name):
+            if name != "skeleton":
+                raise AssertionError(name)
+            return self.skeleton
+
+    def _final_contract(self, runner, environment):
+        mesh_path = "/Game/Meshes/Trees/SK_Test"
+        skeleton_path = mesh_path + "_Skeleton"
+        skeleton = self.FakeSkeleton(skeleton_path)
+        mesh = self.FakeMesh(mesh_path, skeleton)
+        environment.add_asset(skeleton_path, skeleton)
+        environment.add_asset(mesh_path, mesh)
+        ledger = runner._new_durable_save_ledger()
+        receipt = runner._save_final_skeleton_contract_assets(
+            mesh,
+            durable_saves=ledger,
+        )
+        return mesh, skeleton, ledger, receipt
+
+    def test_final_contract_owns_dependency_before_mesh_and_rejects_resave(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = _DurableSaveFake(runner, Path(temporary) / "Content")
+            mesh, _skeleton, ledger, receipt = self._final_contract(
+                runner,
+                environment,
+            )
+
+            self.assertEqual(
+                environment.save_asset_calls,
+                [
+                    (receipt["skeleton"], False),
+                    (receipt["mesh"], False),
+                ],
+            )
+            self.assertEqual(
+                [row["role"] for row in ledger["records"]],
+                ["skeleton", "mesh"],
+            )
+            self.assertEqual(
+                json.loads(json.dumps(runner._durable_save_report(ledger))),
+                ledger,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "already has an owner"):
+                runner._save_final_skeleton_contract_assets(
+                    mesh,
+                    durable_saves=ledger,
+                )
+            self.assertEqual(len(environment.save_asset_calls), 2)
+
+    def test_cluster_assembly_verifies_first_receipt_without_second_save(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = _DurableSaveFake(runner, Path(temporary) / "Content")
+            mesh, _skeleton, ledger, receipt = self._final_contract(
+                runner,
+                environment,
+            )
+            before = list(environment.save_asset_calls)
+            runner.validate_manifest_artifacts = lambda _manifest: None
+            runner._without_generated_physics_assets = lambda _module: nullcontext(True)
+            runner.build_unreal_nanite_assembly = (
+                lambda *_args: {"status": "ok", "assembly": None}
+            )
+            runner._material_prebuild_compile_and_usage_normalization = (
+                lambda path: {"mesh": path}
+            )
+
+            result = runner._ingest_cluster_assembly(
+                object(),
+                {
+                    "cluster_assembly": {
+                        "manifest": {"status": "ready"},
+                        "ingest_plan": {
+                            "status": "ready",
+                            "asset_contract": {
+                                "full_skeletal_mesh": mesh.path,
+                            },
+                            "assets": [],
+                        },
+                    }
+                },
+                {"status": "ok"},
+                durable_saves=ledger,
+                final_skeleton_receipt=receipt,
+            )
+
+            self.assertEqual(result["persisted_final_contract"], receipt)
+            self.assertEqual(environment.save_asset_calls, before)
+
+    def test_prototype_and_final_assembly_each_have_one_save_owner(self):
+        runner = load_runner()
+        events = []
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = _DurableSaveFake(runner, Path(temporary) / "Content")
+            mesh, _skeleton, ledger, receipt = self._final_contract(
+                runner,
+                environment,
+            )
+            prototype = "/Game/Meshes/Trees/Assembly/SK_Test_NA_Base"
+            assembly_path = (
+                "/Game/Meshes/Trees/Assembly/SK_Test_NaniteAssembly"
+            )
+            assembly = environment.add_asset(assembly_path)
+            environment.install_thumbnail_free_saver()
+            runner.validate_manifest_artifacts = lambda _manifest: None
+            runner.validate_file_fingerprint = lambda *_args: None
+            runner._without_generated_physics_assets = lambda _module: nullcontext(True)
+            runner._default_physics_asset_preexisting = lambda _path: False
+            runner._prepare_speedtree_skeletal_optimization = (
+                lambda *_args: {"status": "ok"}
+            )
+            runner._finalize_speedtree_skeletal_optimization = lambda value: value
+            runner._ensure_declared_package_writable = (
+                lambda _item, path: {"status": "writable", "asset": path}
+            )
+
+            def import_asset(_module, manifest_asset):
+                path = manifest_asset["asset_data"]["asset_path"]
+                environment.add_asset(path)
+                return {"asset_path": path}
+
+            runner._import_manifest_asset = import_asset
+            runner.build_unreal_nanite_assembly = (
+                lambda *_args: events.append("build") or {
+                    "status": "ok",
+                    "assembly": assembly_path,
+                }
+            )
+            runner._material_prebuild_compile_and_usage_normalization = (
+                lambda path: events.append(("prebuild", path)) or {"mesh": path}
+            )
+            runner._material_postbuild_slot_audit = (
+                lambda path: events.append(("audit", path)) or {"mesh": path}
+            )
+
+            result = runner._ingest_cluster_assembly(
+                object(),
+                {
+                    "cluster_assembly": {
+                        "manifest": {"status": "ready"},
+                        "ingest_plan": {
+                            "status": "ready",
+                            "asset_contract": {
+                                "full_skeletal_mesh": mesh.path,
+                            },
+                            "assets": [
+                                {
+                                    "asset_data": {
+                                        "asset_path": prototype,
+                                        "_material_pipeline_json_fingerprint": {},
+                                    }
+                                }
+                            ],
+                        },
+                    }
+                },
+                {"status": "ok"},
+                durable_saves=ledger,
+                final_skeleton_receipt=receipt,
+            )
+
+            self.assertEqual(result["persisted_generated_assets"], [prototype])
+            self.assertEqual(environment.save_asset_calls.count((prototype, False)), 1)
+            self.assertEqual(environment.native_save_calls, [assembly_path])
+            prototype_record = runner._find_durable_save(ledger, prototype)
+            assembly_record = runner._find_durable_save(ledger, assembly_path)
+            self.assertEqual(
+                prototype_record["owner"],
+                "assembly_prototype_prebuild",
+            )
+            self.assertEqual(assembly_record["save_mode"], "thumbnail_free")
+            self.assertIs(environment.assets[assembly_path], assembly)
+            self.assertEqual(
+                events,
+                [
+                    ("prebuild", mesh.path),
+                    ("prebuild", prototype),
+                    "build",
+                    ("audit", assembly_path),
+                ],
+            )
+
+    def test_external_provider_material_prebuild_is_path_deduplicated(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = _DurableSaveFake(runner, Path(temporary) / "Content")
+            mesh, _skeleton, ledger, receipt = self._final_contract(
+                runner,
+                environment,
+            )
+            provider = "/Game/Meshes/Trees/Cluster/SK_Branch_Provider"
+            calls = []
+            runner.validate_manifest_artifacts = lambda _manifest: None
+            runner._without_generated_physics_assets = lambda _module: nullcontext(True)
+            runner._material_prebuild_compile_and_usage_normalization = (
+                lambda path: calls.append(path) or {"mesh": path}
+            )
+            runner.build_unreal_nanite_assembly = (
+                lambda *_args: {"status": "ok", "assembly": None}
+            )
+
+            result = runner._ingest_cluster_assembly(
+                object(),
+                {
+                    "cluster_assembly": {
+                        "manifest": {"status": "ready"},
+                        "ingest_plan": {
+                            "status": "ready",
+                            "assets": [],
+                            "external_assets": [
+                                {"asset_path": provider, "prototype_id": "a"},
+                                {"asset_path": provider, "prototype_id": "b"},
+                            ],
+                            "asset_contract": {
+                                "full_skeletal_mesh": mesh.path,
+                                "parts": {"a": provider, "b": provider},
+                            },
+                        },
+                    }
+                },
+                {"status": "ok"},
+                durable_saves=ledger,
+                final_skeleton_receipt=receipt,
+            )
+
+            self.assertEqual(calls, [mesh.path, provider])
+            self.assertEqual(
+                [row["mesh"] for row in result["prebuild_materials"]],
+                [mesh.path, provider],
+            )
+
+    def test_terminal_save_keeps_saved_shape_and_verifies_owned_asset(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = _DurableSaveFake(runner, Path(temporary) / "Content")
+            mesh_path = "/Game/Meshes/Trees/SK_Test"
+            provider_path = "/Game/Meshes/Trees/DA_WindProvider"
+            environment.add_asset(mesh_path)
+            environment.add_asset(provider_path)
+            ledger = runner._new_durable_save_ledger()
+            runner._save_asset_owned(
+                mesh_path,
+                ledger,
+                owner="final_skeleton_contract",
+                role="mesh",
+            )
+            before = list(environment.save_asset_calls)
+
+            saved = runner._save_item_assets(
+                {
+                    "mesh_path": mesh_path,
+                    "unreal_folder": "/Game/Meshes/Trees/",
+                },
+                [
+                    {"asset_path": mesh_path},
+                    {"asset_path": mesh_path},
+                    {"asset_path": provider_path},
+                ],
+                durable_saves=ledger,
+            )
+
+            self.assertEqual(saved, [mesh_path, provider_path])
+            self.assertEqual(
+                environment.save_asset_calls,
+                before + [(provider_path, False)],
+            )
+            self.assertEqual(
+                environment.save_directory_calls,
+                [("/Game/Meshes/Trees/", True)],
+            )
+
+    def test_terminal_directory_save_rejects_dirty_owned_package(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = _DurableSaveFake(runner, Path(temporary) / "Content")
+            assembly_path = (
+                "/Game/Meshes/Trees/Assembly/SK_Test_NaniteAssembly"
+            )
+            environment.add_asset(assembly_path)
+            environment.install_thumbnail_free_saver()
+            ledger = runner._new_durable_save_ledger()
+            runner._save_large_assembly_without_thumbnail(
+                assembly_path,
+                durable_saves=ledger,
+            )
+            environment.dirty.add(assembly_path.casefold())
+
+            with self.assertRaisesRegex(RuntimeError, "became dirty"):
+                runner._save_item_assets(
+                    {"unreal_folder": "/Game/Meshes/Trees/"},
+                    [],
+                    durable_saves=ledger,
+                )
+            self.assertEqual(environment.save_directory_calls, [])
+
+    def test_terminal_directory_save_detects_owned_package_stat_change(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = _DurableSaveFake(runner, Path(temporary) / "Content")
+            assembly_path = (
+                "/Game/Meshes/Trees/Assembly/SK_Test_NaniteAssembly"
+            )
+            environment.add_asset(assembly_path)
+            environment.install_thumbnail_free_saver()
+            ledger = runner._new_durable_save_ledger()
+            runner._save_large_assembly_without_thumbnail(
+                assembly_path,
+                durable_saves=ledger,
+            )
+            environment.directory_intruder = lambda: environment.write_package(
+                assembly_path,
+                "intruding-directory-save",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "changed after ownership"):
+                runner._save_item_assets(
+                    {"unreal_folder": "/Game/Meshes/Trees/"},
+                    [],
+                    durable_saves=ledger,
+                )
+
+    def test_terminal_directory_records_only_unowned_dirty_auxiliaries(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = _DurableSaveFake(runner, Path(temporary) / "Content")
+            auxiliary = "/Game/Meshes/Trees/MI_Auxiliary"
+            environment.add_asset(auxiliary)
+            environment.dirty.add(auxiliary.casefold())
+            ledger = runner._new_durable_save_ledger()
+
+            saved = runner._save_item_assets(
+                {"unreal_folder": "/Game/Meshes/Trees/"},
+                [],
+                durable_saves=ledger,
+            )
+
+            self.assertEqual(saved, [])
+            self.assertEqual(len(ledger["records"]), 1)
+            record = ledger["records"][0]
+            self.assertEqual(record["package"], auxiliary)
+            self.assertEqual(record["owner"], "terminal_directory")
+            self.assertEqual(record["role"], "auxiliary")
+            self.assertEqual(record["save_mode"], "directory_dirty_only")
+            self.assertNotIn(auxiliary.casefold(), environment.dirty)
 
 
 class UnrealIngestSaveTests(unittest.TestCase):
@@ -1332,6 +2583,16 @@ class UnrealIngestSaveTests(unittest.TestCase):
             lambda _send2ue, _asset: {"asset_path": mesh_path}
         )
         runner._material_pipeline_checkouts = lambda: []
+        runner._material_prebuild_compile_and_usage_normalization = (
+            lambda path: {"mesh": path, "slots": []}
+        )
+        runner._material_postbuild_slot_audit = (
+            lambda path: {
+                "mesh": path,
+                "slots": [{"material": "/Game/Material/MI_Test"}],
+                "section_material_validation": {"status": "ok"},
+            }
+        )
         runner._default_physics_asset_preexisting = lambda _path: False
         runner._prepare_speedtree_skeletal_optimization = (
             lambda _path, _preexisting: {
@@ -1342,49 +2603,84 @@ class UnrealIngestSaveTests(unittest.TestCase):
         runner._finalize_speedtree_skeletal_optimization = lambda value: value
         runner._clear_placeholder_skeleton_before_import = lambda _item: {"status": "ok"}
         runner._apply_dynamic_wind = lambda _item: {"status": "ok"}
-        runner._save_item_assets = (
-            lambda _item, _assets: events.append("save") or [mesh_path]
+        runner._save_item_assets = lambda _item, _assets, **_kwargs: (
+            events.append("save") or [mesh_path]
         )
 
     def test_save_item_assets_deduplicates_imported_mesh_path(self):
         runner = load_runner()
-        save_calls = []
-        directory_calls = []
-
-        class FakeEditorAssetLibrary:
-            @staticmethod
-            def does_asset_exist(_path):
-                return True
-
-            @staticmethod
-            def save_asset(path, only_if_is_dirty=False):
-                save_calls.append((path, only_if_is_dirty))
-                return True
-
-            @staticmethod
-            def save_directory(path, only_if_is_dirty=True):
-                directory_calls.append((path, only_if_is_dirty))
-                return True
-
-        runner.unreal.EditorAssetLibrary = FakeEditorAssetLibrary
         mesh_path = "/Game/Meshes/Trees/SK_Test"
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = _DurableSaveFake(runner, Path(temporary) / "Content")
+            environment.add_asset(mesh_path)
+            saved = runner._save_item_assets(
+                {
+                    "mesh_path": mesh_path,
+                    "unreal_folder": "/Game/Meshes/Trees/",
+                },
+                [{"asset_path": mesh_path}, {"asset_path": mesh_path}],
+                durable_saves=runner._new_durable_save_ledger(),
+            )
 
-        saved = runner._save_item_assets(
-            {"mesh_path": mesh_path, "unreal_folder": "/Game/Meshes/Trees/"},
-            [{"asset_path": mesh_path}, {"asset_path": mesh_path}],
+            self.assertEqual(saved, [mesh_path])
+            self.assertEqual(
+                environment.save_asset_calls,
+                [(mesh_path, False)],
+            )
+            self.assertEqual(
+                environment.save_directory_calls,
+                [("/Game/Meshes/Trees/", True)],
+            )
+
+    def test_large_assembly_uses_thumbnail_free_package_save(self):
+        runner = load_runner()
+        assembly_path = "/Game/Meshes/Trees/Assembly/SK_Test_NaniteAssembly"
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = _DurableSaveFake(runner, Path(temporary) / "Content")
+            environment.add_asset(assembly_path)
+            environment.install_thumbnail_free_saver()
+            ledger = runner._new_durable_save_ledger()
+
+            result = runner._save_large_assembly_without_thumbnail(
+                assembly_path + ".SK_Test_NaniteAssembly",
+                durable_saves=ledger,
+            )
+
+            self.assertEqual(result, assembly_path)
+            self.assertEqual(environment.native_save_calls, [assembly_path])
+            self.assertEqual(ledger["records"][0]["save_mode"], "thumbnail_free")
+
+    def test_large_assembly_save_fails_closed_without_native_helper(self):
+        runner = load_runner()
+        runner.unreal.EditorAssetLibrary = types.SimpleNamespace(
+            load_asset=lambda _path: object(),
         )
 
-        self.assertEqual(saved, [mesh_path])
-        self.assertEqual(save_calls, [(mesh_path, False)])
-        self.assertEqual(directory_calls, [("/Game/Meshes/Trees/", True)])
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "thumbnail-free package save API is unavailable",
+        ):
+            runner._save_large_assembly_without_thumbnail(
+                "/Game/Meshes/Trees/Assembly/SK_Test_NaniteAssembly",
+                durable_saves=runner._new_durable_save_ledger(),
+            )
 
-    def test_ingest_item_saves_once_before_material_validation(self):
+    def test_ingest_item_prebuilds_before_nanite_and_only_audits_after_save(self):
         runner = load_runner()
         events = []
         mesh_path = "/Game/Meshes/Trees/SK_Test"
         self._configure_ingest_runner(runner, events, mesh_path)
-        runner._material_compile_and_slot_validation = (
-            lambda _path: events.append("validate") or {"mesh": mesh_path}
+        runner._material_prebuild_compile_and_usage_normalization = (
+            lambda path: events.append("prebuild") or {"mesh": path}
+        )
+        runner._prepare_speedtree_skeletal_optimization = (
+            lambda _path, _preexisting: events.append("optimize") or {
+                "status": "ok",
+                "_delete_physics_asset_path": "",
+            }
+        )
+        runner._material_postbuild_slot_audit = (
+            lambda path: events.append("audit") or {"mesh": path}
         )
 
         result = runner.ingest_item(
@@ -1395,8 +2691,13 @@ class UnrealIngestSaveTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(events, ["save", "validate"])
+        self.assertEqual(events, ["prebuild", "optimize", "save", "audit"])
         self.assertEqual(result["saved"], [mesh_path])
+        self.assertEqual(result["prebuild_materials"], [{"mesh": mesh_path}])
+        self.assertEqual(
+            result["durable_saves"],
+            {"schema_version": 1, "records": []},
+        )
 
     @staticmethod
     def _skeleton_fixture(
@@ -1790,7 +3091,6 @@ class UnrealIngestSaveTests(unittest.TestCase):
         runner._apply_dynamic_wind = (
             lambda _item: events.append("wind") or {"status": "ok"}
         )
-        runner._material_compile_and_slot_validation = lambda _path: {}
 
         result = runner.ingest_item(
             {
@@ -1827,7 +3127,6 @@ class UnrealIngestSaveTests(unittest.TestCase):
             )
             or {"asset_path": mesh_path}
         )
-        runner._material_compile_and_slot_validation = lambda _path: {}
 
         runner.ingest_item(
             {
@@ -1877,7 +3176,6 @@ class UnrealIngestSaveTests(unittest.TestCase):
             )
             or {"asset_path": asset["asset_data"]["asset_path"]}
         )
-        runner._material_compile_and_slot_validation = lambda _path: {}
 
         result = runner.ingest_item(
             {
@@ -2539,19 +3837,19 @@ class UnrealIngestSaveTests(unittest.TestCase):
             ["/Game/Meshes/Other/SK_Shared"],
         )
 
-    def test_ingest_item_still_saves_before_material_validation_failure(self):
+    def test_ingest_item_prebuild_material_failure_happens_before_save(self):
         runner = load_runner()
         events = []
         mesh_path = "/Game/Meshes/Trees/SK_Test"
         self._configure_ingest_runner(runner, events, mesh_path)
 
-        def fail_validation(_path):
-            events.append("validate")
+        def fail_prebuild(_path):
+            events.append("prebuild")
             raise RuntimeError("material compile failed")
 
-        runner._material_compile_and_slot_validation = fail_validation
+        runner._material_prebuild_compile_and_usage_normalization = fail_prebuild
 
-        try:
+        with self.assertRaisesRegex(RuntimeError, "material compile failed"):
             runner.ingest_item(
                 {
                     "send2ue_unreal_py": "send2ue_unreal.py",
@@ -2559,12 +3857,31 @@ class UnrealIngestSaveTests(unittest.TestCase):
                     "mesh_path": mesh_path,
                 }
             )
-        except RuntimeError as exc:
-            self.assertIn("material compile failed", str(exc))
-        else:
-            self.fail("material validation failure must propagate")
 
-        self.assertEqual(events, ["save", "validate"])
+        self.assertEqual(events, ["prebuild"])
+
+    def test_ingest_item_still_saves_before_postbuild_material_audit_failure(self):
+        runner = load_runner()
+        events = []
+        mesh_path = "/Game/Meshes/Trees/SK_Test"
+        self._configure_ingest_runner(runner, events, mesh_path)
+
+        def fail_audit(_path):
+            events.append("audit")
+            raise RuntimeError("material section audit failed")
+
+        runner._material_postbuild_slot_audit = fail_audit
+
+        with self.assertRaisesRegex(RuntimeError, "material section audit failed"):
+            runner.ingest_item(
+                {
+                    "send2ue_unreal_py": "send2ue_unreal.py",
+                    "assets": [{}],
+                    "mesh_path": mesh_path,
+                }
+            )
+
+        self.assertEqual(events, ["save", "audit"])
 
 
 class PreImportMaterialSlotNormalizationTests(unittest.TestCase):

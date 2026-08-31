@@ -13,12 +13,15 @@ Birch Paper is sorted last by default.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import stat
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 
 from exact_push import (
     DEFAULT_BLENDER,
@@ -39,17 +42,178 @@ from push_dependency_schedule import (
     normalized_path_key,
 )
 from sk_common import wind_preset_for_spm
+from stage_batch_policy import run_memory_bounded_stage, stage_worker_policy
 from assembly_runtime_contract import assembly_runtime_code_state
 
 
 DEFAULT_ROOT = Path(r"D:\OneDrive\Forestportfolio\02_nature\Tree")
 ASSEMBLY_JOB = Path(__file__).resolve().parent / "jobs" / "assembly_headless_job.py"
+SPM_BONE_POLICY_JOB = (
+    Path(__file__).resolve().parent
+    / "jobs"
+    / "spm_bone_policy_headless_job.py"
+)
 PCG_AUDIT = (
     Path(__file__).resolve().parents[1]
     / "pcg_st9_texture_batch"
     / "pcg_texture_audit.py"
 )
+
+
+def _persisted_stage_policy(policy):
+    """Keep fleet receipts useful without embedding every RAM poll."""
+    policy = dict(policy or {})
+    checks = list(policy.pop("admission_checks", []) or [])
+    policy["admission_check_count"] = len(checks)
+    policy["denied_admission_count"] = len([
+        row for row in checks if not row.get("admitted")
+    ])
+    if checks:
+        policy["first_memory_sample"] = checks[0]
+        policy["last_memory_sample"] = checks[-1]
+    return policy
+
+
+def root_dependency_round_plan(rows, processed_provider_keys):
+    """Plan the provider barrier after one parallel root Assembly round.
+
+    Every root that observed a provider absent at round start must be rebuilt,
+    including later roots that share a provider first discovered by an earlier
+    completed worker.  Provider processing order stays deterministic.
+    """
+    processed = set(processed_provider_keys)
+    ordered_new = []
+    seen_new = set()
+    rebuild_job_keys = set()
+    for row in rows:
+        job_key = row["job_key"]
+        for provider in row.get("dependencies") or []:
+            provider_key = normalized_path_key(provider)
+            if provider_key in processed:
+                continue
+            rebuild_job_keys.add(job_key)
+            if provider_key not in seen_new:
+                seen_new.add(provider_key)
+                ordered_new.append(Path(provider).resolve())
+    return {
+        "new_providers": ordered_new,
+        "rebuild_job_keys": rebuild_job_keys,
+    }
+
+
+def seal_root_material_contract(command, outputs, sealed_path):
+    """Give a parallel root job an immutable, run-unique contract path."""
+    command = list(command)
+    source = Path(outputs["material_contract"]).resolve()
+    sealed = Path(sealed_path).resolve()
+    try:
+        marker = command.index("--material-contract")
+        command_contract = Path(command[marker + 1]).resolve()
+    except (ValueError, IndexError) as exc:
+        raise ExactPushError(
+            "exact Push command has no material contract argument"
+        ) from exc
+    if command_contract != source:
+        raise ExactPushError(
+            "exact Push command and outputs disagree on material contract"
+        )
+    try:
+        payload = source.read_bytes()
+    except OSError as exc:
+        raise ExactPushError(
+            f"current Push material contract is unreadable: {source}: {exc}"
+        ) from exc
+    if not payload:
+        raise ExactPushError(
+            f"current Push material contract is empty: {source}"
+        )
+    sealed.parent.mkdir(parents=True, exist_ok=True)
+    sealed.write_bytes(payload)
+    command[marker + 1] = str(sealed)
+    outputs["material_contract"] = sealed
+    return command, outputs
+
+
 DEFAULT_P4_CLIENT = "UnrealProjects"
+COMBINED_MANIFEST_SCHEMA_VERSION = 2
+EXTERNAL_ITEM_STORAGE_SCHEMA_VERSION = 1
+
+
+def _completed_process_metrics(completed, started):
+    return {
+        "wall_seconds": round(perf_counter() - float(started), 6),
+        "resource_usage": getattr(completed, "resource_usage", None),
+    }
+
+def _atomic_write_bytes(path, payload):
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    temporary.write_bytes(payload)
+    os.replace(temporary, target)
+
+
+def write_combined_lazy_manifest(manifest_path, manifest_metadata, pending):
+    """Publish a small v2 index whose large v1 items live in separate files."""
+    manifest_path = Path(manifest_path).resolve()
+    payload_dir = manifest_path.with_name(manifest_path.stem + "_items")
+    item_refs = []
+    for index, entry in enumerate(pending):
+        item = entry.get("item")
+        if not isinstance(item, dict):
+            raise ExactPushError(
+                f"combined manifest item {index} is not a JSON object"
+            )
+        queue_id = str(item.get("queue_id") or "")
+        fingerprint = str(item.get("fingerprint") or "")
+        if not queue_id or not fingerprint:
+            raise ExactPushError(
+                f"combined manifest item {index} has no queue id or fingerprint"
+            )
+        payload = json.dumps(
+            item,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        payload_sha256 = hashlib.sha256(payload).hexdigest()
+        payload_path = payload_dir / f"{index:04d}_{payload_sha256[:16]}.json"
+        _atomic_write_bytes(payload_path, payload)
+        item_refs.append({
+            "schema_version": 1,
+            "queue_id": queue_id,
+            "fingerprint": fingerprint,
+            "depends_on_queue_ids": list(
+                item.get("depends_on_queue_ids") or []
+            ),
+            "report_path": item.get("report_path"),
+            "checkout_asset_paths": list(
+                item.get("checkout_asset_paths") or []
+            ),
+            "payload_relpath": payload_path.relative_to(
+                manifest_path.parent
+            ).as_posix(),
+            "payload_size": len(payload),
+            "payload_sha256": payload_sha256,
+        })
+
+    manifest = dict(manifest_metadata)
+    manifest.update({
+        "schema_version": COMBINED_MANIFEST_SCHEMA_VERSION,
+        "item_storage": {
+            "kind": "external_json",
+            "schema_version": EXTERNAL_ITEM_STORAGE_SCHEMA_VERSION,
+            "integrity": "sha256",
+            "base_relpath": payload_dir.relative_to(
+                manifest_path.parent
+            ).as_posix(),
+        },
+        "items": item_refs,
+    })
+    _atomic_write_bytes(
+        manifest_path,
+        json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"),
+    )
+    return manifest
 
 
 def _asset_package_file(unreal_project, asset_path):
@@ -153,7 +317,19 @@ def build_assembly_command(
     *,
     cluster_assembly_contract=None,
     force_native_export=False,
+    fresh_verification_only_export=False,
+    force_cluster_assembly_rebuild=False,
+    provider_no_owner_receipt=False,
 ):
+    if fresh_verification_only_export and not force_native_export:
+        raise ExactPushError(
+            "fresh Collision/Prune export requires force native export"
+        )
+    if provider_no_owner_receipt and cluster_assembly_contract:
+        raise ExactPushError(
+            "provider no-owner receipt mode cannot carry a root Cluster "
+            "Assembly contract"
+        )
     spm = Path(target["spm"]).resolve()
     command = [
         str(Path(blender).resolve()),
@@ -178,13 +354,112 @@ def build_assembly_command(
             "--cluster-assembly-contract",
             str(Path(cluster_assembly_contract).resolve()),
         ])
+    if provider_no_owner_receipt:
+        command.append("--provider-no-owner-receipt")
     command.extend([
         "--report",
         str(Path(report_path).resolve()),
     ])
     if force_native_export:
         command.insert(-2, "--force-native-export")
+    if fresh_verification_only_export:
+        command.insert(-2, "--fresh-collision-prune-export")
+    if force_cluster_assembly_rebuild:
+        command.insert(-2, "--force-cluster-assembly-rebuild")
     return command
+
+
+def build_spm_bone_policy_command(targets, blender, request_path, report_path):
+    """Build one headless add-on transaction for every selected root SPM."""
+    targets = [Path(row["spm"]).resolve() for row in targets]
+    if not targets:
+        raise ExactPushError("SPM bone-policy batch has no selected targets")
+    if not SPM_BONE_POLICY_JOB.is_file():
+        raise ExactPushError(
+            "SPM bone-policy headless job is missing: "
+            + str(SPM_BONE_POLICY_JOB)
+        )
+    blender = Path(blender).resolve()
+    if not blender.is_file():
+        raise ExactPushError("Blender executable is missing: " + str(blender))
+    request_path = Path(request_path).resolve()
+    report_path = Path(report_path).resolve()
+    request_path.parent.mkdir(parents=True, exist_ok=True)
+    request_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "speedtree_spm_minimum_bone_policy_batch_request",
+                "targets": [str(path) for path in targets],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return [
+        str(blender),
+        "--factory-startup",
+        "--background",
+        "--python",
+        str(SPM_BONE_POLICY_JOB),
+        "--",
+        "--request",
+        str(request_path),
+        "--report",
+        str(report_path),
+    ]
+
+
+def validate_spm_bone_policy_report(report_path, targets):
+    """Fail closed unless every exact root produced one validated receipt."""
+    report_path = Path(report_path).resolve()
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    if payload.get("status") != "ok":
+        raise RuntimeError(
+            "SPM bone-policy batch failed: " + str(payload.get("error") or "")
+        )
+    expected = [
+        normalized_path_key(Path(row["spm"]).resolve()) for row in targets
+    ]
+    results = list(payload.get("results") or [])
+    actual = [normalized_path_key(row.get("spm") or "") for row in results]
+    if actual != expected:
+        raise RuntimeError(
+            "SPM bone-policy batch receipt order/identity mismatch"
+        )
+    allowed = {
+        "updated",
+        "already_compliant",
+        "excluded_cluster_source",
+    }
+    if any(row.get("status") not in allowed for row in results):
+        raise RuntimeError("SPM bone-policy batch contains an invalid status")
+    for target, row in zip(targets, results):
+        spm = Path(target["spm"]).resolve()
+        sealed = row.get("sealed_source_identity") or {}
+        stat_result = spm.stat()
+        digest_builder = hashlib.sha256()
+        with spm.open("rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest_builder.update(chunk)
+        digest = digest_builder.hexdigest()
+        if (
+            normalized_path_key(sealed.get("path") or "")
+            != normalized_path_key(spm)
+            or int(sealed.get("size", -1)) != stat_result.st_size
+            or int(sealed.get("mtime_ns", -1)) != stat_result.st_mtime_ns
+            or str(sealed.get("sha256") or "").casefold()
+            != digest.casefold()
+        ):
+            raise RuntimeError(
+                "SPM bone-policy sealed source changed before fleet execution: "
+                + str(spm)
+            )
+    return payload
 
 
 def validate_assembly_result(report_path, target):
@@ -715,6 +990,27 @@ def discover_current_cluster_targets(
 def validate_live_result(report: dict, target: dict) -> dict:
     unreal_result = report.get("unreal_result") or {}
     assembly = unreal_result.get("cluster_assembly") or {}
+    if target.get("pass_through"):
+        problems = []
+        if (
+            report.get("status") != "ok"
+            or unreal_result.get("status") != "imported_ok"
+        ):
+            problems.append("unreal_import_not_ok")
+        if assembly.get("status") != "skipped":
+            problems.append("pass_through_assembly_not_skipped")
+        return {
+            "ok": not problems,
+            "pass_through": True,
+            "problems": problems,
+            "assembly": None,
+            "built_parts": 0,
+            "binding_count": 0,
+            "wind_success": None,
+            "provenance_success": None,
+            "assembly_status": assembly.get("status"),
+            "assembly_reason": assembly.get("reason"),
+        }
     build = assembly.get("build") or {}
     built_parts = list(build.get("parts") or [])
     wind = build.get("dynamic_wind") or {}
@@ -784,6 +1080,34 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--fresh-collision-prune-export",
+        "--fresh-verification-only-export",
+        dest="fresh_verification_only_export",
+        action="store_true",
+        help=(
+            "use one forced fresh normal Collision/Prune FBX/XML/receipt "
+            "transaction for every selected job; the old fresh-"
+            "verification-only spelling is a compatibility alias"
+        ),
+    )
+    parser.add_argument(
+        "--force-cluster-assembly-rebuild",
+        action="store_true",
+        help=(
+            "rebuild current Cluster Assembly output instead of reusing an "
+            "existing Assembly computation"
+        ),
+    )
+    parser.add_argument(
+        "--transport",
+        choices=("headless", "rpc"),
+        default="headless",
+        help=(
+            "use a new Unreal commandlet batch or the currently open Unreal "
+            "Editor's Send2UE RPC endpoint"
+        ),
+    )
+    parser.add_argument(
         "--push-pass-through-roots",
         action="store_true",
         help=(
@@ -791,7 +1115,24 @@ def parse_args(argv=None):
             "pass-through; required when native full-mesh bone data changed"
         ),
     )
+    parser.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help=(
+            "prepare and validate native/Assembly FBX outputs without "
+            "checking out Unreal packages or launching an Unreal commandlet"
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--blender-workers",
+        type=int,
+        default=2,
+        help=(
+            "maximum concurrent root Assembly and Send2UE processes; current "
+            "physical and commit headroom can reduce this value"
+        ),
+    )
     parser.add_argument("--run-id")
     parser.add_argument("--reset-item-retries", action="store_true")
     parser.add_argument(
@@ -812,6 +1153,12 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.fresh_verification_only_export and not args.force_native_export:
+        raise SystemExit(
+            "--fresh-collision-prune-export requires --force-native-export"
+        )
+    if args.prepare_only and args.transport == "rpc":
+        raise SystemExit("--prepare-only cannot be combined with --transport rpc")
     exact_target_keys = {
         normalized_path_key(Path(value).expanduser().resolve())
         for value in args.target_spm
@@ -866,11 +1213,22 @@ def main(argv=None):
     fleet = {
         "status": "running",
         "root": str(args.root.expanduser().resolve()),
-        "transport": "headless_commandlet",
+        "transport": (
+            "fbx_only"
+            if args.prepare_only
+            else ("open_editor_rpc" if args.transport == "rpc" else "headless_commandlet")
+        ),
         "assembly_policy": (
             "provider_assembly_push_then_refresh_exact_target_"
             "assembly_export_and_push"
         ),
+        "native_export_execution_policy": {
+            "fresh_verification_only_export": bool(
+                args.fresh_verification_only_export
+            ),
+            "explicit_opt_in": bool(args.fresh_verification_only_export),
+            "force_native_export": bool(args.force_native_export),
+        },
         "birch_paper_order": "last",
         "targets": [str(row["spm"]) for row in targets],
         "requested_target_spms": [
@@ -904,6 +1262,49 @@ def main(argv=None):
         save_fleet()
         return 1 if missing_requested_target_spms else 0
 
+    policy_request_path = (
+        args.log_dir / f"cluster_fleet_push_{run_id}_spm_bone_policy_request.json"
+    )
+    policy_report_path = (
+        args.log_dir / f"cluster_fleet_push_{run_id}_spm_bone_policy.json"
+    )
+    fleet["spm_bone_policy_request"] = str(policy_request_path)
+    fleet["spm_bone_policy_report"] = str(policy_report_path)
+    try:
+        policy_command = build_spm_bone_policy_command(
+            targets,
+            args.blender,
+            policy_request_path,
+            policy_report_path,
+        )
+        policy_completed = owned_run(
+            policy_command,
+            source="sk_batch.cluster_fleet_push.spm_bone_policy",
+            run_factory=subprocess.run,
+            check=False,
+        )
+        fleet["spm_bone_policy_returncode"] = policy_completed.returncode
+        if policy_completed.returncode:
+            raise RuntimeError(
+                "SPM bone-policy headless batch exited "
+                f"{policy_completed.returncode}"
+            )
+        fleet["spm_bone_policy"] = validate_spm_bone_policy_report(
+            policy_report_path,
+            targets,
+        )
+    except (ExactPushError, OSError, ValueError, RuntimeError) as exc:
+        fleet["status"] = "failed"
+        fleet["spm_bone_policy_error"] = str(exc)
+        fleet["provider_verified_count"] = 0
+        fleet["provider_failed_count"] = 0
+        fleet["verified_count"] = 0
+        fleet["failed_count"] = 0
+        save_fleet()
+        print("SK_CLUSTER_FLEET_SPM_BONE_POLICY_FAILED=1")
+        return 1
+    save_fleet()
+
     pending = []
     processed_providers = {}
 
@@ -924,6 +1325,10 @@ def main(argv=None):
             "spm": str(provider_spm),
             "dependency_of": [dependency_of] if dependency_of else [],
             "status": "running",
+            "assembly_invocation_role": "provider_dependency",
+            "owner_receipt_policy": (
+                "fleet_provider_dependency_no_owner_receipt"
+            ),
         }
         processed_providers[key] = result
         fleet["provider_results"].append(result)
@@ -994,6 +1399,7 @@ def main(argv=None):
                 log_dir=args.log_dir,
                 run_id=f"fleet_{run_id}_provider_{ordinal:03d}",
                 unreal_project=args.unreal_project,
+                transport=args.transport,
             )
             assembly_report = (
                 args.log_dir
@@ -1008,6 +1414,13 @@ def main(argv=None):
                 outputs["material_contract"],
                 assembly_report,
                 force_native_export=args.force_native_export,
+                fresh_verification_only_export=(
+                    args.fresh_verification_only_export
+                ),
+                force_cluster_assembly_rebuild=(
+                    args.force_cluster_assembly_rebuild
+                ),
+                provider_no_owner_receipt=True,
             )
             result["assembly_report"] = str(assembly_report)
             if (
@@ -1047,6 +1460,7 @@ def main(argv=None):
                     })
                     save_fleet()
                     return result
+            assembly_started = perf_counter()
             assembly_completed = owned_run(
                 assembly_command,
                 source=(
@@ -1054,6 +1468,10 @@ def main(argv=None):
                 ),
                 run_factory=subprocess.run,
                 check=False,
+            )
+            result["assembly_execution"] = _completed_process_metrics(
+                assembly_completed,
+                assembly_started,
             )
             result["assembly_returncode"] = assembly_completed.returncode
             if assembly_completed.returncode:
@@ -1071,6 +1489,7 @@ def main(argv=None):
                     "provider Assembly postcondition failed: "
                     + "; ".join(verification["problems"])
                 )
+            export_started = perf_counter()
             completed = owned_run(
                 command,
                 source=(
@@ -1078,6 +1497,10 @@ def main(argv=None):
                 ),
                 run_factory=subprocess.run,
                 check=False,
+            )
+            result["export_execution"] = _completed_process_metrics(
+                completed,
+                export_started,
             )
             result["returncode"] = completed.returncode
             result["report"] = str(outputs["report"])
@@ -1089,6 +1512,17 @@ def main(argv=None):
             export_report = json.loads(
                 outputs["report"].read_text(encoding="utf-8")
             )
+            if args.transport == "rpc":
+                verification = validate_provider_live_result(export_report)
+                result["verification"] = verification
+                if not verification["ok"]:
+                    raise RuntimeError(
+                        "provider RPC Push postcondition failed: "
+                        + "; ".join(verification["problems"])
+                    )
+                result["status"] = "verified_dependency_in_unreal"
+                save_fleet()
+                return result
             if export_report.get("status") != "exported_pending_unreal":
                 raise RuntimeError(
                     "provider export did not reach exported_pending_unreal"
@@ -1153,8 +1587,13 @@ def main(argv=None):
         )
         return 1
 
+    prepared_roots_by_index = {}
+    root_jobs = []
+    fleet["root_execution_policy"] = (
+        "provider_barrier_then_memory_bounded_root_assembly_rounds_then_"
+        "all_root_blender_export_then_combined_unreal"
+    )
     for index, target in enumerate(targets, 1):
-        print(f"[{index}/{len(targets)}] EXPORT {target['stem']}", flush=True)
         result = {
             "stem": target["stem"],
             "spm": str(target["spm"]),
@@ -1214,6 +1653,15 @@ def main(argv=None):
                 log_dir=args.log_dir,
                 run_id=f"fleet_{run_id}_{index:03d}",
                 unreal_project=args.unreal_project,
+                transport=args.transport,
+            )
+            command, outputs = seal_root_material_contract(
+                command,
+                outputs,
+                args.log_dir / (
+                    f"{target['stem']}_fleet_material_contract_"
+                    f"{run_id}_{index:03d}.json"
+                ),
             )
             assembly_report = (
                 args.log_dir
@@ -1226,35 +1674,67 @@ def main(argv=None):
                 assembly_report,
                 cluster_assembly_contract=receipt_refresh_report,
                 force_native_export=args.force_native_export,
+                fresh_verification_only_export=(
+                    args.fresh_verification_only_export
+                ),
+                force_cluster_assembly_rebuild=(
+                    args.force_cluster_assembly_rebuild
+                ),
             )
             result["assembly_report"] = str(assembly_report)
-            while True:
-                assembly_completed = owned_run(
-                    assembly_command,
-                    source="sk_batch.cluster_fleet_push.blender_assembly",
-                    run_factory=subprocess.run,
-                    check=False,
+            root_jobs.append({
+                "index": index,
+                "root_key": root_key,
+                "target": target,
+                "command": command,
+                "outputs": outputs,
+                "result": result,
+                "assembly_report": assembly_report,
+                "assembly_command": assembly_command,
+            })
+        except (ExactPushError, OSError, ValueError, RuntimeError) as exc:
+            result["status"] = "failed"
+            result["error"] = str(exc)
+        save_fleet()
+        if args.fail_fast and result.get("status") == "failed":
+            break
+
+    def run_root_assembly(job):
+        target = job["target"]
+        print(
+            f"[{job['index']}/{len(targets)}] ASSEMBLY {target['stem']}",
+            flush=True,
+        )
+        try:
+            assembly_started = perf_counter()
+            assembly_completed = owned_run(
+                job["assembly_command"],
+                source="sk_batch.cluster_fleet_push.blender_assembly",
+                run_factory=subprocess.run,
+                check=False,
+            )
+            execution = _completed_process_metrics(
+                assembly_completed,
+                assembly_started,
+            )
+            if assembly_completed.returncode:
+                raise RuntimeError(
+                    "production Assembly exited "
+                    f"{assembly_completed.returncode}"
                 )
-                result["assembly_returncode"] = assembly_completed.returncode
-                if assembly_completed.returncode:
-                    raise RuntimeError(
-                        "production Assembly exited "
-                        f"{assembly_completed.returncode}"
-                    )
-                assembly_verification = validate_assembly_result(
-                    assembly_report,
-                    target,
+            verification = validate_assembly_result(
+                job["assembly_report"],
+                target,
+            )
+            if not verification["ok"]:
+                raise RuntimeError(
+                    "production Assembly postcondition failed: "
+                    + "; ".join(verification["problems"])
                 )
-                result["assembly_verification"] = assembly_verification
-                if not assembly_verification["ok"]:
-                    raise RuntimeError(
-                        "production Assembly postcondition failed: "
-                        + "; ".join(assembly_verification["problems"])
-                    )
-                if assembly_verification.get("pass_through"):
-                    break
+            dependencies = []
+            if not verification.get("pass_through"):
                 assembly_payload = json.loads(
-                    assembly_report.read_text(encoding="utf-8")
+                    job["assembly_report"].read_text(encoding="utf-8")
                 )
                 dependency_contract = (
                     exact_dependency_contract_from_validated_manifest(
@@ -1262,30 +1742,142 @@ def main(argv=None):
                         assembly_payload.get("cluster_assembly_manifest"),
                     )
                 )
-                current_dependencies = list(
+                dependencies = list(
                     dependency_contract.get("dependency_spms") or []
                 )
-                result["validated_provider_dependencies"] = (
-                    current_dependencies
+            return {
+                "status": "ok",
+                "returncode": assembly_completed.returncode,
+                "execution": execution,
+                "verification": verification,
+                "dependencies": dependencies,
+            }
+        except (ExactPushError, OSError, ValueError, RuntimeError) as exc:
+            return {
+                "status": "failed",
+                "error": str(exc),
+            }
+
+    fleet["root_assembly_rounds"] = []
+    waiting_root_jobs = list(root_jobs)
+    root_round = 0
+    root_failed_fast = False
+    while waiting_root_jobs:
+        root_round += 1
+        if root_round > 1000:
+            for waiting_job in waiting_root_jobs:
+                waiting_job["result"]["status"] = "failed"
+                waiting_job["result"]["error"] = (
+                    "root Assembly dependency rounds exceeded 1000"
                 )
-                newly_processed = False
-                for provider_spm in current_dependencies:
-                    provider_key = normalized_path_key(provider_spm)
-                    if provider_key not in processed_providers:
-                        newly_processed = True
-                    provider_result = process_provider(
-                        provider_spm,
-                        root_key,
-                    )
-                    if provider_result.get("status") == "failed":
-                        raise RuntimeError(
-                            "provider dependency failed: "
-                            + str(provider_spm)
-                        )
-                if not newly_processed:
-                    break
+            save_fleet()
+            break
+        round_jobs = (
+            waiting_root_jobs[:1]
+            if args.fail_fast
+            else waiting_root_jobs
+        )
+        deferred_jobs = (
+            waiting_root_jobs[1:]
+            if args.fail_fast
+            else []
+        )
+        requested_root_workers = (
+            1
+            if args.fail_fast or args.transport == "rpc"
+            else args.blender_workers
+        )
+        initial_root_policy = stage_worker_policy(
+            "assembly",
+            requested_root_workers,
+            len(round_jobs),
+        )
+        round_outcomes, dynamic_root_policy = run_memory_bounded_stage(
+            "assembly",
+            round_jobs,
+            requested_root_workers,
+            run_root_assembly,
+        )
+        round_receipt = {
+            "round": root_round,
+            "job_indices": [job["index"] for job in round_jobs],
+            "initial_policy": initial_root_policy,
+            "dynamic_policy": _persisted_stage_policy(
+                dynamic_root_policy
+            ),
+        }
+        fleet["root_assembly_rounds"].append(round_receipt)
+
+        dependency_rows = []
+        for job, outcome in zip(round_jobs, round_outcomes):
+            result = job["result"]
+            if outcome["status"] != "ok":
+                result["status"] = "failed"
+                result["error"] = outcome["error"]
+                if args.fail_fast:
+                    root_failed_fast = True
+                continue
+            execution = outcome["execution"]
+            result["assembly_execution"] = execution
+            result.setdefault("assembly_executions", []).append(execution)
+            result["assembly_returncode"] = outcome["returncode"]
+            result["assembly_verification"] = outcome["verification"]
+            result["validated_provider_dependencies"] = (
+                outcome["dependencies"]
+            )
+            dependency_rows.append({
+                "job_key": job["index"],
+                "dependencies": outcome["dependencies"],
+            })
+
+        processed_at_round_start = set(processed_providers)
+        dependency_plan = root_dependency_round_plan(
+            dependency_rows,
+            processed_at_round_start,
+        )
+        round_receipt["new_providers"] = [
+            str(path) for path in dependency_plan["new_providers"]
+        ]
+        round_receipt["rebuild_job_indices"] = sorted(
+            dependency_plan["rebuild_job_keys"]
+        )
+
+        provider_failures = {}
+        for job, outcome in zip(round_jobs, round_outcomes):
+            if outcome["status"] != "ok":
+                continue
+            for provider_spm in outcome["dependencies"]:
+                provider_result = process_provider(
+                    provider_spm,
+                    job["root_key"],
+                )
+                if provider_result.get("status") == "failed":
+                    provider_failures[job["index"]] = str(provider_spm)
+                    if args.fail_fast:
+                        root_failed_fast = True
+                        break
+            if root_failed_fast:
+                break
+
+        next_round = []
+        for job, outcome in zip(round_jobs, round_outcomes):
+            result = job["result"]
+            if outcome["status"] != "ok":
+                continue
+            failed_provider = provider_failures.get(job["index"])
+            if failed_provider:
+                result["status"] = "failed"
+                result["error"] = (
+                    "provider dependency failed: " + failed_provider
+                )
+                continue
+            if job["index"] in dependency_plan["rebuild_job_keys"]:
                 result["assembly_repeated_after_new_provider"] = True
-            if assembly_verification.get("pass_through"):
+                next_round.append(job)
+                continue
+            verification = outcome["verification"]
+            target = job["target"]
+            if verification.get("pass_through"):
                 if not args.push_pass_through_roots:
                     result["status"] = "skipped_no_current_assembly"
                     result["diagnostic"] = (
@@ -1293,27 +1885,99 @@ def main(argv=None):
                         "recorded separately when a production build manifest "
                         "already existed, and no Assembly was exported"
                     )
-                    save_fleet()
                     continue
                 target["pass_through"] = True
                 target["expected_parts"] = 0
                 target["expected_bindings"] = 0
             else:
-                target["expected_parts"] = assembly_verification["parts"]
-                target["expected_bindings"] = assembly_verification["bindings"]
+                target["expected_parts"] = verification["parts"]
+                target["expected_bindings"] = verification["bindings"]
+            result["status"] = "assembly_ready_for_export"
+            prepared_roots_by_index[job["index"]] = {
+                "target": target,
+                "command": job["command"],
+                "outputs": job["outputs"],
+                "result": result,
+            }
+        save_fleet()
+        if root_failed_fast:
+            for deferred_job in deferred_jobs:
+                deferred_job["result"]["status"] = "not_run"
+                deferred_job["result"]["error"] = (
+                    "not run after fail-fast root Assembly failure"
+                )
+            save_fleet()
+            break
+        waiting_root_jobs = next_round + deferred_jobs
+
+    prepared_roots = [
+        prepared_roots_by_index[index]
+        for index in sorted(prepared_roots_by_index)
+    ]
+
+    # The Assembly phase is a real barrier.  This keeps native exporter and
+    # Assembly peak lifetimes out of the Send2UE export wave and lets the GUI
+    # and the fleet tool share the same all-A -> all-B -> all-U structure.
+    export_worker_policy = stage_worker_policy(
+        "blender_export",
+        args.blender_workers,
+        len(prepared_roots),
+    )
+    requested_export_workers = args.blender_workers
+    if args.fail_fast or args.transport == "rpc":
+        # Preserve strict fail-fast semantics: do not launch work beyond the
+        # exact export whose failure is being reported.  An open Editor RPC
+        # endpoint also remains single-owner even though headless export is
+        # safely parallel.
+        export_worker_policy["selected_workers"] = 1
+        export_worker_policy["serial_override"] = (
+            "fail_fast" if args.fail_fast else "rpc_single_editor_owner"
+        )
+        requested_export_workers = 1
+    fleet["root_export_worker_policy"] = export_worker_policy
+    save_fleet()
+
+    def export_prepared_root(export_index, prepared):
+        target = prepared["target"]
+        command = prepared["command"]
+        outputs = prepared["outputs"]
+        result = prepared["result"]
+        print(
+            f"[{export_index}/{len(prepared_roots)}] BLENDER EXPORT "
+            f"{target['stem']}",
+            flush=True,
+        )
+        try:
+            export_started = perf_counter()
             completed = owned_run(
                 command,
                 source="sk_batch.cluster_fleet_push.blender_export",
                 run_factory=subprocess.run,
                 check=False,
             )
+            result["export_execution"] = _completed_process_metrics(
+                completed,
+                export_started,
+            )
             result["returncode"] = completed.returncode
             result["report"] = str(outputs["report"])
             if completed.returncode:
-                raise RuntimeError(f"production export exited {completed.returncode}")
+                raise RuntimeError(
+                    f"production export exited {completed.returncode}"
+                )
             export_report = json.loads(
                 outputs["report"].read_text(encoding="utf-8")
             )
+            if args.transport == "rpc":
+                verification = validate_live_result(export_report, target)
+                result["verification"] = verification
+                if not verification["ok"]:
+                    raise RuntimeError(
+                        "production RPC Push postcondition failed: "
+                        + "; ".join(verification["problems"])
+                    )
+                result["status"] = "verified_in_unreal"
+                return None
             if export_report.get("status") != "exported_pending_unreal":
                 raise RuntimeError(
                     "production export did not reach exported_pending_unreal"
@@ -1324,39 +1988,101 @@ def main(argv=None):
             items = list(exported_manifest.get("items") or [])
             if len(items) != 1:
                 raise RuntimeError(
-                    f"exact export manifest item count is {len(items)}, expected 1"
+                    "exact export manifest item count is "
+                    f"{len(items)}, expected 1"
                 )
             result["status"] = "exported_pending_unreal"
-            pending.append({
+            return {
                 "kind": "root",
                 "target": target,
                 "outputs": outputs,
                 "item": items[0],
                 "result": result,
-            })
+            }
         except (ExactPushError, OSError, ValueError, RuntimeError) as exc:
             result["status"] = "failed"
             result["error"] = str(exc)
+            return None
+
+    root_pending_by_index = {}
+    export_entries = list(enumerate(prepared_roots, 1))
+
+    def accept_export(_position, entry, pending_entry):
+        export_index, _prepared = entry
+        if pending_entry is not None:
+            root_pending_by_index[export_index] = pending_entry
         save_fleet()
-        if args.fail_fast and result.get("status") == "failed":
-            break
+
+    if args.fail_fast:
+        completed_export_entries = []
+        for entry in export_entries:
+            pending_entry = export_prepared_root(*entry)
+            accept_export(
+                len(completed_export_entries),
+                entry,
+                pending_entry,
+            )
+            completed_export_entries.append(entry)
+            if entry[1]["result"].get("status") == "failed":
+                break
+        dynamic_export_policy = {
+            "stage": "blender_export",
+            "requested_workers": 1,
+            "selected_worker_ceiling": 1 if export_entries else 0,
+            "max_concurrent_workers": 1 if completed_export_entries else 0,
+            "per_worker_peak_bytes": export_worker_policy[
+                "per_worker_peak_bytes"
+            ],
+            "reserve_bytes": export_worker_policy["reserve_bytes"],
+            "admission_checks": [],
+            "memory_limited": False,
+            "serial_override": "fail_fast",
+        }
+    else:
+        _export_results, dynamic_export_policy = run_memory_bounded_stage(
+            "blender_export",
+            export_entries,
+            requested_export_workers,
+            lambda entry: export_prepared_root(*entry),
+            on_complete=accept_export,
+        )
+    fleet["root_export_dynamic_policy"] = _persisted_stage_policy(
+        dynamic_export_policy
+    )
+    save_fleet()
+    pending.extend(
+        root_pending_by_index[index]
+        for index in sorted(root_pending_by_index)
+    )
+
+    if pending and args.prepare_only:
+        for entry in pending:
+            entry["result"]["status"] = (
+                "prepared_dependency_fbx"
+                if entry["kind"] == "provider"
+                else "prepared_fbx"
+            )
+        fleet["prepare_only"] = True
+        fleet["prepared_manifest_item_count"] = len(pending)
+        pending.clear()
+        save_fleet()
 
     if pending:
         manifest_path = args.log_dir / f"cluster_fleet_push_{run_id}_unreal_manifest.json"
         checkpoint_path = args.log_dir / f"cluster_fleet_push_{run_id}_unreal_checkpoint.json"
         batch_report_path = args.log_dir / f"cluster_fleet_push_{run_id}_unreal_report.json"
-        manifest = {
-            "schema_version": 1,
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "checkpoint_path": str(checkpoint_path.resolve()),
-            "report_path": str(batch_report_path.resolve()),
-            "max_item_crash_retries": 2,
-            "items": [entry["item"] for entry in pending],
-        }
-        manifest_path.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        manifest = write_combined_lazy_manifest(
+            manifest_path,
+            {
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "checkpoint_path": str(checkpoint_path.resolve()),
+                "report_path": str(batch_report_path.resolve()),
+                "max_item_crash_retries": 2,
+            },
+            pending,
         )
+        for entry in pending:
+            entry.pop("item", None)
         fleet["unreal_manifest"] = str(manifest_path)
         fleet["unreal_checkpoint"] = str(checkpoint_path)
         fleet["unreal_report"] = str(batch_report_path)
@@ -1416,13 +2142,18 @@ def main(argv=None):
         "verified_in_unreal",
         "skipped_no_current_assembly",
     }
+    if args.prepare_only:
+        successful_statuses.add("prepared_fbx")
     failed = [
         row for row in fleet["results"]
         if row["status"] not in successful_statuses
     ]
+    successful_provider_statuses = {"verified_dependency_in_unreal"}
+    if args.prepare_only:
+        successful_provider_statuses.add("prepared_dependency_fbx")
     failed_providers = [
         row for row in fleet["provider_results"]
-        if row["status"] != "verified_dependency_in_unreal"
+        if row["status"] not in successful_provider_statuses
     ]
     fleet["status"] = (
         "ok"
@@ -1442,9 +2173,18 @@ def main(argv=None):
         row for row in fleet["provider_results"]
         if row["status"] == "verified_dependency_in_unreal"
     ])
+    fleet["prepared_count"] = len([
+        row for row in fleet["results"]
+        if row["status"] == "prepared_fbx"
+    ])
+    fleet["provider_prepared_count"] = len([
+        row for row in fleet["provider_results"]
+        if row["status"] == "prepared_dependency_fbx"
+    ])
     fleet["provider_failed_count"] = len(failed_providers)
     save_fleet()
     print(f"SK_CLUSTER_FLEET_VERIFIED={fleet['verified_count']}")
+    print(f"SK_CLUSTER_FLEET_PREPARED={fleet['prepared_count']}")
     print(
         "SK_CLUSTER_FLEET_SKIPPED_NO_CURRENT_ASSEMBLY="
         f"{fleet['skipped_no_current_assembly_count']}"
@@ -1457,6 +2197,10 @@ def main(argv=None):
     print(
         "SK_CLUSTER_FLEET_PROVIDER_FAILED="
         f"{fleet['provider_failed_count']}"
+    )
+    print(
+        "SK_CLUSTER_FLEET_PROVIDER_PREPARED="
+        f"{fleet['provider_prepared_count']}"
     )
     return (
         0

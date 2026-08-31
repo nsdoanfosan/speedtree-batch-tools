@@ -212,6 +212,39 @@ class NativeSpeedTreeReceiptTests(unittest.TestCase):
             (0.0, 1.0, 0.0),
         )
 
+    def test_rejects_missing_nonzero_bone_parent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spm, receipt_path = self._write(Path(temporary))
+            payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+            payload["bones"][0]["parent_id"] = 99
+            receipt_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(NativeReceiptError, "parent ID is missing"):
+                load_native_export_receipt(receipt_path, source_spm=spm)
+
+    def test_rejects_bone_parent_cycle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spm, receipt_path = self._write(Path(temporary))
+            payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+            payload["bones"] = [
+                {
+                    "id": 7,
+                    "parent_id": 8,
+                    "start_native": [1.0, 2.0, 3.0],
+                    "end_native": [4.0, 5.0, 6.0],
+                },
+                {
+                    "id": 8,
+                    "parent_id": 7,
+                    "start_native": [4.0, 5.0, 6.0],
+                    "end_native": [7.0, 8.0, 9.0],
+                },
+            ]
+            receipt_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(NativeReceiptError, "contains a cycle"):
+                load_native_export_receipt(receipt_path, source_spm=spm)
+
     def test_native_position_preserves_xyz_and_only_converts_units(self):
         with tempfile.TemporaryDirectory() as temporary:
             spm, receipt_path = self._write(Path(temporary))

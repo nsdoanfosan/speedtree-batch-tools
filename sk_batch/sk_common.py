@@ -102,6 +102,10 @@ UNREAL_COMMANDLET_BASE_ARGS = (
     "-unattended",
     "-NoSplash",
     "-NoSound",
+    # Vegetation commandlets do not need a viewport.  Make NullRHI an explicit
+    # launch invariant so a future engine/plugin startup change cannot silently
+    # create a D3D device and compete with the editor on an 8 GiB adapter.
+    "-NullRHI",
     "-UTF8Output",
     "-NoDDCCleanup",
 )
@@ -213,8 +217,12 @@ def unreal_remote_execution_settings(unreal_project):
         if project_path.suffix.casefold() == ".uproject"
         else project_path
     )
-    ini_path = project_dir / "Config" / "DefaultEngine.ini"
-    if not ini_path.is_file():
+    ini_paths = [
+        project_dir / "Config" / "DefaultEngine.ini",
+        project_dir / "Saved" / "Config" / "WindowsEditor" / "Engine.ini",
+    ]
+    existing_ini_paths = [path for path in ini_paths if path.is_file()]
+    if not existing_ini_paths:
         return {}
 
     parser = configparser.RawConfigParser(
@@ -223,7 +231,8 @@ def unreal_remote_execution_settings(unreal_project):
         allow_no_value=True,
     )
     try:
-        parser.read_string(ini_path.read_text(encoding="utf-8-sig"))
+        for ini_path in existing_ini_paths:
+            parser.read_string(ini_path.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeError, configparser.Error):
         return {}
 
@@ -238,7 +247,10 @@ def unreal_remote_execution_settings(unreal_project):
     if enabled in {"0", "false", "no", "off"}:
         return {}
 
-    settings = {"config_path": str(ini_path.resolve())}
+    settings = {
+        "config_path": str(existing_ini_paths[-1].resolve()),
+        "config_paths": [str(path.resolve()) for path in existing_ini_paths],
+    }
     bind_address = values.get("remoteexecutionmulticastbindaddress", "")
     try:
         bind_ip = ipaddress.ip_address(bind_address)
