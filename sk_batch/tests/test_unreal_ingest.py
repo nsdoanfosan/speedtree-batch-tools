@@ -2545,6 +2545,52 @@ class DurableSaveOwnershipTests(unittest.TestCase):
         )
         return mesh, skeleton, ledger, receipt
 
+    def test_headless_thumbnail_free_save_rescans_exact_package(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = _DurableSaveFake(
+                runner,
+                Path(temporary) / "Content",
+            )
+            mesh_path = "/Game/Meshes/Trees/Assembly/SK_Test_NA_Base"
+            mesh = environment.add_asset(mesh_path)
+            environment.install_thumbnail_free_saver()
+            scans = []
+            waits = []
+
+            class FakeRegistry:
+                @staticmethod
+                def scan_modified_asset_files(paths):
+                    scans.append(list(paths))
+
+                @staticmethod
+                def wait_for_completion():
+                    waits.append(True)
+
+            runner.unreal.AssetRegistryHelpers = types.SimpleNamespace(
+                get_asset_registry=lambda: FakeRegistry(),
+            )
+            runner._is_headless_manifest_runtime = lambda: True
+            ledger = runner._new_durable_save_ledger()
+
+            runner._save_skeletal_mesh_owned_without_thumbnail(
+                mesh_path,
+                ledger,
+                owner="assembly_prototype_prebuild",
+                role="prototype",
+            )
+
+            self.assertEqual(environment.native_save_calls, [mesh_path])
+            self.assertEqual(
+                scans,
+                [[str(environment.package_file(mesh_path))]],
+            )
+            self.assertEqual(waits, [True])
+            self.assertIs(
+                runner.unreal.EditorAssetLibrary.load_asset(mesh_path),
+                mesh,
+            )
+
     def test_final_contract_owns_dependency_before_mesh_and_rejects_resave(self):
         runner = load_runner()
         with tempfile.TemporaryDirectory() as temporary:

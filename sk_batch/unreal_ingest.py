@@ -2877,6 +2877,7 @@ def _save_skeletal_mesh_owned_without_thumbnail(
             "failed to persist generated SkeletalMesh without thumbnail rendering: "
             + candidate
         )
+    _refresh_headless_saved_asset_registry(candidate)
     _record_durable_save(
         durable_saves,
         candidate,
@@ -2886,6 +2887,68 @@ def _save_skeletal_mesh_owned_without_thumbnail(
     )
     _validate_durable_save_ledger(durable_saves)
     return candidate
+
+
+def _refresh_headless_saved_asset_registry(asset_path):
+    """Publish one freshly saved package to the commandlet Asset Registry.
+
+    Force-deleting a generated mesh with a stale Skeleton removes its registry
+    row.  FBX import creates and saves the replacement UObject, but a NullRHI
+    commandlet does not reliably republish that row before the next Assembly
+    wave unloads the object.  Rescan only the exact saved package so a later
+    ``load_asset`` resolves the durable replacement rather than session state.
+    """
+    candidate = str(asset_path or "").split(".", 1)[0].replace("\\", "/")
+    if not _is_headless_manifest_runtime():
+        return {
+            "status": "persistent_editor_registry",
+            "asset": candidate,
+        }
+    if not candidate.casefold().startswith("/game/"):
+        raise RuntimeError(
+            "cannot refresh a generated asset outside /Game: " + candidate
+        )
+    content_dir = Path(
+        unreal.Paths.convert_relative_path_to_full(
+            unreal.Paths.project_content_dir()
+        )
+    )
+    package_file = content_dir.joinpath(
+        *candidate[len("/Game/") :].split("/")
+    ).with_suffix(".uasset")
+    if not package_file.is_file():
+        raise RuntimeError(
+            "thumbnail-free save did not create its package before Asset "
+            "Registry refresh: " + str(package_file)
+        )
+    registry_helpers = getattr(unreal, "AssetRegistryHelpers", None)
+    get_registry = getattr(registry_helpers, "get_asset_registry", None)
+    if not callable(get_registry):
+        raise RuntimeError(
+            "headless generated asset save requires AssetRegistryHelpers: "
+            + candidate
+        )
+    registry = get_registry()
+    scan_modified = getattr(registry, "scan_modified_asset_files", None)
+    if not callable(scan_modified):
+        raise RuntimeError(
+            "headless generated asset save cannot rescan its package: "
+            + candidate
+        )
+    scan_modified([str(package_file)])
+    wait_for_completion = getattr(registry, "wait_for_completion", None)
+    if callable(wait_for_completion):
+        wait_for_completion()
+    if not unreal.EditorAssetLibrary.does_asset_exist(candidate):
+        raise RuntimeError(
+            "saved generated SkeletalMesh is absent from the refreshed Asset "
+            "Registry: " + candidate
+        )
+    return {
+        "status": "rescanned",
+        "asset": candidate,
+        "package_file": str(package_file),
+    }
 
 
 def _save_large_assembly_without_thumbnail(asset_path, *, durable_saves):

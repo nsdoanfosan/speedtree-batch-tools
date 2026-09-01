@@ -102,6 +102,12 @@ UNREAL_COMMANDLET_BASE_ARGS = (
     "-unattended",
     "-NoSplash",
     "-NoSound",
+    # The immutable headless manifest is checked out through the exact P4
+    # workspace before Unreal starts.  Leaving the editor provider enabled
+    # launches asynchronous ``p4 diff`` workers during FBX reimport; those
+    # workers can retain the old .uasset handle while SavePackage tries to
+    # move it aside, which is a Windows sharing violation (error 32).
+    "-nop4",
     # Vegetation commandlets do not need a viewport.  Make NullRHI an explicit
     # launch invariant so a future engine/plugin startup change cannot silently
     # create a D3D device and compete with the editor on an 8 GiB adapter.

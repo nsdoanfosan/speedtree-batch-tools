@@ -249,7 +249,9 @@ def test_headless_commandlet_disables_local_ddc_cleanup():
     assert "-NoDDCCleanup" in UNREAL_COMMANDLET_BASE_ARGS
     assert "-unattended" in UNREAL_COMMANDLET_BASE_ARGS
     assert "-NullRHI" in UNREAL_COMMANDLET_BASE_ARGS
+    assert "-nop4" in UNREAL_COMMANDLET_BASE_ARGS
     assert "-NoDDCCleanup" in exact_push.UNREAL_COMMANDLET_BASE_ARGS
+    assert "-nop4" in exact_push.UNREAL_COMMANDLET_BASE_ARGS
 
 
 def test_reset_checkpoint_item_retries_requeues_only_stopped_items(tmp_path):
