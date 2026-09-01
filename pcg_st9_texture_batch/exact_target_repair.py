@@ -705,6 +705,7 @@ def execute_step3_standard(request: Mapping, *, progress, cancel_event, lease):
         step3_run_report_path=report_path,
         step3_run_report=run_report,
         exact_mutation_baseline=plan["_exact_mutation_baseline"],
+        normalization_plan=plan.get("normalization_plan"),
     )
     shared = result.get("shared_queue_result") or {}
     progress("PCG 텍스처 복구 완료", completed=1, remaining=0, target=canonical)

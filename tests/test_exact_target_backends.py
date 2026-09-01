@@ -280,6 +280,59 @@ class ExactTargetBackendTests(unittest.TestCase):
         self.assertEqual(app.report["items"], [item])
         self.assertEqual(app.report["pcg_targets"], {"status": "ready"})
 
+    def test_pcg_step3_exact_execution_forwards_normalization_plan(self):
+        captured = {}
+        normalization_plan = {"items": [{"atlas_base": "M_cluster"}]}
+
+        class App:
+            @staticmethod
+            def _begin_step3_run_report(*_args, **_kwargs):
+                return Path("step3-report.json"), {"kind": "test"}
+
+            @staticmethod
+            def _run_step3(*_args, **kwargs):
+                captured.update(kwargs)
+                return {
+                    "shared_queue_result": {"operation": "step3"},
+                    "shared_queue_success": True,
+                }
+
+        plan = {
+            "jobs": [],
+            "skipped": [],
+            "exact_step3_spms": [Path("D:/Trees/SK_tree.spm")],
+            "sync_files": [],
+            "selected_rows": [],
+            "eligible_row_keys": None,
+            "_exact_mutation_baseline": {"contract": "test"},
+            "normalization_plan": normalization_plan,
+        }
+        cancel = SimpleNamespace(is_set=lambda: False)
+        lease = SimpleNamespace(renew_and_check_current=lambda: True)
+
+        with mock.patch.object(
+            pcg_exact,
+            "build_step3_standard_plan",
+            return_value=(
+                SimpleNamespace(),
+                App(),
+                plan,
+                Path("D:/Trees/SK_tree.spm"),
+            ),
+        ):
+            result = pcg_exact.execute_step3_standard(
+                {
+                    "repair_action": pcg_exact.STEP3_STANDARD,
+                    "target_spms": ["D:/Trees/SK_tree.spm"],
+                },
+                progress=lambda *_args, **_kwargs: None,
+                cancel_event=cancel,
+                lease=lease,
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertIs(captured["normalization_plan"], normalization_plan)
+
     def test_generator_scope_filters_sibling_followers_and_cluster_targets(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
