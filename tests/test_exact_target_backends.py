@@ -266,6 +266,20 @@ class ExactTargetBackendTests(unittest.TestCase):
             },
         )
 
+    def test_pcg_step3_exact_scope_retains_normalization_plan_source(self):
+        class App:
+            pass
+
+        app = App()
+        item = {"folder": "D:/Trees/Lauraceae"}
+        report = {"items": [item], "pcg_targets": {"status": "ready"}}
+
+        pcg_exact._bind_authoritative_step3_scope(app, report, item)
+
+        self.assertIs(app._step3_live_scope_report, report)
+        self.assertEqual(app.report["items"], [item])
+        self.assertEqual(app.report["pcg_targets"], {"status": "ready"})
+
     def test_generator_scope_filters_sibling_followers_and_cluster_targets(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

@@ -271,6 +271,13 @@ def _make_authoritative_step3_report(module, cfg, audit_folder):
     return report
 
 
+def _bind_authoritative_step3_scope(app, report, item):
+    """Keep the full live scope available to the normal Step 3 normalizer."""
+
+    app.report = {**report, "items": [item]}
+    app._step3_live_scope_report = report
+
+
 def build_step3_standard_plan(target_spm: str | Path, *, config=None):
     """Re-audit and build the normal Step 3 plan for one canonical SPM."""
 
@@ -304,7 +311,7 @@ def build_step3_standard_plan(target_spm: str | Path, *, config=None):
     app = module.App.__new__(module.App)
     app.cfg = cfg
     app.cfg["unreal_texture_sync_enabled"] = False
-    app.report = {**report, "items": [item]}
+    _bind_authoritative_step3_scope(app, report, item)
     app.items = {str(item["folder"]): {"item": item, "checked": True}}
     app.target_items = {}
     app.texplan_cache = {item["folder"]: rows}
