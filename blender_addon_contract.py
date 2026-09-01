@@ -81,6 +81,12 @@ ADDONS = {
                     "run_speedtree_cli_export",
                 ],
             },
+            "relative_bone_one_v1": {
+                "operations": [
+                    "plan_relative_branch_bones_one",
+                    "apply_relative_branch_bones_one",
+                ],
+            },
             "fresh_verification_export_v1": {
                 "operations": ["run_fresh_verification_only_export"],
             },
@@ -112,6 +118,14 @@ ADDONS = {
             "run_fresh_verification_only_export": (
                 "speedtree_bone_weight_repair.core:"
                 "run_fresh_verification_only_export"
+            ),
+            "plan_relative_branch_bones_one": (
+                "speedtree_bone_weight_repair.core:"
+                "plan_relative_branch_bones_one"
+            ),
+            "apply_relative_branch_bones_one": (
+                "speedtree_bone_weight_repair.core:"
+                "apply_relative_branch_bones_one"
             ),
             "run_fresh_collision_prune_export": (
                 "speedtree_bone_weight_repair.core:"
