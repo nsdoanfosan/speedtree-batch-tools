@@ -252,6 +252,25 @@ def _rows_for_exact_target(rows, canonical):
     return selected
 
 
+def _make_authoritative_step3_report(module, cfg, audit_folder):
+    """Re-audit one Step 3 scope with the same physical mutation evidence as UI."""
+
+    session_evidence = {}
+    report = module.make_report(
+        cfg,
+        targets=[str(audit_folder)],
+        mutation_authority=True,
+        session_evidence=session_evidence,
+    )
+    module.cache_blender_connection_rows(
+        report,
+        verify_physical=True,
+        read_cache=False,
+        session_evidence=session_evidence,
+    )
+    return report
+
+
 def build_step3_standard_plan(target_spm: str | Path, *, config=None):
     """Re-audit and build the normal Step 3 plan for one canonical SPM."""
 
@@ -259,7 +278,11 @@ def build_step3_standard_plan(target_spm: str | Path, *, config=None):
     target = Path(target_spm).expanduser().absolute()
     cfg = dict(config or module.load_config())
     audit_folder = module.step3_audit_folder_for_spm(target)
-    report = module.make_report(cfg, targets=[str(audit_folder)])
+    report = _make_authoritative_step3_report(
+        module,
+        cfg,
+        audit_folder,
+    )
     item, inventory = _exact_item(module, report, target)
     canonical = canonical_exact_spm(target, inventory)
 

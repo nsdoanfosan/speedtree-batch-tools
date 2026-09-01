@@ -228,6 +228,44 @@ class ExactTargetBackendTests(unittest.TestCase):
                 [{"spm": str(target), "material_id": "4"}],
             )
 
+    def test_pcg_step3_exact_report_uses_physical_mutation_evidence(self):
+        calls = []
+        report = {"items": []}
+
+        class Module:
+            @staticmethod
+            def make_report(cfg, **kwargs):
+                calls.append(("report", cfg, kwargs))
+                return report
+
+            @staticmethod
+            def cache_blender_connection_rows(payload, **kwargs):
+                calls.append(("connections", payload, kwargs))
+
+        result = pcg_exact._make_authoritative_step3_report(
+            Module,
+            {"tree_root": "D:/Trees"},
+            Path("D:/Trees/Lauraceae"),
+        )
+
+        self.assertIs(result, report)
+        self.assertEqual(calls[0][0], "report")
+        self.assertTrue(calls[0][2]["mutation_authority"])
+        self.assertEqual(
+            calls[0][2]["targets"],
+            [str(Path("D:/Trees/Lauraceae"))],
+        )
+        session_evidence = calls[0][2]["session_evidence"]
+        self.assertIs(calls[1][1], report)
+        self.assertEqual(
+            calls[1][2],
+            {
+                "verify_physical": True,
+                "read_cache": False,
+                "session_evidence": session_evidence,
+            },
+        )
+
     def test_generator_scope_filters_sibling_followers_and_cluster_targets(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
