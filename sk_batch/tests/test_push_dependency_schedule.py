@@ -263,6 +263,122 @@ def test_current_pass_through_contract_suppresses_relation_dependencies(
     discover.assert_not_called()
 
 
+def test_provider_metadata_pass_through_recovers_relation_dependencies(
+    tmp_path,
+):
+    owner = tmp_path / "Tree_provider_refresh"
+    cluster_dir = owner / "Cluster"
+    cluster_dir.mkdir(parents=True)
+    root_spm = owner / "SK_Tree_provider_refresh_01.spm"
+    source_spm = cluster_dir / "SK_cluster_provider_refresh_01.spm"
+    root_spm.write_bytes(b"root")
+    source_spm.write_bytes(b"cluster")
+    source_spm.with_suffix(".blend").write_bytes(b"blend")
+    manifest = {
+        "kind": schedule.MANIFEST_KIND,
+        "status": "pass_through",
+        "parts": [],
+        "handoff": {
+            "artifact_validation": [{
+                "artifact": "cluster_authoring_spm",
+                "ok": True,
+                "actual": {"path": str(source_spm)},
+            }],
+            "role_demotions": [{
+                "code": "CLUSTER_ROLE_NOT_ASSEMBLED",
+                "role": "cluster",
+                "provider_identity": source_spm.stem,
+                "reason": "normalized_variants_metadata_missing_nonblocking",
+                "receipt_decision": "normalize_part",
+            }],
+        },
+    }
+    contract = schedule.exact_dependency_contract_from_validated_manifest(
+        root_spm,
+        manifest,
+    )
+    items = {
+        str(path): {"spm": path, "checked": path == root_spm}
+        for path in (root_spm, source_spm)
+    }
+    with mock.patch.object(
+        schedule,
+        "load_current_cluster_assembly_manifest",
+        return_value=manifest,
+    ), mock.patch.object(
+        schedule,
+        "discover_cluster_blend_relations",
+        side_effect=AssertionError(
+            "exact pass-through provider evidence must bypass relations"
+        ),
+    ) as discover:
+        ordered, dependencies, auto_added = schedule.expand_push_targets(
+            [items[str(root_spm)]],
+            items,
+            stage_dependency_contracts={str(root_spm): contract},
+        )
+
+    assert contract["provider_refresh_required"] is True
+    assert [item["spm"] for item in ordered] == [source_spm, root_spm]
+    assert dependencies[str(root_spm)] == (str(source_spm),)
+    assert auto_added == {str(source_spm)}
+    discover.assert_not_called()
+
+
+def test_pass_through_loader_preserves_provider_refresh_evidence(tmp_path):
+    root_spm = tmp_path / "Tree_loader" / "SK_Tree_loader_01.spm"
+    root_spm.parent.mkdir(parents=True)
+    root_spm.write_bytes(b"root")
+    manifest_path = root_spm.parent / "assembly" / "bindings.json"
+    manifest_path.parent.mkdir()
+    manifest_path.write_text(
+        json.dumps({
+            "kind": schedule.MANIFEST_KIND,
+            "status": "pass_through",
+            "parts": [],
+            "handoff": {
+                "artifact_validation": [{
+                    "artifact": "cluster_authoring_spm",
+                    "ok": True,
+                    "actual": {
+                        "path": str(
+                            root_spm.parent
+                            / "Cluster"
+                            / "SK_cluster_loader_01.spm"
+                        )
+                    },
+                }],
+                "role_demotions": [{
+                    "code": "CLUSTER_ROLE_NOT_ASSEMBLED",
+                    "provider_identity": "SK_cluster_loader_01",
+                    "reason": (
+                        "normalized_variants_metadata_missing_nonblocking"
+                    ),
+                    "receipt_decision": "normalize_part",
+                }],
+            },
+        }),
+        encoding="utf-8",
+    )
+    report = schedule.assembly_pipeline_report_path(root_spm)
+    report.parent.mkdir(parents=True)
+    report.write_text(
+        json.dumps({
+            "cluster_assembly_manifest": {
+                "status": "pass_through",
+                "manifest": {"path": str(manifest_path)},
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    with mock.patch.object(schedule, "validate_file_fingerprint"):
+        manifest = schedule.load_current_cluster_assembly_manifest(root_spm)
+
+    assert manifest["status"] == "pass_through"
+    assert schedule._pass_through_requires_provider_refresh(manifest) is True
+
+
 def test_stale_assembly_contract_fails_without_relation_fallback(
     tmp_path,
 ):
