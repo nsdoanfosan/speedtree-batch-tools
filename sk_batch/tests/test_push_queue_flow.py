@@ -5290,6 +5290,8 @@ class PushQueueFlowTests(unittest.TestCase):
             }
             with mock.patch.object(
                 gui, "manifest_item_files_match", return_value=True
+            ), mock.patch.object(
+                gui, "cached_manifest_structure_status", return_value={"current": True}
             ):
                 item = app._cached_manifest_item("tree", "source-v2")
 
@@ -5322,6 +5324,8 @@ class PushQueueFlowTests(unittest.TestCase):
             }
             with mock.patch.object(
                 gui, "manifest_item_files_match", return_value=True
+            ), mock.patch.object(
+                gui, "cached_manifest_structure_status", return_value={"current": True}
             ):
                 item = app._cached_manifest_item("tree", "source-v2")
 
@@ -5369,6 +5373,8 @@ class PushQueueFlowTests(unittest.TestCase):
             }
             with mock.patch.object(
                 gui, "manifest_item_files_match", return_value=True
+            ), mock.patch.object(
+                gui, "cached_manifest_structure_status", return_value={"current": True}
             ):
                 item = app._cached_manifest_item("tree", "source-v2")
 
@@ -5404,6 +5410,8 @@ class PushQueueFlowTests(unittest.TestCase):
             }
             with mock.patch.object(
                 gui, "manifest_item_files_match", return_value=True
+            ), mock.patch.object(
+                gui, "cached_manifest_structure_status", return_value={"current": True}
             ), mock.patch.object(
                 gui,
                 "send2ue_export_cache_root",

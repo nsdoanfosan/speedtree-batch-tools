@@ -74,6 +74,7 @@ from send2ue_manifest_contract import (
     validate_material_handoff_wrapper,
 )
 from speedtree_pipeline_contract import shared_contract_api
+from wind_structure_freshness import installed_structure_identity, require_current_structure_contract
 from child_progress_contract import (
     SEND2UE_DISK_EXPORT_DONE_MARKER,
     SEND2UE_DISK_EXPORT_START_MARKER,
@@ -960,6 +961,12 @@ def main():
             raise RuntimeError(
                 "required final-skeleton dynamic wind JSON missing: "
                 + str(wind_json)
+            )
+        if wind_json_enabled:
+            # Fresh processes load the installed BWR recipe, so cached Wind JSON
+            # cannot bypass a newly deployed structural algorithm/schema.
+            report["wind_structure_freshness"] = require_current_structure_contract(
+                wind_json, **installed_structure_identity(),
             )
         if cluster_assembly is not None and cluster_assembly["ingest_plan"].get("status") == "ready":
             if wind_file is None:
