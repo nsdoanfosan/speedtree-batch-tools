@@ -43,6 +43,7 @@ sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(TOOL_DIR))
 
 from process_lifecycle import owned_run, shutdown_process_supervisor
+from wind_structure_freshness import cached_manifest_structure_status
 from stage_batch_policy import run_memory_bounded_stage, stage_worker_policy
 
 from code_compile_gate import (
@@ -16432,6 +16433,10 @@ class App:
             or not manifest_item_has_current_skeleton_root_export(item)
             or not manifest_item_files_match(item)
         ):
+            return None
+        structure_status = cached_manifest_structure_status(item)
+        if not structure_status["current"]:
+            self.log(f"[structural wind cache] {iid}: {structure_status['reason']}")
             return None
         exported_files = item.get("exported_files") or []
         if exported_files:

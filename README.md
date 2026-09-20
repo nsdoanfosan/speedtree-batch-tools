@@ -11,6 +11,23 @@ SpeedTree 식생 변환 작업을 위한 독립형 Windows 배치 도구 모음�
 
 각 도구의 상세 사용법은 해당 폴더의 `README.md`를 참고합니다.
 
+## 구조 기반 윈드 수정치
+
+BWR의 현재 SPM/native FBX/XML/final FBX 계산 결과는 기존 Wind JSON의
+`WindStructureModifierContract`에 독립적으로 들어간다. 기본 그룹·Influence와
+수정치를 섞거나 에셋별 수동 계수를 저장하지 않는다.
+
+새 Push를 만들기 전과 GUI가 기존 export 캐시를 재사용하기 전에 설치된 BWR의
+schema/recipe와 수정치의 출처·본 전체 대응을 검사한다. 구조 정보가 없거나 오래된
+JSON은 `Repair/export` 안내와 함께 재사용을 차단한다. **기존 JSON이 코드 업데이트만으로
+자동 갱신되지는 않으므로, 해당 항목은 현재 BWR로 Repair/export한 뒤 Push한다.**
+이미 생성된 대기열의 재생은 기존 파일 fingerprint 검증을 그대로 사용한다.
+
+현재 `evaluated_structure_art_v4`는 굽힘 크기만 보정하며
+`BendRateScale`, `TorsionGain`, `FlutterGain`은 1이다. 종횡비 기반 속도 보정은
+이 연동에 포함하지 않는다. 구조 계산은 BWR, 검사와 전달은 Batch, 적용은 Unreal
+`CodexDynamicWindImportLibrary`가 담당한다. Full SK와 Assembly 모두 같은 Wind JSON을 전달한다.
+
 ## 프로세스 간 공용 실행 대기열
 
 세 GUI의 **변경 작업**은 창마다 따로 실행되지 않고
