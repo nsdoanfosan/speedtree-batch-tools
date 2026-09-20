@@ -3,22 +3,59 @@
 This policy concerns only work executed in the current run. Receipt reuse,
 artifact caches, and second-run speedups are outside its scope.
 
+## Runtime-safety invariant
+
+Generated Nanite SkeletalMesh, DynamicWind provider, and final Nanite Assembly
+ingest is supported through both live-editor `rpc` and commandlet `headless`.
+An explicit RPC selection is never rewritten or silently persisted as another
+transport. RPC requires the editor to be open and stays asset-serial. The shared
+Unreal manifest runner disables overlapping asynchronous skinned-asset builds,
+drains all asset compilers before restoring the editor setting, releases item
+references, runs Unreal GC, saves generated SkeletalMeshes without thumbnails,
+and enforces the provider/part-before-final-Assembly barrier in either transport.
+
+Headless remains the default and adds process isolation, a six-phase recycle
+ceiling, and `-NullRHI`, so thumbnail rendering, viewport residency, and live
+GPUScene allocation cannot compete with Nanite/skinned-asset compilation. These
+are first-import execution controls, not cache or second-run optimizations.
+
 ## Chosen execution shape
 
-Production uses stage batching with bounded workers:
+Headless and deferred-wait production runs use stage batching with bounded workers:
 
 1. complete the Cluster Blender/Normalizer dependency wave;
 2. complete the root Blender Assembly wave;
 3. export every eligible Send2UE item with bounded Blender workers;
-4. ingest the combined lazy manifest serially in Unreal, checkpointing and
-   collecting each item, and recycle the commandlet after six completed items.
+4. ingest every provider item and prepare every root's Full mesh, wind, and
+   generated part prototypes serially in Unreal;
+5. cross a manifest-level barrier and build/publish final Assemblies, rejecting
+   duplicate final Assembly targets; then checkpoint, collect each item, and
+   recycle the commandlet after six completed item phases.
 
 The GUI implements the first two barriers in
 `_run_full_pipeline_stages()` and `_run_batch_impl()`. The push stage implements
 the export batch in `_run_headless_push_batch()`. `unreal_ingest.run_manifest()`
-owns item-local checkpoints, compiler drains, GC, and the six-item process
-lifetime. Cluster dependencies are still completed before their consumers, so
-stage batching does not weaken the native branch/bone contract.
+owns item-local checkpoints, compiler drains, and GC for both RPC and headless;
+the six-item process lifetime applies to the recyclable commandlet. Cluster
+dependencies are still completed before their consumers, so stage batching does
+not weaken the native branch/bone contract. Explicit RPC runs use the same
+transaction and safety controls one asset at a time in the open editor.
+
+The Unreal barrier is stricter than ordinary topological ordering. A valid
+provider cannot appear after the first final Assembly item, and a provider is
+not allowed to depend on an Assembly-wave item. This prevents canonical
+provider mutations from interleaving with final builds and gives every final
+Assembly one explicit publish turn.
+
+Prepared roots are checkpointed as `assembly_prepared` only after their inputs
+have been saved and collected. A process recycle resumes at the final build
+without replaying import/wind/prototype work. A crash recorded as
+`assembly_building` likewise returns to `assembly_prepared` and retries only the
+single final build until its existing per-item crash ceiling is exhausted.
+The six-phase commandlet ceiling is enforced again inside the Unreal runner;
+an inherited environment value may lower the ceiling but cannot set it to zero
+or raise it above six. Planned process yields do not consume the crash-restart
+budget in either the GUI or exact/headless launcher.
 
 The headless fleet uses the same root Assembly barrier without allowing worker
 threads to mutate provider state. One memory-bounded root round completes,
@@ -74,7 +111,12 @@ process-lifetime boundary every six Unreal items.
   Assembly. Post-build material work is read-only slot/section/usage audit.
 - Each Unreal item disables overlapping asynchronous skinned-asset builds,
   drains compilers before restoring the editor setting, releases Python
-  references, and requests immediate commandlet GC.
+  references, and requests immediate Unreal GC in both RPC and headless.
+- Every batch-generated SkeletalMesh uses the project plugin's direct
+  thumbnail-free package save: the Full mesh, generated provider/part
+  prototypes, and final Assembly. Skeleton and non-skeletal auxiliary packages
+  retain the normal editor save path. The batch fails closed if the native
+  no-thumbnail helper is unavailable.
 - Windows Job Object receipts now record exact-tree user/kernel CPU time and
   peak process/job memory for future production measurements.
 - Durable Unreal checkpoints use compact JSON while item and final reports

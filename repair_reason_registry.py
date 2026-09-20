@@ -450,6 +450,24 @@ for _policy_name in (
 
 
 _REASON_SEEDS: dict[str, ReasonRow] = {
+    # Unreal ingest emits these as policy/flow receipts, not repair failures.
+    # The heavy-item rows explain which shared safety controls were selected;
+    # process-lifetime rows explain a planned commandlet recycle.
+    "assembly_build_process_lifetime_limit": ReasonRow(
+        INFORMATIONAL, "sk_batch/unreal_ingest.py", "lifecycle_event",
+    ),
+    "dynamic_wind_provider": ReasonRow(
+        INFORMATIONAL, "sk_batch/unreal_ingest_policy.py", "audit_detail",
+    ),
+    "final_nanite_assembly": ReasonRow(
+        INFORMATIONAL, "sk_batch/unreal_ingest_policy.py", "audit_detail",
+    ),
+    "generated_nanite_skeletal_mesh": ReasonRow(
+        INFORMATIONAL, "sk_batch/unreal_ingest_policy.py", "audit_detail",
+    ),
+    "item_process_lifetime_limit": ReasonRow(
+        INFORMATIONAL, "sk_batch/unreal_ingest.py", "lifecycle_event",
+    ),
     # The affected headless refresh audit uses these as durable selection
     # evidence. They describe why a current asset must be regenerated; they
     # are not repair-planner failures and therefore remain informational.

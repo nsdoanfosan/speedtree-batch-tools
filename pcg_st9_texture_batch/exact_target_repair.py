@@ -252,6 +252,32 @@ def _rows_for_exact_target(rows, canonical):
     return selected
 
 
+def _make_authoritative_step3_report(module, cfg, audit_folder):
+    """Re-audit one Step 3 scope with the same physical mutation evidence as UI."""
+
+    session_evidence = {}
+    report = module.make_report(
+        cfg,
+        targets=[str(audit_folder)],
+        mutation_authority=True,
+        session_evidence=session_evidence,
+    )
+    module.cache_blender_connection_rows(
+        report,
+        verify_physical=True,
+        read_cache=False,
+        session_evidence=session_evidence,
+    )
+    return report
+
+
+def _bind_authoritative_step3_scope(app, report, item):
+    """Keep the full live scope available to the normal Step 3 normalizer."""
+
+    app.report = {**report, "items": [item]}
+    app._step3_live_scope_report = report
+
+
 def build_step3_standard_plan(target_spm: str | Path, *, config=None):
     """Re-audit and build the normal Step 3 plan for one canonical SPM."""
 
@@ -259,7 +285,11 @@ def build_step3_standard_plan(target_spm: str | Path, *, config=None):
     target = Path(target_spm).expanduser().absolute()
     cfg = dict(config or module.load_config())
     audit_folder = module.step3_audit_folder_for_spm(target)
-    report = module.make_report(cfg, targets=[str(audit_folder)])
+    report = _make_authoritative_step3_report(
+        module,
+        cfg,
+        audit_folder,
+    )
     item, inventory = _exact_item(module, report, target)
     canonical = canonical_exact_spm(target, inventory)
 
@@ -281,7 +311,7 @@ def build_step3_standard_plan(target_spm: str | Path, *, config=None):
     app = module.App.__new__(module.App)
     app.cfg = cfg
     app.cfg["unreal_texture_sync_enabled"] = False
-    app.report = {**report, "items": [item]}
+    _bind_authoritative_step3_scope(app, report, item)
     app.items = {str(item["folder"]): {"item": item, "checked": True}}
     app.target_items = {}
     app.texplan_cache = {item["folder"]: rows}
@@ -675,6 +705,7 @@ def execute_step3_standard(request: Mapping, *, progress, cancel_event, lease):
         step3_run_report_path=report_path,
         step3_run_report=run_report,
         exact_mutation_baseline=plan["_exact_mutation_baseline"],
+        normalization_plan=plan.get("normalization_plan"),
     )
     shared = result.get("shared_queue_result") or {}
     progress("PCG 텍스처 복구 완료", completed=1, remaining=0, target=canonical)

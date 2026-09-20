@@ -33,6 +33,7 @@ from sk_common import (  # noqa: E402
     unreal_remote_execution_settings,
     wind_preset_for_spm,
 )
+from unreal_ingest_policy import bounded_heavy_process_item_limit  # noqa: E402
 
 LOG_DIR = SK_BATCH_DIR / "logs"
 PUSH_JOB = SK_BATCH_DIR / "jobs" / "send2ue_push_job.py"
@@ -412,9 +413,10 @@ def run_headless_manifest(
         # A successful process yield is an intentional package/render-resource
         # lifetime boundary, not a crash retry.  Six large vegetation items per
         # commandlet keeps the working set bounded without per-asset startup.
-        "SK_BATCH_MAX_ITEMS_PER_PROCESS": environment.get(
-            "SK_BATCH_MAX_ITEMS_PER_PROCESS",
-            "6",
+        "SK_BATCH_MAX_ITEMS_PER_PROCESS": str(
+            bounded_heavy_process_item_limit(
+                environment.get("SK_BATCH_MAX_ITEMS_PER_PROCESS", "6")
+            )
         ),
     })
     last_returncode = None

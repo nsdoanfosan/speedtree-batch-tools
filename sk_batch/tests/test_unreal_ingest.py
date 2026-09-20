@@ -10,6 +10,11 @@ from copy import deepcopy
 from contextlib import nullcontext
 from pathlib import Path
 
+SK_BATCH_DIR = Path(__file__).resolve().parents[1]
+if str(SK_BATCH_DIR) not in sys.path:
+    sys.path.insert(0, str(SK_BATCH_DIR))
+from unreal_ingest_policy import manifest_item_policy_metadata
+
 
 RUNNER = Path(__file__).resolve().parents[1] / "unreal_ingest.py"
 
@@ -67,6 +72,8 @@ def write_manifest_v2(tmp_path, items, max_retries=2):
     for index, current in enumerate(items):
         current = dict(current)
         current.setdefault("schema_version", 1)
+        policy_metadata = manifest_item_policy_metadata(current)
+        current.update(policy_metadata)
         payload = json.dumps(
             current,
             ensure_ascii=False,
@@ -86,6 +93,7 @@ def write_manifest_v2(tmp_path, items, max_retries=2):
             "checkout_asset_paths": list(
                 current.get("checkout_asset_paths") or []
             ),
+            **policy_metadata,
             "payload_relpath": payload_path.relative_to(tmp_path).as_posix(),
             "payload_size": len(payload),
             "payload_sha256": digest,
@@ -850,6 +858,237 @@ def test_manifest_dependencies_run_provider_before_tree(tmp_path, monkeypatch):
     assert result["items"]["tree"]["status"] == "imported_ok"
 
 
+def test_live_rpc_runs_generated_skeletal_manifest_with_shared_safety_controls(
+    tmp_path,
+    monkeypatch,
+):
+    runner = load_runner(monkeypatch)
+    current = item("tree", "tree-v1")
+    current["assets"] = [{"asset_data": {
+        "_asset_type": "SkeletalMesh",
+        "asset_path": "/Game/Trees/SK_Tree",
+    }}]
+    manifest, checkpoint, report_path = write_manifest(tmp_path, [current])
+    calls = []
+    monkeypatch.setattr(
+        runner,
+        "ingest_item",
+        lambda rpc_item: calls.append(rpc_item["queue_id"])
+        or {"status": "imported_ok"},
+    )
+
+    result = runner.run_manifest(manifest)
+
+    assert calls == ["tree"]
+    assert result["items"]["tree"]["status"] == "imported_ok"
+    policy = result["process_lifetime_policy"]["ingest_policy"]
+    assert policy["safety_mode"] == "live_editor_serialized_rpc"
+    assert policy["heavy_item_count"] == 1
+    assert "compiler_drain_before_restore" in policy["shared_controls"]
+    assert checkpoint.exists()
+    assert report_path.exists()
+
+
+def test_heavy_headless_manifest_fails_closed_without_null_rhi(
+    tmp_path,
+    monkeypatch,
+):
+    runner = load_runner(monkeypatch)
+    current = item("tree", "tree-v1")
+    current["assets"] = [{"asset_data": {
+        "_asset_type": "SkeletalMesh",
+        "asset_path": "/Game/Trees/SK_Tree",
+    }}]
+    manifest, checkpoint, _report = write_manifest(tmp_path, [current])
+    monkeypatch.setattr(runner, "_is_headless_manifest_runtime", lambda: True)
+    monkeypatch.setattr(runner, "_is_null_rhi_runtime", lambda: False)
+
+    with unittest.TestCase().assertRaisesRegex(RuntimeError, "requires -NullRHI"):
+        runner.run_manifest(manifest)
+
+    assert not checkpoint.exists()
+
+
+def test_manifest_runs_all_providers_before_any_final_assembly(
+    tmp_path,
+    monkeypatch,
+):
+    runner = load_runner(monkeypatch)
+    provider_a = item("provider-a", "provider-a-v1")
+    provider_b = item("provider-b", "provider-b-v1")
+    root_a = item("root-a", "root-a-v1")
+    root_a["depends_on_queue_ids"] = ["provider-a"]
+    root_a["cluster_assembly"] = {
+        "ingest_plan": {
+            "status": "ready",
+            "asset_contract": {"assembly": "/Game/Trees/SK_A_Assembly"},
+        }
+    }
+    root_b = item("root-b", "root-b-v1")
+    root_b["depends_on_queue_ids"] = ["provider-b"]
+    root_b["cluster_assembly"] = {
+        "ingest_plan": {
+            "status": "ready",
+            "asset_contract": {"assembly": "/Game/Trees/SK_B_Assembly"},
+        }
+    }
+    manifest, _checkpoint, _report = write_manifest(
+        tmp_path,
+        [root_a, provider_a, root_b, provider_b],
+    )
+    calls = []
+    monkeypatch.setattr(runner, "_is_headless_manifest_runtime", lambda: True)
+    monkeypatch.setattr(runner, "_is_null_rhi_runtime", lambda: True)
+
+    def ingest(current, *, defer_cluster_build=False):
+        calls.append(("prepare", current["queue_id"]))
+        return {
+            "status": (
+                "assembly_prepared"
+                if defer_cluster_build
+                else "imported_ok"
+            ),
+            "cluster_assembly": (
+                {"status": "prepared_for_build"}
+                if defer_cluster_build
+                else {"status": "skipped"}
+            ),
+            "durable_saves": {"schema_version": 1, "records": []},
+        }
+
+    monkeypatch.setattr(
+        runner,
+        "ingest_item",
+        ingest,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_finalize_prepared_assembly_item",
+        lambda current, _state: calls.append(("build", current["queue_id"]))
+        or {"status": "imported_ok", "cluster_assembly": {"status": "ok"}},
+    )
+
+    result = runner.run_manifest(manifest)
+
+    assert calls == [
+        ("prepare", "provider-a"),
+        ("prepare", "provider-b"),
+        ("prepare", "root-a"),
+        ("prepare", "root-b"),
+        ("build", "root-a"),
+        ("build", "root-b"),
+    ]
+    assert result["process_lifetime_policy"]["ingest_policy"][
+        "heavy_item_count"
+    ] == 2
+
+
+def test_manifest_rejects_duplicate_final_assembly_publish_target(
+    tmp_path,
+    monkeypatch,
+):
+    runner = load_runner(monkeypatch)
+    roots = []
+    for queue_id in ("root-a", "root-b"):
+        current = item(queue_id, queue_id + "-v1")
+        current["cluster_assembly"] = {
+            "ingest_plan": {
+                "status": "ready",
+                "asset_contract": {
+                    "assembly": "/Game/Trees/SK_Shared_Assembly"
+                },
+            }
+        }
+        roots.append(current)
+    manifest, checkpoint, _report = write_manifest(tmp_path, roots)
+    monkeypatch.setattr(runner, "_is_headless_manifest_runtime", lambda: True)
+    monkeypatch.setattr(runner, "_is_null_rhi_runtime", lambda: True)
+
+    with unittest.TestCase().assertRaisesRegex(
+        RuntimeError,
+        "scheduled more than once",
+    ):
+        runner.run_manifest(manifest)
+
+    assert not checkpoint.exists()
+
+
+def test_process_recycle_preserves_prepared_assembly_without_reimport(
+    tmp_path,
+    monkeypatch,
+):
+    runner = load_runner(monkeypatch)
+    provider = item("provider", "provider-v1")
+    root = item("root", "root-v1")
+    root["depends_on_queue_ids"] = ["provider"]
+    root["cluster_assembly"] = {
+        "ingest_plan": {
+            "status": "ready",
+            "asset_contract": {"assembly": "/Game/Trees/SK_Root_Assembly"},
+        }
+    }
+    manifest, checkpoint, report = write_manifest(tmp_path, [root, provider])
+    monkeypatch.setattr(runner, "_is_headless_manifest_runtime", lambda: True)
+    monkeypatch.setattr(runner, "_is_null_rhi_runtime", lambda: True)
+    monkeypatch.setenv("SK_BATCH_MAX_ITEMS_PER_PROCESS", "2")
+    calls = []
+
+    def ingest(current, *, defer_cluster_build=False):
+        calls.append(("prepare", current["queue_id"]))
+        return {
+            "status": "assembly_prepared" if defer_cluster_build else "imported_ok",
+            "cluster_assembly": {"status": "prepared_for_build"},
+            "durable_saves": {"schema_version": 1, "records": []},
+        }
+
+    monkeypatch.setattr(runner, "ingest_item", ingest)
+    monkeypatch.setattr(
+        runner,
+        "_finalize_prepared_assembly_item",
+        lambda current, _state: calls.append(("build", current["queue_id"]))
+        or {"status": "imported_ok", "cluster_assembly": {"status": "ok"}},
+    )
+
+    first = runner.run_manifest(manifest, checkpoint, report)
+    first_checkpoint = json.loads(checkpoint.read_text(encoding="utf-8"))
+    second = runner.run_manifest(manifest, checkpoint, report)
+
+    assert first["status"] == "process_yield"
+    assert first["process_yield"]["reason"] == (
+        "assembly_build_process_lifetime_limit"
+    )
+    assert first_checkpoint["items"]["root"]["status"] == "assembly_prepared"
+    assert second["status"] == "complete"
+    assert calls == [
+        ("prepare", "provider"),
+        ("prepare", "root"),
+        ("build", "root"),
+    ]
+
+
+def test_recover_interrupted_final_build_reuses_prepared_inputs():
+    runner = load_runner()
+    checkpoint = {
+        "current_item": "root",
+        "items": {
+            "root": {
+                "status": "assembly_building",
+                "fingerprint": "root-v1",
+                "crash_count": 0,
+                "cluster_assembly": {"status": "prepared_for_build"},
+            }
+        },
+    }
+
+    runner._recover_interrupted_item(checkpoint, 2)
+
+    state = checkpoint["items"]["root"]
+    assert state["status"] == "assembly_prepared"
+    assert state["crash_count"] == 1
+    assert state["cluster_assembly"]["status"] == "prepared_for_build"
+    assert checkpoint["current_item"] is None
+
+
 def test_manifest_v2_lazy_items_preserve_dependency_order(tmp_path, monkeypatch):
     runner = load_runner(monkeypatch)
     from cluster_fleet_push import write_combined_lazy_manifest
@@ -898,6 +1137,29 @@ def test_manifest_v2_lazy_items_preserve_dependency_order(tmp_path, monkeypatch)
     assert checkpoint_payload["schema_version"] == 1
 
 
+def test_manifest_v2_without_wave_policy_requires_reexport(tmp_path, monkeypatch):
+    runner = load_runner(monkeypatch)
+    manifest, checkpoint, _report = write_manifest_v2(
+        tmp_path,
+        [item("legacy", "legacy-v1")],
+    )
+    root = json.loads(manifest.read_text(encoding="utf-8"))
+    for key in (
+        "ingest_wave",
+        "heavy_ingest_reasons",
+        "final_assembly_asset_path",
+    ):
+        root["items"][0].pop(key, None)
+    manifest.write_text(json.dumps(root), encoding="utf-8")
+    monkeypatch.setattr(runner, "_is_headless_manifest_runtime", lambda: True)
+    monkeypatch.setattr(runner, "_is_null_rhi_runtime", lambda: True)
+
+    with unittest.TestCase().assertRaisesRegex(RuntimeError, "predates.*re-export"):
+        runner.run_manifest(manifest)
+
+    assert not checkpoint.exists()
+
+
 def test_manifest_v2_terminal_item_does_not_reload_payload(tmp_path, monkeypatch):
     runner = load_runner(monkeypatch)
     manifest, checkpoint, report = write_manifest_v2(
@@ -939,7 +1201,6 @@ def test_manifest_v2_payload_hash_failure_is_item_local(tmp_path, monkeypatch):
         lambda current: calls.append(current["queue_id"])
         or {"status": "imported_ok"},
     )
-
     result = runner.run_manifest(manifest)
 
     assert result["items"]["bad"]["status"] == "data_error"
@@ -979,6 +1240,45 @@ def test_manifest_v2_rejects_payload_identity_drift(tmp_path, monkeypatch):
 
     assert result["items"]["tree"]["status"] == "data_error"
     assert "identity differs" in result["items"]["tree"]["message"]
+
+
+def test_manifest_v2_recomputes_policy_before_any_heavy_ingest(
+    tmp_path,
+    monkeypatch,
+):
+    runner = load_runner(monkeypatch)
+    current = item("tree", "tree-v1")
+    current["mesh_path"] = "/Game/Trees/SK_Tree"
+    manifest, _checkpoint, _report = write_manifest_v2(tmp_path, [current])
+    root = json.loads(manifest.read_text(encoding="utf-8"))
+    item_ref = root["items"][0]
+    payload_path = tmp_path / Path(item_ref["payload_relpath"])
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    payload["heavy_ingest_reasons"] = []
+    item_ref["heavy_ingest_reasons"] = []
+    payload_bytes = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    payload_path.write_bytes(payload_bytes)
+    item_ref["payload_size"] = len(payload_bytes)
+    item_ref["payload_sha256"] = hashlib.sha256(payload_bytes).hexdigest()
+    manifest.write_text(json.dumps(root), encoding="utf-8")
+    monkeypatch.setattr(runner, "_is_headless_manifest_runtime", lambda: True)
+    monkeypatch.setattr(runner, "_is_null_rhi_runtime", lambda: True)
+    monkeypatch.setattr(
+        runner,
+        "ingest_item",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("policy-tampered payload must not mutate assets")
+        ),
+    )
+
+    result = runner.run_manifest(manifest)
+
+    assert result["items"]["tree"]["status"] == "data_error"
+    assert "policy differs" in result["items"]["tree"]["message"]
 
 
 def test_manifest_v2_rejects_storage_directory_outside_manifest_directory(
@@ -1292,9 +1592,11 @@ def test_missing_cached_assembly_part_reimports_tree(tmp_path, monkeypatch):
     monkeypatch.setattr(
         runner,
         "ingest_item",
-        lambda current: calls.append(current["queue_id"])
+        lambda current, **_kwargs: calls.append(current["queue_id"])
         or {"status": "imported_ok"},
     )
+    monkeypatch.setattr(runner, "_is_headless_manifest_runtime", lambda: True)
+    monkeypatch.setattr(runner, "_is_null_rhi_runtime", lambda: True)
 
     result = runner.run_manifest(manifest)
 
@@ -2235,12 +2537,59 @@ class DurableSaveOwnershipTests(unittest.TestCase):
         mesh = self.FakeMesh(mesh_path, skeleton)
         environment.add_asset(skeleton_path, skeleton)
         environment.add_asset(mesh_path, mesh)
+        environment.install_thumbnail_free_saver()
         ledger = runner._new_durable_save_ledger()
         receipt = runner._save_final_skeleton_contract_assets(
             mesh,
             durable_saves=ledger,
         )
         return mesh, skeleton, ledger, receipt
+
+    def test_headless_thumbnail_free_save_rescans_exact_package(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = _DurableSaveFake(
+                runner,
+                Path(temporary) / "Content",
+            )
+            mesh_path = "/Game/Meshes/Trees/Assembly/SK_Test_NA_Base"
+            mesh = environment.add_asset(mesh_path)
+            environment.install_thumbnail_free_saver()
+            scans = []
+            waits = []
+
+            class FakeRegistry:
+                @staticmethod
+                def scan_modified_asset_files(paths):
+                    scans.append(list(paths))
+
+                @staticmethod
+                def wait_for_completion():
+                    waits.append(True)
+
+            runner.unreal.AssetRegistryHelpers = types.SimpleNamespace(
+                get_asset_registry=lambda: FakeRegistry(),
+            )
+            runner._is_headless_manifest_runtime = lambda: True
+            ledger = runner._new_durable_save_ledger()
+
+            runner._save_skeletal_mesh_owned_without_thumbnail(
+                mesh_path,
+                ledger,
+                owner="assembly_prototype_prebuild",
+                role="prototype",
+            )
+
+            self.assertEqual(environment.native_save_calls, [mesh_path])
+            self.assertEqual(
+                scans,
+                [[str(environment.package_file(mesh_path))]],
+            )
+            self.assertEqual(waits, [True])
+            self.assertIs(
+                runner.unreal.EditorAssetLibrary.load_asset(mesh_path),
+                mesh,
+            )
 
     def test_final_contract_owns_dependency_before_mesh_and_rejects_resave(self):
         runner = load_runner()
@@ -2253,14 +2602,16 @@ class DurableSaveOwnershipTests(unittest.TestCase):
 
             self.assertEqual(
                 environment.save_asset_calls,
-                [
-                    (receipt["skeleton"], False),
-                    (receipt["mesh"], False),
-                ],
+                [(receipt["skeleton"], False)],
             )
+            self.assertEqual(environment.native_save_calls, [receipt["mesh"]])
             self.assertEqual(
                 [row["role"] for row in ledger["records"]],
                 ["skeleton", "mesh"],
+            )
+            self.assertEqual(
+                [row["save_mode"] for row in ledger["records"]],
+                ["editor_asset", "thumbnail_free"],
             )
             self.assertEqual(
                 json.loads(json.dumps(runner._durable_save_report(ledger))),
@@ -2272,7 +2623,8 @@ class DurableSaveOwnershipTests(unittest.TestCase):
                     mesh,
                     durable_saves=ledger,
                 )
-            self.assertEqual(len(environment.save_asset_calls), 2)
+            self.assertEqual(len(environment.save_asset_calls), 1)
+            self.assertEqual(len(environment.native_save_calls), 1)
 
     def test_cluster_assembly_verifies_first_receipt_without_second_save(self):
         runner = load_runner()
@@ -2387,8 +2739,11 @@ class DurableSaveOwnershipTests(unittest.TestCase):
             )
 
             self.assertEqual(result["persisted_generated_assets"], [prototype])
-            self.assertEqual(environment.save_asset_calls.count((prototype, False)), 1)
-            self.assertEqual(environment.native_save_calls, [assembly_path])
+            self.assertEqual(environment.native_save_calls.count(prototype), 1)
+            self.assertEqual(
+                environment.native_save_calls,
+                [mesh.path, prototype, assembly_path],
+            )
             prototype_record = runner._find_durable_save(ledger, prototype)
             assembly_record = runner._find_durable_save(ledger, assembly_path)
             self.assertEqual(
@@ -2613,6 +2968,7 @@ class UnrealIngestSaveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             environment = _DurableSaveFake(runner, Path(temporary) / "Content")
             environment.add_asset(mesh_path)
+            environment.install_thumbnail_free_saver()
             saved = runner._save_item_assets(
                 {
                     "mesh_path": mesh_path,
@@ -2625,8 +2981,9 @@ class UnrealIngestSaveTests(unittest.TestCase):
             self.assertEqual(saved, [mesh_path])
             self.assertEqual(
                 environment.save_asset_calls,
-                [(mesh_path, False)],
+                [],
             )
+            self.assertEqual(environment.native_save_calls, [mesh_path])
             self.assertEqual(
                 environment.save_directory_calls,
                 [("/Game/Meshes/Trees/", True)],

@@ -748,10 +748,13 @@ class ClusterFleetPushTests(unittest.TestCase):
                 item["checkout_asset_paths"],
             )
             payload_path = root / Path(item_ref["payload_relpath"])
-            self.assertEqual(
-                json.loads(payload_path.read_text(encoding="utf-8")),
-                item,
-            )
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            for key, value in item.items():
+                self.assertEqual(payload[key], value)
+            self.assertEqual(item_ref["ingest_wave"], "provider_part")
+            self.assertEqual(payload["ingest_wave"], "provider_part")
+            self.assertEqual(item_ref["heavy_ingest_reasons"], [])
+            self.assertEqual(item_ref["final_assembly_asset_path"], "")
             self.assertLess(
                 manifest_path.stat().st_size,
                 payload_path.stat().st_size,

@@ -44,6 +44,7 @@ from push_dependency_schedule import (
 from sk_common import wind_preset_for_spm
 from stage_batch_policy import run_memory_bounded_stage, stage_worker_policy
 from assembly_runtime_contract import assembly_runtime_code_state
+from unreal_ingest_policy import manifest_item_policy_metadata
 
 
 DEFAULT_ROOT = Path(r"D:\OneDrive\Forestportfolio\02_nature\Tree")
@@ -164,6 +165,9 @@ def write_combined_lazy_manifest(manifest_path, manifest_metadata, pending):
             raise ExactPushError(
                 f"combined manifest item {index} is not a JSON object"
             )
+        item = dict(item)
+        policy_metadata = manifest_item_policy_metadata(item)
+        item.update(policy_metadata)
         queue_id = str(item.get("queue_id") or "")
         fingerprint = str(item.get("fingerprint") or "")
         if not queue_id or not fingerprint:
@@ -189,6 +193,7 @@ def write_combined_lazy_manifest(manifest_path, manifest_metadata, pending):
             "checkout_asset_paths": list(
                 item.get("checkout_asset_paths") or []
             ),
+            **policy_metadata,
             "payload_relpath": payload_path.relative_to(
                 manifest_path.parent
             ).as_posix(),

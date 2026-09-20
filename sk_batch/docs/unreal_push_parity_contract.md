@@ -2,12 +2,13 @@
 
 ## Scope
 
-`rpc` and `headless` are execution transports. `unreal_wait` uses the headless
-export contract but deliberately stops before Unreal starts. All three consume
-the same versioned item manifest; the later `대기 에셋 임포트` action executes
-waiting items through the same Unreal-side headless ingest function. A mode must
-not reinterpret Send2UE settings or replace the Send2UE importer with a generic
-FBX task.
+`rpc` and `headless` execute the same transaction for generated Nanite
+SkeletalMesh, DynamicWind provider, and final Assembly workloads. `unreal_wait`
+uses the headless export contract and deliberately stops before Unreal starts.
+All modes consume the same versioned item manifest, and a mode must not
+reinterpret Send2UE settings or replace the Send2UE importer with a generic FBX
+task. Headless adds process isolation and `-NullRHI`; RPC keeps the requested
+live-editor workflow while using the shared serial compiler/GC safety controls.
 
 All three modes must also preserve the channel meanings and failure rules in
 the [Tree Vertex Color contract](tree_vertex_color_contract.md); transport is
@@ -52,8 +53,9 @@ not allowed to remap, regenerate, or discard R/G.
     and its PhysicsAsset assignment are disabled. A default generated
     PhysicsAsset is deleted only when it has no foreign referencer.
 11. Dynamic wind is applied through `CodexDynamicWindImportLibrary`.
-12. Assets/directories are saved, assigned slots are verified, and relevant
-    materials are compiled/checked.
+12. Generated SkeletalMeshes are saved through the thumbnail-free package API;
+    Skeleton and auxiliary assets use the normal save path. Assigned slots are
+    verified and relevant materials are compiled/checked.
 
 ## Optional texture availability
 
@@ -65,9 +67,14 @@ left unassigned; ambiguous, stale, or unsafe candidates are omitted. The
 material instance is still reused or created and assigned to its mesh slot, and
 texture availability never changes the target outcome.
 
-RPC invokes this transaction through the open editor's existing Send2UE RPC
-bridge. Headless invokes the identical transaction in one
-`UnrealEditor-Cmd.exe -run=pythonscript` session for the pending batch.
+Headless invokes this transaction in one
+`UnrealEditor-Cmd.exe -run=pythonscript -NullRHI` session for the pending batch.
+The RPC bridge invokes the same runner one item at a time in the open editor.
+For both transports, each item temporarily disables overlapping asynchronous
+skinned-asset compilation, drains compilers before restoring the editor setting,
+releases transient references, performs Unreal GC, and uses thumbnail-free saves
+for generated SkeletalMeshes. The provider/part and final-Assembly waves retain
+one explicit barrier.
 
 ## Queue and recovery contract
 
@@ -95,8 +102,10 @@ match; `--force` bypasses both caches.
 ## GUI compatibility
 
 - The existing `③ Unreal Push` button remains and defaults to `headless`.
-- A transport selector permits explicit `rpc`, `headless`, or `unreal_wait`
-  runs.
+- A transport selector permits `rpc`, `headless`, or `unreal_wait`. An explicit
+  RPC selection remains RPC and requires MyProject2 Unreal Editor to be open.
+- Saved RPC preferences remain RPC; loading or saving configuration never
+  silently rewrites the selected transport.
 - `unreal_wait` persists dependency-ordered immutable exports as
   `exported_pending_unreal`. The state and waiting manifest survive GUI restarts.
 - `대기 에셋 임포트` revalidates source and export fingerprints, refuses to
@@ -105,7 +114,7 @@ match; `--force` bypasses both caches.
 - The full unattended pipeline defaults to `headless`, preserving the existing
   one-click workflow while removing its open-editor requirement.
 
-## Runtime parity evidence (2026-07-14)
+## Historical runtime parity evidence (2026-07-14)
 
 - MyProject2: Unreal Engine 5.8.0, `UnrealEditor-Cmd -run=pythonscript`.
 - Headless and open-editor RPC both completed `SK_bush_blackgum_01` through the
@@ -119,3 +128,7 @@ match; `--force` bypasses both caches.
   `/Game/Material/Tree/AssetTree/Master/M_TreeAsset_Master`.
 - Verification artifacts are listed in
   `logs/verification_headless_rpc_parity.json`.
+
+This evidence supports using either transport. Production RPC additionally
+inherits the current serial compiler-drain, item-GC, thumbnail-free save, and
+two-wave Assembly safety controls.

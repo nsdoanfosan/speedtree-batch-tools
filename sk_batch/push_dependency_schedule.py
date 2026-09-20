@@ -39,6 +39,9 @@ class PushDependencyError(RuntimeError):
 
 STAGE_DEPENDENCY_CONTRACT_KIND = "sk_batch_verified_push_dependencies"
 STAGE_DEPENDENCY_CONTRACT_VERSION = 1
+PASS_THROUGH_PROVIDER_REFRESH_REASONS = frozenset({
+    "normalized_variants_metadata_missing_nonblocking",
+})
 
 
 def normalized_path_key(path):
@@ -80,13 +83,13 @@ def load_current_cluster_assembly_manifest(spm):
         embedded = pipeline.get("cluster_assembly_manifest")
         if not isinstance(embedded, dict):
             return None
-        if embedded.get("status") == "pass_through":
+        manifest_record = embedded.get("manifest") or {}
+        if embedded.get("status") == "pass_through" and not manifest_record:
             return {
                 "kind": MANIFEST_KIND,
                 "status": "pass_through",
                 "parts": [],
             }
-        manifest_record = embedded.get("manifest") or {}
         manifest_path = Path(str(manifest_record.get("path") or ""))
         if not manifest_path.is_file():
             raise PushDependencyError(
@@ -102,6 +105,13 @@ def load_current_cluster_assembly_manifest(spm):
             raise PushDependencyError(
                 "unsupported Assembly Cluster Assembly manifest kind"
             )
+        if embedded.get("status") == "pass_through":
+            if manifest.get("status") != "pass_through":
+                raise PushDependencyError(
+                    "Assembly pass-through summary points to a non-pass-through "
+                    "manifest"
+                )
+            return manifest
         validate_manifest_artifacts(manifest)
         return manifest
     except PushDependencyError:
@@ -116,6 +126,8 @@ def _dependency_spms_from_manifest(manifest):
     """Return available scheduling hints without gating materialized output."""
     status = str(manifest.get("status") or "")
     if status == "pass_through":
+        if _pass_through_requires_provider_refresh(manifest):
+            return _pass_through_provider_refresh_spms(manifest)
         return []
 
     dependencies = []
@@ -134,6 +146,70 @@ def _dependency_spms_from_manifest(manifest):
             continue
         if not dependency.is_file():
             continue
+        key = normalized_path_key(dependency)
+        if key not in seen:
+            seen.add(key)
+            dependencies.append(dependency)
+    return dependencies
+
+
+def _pass_through_requires_provider_refresh(manifest):
+    """Return true only for a proven recoverable provider-metadata demotion."""
+    if not isinstance(manifest, dict) or manifest.get("status") != "pass_through":
+        return False
+    handoff = manifest.get("handoff") or {}
+    demotions = list(manifest.get("role_demotions") or ())
+    if isinstance(handoff, dict):
+        demotions.extend(handoff.get("role_demotions") or ())
+    return any(
+        isinstance(row, dict)
+        and row.get("code") == "CLUSTER_ROLE_NOT_ASSEMBLED"
+        and row.get("receipt_decision") == "normalize_part"
+        and row.get("reason") in PASS_THROUGH_PROVIDER_REFRESH_REASONS
+        for row in demotions
+    )
+
+
+def _pass_through_provider_refresh_spms(manifest):
+    """Recover exact provider SPMs already fingerprinted by the handoff."""
+    handoff = manifest.get("handoff") or {}
+    if not isinstance(handoff, dict):
+        raise PushDependencyError(
+            "provider-refresh pass-through has no handoff evidence"
+        )
+    demotions = [
+        row
+        for row in (handoff.get("role_demotions") or ())
+        if isinstance(row, dict)
+        and row.get("code") == "CLUSTER_ROLE_NOT_ASSEMBLED"
+        and row.get("receipt_decision") == "normalize_part"
+        and row.get("reason") in PASS_THROUGH_PROVIDER_REFRESH_REASONS
+    ]
+    candidates = {}
+    for row in handoff.get("artifact_validation") or ():
+        if (
+            not isinstance(row, dict)
+            or row.get("artifact") != "cluster_authoring_spm"
+            or row.get("ok") is not True
+        ):
+            continue
+        actual = row.get("actual") or {}
+        path = Path(str(actual.get("path") or ""))
+        if not is_cluster_source_spm(path) or not path.is_file():
+            continue
+        candidates.setdefault(path.stem.casefold(), path)
+
+    dependencies = []
+    seen = set()
+    for demotion in demotions:
+        identity = str(demotion.get("provider_identity") or "").strip()
+        dependency = candidates.get(identity.casefold())
+        if not identity or dependency is None:
+            raise PushDependencyError(
+                "provider-refresh pass-through is missing an exact validated "
+                "Cluster source for provider identity: "
+                + (identity or "<missing>")
+            )
         key = normalized_path_key(dependency)
         if key not in seen:
             seen.add(key)
@@ -162,7 +238,7 @@ def exact_dependency_contract_from_validated_manifest(root_spm, manifest):
             "unsupported Assembly Cluster Assembly manifest kind"
         )
     dependencies = _dependency_spms_from_manifest(manifest)
-    return {
+    contract = {
         "kind": STAGE_DEPENDENCY_CONTRACT_KIND,
         "schema_version": STAGE_DEPENDENCY_CONTRACT_VERSION,
         "root_spm": str(Path(root_spm).resolve()),
@@ -173,6 +249,9 @@ def exact_dependency_contract_from_validated_manifest(root_spm, manifest):
         ],
         "evidence": "validated_cluster_assembly_manifest",
     }
+    if _pass_through_requires_provider_refresh(manifest):
+        contract["provider_refresh_required"] = True
+    return contract
 
 
 def _stage_dependency_spms(root_spm, contract):
@@ -205,11 +284,20 @@ def _stage_dependency_spms(root_spm, contract):
         return None
     status = str(contract.get("assembly_status") or "")
     dependency_values = contract.get("dependency_spms")
+    provider_refresh_required = (
+        contract.get("provider_refresh_required") is True
+    )
     if status not in {"ready", "pass_through"} or not isinstance(
         dependency_values, (list, tuple)
     ):
         return None
-    if status == "pass_through" and dependency_values:
+    if (
+        status == "pass_through"
+        and dependency_values
+        and not provider_refresh_required
+    ):
+        return None
+    if provider_refresh_required and status != "pass_through":
         return None
 
     dependencies = []
