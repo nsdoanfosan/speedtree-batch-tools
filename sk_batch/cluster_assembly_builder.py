@@ -2771,8 +2771,15 @@ def _fbx_coordinate_tolerance(coordinates):
         - min(point[axis] for point in points)
         for axis in range(3)
     ]
+    # Blender stores FBX positions as float32. Small cards far from the
+    # origin can have seam copies several ULPs apart even though their own
+    # bounds are tiny; an extent-only tolerance rejects those shared points.
+    coordinate_roundoff = max(
+        abs(value) for point in points for value in point
+    ) * (4.0 * 2.0 ** -23)
     return max(
         max(spans) * 2.0e-6,
+        coordinate_roundoff,
         MIN_FBX_COORDINATE_TOLERANCE_METERS,
     )
 

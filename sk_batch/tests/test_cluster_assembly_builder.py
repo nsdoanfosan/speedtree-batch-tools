@@ -41,6 +41,7 @@ from cluster_assembly_builder import (  # noqa: E402
     _base_role_polygon_indices,
     _build_unreal_assembly_provenance_payload,
     _coalesce_normalized_external_parts,
+    _coincident_candidate_groups,
     _component_groups,
     _component_signature,
     _current_unreal_skeleton_diagnostic,
@@ -78,6 +79,34 @@ from cluster_assembly_builder import (  # noqa: E402
 from speedtree_native_receipt import (  # noqa: E402
     build_exact_native_receipt_index,
 )
+
+
+class FBXCoordinatePrecisionTests(unittest.TestCase):
+    def candidate_groups(self, points):
+        obj = SimpleNamespace(data=SimpleNamespace(vertices=[
+            SimpleNamespace(co=point) for point in points
+        ]))
+        candidates = {
+            index: {"faces": Counter({"face": 1}), "neighbors": Counter({"uv": 1})}
+            for index in range(len(points))
+        }
+        return _coincident_candidate_groups(
+            obj, {"vertices": list(candidates)}, candidates
+        )
+
+    def test_fagus_render_seam_copies_share_one_uv_position(self):
+        groups = self.candidate_groups([
+            (-3.076387643814087, 28.43783187866211, 8.638651847839355),
+            (-3.0763871669769287, 28.437828063964844, 8.638651847839355),
+        ])
+        self.assertEqual([group["indices"] for group in groups], [[0, 1]])
+
+    def test_distinct_nearby_positions_remain_ambiguous_candidates(self):
+        groups = self.candidate_groups([
+            (-3.076387643814087, 28.43783187866211, 8.638651847839355),
+            (-3.076387643814087, 28.43793187866211, 8.638651847839355),
+        ])
+        self.assertEqual([group["indices"] for group in groups], [[0], [1]])
 
 
 class FakeEditorProperties:
