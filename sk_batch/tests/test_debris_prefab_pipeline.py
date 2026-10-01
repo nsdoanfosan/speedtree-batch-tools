@@ -5,6 +5,7 @@ small synthetic receipts; no real Blender source, editor, or depot is touched.
 """
 import hashlib
 import json
+import marshal
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -279,6 +280,22 @@ class NativeStrictStateTests(unittest.TestCase):
         self.assertFalse(receipt["map_saved"])
         self.assertFalse(receipt["pcg_generated"])
 
+    def test_geometry_verifier_preserves_utf8_capture_and_owned_process_contract(self):
+        with mock.patch.object(ingest_job, "owned_run", return_value=SimpleNamespace(
+                returncode=1, stdout="형상 검증 실패")) as owned:
+            with self.assertRaisesRegex(RuntimeError, "geometry verification failed"):
+                self.run_with_mocks()
+        args, options = owned.call_args
+        self.assertEqual(args[0][0:3], ["mock-python", "-X", "utf8"])
+        self.assertEqual(options["source"], "sk_batch.debris_prefab.geometry_verification")
+        self.assertTrue(options["capture_output"])
+        self.assertTrue(options["text"])
+        self.assertEqual(options["encoding"], "utf-8")
+        self.assertEqual(options["errors"], "replace")
+        self.assertIs(options["check"], False)
+        self.assertNotIn("cwd", options)
+        self.assertNotIn("timeout", options)
+
     def test_guard_close_failure_cannot_report_completed_publication(self):
         self.library.end_native_authoring_guard.return_value = json.dumps({"success": False})
         self.editor.preflight.return_value["material_bindings"] = []
@@ -319,6 +336,34 @@ class NativeStrictStateTests(unittest.TestCase):
             self.assertEqual(receipt["status"], "failed")
             self.assertEqual(receipt["partial_ledger"], ledger)
             self.assertTrue(receipt["guard_closed"]["success"])
+
+
+class NativePerforceProcessTests(unittest.TestCase):
+    def test_marshaled_bytes_and_utf8_record_decoding_preserve_existing_mock_seam(self):
+        form = {b"Change": b"new", b"Client": b"UnrealProjects"}
+        output = marshal.dumps({b"code": b"stat", b"data": "변경 생성".encode("utf-8")}, 0)
+        completed = SimpleNamespace(returncode=0, stdout=output, stderr=b"")
+        with mock.patch.object(ingest_job.subprocess, "run", return_value=completed) as process:
+            rows = ingest_job._p4("change", "-i", form=form)
+        self.assertEqual(rows, [{"code": "stat", "data": "변경 생성"}])
+        self.assertEqual(process.call_args.args[0], ["p4", "-c", "UnrealProjects", "-G", "change", "-i"])
+        options = process.call_args.kwargs
+        self.assertEqual(options["input"], marshal.dumps(form, 0))
+        self.assertIsInstance(options["input"], bytes)
+        self.assertTrue(options["capture_output"])
+        self.assertIs(options["check"], False)
+        self.assertIsNone(options["timeout"])
+        self.assertNotIn("text", options)
+        self.assertNotIn("encoding", options)
+        self.assertNotIn("cwd", options)
+
+    def test_p4_uses_named_owner_without_swallowing_returned_error_records(self):
+        completed = SimpleNamespace(returncode=1, stdout=marshal.dumps({b"code": b"error", b"data": b"denied"}, 0))
+        with mock.patch.object(ingest_job, "owned_run", return_value=completed) as owned:
+            rows = ingest_job._p4("fstat", "exact-file.uasset")
+        self.assertEqual(rows, [{"code": "error", "data": "denied"}])
+        self.assertEqual(owned.call_args.kwargs["source"], "sk_batch.debris_prefab.perforce")
+        self.assertIs(owned.call_args.kwargs["run_factory"], ingest_job.subprocess.run)
 
 
 if __name__ == "__main__":

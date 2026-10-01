@@ -2624,8 +2624,9 @@ class App:
             anchor="w",
         ).pack(fill="x")
 
-        cols = ("wind", "terrain_group", "spm_status", "blend_status", "push_status", "folder")
-        visible_cols = ("wind", "terrain_group", "spm_status", "blend_status", "push_status")
+        # Preserve the existing data-column indices, including hidden folder.
+        cols = ("wind", "spm_status", "blend_status", "push_status", "folder", "terrain_group")
+        visible_cols = ("wind", "spm_status", "blend_status", "push_status", "terrain_group")
         tablef = ttk.LabelFrame(
             self.root,
             text="파일 목록 (표는 요약 · 행을 선택하면 아래에 전체 내용 표시)",
@@ -3291,7 +3292,7 @@ class App:
             folder_iid = f"folder::{_normalized_path(folder)}"
             if folder_iid in self.folder_rows:
                 return folder_iid
-            values = ("", "", "", "", "", str(folder))
+            values = ("", "", "", "", str(folder), "")
             try:
                 self.tree.insert(
                     parent,
@@ -3404,11 +3405,11 @@ class App:
                 text=self._item_label(iid),
                 values=(
                     self._wind_label(iid),
-                    self._terrain_group_label(iid),
                     self._table_display_value(iid, "spm_status", spm_status),
                     self._table_display_value(iid, "blend_status", blend_status),
                     self._table_display_value(iid, "push_status", push_status),
                     str(spm.parent),
+                    self._terrain_group_label(iid),
                 ),
             )
             self.row_copy_paths[iid] = [spm]
@@ -4223,7 +4224,7 @@ class App:
         if region != "cell":
             return
         column = self.tree.identify_column(event.x)
-        if column == "#2":
+        if column == "#5":
             # Unlike wind/source settings, this only selects a future queued
             # stage. The running job continues to use its captured path list.
             self._toggle_terrain_group(iid)

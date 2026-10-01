@@ -11,6 +11,11 @@ import subprocess
 import sys
 import traceback
 
+REPO = Path(__file__).resolve().parents[2]
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+from process_lifecycle import owned_run
+
 
 def _load(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
@@ -20,9 +25,10 @@ def _load(name, path):
 
 
 def _p4(*args, form=None):
-    result = subprocess.run(["p4", "-c", "UnrealProjects", "-G", *args],
-                            input=marshal.dumps(form, 0) if form is not None else None,
-                            capture_output=True, check=False)
+    result = owned_run(["p4", "-c", "UnrealProjects", "-G", *args],
+                       source="sk_batch.debris_prefab.perforce", run_factory=subprocess.run,
+                       input=marshal.dumps(form, 0) if form is not None else None,
+                       capture_output=True, check=False)
     stream = io.BytesIO(result.stdout)
     rows = []
     while stream.tell() < len(result.stdout):
@@ -107,7 +113,9 @@ def run(request_path):
                    str(project.parent / "Scripts/PCGTests/verify_debris_group_import.py"),
                    "--expected-header", str(expected), "--actual-header", str(actual),
                    "--output", str(paths["geometry_comparison"])]
-        proof_process = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+        proof_process = owned_run(command, source="sk_batch.debris_prefab.geometry_verification",
+                                  run_factory=subprocess.run, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", check=False)
         if proof_process.returncode:
             raise RuntimeError("Independent SOURCE_MODEL geometry verification failed: " + proof_process.stdout[-2000:])
         from sk_batch.debris_prefab_manifest import finalize_import_verified_manifest

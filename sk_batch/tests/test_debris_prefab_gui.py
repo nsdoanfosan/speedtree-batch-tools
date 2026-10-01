@@ -97,13 +97,43 @@ class RowPrefabTests(unittest.TestCase):
         item = self.app.items[str(self.source)]
         item["checked"] = True
         self.app.tree = mock.Mock()
+        self.app.tree.identify_region.return_value = "cell"
+        self.app.tree.identify_row.return_value = str(self.source)
+        self.app.tree.identify_column.return_value = "#5"
+        self.app.cell_editor = None
         self.app.active_batch_job = self.job
         with mock.patch.object(GUI, "save_config"):
-            self.app._toggle_terrain_group(str(self.source))
+            result = self.app._on_click(types.SimpleNamespace(x=1, y=1))
+        self.assertEqual(result, "break")
         self.assertFalse(item["debris_terrain_prefab"])
         self.assertTrue(item["checked"])
         self.assertEqual(item["wind_override"], "TREE")
         self.assertIn(str(self.source), self.job["cfg"]["debris_terrain_prefab_spms"])
+
+    def test_scan_retains_legacy_status_and_folder_indices_with_group_action_appended(self):
+        source = self.root / "SK_Any_Test.spm"
+        iid = str(source)
+        self.app.root_var = types.SimpleNamespace(get=lambda: str(self.root))
+        self.app.tree = mock.Mock()
+        self.app.tree.get_children.return_value = ()
+        self.app.checked_rows = mock.Mock()
+        self.app.cfg["debris_terrain_prefab_spms"] = [iid]
+        self.app.state = {iid: {
+            "spm_status": "Source ready", "blend_status": "Latest",
+            "live_status_signature": [0], "push_status": "Original ready",
+            "wind_override": "TREE",
+        }}
+        self.app.scan(prepared={"spms": [source], "cluster_sources": []}, generation=0)
+        rows = {call.kwargs["iid"]: call.kwargs["values"]
+                for call in self.app.tree.insert.call_args_list}
+        values = rows[iid]
+        self.assertEqual(values[:5], (
+            self.app._wind_label(iid), "Source ready", "Latest", "Original ready",
+            str(self.root),
+        ))
+        self.assertEqual(values[5], self.app._terrain_group_label(iid))
+        folder_values = next(value for key, value in rows.items() if key != iid)
+        self.assertEqual(folder_values, ("", "", "", "", str(self.root), ""))
 
     def test_only_captured_selected_original_success_runs_without_name_or_wind_gate(self):
         # A subsequent UI edit must not alter the captured request.
