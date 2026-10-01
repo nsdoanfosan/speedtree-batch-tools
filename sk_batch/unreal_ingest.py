@@ -540,8 +540,27 @@ def _pcg_provider_binding_checkout(item):
     return payload
 
 
+def _static_only_manifest_item(item):
+    assets = item.get("assets") or []
+    assembly = item.get("cluster_assembly") or {}
+    if assembly and (assembly.get("manifest") or {}).get("status") != "pass_through":
+        return False
+    if (assembly.get("ingest_plan") or {}).get("assets"):
+        return False
+    return bool(assets) and all(
+        (asset.get("asset_data") or {}).get("_asset_type") == "StaticMesh"
+        for asset in assets
+    )
+
+
 def _checkout_existing_assets(item):
     candidates = list(item.get("checkout_asset_paths") or [])
+    if _static_only_manifest_item(item):
+        declared_static_paths = {
+            _normalized_unreal_asset_path((asset.get("asset_data") or {}).get("asset_path")).casefold()
+            for asset in item["assets"]
+        }
+        candidates = [path for path in candidates if _normalized_unreal_asset_path(path).casefold() in declared_static_paths]
     provider_binding = _pcg_provider_binding_checkout(item)
     if provider_binding:
         item["_pcg_provider_binding_checkout"] = provider_binding
@@ -3407,18 +3426,25 @@ def _material_slot_inventory(mesh_path):
     mesh = unreal.EditorAssetLibrary.load_asset(mesh_path)
     if not mesh:
         raise RuntimeError(f"mesh not found: {mesh_path}")
-    slots = list(mesh.get_editor_property("materials") or [])
-    if not slots:
+    static_mesh_class = getattr(unreal, "StaticMesh", None)
+    is_static = static_mesh_class is not None and isinstance(mesh, static_mesh_class)
+    slots = list(mesh.get_editor_property("static_materials" if is_static else "materials") or [])
+    if not slots and not is_static:
         raise RuntimeError("skeletal mesh has no material slots")
 
     details = []
     missing = []
+    placeholders = []
     base_materials = {}
     for index, slot in enumerate(slots):
         slot_name = str(slot.get_editor_property("material_slot_name"))
         material = slot.get_editor_property("material_interface")
         material_path = material.get_path_name() if material else ""
         details.append({"index": index, "slot": slot_name, "material": material_path})
+        if is_static and material_path.casefold().startswith(
+            "/engine/enginematerials/defaultmaterial"
+        ):
+            placeholders.append(f"{slot_name}[{index}]")
         if not material:
             missing.append(f"{slot_name}[{index}]")
             continue
@@ -3431,19 +3457,49 @@ def _material_slot_inventory(mesh_path):
         base_path = base_material.get_path_name()
         base_materials.setdefault(base_path, base_material)
 
-    if missing:
+    if missing and not is_static:
         raise RuntimeError("unassigned material slots: " + ", ".join(missing))
     return {
         "mesh": mesh_path,
         "slots": slots,
         "details": details,
         "base_materials": base_materials,
+        "asset_type": "StaticMesh" if is_static else "SkeletalMesh",
+        "missing_slots": missing,
+        "placeholder_slots": placeholders,
+        "needs_assignment": bool(is_static and (not slots or missing or placeholders)),
+    }
+
+
+def _static_material_readonly_audit(inventory, *, stage):
+    """Report StaticMesh slots without touching shared master-material usage."""
+    return {
+        "status": "static_material_audit",
+        "stage": stage,
+        "mesh": inventory["mesh"],
+        "asset_type": "StaticMesh",
+        "slots": inventory["details"],
+        "slot_count": len(inventory["slots"]),
+        "native_material_ids": [row["index"] for row in inventory["details"]],
+        "missing_slots": inventory["missing_slots"],
+        "placeholder_slots": inventory["placeholder_slots"],
+        "needs_assignment": inventory["needs_assignment"],
+        "no_material_slots": not inventory["slots"],
+        "no_master_mutation": True,
+        "compiled_base_materials": [],
+        "nanite_voxel_material_usage": [],
+        "section_material_validation": {
+            "status": "static_slot_inventory",
+            "skeletal_section_audit_called": False,
+        },
     }
 
 
 def _material_prebuild_compile_and_usage_normalization(mesh_path):
     """Make source materials build-ready before any Nanite mesh is created."""
     inventory = _material_slot_inventory(mesh_path)
+    if inventory["asset_type"] == "StaticMesh":
+        return _static_material_readonly_audit(inventory, stage="prebuild")
     usage_validation = []
     compile_errors = []
     for base_path, base_material in inventory["base_materials"].items():
@@ -3486,6 +3542,8 @@ def _material_prebuild_compile_and_usage_normalization(mesh_path):
 def _material_postbuild_slot_audit(mesh_path):
     """Audit the finished mesh without invalidating any Nanite referencer."""
     inventory = _material_slot_inventory(mesh_path)
+    if inventory["asset_type"] == "StaticMesh":
+        return _static_material_readonly_audit(inventory, stage="postbuild")
     usage_validation = []
     invalid_usage = []
     properties = (
@@ -3541,9 +3599,26 @@ def _prebuild_material_path_once(mesh_path, reports, seen_paths):
 
 
 def _save_item_assets(item, imported_assets, *, durable_saves):
-    generated_skeletal_paths = {
-        _normalized_unreal_asset_path(item.get("mesh_path")).casefold()
-    }
+    generated_skeletal_paths = set()
+    primary_path = _normalized_unreal_asset_path(item.get("mesh_path"))
+    primary_type = next((
+        (asset.get("asset_data") or {}).get("_asset_type")
+        for asset in item.get("assets") or []
+        if _normalized_unreal_asset_path((asset.get("asset_data") or {}).get("asset_path")).casefold() == primary_path.casefold()
+    ), None)
+    if primary_path and primary_type is None:
+        primary_mesh = unreal.EditorAssetLibrary.load_asset(primary_path)
+        skeletal_class = getattr(unreal, "SkeletalMesh", None)
+        static_class = getattr(unreal, "StaticMesh", None)
+        if skeletal_class is not None and isinstance(primary_mesh, skeletal_class):
+            primary_type = "SkeletalMesh"
+        elif static_class is not None and isinstance(primary_mesh, static_class):
+            primary_type = "StaticMesh"
+        elif skeletal_class is None and static_class is None:
+            # Preserve legacy thin runtime adapters without Unreal class exports.
+            primary_type = "SkeletalMesh"
+    if primary_type == "SkeletalMesh":
+        generated_skeletal_paths.add(primary_path.casefold())
     for manifest_asset in item.get("assets") or []:
         asset_data = (
             manifest_asset.get("asset_data")
@@ -3616,7 +3691,7 @@ def _save_item_assets(item, imported_assets, *, durable_saves):
             saved.append(asset_path)
 
     folder = item.get("unreal_folder")
-    if folder:
+    if folder and not _static_only_manifest_item(item):
         folder_path = str(folder).replace("\\", "/").rstrip("/") + "/"
         folder_key = folder_path.casefold()
         _validate_durable_save_ledger(durable_saves)
@@ -3664,10 +3739,139 @@ def _save_item_assets(item, imported_assets, *, durable_saves):
     return saved
 
 
+def _static_manifest_remove_degenerates(manifest_asset):
+    """Return an explicitly declared static FBX option, never an implicit default."""
+    asset_data = manifest_asset.get("asset_data") or {}
+    if asset_data.get("_asset_type") != "StaticMesh":
+        return None
+    if Path(str(asset_data.get("file_path") or "")).suffix.casefold() != ".fbx":
+        return None
+    settings = (((manifest_asset.get("property_data") or {}).get("unreal") or {})
+                .get("import_method") or {}).get("fbx") or {}
+    settings = settings.get("static_mesh_import_data") or {}
+    if "remove_degenerates" not in settings:
+        return None
+    declared = settings["remove_degenerates"]
+    if not isinstance(declared, dict) or not isinstance(declared.get("value"), bool):
+        raise RuntimeError("Static FBX remove_degenerates must be an explicit Boolean")
+    return declared["value"]
+
+
+def _static_fbx_import_data(mesh, path):
+    data = mesh.get_editor_property("asset_import_data")
+    expected_class = getattr(unreal, "FbxStaticMeshImportData", None)
+    if expected_class is None or not isinstance(data, expected_class):
+        raise RuntimeError("Existing static FBX import data has an incompatible type: " + path)
+    return data
+
+
+def _sync_static_reimport_remove_degenerates(manifest_asset):
+    """Honor one declared option before UE's unattended reimport reads old data.
+
+    UE's reimport factory replaces task StaticMeshImportData with the existing
+    mesh's data even when replace_existing_settings=True. The common checkout
+    has already made this exact manifest-owned asset writable. Do not modify
+    any other import option, material, source mesh or skeletal/mixed route.
+    """
+    requested = _static_manifest_remove_degenerates(manifest_asset)
+    path = _normalized_unreal_asset_path((manifest_asset.get("asset_data") or {}).get("asset_path"))
+    report = {"asset_path": path, "property": "remove_degenerates"}
+    if requested is None:
+        return {**report, "status": "skipped", "reason": "No explicit static FBX setting"}
+    mesh = unreal.EditorAssetLibrary.load_asset(path)
+    if mesh is None:
+        return {**report, "status": "skipped", "reason": "New asset; task options are authoritative",
+                "manifest_value": requested}
+    if not isinstance(mesh, unreal.StaticMesh):
+        raise RuntimeError("Static reimport target is not a StaticMesh: " + path)
+    data = _static_fbx_import_data(mesh, path)
+    before = data.get_editor_property("remove_degenerates")
+    if not isinstance(before, bool):
+        raise RuntimeError("Existing static FBX remove_degenerates is not Boolean: " + path)
+    try:
+        if before != requested:
+            data.set_editor_property("remove_degenerates", requested)
+        after = data.get_editor_property("remove_degenerates")
+        if after is not requested:
+            raise RuntimeError("Static reimport option readback differs from the manifest: " + path)
+    except Exception:
+        data.set_editor_property("remove_degenerates", before)
+        raise
+    return {**report, "status": "configured", "manifest_value": requested,
+            "before": before, "after": after, "changed": before != after,
+            "scope": "Exact existing task-owned StaticMesh import data only"}
+
+
+def _audit_static_import_remove_degenerates(manifest_asset, mesh):
+    requested = _static_manifest_remove_degenerates(manifest_asset)
+    path = _normalized_unreal_asset_path((manifest_asset.get("asset_data") or {}).get("asset_path"))
+    if requested is None:
+        return {"asset_path": path, "status": "skipped", "reason": "No explicit static FBX setting"}
+    actual = _static_fbx_import_data(mesh, path).get_editor_property("remove_degenerates")
+    if actual is not requested:
+        raise RuntimeError("Imported static FBX settings do not honor remove_degenerates: " + path)
+    return {"asset_path": path, "status": "verified", "manifest_value": requested,
+            "actual_import_data_value": actual}
+
+
+def _ingest_static_mesh_item(send2ue_unreal, item, checkout, durable_saves):
+    """Import a static-only unit without entering any skeletal asset stage."""
+    policy = item.get("wind_policy") or {}
+    if policy.get("requires_json") or item.get("wind_json") or item.get("wind_file"):
+        raise RuntimeError("Static-only ingest requires an explicitly disabled DynamicWind handoff")
+    static_mesh_class = getattr(unreal, "StaticMesh", None)
+    if static_mesh_class is None:
+        raise RuntimeError("Unreal StaticMesh class is unavailable for static ingest")
+    imported_assets = []
+    prebuild_materials = []
+    imported_paths = []
+    static_import_settings = []
+    for manifest_asset in item["assets"]:
+        preimport = _sync_static_reimport_remove_degenerates(manifest_asset)
+        imported = _import_manifest_asset(send2ue_unreal, manifest_asset)
+        imported_assets.append(imported)
+        path = _normalized_unreal_asset_path((manifest_asset.get("asset_data") or {}).get("asset_path"))
+        mesh = unreal.EditorAssetLibrary.load_asset(path)
+        if not isinstance(mesh, static_mesh_class):
+            raise RuntimeError("Static manifest did not import a StaticMesh: " + path)
+        static_import_settings.append({"asset_path": path, "preimport": preimport,
+                                       "postimport": _audit_static_import_remove_degenerates(manifest_asset, mesh)})
+        if path not in imported_paths:
+            imported_paths.append(path)
+            prebuild_materials.append(_material_prebuild_compile_and_usage_normalization(path))
+    saved = _save_item_assets(item, imported_assets, durable_saves=durable_saves)
+    postbuild_materials = [_material_postbuild_slot_audit(path) for path in imported_paths]
+    primary_path = _normalized_unreal_asset_path(item.get("mesh_path"))
+    materials = next((report for report in postbuild_materials if report["mesh"] == primary_path), None)
+    if materials is None:
+        raise RuntimeError("Static manifest primary mesh was not imported: " + primary_path)
+    skipped = {"status": "skipped", "reason": "not applicable to a static-only manifest"}
+    return {
+        "status": "imported_ok",
+        "checkout": checkout,
+        "assets": imported_assets,
+        "static_import_settings": static_import_settings,
+        "skeleton": dict(skipped),
+        "skeleton_refresh_plans": {},
+        "wind": {**skipped, "policy": policy},
+        "final_skeleton_saved": {},
+        "cluster_assembly": dict(skipped),
+        "optimization": dict(skipped),
+        "materials": materials,
+        "prebuild_materials": prebuild_materials,
+        "postbuild_materials": postbuild_materials,
+        "material_assignment_pending": any(report["needs_assignment"] for report in postbuild_materials),
+        "saved": saved,
+        "durable_saves": _durable_save_report(durable_saves),
+    }
+
+
 def ingest_item(item, *, defer_cluster_build=False):
     durable_saves = _new_durable_save_ledger()
     send2ue_unreal = _load_send2ue_unreal(item["send2ue_unreal_py"])
     checkout = _checkout_existing_assets(item)
+    if _static_only_manifest_item(item):
+        return _ingest_static_mesh_item(send2ue_unreal, item, checkout, durable_saves)
     # Source-controlled packages must be writable before stale mesh/Skeleton
     # cleanup.  Deleting a read-only package can disappear from the in-memory
     # registry while remaining on disk, after which AssetTools reloads it and
@@ -3749,7 +3953,7 @@ def ingest_item(item, *, defer_cluster_build=False):
             if (
                 not (isinstance(imported, dict) and imported.get("skipped"))
                 and (
-                    asset_data.get("_asset_type") == "SkeletalMesh"
+                    asset_data.get("_asset_type") in {"SkeletalMesh", "StaticMesh"}
                     or _normalized_unreal_asset_path(imported_path).casefold()
                     == primary_mesh_key
                 )
@@ -3813,6 +4017,15 @@ def ingest_item(item, *, defer_cluster_build=False):
     )
     optimization = _finalize_speedtree_skeletal_optimization(optimization)
     materials = _material_postbuild_slot_audit(mesh_path)
+    postbuild_materials = [materials]
+    postbuilt_static_paths = {primary_mesh_key}
+    for manifest_asset in item.get("assets") or []:
+        asset_data = manifest_asset.get("asset_data") or {}
+        path = _normalized_unreal_asset_path(asset_data.get("asset_path"))
+        key = path.casefold()
+        if asset_data.get("_asset_type") == "StaticMesh" and path and key not in postbuilt_static_paths:
+            postbuild_materials.append(_material_postbuild_slot_audit(path))
+            postbuilt_static_paths.add(key)
     item_status = (
         "assembly_prepared"
         if assembly.get("status") == "prepared_for_build"
@@ -3832,6 +4045,7 @@ def ingest_item(item, *, defer_cluster_build=False):
         "cluster_assembly": assembly,
         "materials": materials,
         "prebuild_materials": prebuild_materials,
+        "postbuild_materials": postbuild_materials,
         "optimization": optimization,
         "saved": saved,
         "durable_saves": _durable_save_report(durable_saves),

@@ -414,6 +414,18 @@ POLICY_CONTRACTS = {
         "SPM을 갱신하는 동안 다른 프로세스가 같은 파일을 변경했습니다.",
         "외부 편집을 보존한 채 다른 writer를 종료하고 SPM을 다시 검사한 뒤 재시도하세요.",
     ),
+    "terrain_prefab_selection": _terminal(
+        "지형 그룹 프리팹 활성화 요청의 선택 값이 명시적인 bool이 아닙니다.",
+        "해당 SPM 행의 지형 그룹화 선택 값을 확인하고 bool 선택 상태로 다시 요청하세요.",
+    ),
+    "terrain_prefab_source_geometry": _terminal(
+        "원본의 전체 조각 보존과 그룹 소유권을 검증하는 증거가 없습니다.",
+        "해당 SPM의 BWR 원본 조각 검증과 그룹 빌드 보고서를 확인하고 검증된 입력으로 다시 실행하세요.",
+    ),
+    "terrain_prefab_import_geometry": _terminal(
+        "가져온 지형 그룹 메시의 Native SOURCE_MODEL 형상 동등성이 검증되지 않았습니다.",
+        "해당 그룹의 Send to Unreal import와 양방향 정점·삼각형 검증 보고서를 확인하고 검증을 다시 실행하세요.",
+    ),
 }
 
 # Existing decided families whose operator wording does not need a distinct
@@ -450,6 +462,28 @@ for _policy_name in (
 
 
 _REASON_SEEDS: dict[str, ReasonRow] = {
+    # Optional terrain-prefab admission is independent of source Wind. A
+    # disabled request or an eligible result is a status, while malformed
+    # selection/missing geometry proof must remain fail-closed. None has an
+    # automatic exact-target repair action registered with this planner.
+    "disabled": ReasonRow(
+        INFORMATIONAL, "sk_batch/debris_prefab_policy.py", "audit_detail",
+    ),
+    "eligible_explicit_selection": ReasonRow(
+        INFORMATIONAL, "sk_batch/debris_prefab_policy.py", "audit_detail",
+    ),
+    "eligible_native_verified": ReasonRow(
+        INFORMATIONAL, "sk_batch/debris_prefab_policy.py", "audit_detail",
+    ),
+    "invalid_enabled_flag": ReasonRow(
+        UNSUPPORTED, "sk_batch/debris_prefab_policy.py", "terrain_prefab_selection",
+    ),
+    "source_parts_unverified": ReasonRow(
+        UNSUPPORTED, "sk_batch/debris_prefab_policy.py", "terrain_prefab_source_geometry",
+    ),
+    "import_geometry_unverified": ReasonRow(
+        UNSUPPORTED, "sk_batch/debris_prefab_policy.py", "terrain_prefab_import_geometry",
+    ),
     # Unreal ingest emits these as policy/flow receipts, not repair failures.
     # The heavy-item rows explain which shared safety controls were selected;
     # process-lifetime rows explain a planned commandlet recycle.
