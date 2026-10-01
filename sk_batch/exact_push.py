@@ -203,6 +203,8 @@ def build_exact_push_command(
     max_push_bones: int = DEFAULT_MAX_PUSH_BONES,
     rpc_timeout_min: int = DEFAULT_RPC_TIMEOUT_MIN,
     rpc_timeout_max: int = DEFAULT_RPC_TIMEOUT_MAX,
+    debris_terrain_prefab: bool = False,
+    unreal_editor_cmd: Path = DEFAULT_UNREAL_EDITOR_CMD,
 ) -> tuple[list[str], dict]:
     spm = spm.expanduser().resolve()
     blender = blender.expanduser().resolve()
@@ -288,6 +290,16 @@ def build_exact_push_command(
         else None
     )
     outputs["transport"] = transport
+    if debris_terrain_prefab:
+        # Keep opt-in context in deferred reports; the original export job and
+        # its content fingerprint stay unchanged.
+        outputs["debris_terrain_prefab"] = True
+        outputs["debris_prefab_context"] = {
+            "spm": str(spm),
+            "blender": str(blender),
+            "send2ue_dir": str(Path(send2ue_dir).expanduser().resolve()),
+            "unreal_editor_cmd": str(Path(unreal_editor_cmd).expanduser().resolve()),
+        }
     if transport == "rpc":
         send2ue_unreal_py = (
             Path(send2ue_dir).expanduser().resolve()
@@ -480,6 +492,47 @@ def run_headless_manifest(
     )
 
 
+def _serialized_outputs(outputs: dict) -> dict:
+    """Keep booleans and nested opt-in context typed across deferred runs."""
+    def serialize(value):
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {key: serialize(child) for key, child in value.items()}
+        return value
+    return serialize(outputs)
+
+
+def _complete_optional_debris_prefab(outputs: dict, report: dict) -> dict:
+    if outputs.get("debris_terrain_prefab") is not True or report.get("status") != "ok":
+        return report
+    context = outputs.get("debris_prefab_context") or {}
+    try:
+        from sk_batch.debris_prefab_pipeline import run_pipeline
+
+        receipt = run_pipeline(
+            Path(context["spm"]),
+            blender=Path(context["blender"]),
+            unreal_project=Path(outputs["unreal_project"]),
+            send2ue_dir=Path(context["send2ue_dir"]),
+            material_contract=Path(outputs["material_contract"]),
+            log_dir=Path(outputs["report"]).parent,
+            transport=str(outputs.get("transport") or "headless"),
+            unreal_editor_cmd=context.get("unreal_editor_cmd"),
+            source_push_report=Path(outputs["report"]),
+            log=lambda message: print(message, flush=True),
+        )
+        if not isinstance(receipt, dict) or receipt.get("status") not in {"ok", "skipped"}:
+            raise RuntimeError("terrain-group prefab completion receipt is invalid")
+    except Exception as exc:
+        raise ExactPushError(
+            "original Push succeeded; terrain-group prefab stage failed: " + str(exc)
+        ) from exc
+    # The original success report remains immutable as the source of the
+    # derivative stage. Its own separate receipt carries generated assets.
+    return {**report, "debris_prefab_pipeline": receipt}
+
+
 def merge_unreal_result(outputs: dict, batch_result: dict) -> dict:
     """Promote commandlet item evidence into the exact Push report."""
     report_path = Path(outputs["report"])
@@ -505,7 +558,7 @@ def merge_unreal_result(outputs: dict, batch_result: dict) -> dict:
         json.dumps(report, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    return report
+    return _complete_optional_debris_prefab(outputs, report)
 
 
 def parse_args(argv=None):
@@ -520,6 +573,11 @@ def parse_args(argv=None):
     parser.add_argument("--log-dir", type=Path, default=LOG_DIR)
     parser.add_argument("--material-contract", type=Path)
     parser.add_argument("--unreal-project", type=Path, default=DEFAULT_UNREAL_PROJECT)
+    parser.add_argument("--send2ue-dir", type=Path, default=DEFAULT_SEND2UE_DIR)
+    parser.add_argument(
+        "--debris-terrain-prefab", action="store_true",
+        help="After this exact source Push succeeds, create/update its static terrain-group prefab; source wind motion is not retained",
+    )
     parser.add_argument(
         "--unreal-editor-cmd",
         type=Path,
@@ -546,6 +604,9 @@ def main(argv=None):
             material_contract=args.material_contract,
             unreal_project=args.unreal_project,
             transport=args.transport,
+            send2ue_dir=args.send2ue_dir,
+            debris_terrain_prefab=args.debris_terrain_prefab,
+            unreal_editor_cmd=args.unreal_editor_cmd,
         )
     except ExactPushError as exc:
         print(f"SK Exact Push failed: {exc}", file=sys.stderr)
@@ -555,7 +616,7 @@ def main(argv=None):
         {
             "spm": str(args.spm.expanduser().resolve()),
             "command": command,
-            "outputs": {key: str(value) for key, value in outputs.items()},
+            "outputs": _serialized_outputs(outputs),
             "dry_run": bool(args.dry_run),
         },
         ensure_ascii=False,
@@ -644,7 +705,7 @@ def main(argv=None):
                     "Blender RPC Push did not reach status=ok: "
                     + str(export_report)
                 )
-            report = export_report
+            report = _complete_optional_debris_prefab(outputs, export_report)
         else:
             if export_report.get("status") != "exported_pending_unreal":
                 raise ExactPushError(
@@ -662,10 +723,8 @@ def main(argv=None):
                     json.dumps({
                         "schema_version": 1,
                         "status": "prepared_pending_unreal",
-                        "outputs": {
-                            key: str(value) if value is not None else None
-                            for key, value in outputs.items()
-                        },
+                        "debris_terrain_prefab": bool(args.debris_terrain_prefab),
+                        "outputs": _serialized_outputs(outputs),
                     }, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
