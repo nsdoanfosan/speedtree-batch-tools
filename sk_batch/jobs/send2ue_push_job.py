@@ -775,6 +775,11 @@ def main():
                 args.rpc_timeout_max,
             )
             set_rpc_env("RPC_TIME_OUT", rpc_timeout)
+            # Remote Python commands use the Blender-side response timeout,
+            # independently of the legacy RPC server environment above.
+            # This headless session never saves user preferences.
+            rpc_preferences = bpy.context.preferences.addons["send2ue"].preferences
+            rpc_preferences.rpc_response_timeout = int(math.ceil(rpc_timeout))
             report["rpc_timeout_seconds"] = rpc_timeout
             report["rpc_timeout"] = {
                 "seconds": rpc_timeout,

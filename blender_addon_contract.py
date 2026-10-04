@@ -96,6 +96,15 @@ ADDONS = {
             "assembly_pipeline_v1": {
                 "operations": ["run_import_and_assemble"],
             },
+            "debris_terrain_groups_v1": {
+                "operations": ["build_terrain_groups", "activate_terrain_group_export"],
+            },
+            "debris_terrain_control_v1": {
+                "operations": ["activate_terrain_control_export"],
+            },
+            "debris_terrain_prefab_v1": {
+                "operations": ["build_generic_terrain_groups"],
+            },
             "material_handoff_v1": {
                 "operations": [
                     "consolidate_speedtree_group_materials",
@@ -133,6 +142,18 @@ ADDONS = {
             ),
             "run_import_and_assemble": (
                 "speedtree_bone_weight_repair.core:run_import_and_assemble"
+            ),
+            "build_terrain_groups": (
+                "speedtree_bone_weight_repair.debris_terrain_groups:build_terrain_groups"
+            ),
+            "activate_terrain_group_export": (
+                "speedtree_bone_weight_repair.debris_terrain_groups:activate_terrain_group_export"
+            ),
+            "activate_terrain_control_export": (
+                "speedtree_bone_weight_repair.debris_terrain_groups:activate_terrain_control_export"
+            ),
+            "build_generic_terrain_groups": (
+                "speedtree_bone_weight_repair.debris_terrain_prefab:build_generic_terrain_groups"
             ),
             "consolidate_speedtree_group_materials": (
                 "speedtree_bone_weight_repair.core:"

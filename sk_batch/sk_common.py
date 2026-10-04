@@ -185,6 +185,9 @@ DEFAULT_CONFIG = {
     # ``unreal_wait`` can materialize exports for a later manual headless run.
     "push_transport": "headless",
     "night_headless": True,
+    # Optional post-Push stage. Turning it off preserves existing prefab/DA
+    # bindings and never generates or refreshes terrain-group assets.
+    "debris_terrain_prefab_spms": [],
     "unreal_editor_cmd": r"C:\Program Files\Epic Games\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe",
     "unreal_project": r"C:\UnrealProjects\MyProject2\MyProject2.uproject",
     "send2ue_dir": str(DEFAULT_SEND2UE_DIR),

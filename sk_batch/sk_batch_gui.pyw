@@ -2635,8 +2635,9 @@ class App:
             anchor="w",
         ).pack(fill="x")
 
-        cols = ("wind", "spm_status", "blend_status", "push_status", "folder")
-        visible_cols = ("wind", "spm_status", "blend_status", "push_status")
+        # Preserve the existing data-column indices, including hidden folder.
+        cols = ("wind", "spm_status", "blend_status", "push_status", "folder", "terrain_group")
+        visible_cols = ("wind", "spm_status", "blend_status", "push_status", "terrain_group")
         tablef = ttk.LabelFrame(
             self.root,
             text="파일 목록 (표는 요약 · 행을 선택하면 아래에 전체 내용 표시)",
@@ -2656,6 +2657,7 @@ class App:
         self.tree.column("#0", width=300, minwidth=220, anchor="w")
         headers = {
             "wind": ("Wind (▼)", 110),
+            "terrain_group": ("지형 그룹 (클릭)", 125),
             "spm_status": ("Source", 205),
             "blend_status": ("① Blender", 245),
             "push_status": ("② Unreal", 190),
@@ -2671,6 +2673,14 @@ class App:
         tree_y.grid(row=0, column=1, sticky="ns")
         tree_x.grid(row=1, column=0, sticky="ew")
         self.tree.bind("<Button-1>", self._on_click)
+        Tooltip(
+            self.tree,
+            "지형 그룹: 각 SPM 행의 활성/비활성 칸을 클릭해 독립적으로 선택합니다.\n"
+            "파일 이름·Wind 값과 관계없이 활성 행의 원본 Push 성공 뒤 프리팹을 생성합니다.\n"
+            "원본 rest pose를 정적 그룹으로 만들며 원본 Wind 움직임은 유지하지 않습니다.\n"
+            "그룹 수는 공간 특징과 예산으로 결정합니다. 비활성은 생성·갱신을 하지 않고 기존 DA 연결을 유지합니다.\n"
+            "선택은 작업 등록 시 고정됩니다. Unreal 대기는 import 완료 뒤 처리합니다.",
+        )
         self.tree.bind("<Control-c>", self.copy_selected_paths, add="+")
         self.tree.bind("<<TreeviewSelect>>", self._refresh_selected_detail, add="+")
 
@@ -3293,7 +3303,7 @@ class App:
             folder_iid = f"folder::{_normalized_path(folder)}"
             if folder_iid in self.folder_rows:
                 return folder_iid
-            values = ("", "", "", "", "", str(folder))
+            values = ("", "", "", "", str(folder), "")
             try:
                 self.tree.insert(
                     parent,
@@ -3379,6 +3389,11 @@ class App:
                 "blend_path": blend_path_for(spm),
                 "checked": True,
                 "wind_override": wind_override,
+                "debris_terrain_prefab": _normalized_path(spm) in {
+                    _normalized_path(value)
+                    for value in self.cfg.get("debris_terrain_prefab_spms", ())
+                    if isinstance(value, str) and value
+                },
                 "live_texture_paths": cached_texture_paths,
                 "live_status_signature": cached_live_signature,
                 "blend_resume_receipt": copy.deepcopy(
@@ -3405,6 +3420,7 @@ class App:
                     self._table_display_value(iid, "blend_status", blend_status),
                     self._table_display_value(iid, "push_status", push_status),
                     str(spm.parent),
+                    self._terrain_group_label(iid),
                 ),
             )
             self.row_copy_paths[iid] = [spm]
@@ -4141,6 +4157,26 @@ class App:
             return f"{auto} (자동)  ▼"
         return f"{item['wind_override']} (수동)  ▼"
 
+    def _terrain_group_label(self, iid):
+        return (
+            f"{CHECK_ON} 활성" if self.items[iid].get("debris_terrain_prefab", False)
+            else f"{CHECK_OFF} 비활성"
+        )
+
+    def _toggle_terrain_group(self, iid):
+        """Persist one future-job option without changing source or wind."""
+        if iid not in self.items:
+            return
+        item = self.items[iid]
+        item["debris_terrain_prefab"] = not bool(item.get("debris_terrain_prefab", False))
+        self.cfg = self._collect_cfg()
+        save_config(self.cfg)
+        self.tree.set(iid, "terrain_group", self._terrain_group_label(iid))
+        self.log(
+            f"지형 그룹 설정: {Path(item['spm']).name} → "
+            f"{'활성' if item['debris_terrain_prefab'] else '비활성'} · 다음 등록 작업부터 적용"
+        )
+
     def _close_cell_editor(self):
         if self.cell_editor is not None:
             try:
@@ -4202,6 +4238,12 @@ class App:
             return "break"
         if region != "cell":
             return
+        column = self.tree.identify_column(event.x)
+        if column == "#5":
+            # Unlike wind/source settings, this only selects a future queued
+            # stage. The running job continues to use its captured path list.
+            self._toggle_terrain_group(iid)
+            return "break"
         if getattr(self, "active_batch_job", None) is not None:
             # Checked targets may change for a future queued request. Per-row
             # modes can write marker/state data, so freeze only those edits
@@ -4210,7 +4252,6 @@ class App:
             self.tree.focus(iid)
             self.tree.focus_set()
             return "break"
-        column = self.tree.identify_column(event.x)
         if column == "#1":
             current = self.items[iid].get("wind_override", "auto")
             self.root.after_idle(
@@ -4426,6 +4467,25 @@ class App:
             cfg["night_headless"] = bool(self.night_headless_var.get())
         except (AttributeError, tk.TclError):
             pass
+        # Preserve selected paths outside the current scanned root while
+        # taking visible per-row choices from the Tk-owner inventory.
+        items = getattr(self, "items", {}) or {}
+        visible_keys = {
+            _normalized_path(item["spm"])
+            for item in items.values() if item.get("spm")
+        }
+        selected = {
+            _normalized_path(value): str(value)
+            for value in cfg.get("debris_terrain_prefab_spms", ())
+            if isinstance(value, str) and value
+            and _normalized_path(value) not in visible_keys
+        }
+        selected.update({
+            _normalized_path(item["spm"]): str(item["spm"])
+            for item in items.values()
+            if item.get("spm") and item.get("debris_terrain_prefab", False)
+        })
+        cfg["debris_terrain_prefab_spms"] = [selected[key] for key in sorted(selected)]
         return cfg
 
     @staticmethod
@@ -4541,6 +4601,9 @@ class App:
                             str(item.get("spm") or "")
                             for item in job.get("targets") or []
                         ],
+                        "debris_terrain_prefab_spms": list(
+                            (job.get("cfg") or {}).get("debris_terrain_prefab_spms", ())
+                        ),
                     },
                 )
             except Exception as exc:
@@ -4856,6 +4919,160 @@ class App:
                 (payload or {}).get("production_source_revision") or {}
             )
 
+    @staticmethod
+    def _debris_original_push_report(iid, entry):
+        """Find the original item's durable success report without changing it."""
+        paths = entry.get("push_paths") or {}
+        candidates = [
+            paths.get(key) for key in ("report", "import_report", "export_report")
+        ]
+        manifest_paths = [
+            paths.get("manifest"),
+            (entry.get("push_export_cache") or {}).get("manifest"),
+        ]
+        for value in manifest_paths:
+            if not value:
+                continue
+            try:
+                manifest = json.loads(Path(value).read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                continue
+            if not isinstance(manifest, dict):
+                continue
+            for item in manifest.get("items") or ():
+                if isinstance(item, dict) and str(item.get("queue_id")) == iid:
+                    candidates.append(item.get("report_path"))
+        seen = set()
+        for value in candidates:
+            if not value or str(value) in seen:
+                continue
+            seen.add(str(value))
+            try:
+                report = json.loads(Path(value).read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                continue
+            if not isinstance(report, dict):
+                continue
+            if report.get("status") in {"ok", "imported_ok"}:
+                return Path(value)
+            candidates.append(report.get("item_import_report"))
+        return None
+
+    def _run_optional_debris_prefabs(self, job):
+        """Finish opt-in prefab work after successful original Push targets."""
+        cfg = dict(job.get("cfg") or {})
+        selected = {
+            _normalized_path(value)
+            for value in cfg.get("debris_terrain_prefab_spms", ())
+            if isinstance(value, str) and value
+        }
+        if not selected:
+            return set()
+        mode = str(job.get("mode") or "")
+        is_push = (
+            (mode == "pipeline" and job.get("terminal_phase") == "push")
+            or mode in {"unreal_recovery", "waiting_import", "failed_retry_repair"}
+            or (mode not in {"pipeline"} and job.get("phase") == "push")
+        )
+        if not is_push:
+            return set()
+        authoritative = getattr(self, "_phase_result_summary", None)
+        successful_ids = None
+        if isinstance(authoritative, dict):
+            successful_ids = {
+                str(row.get("target"))
+                for row in authoritative.get("target_outcomes") or ()
+                if row.get("outcome") == "completed"
+            }
+        failed = set()
+        task_cl = job.get("debris_prefab_changelist") or cfg.get("debris_prefab_changelist")
+        for item in job.get("targets") or ():
+            iid = str(item["spm"])
+            if _normalized_path(item["spm"]) not in selected:
+                continue
+            if successful_ids is not None and iid not in successful_ids:
+                continue
+            with self.state_lock:
+                original_entry = copy.deepcopy(self.state.get(iid, {}))
+            if original_entry.get("push_status_kind") != "imported_ok":
+                continue
+            original = {
+                "status": "imported_ok",
+                "paths": copy.deepcopy(original_entry.get("push_paths") or {}),
+                "import_fingerprint": original_entry.get("push_import_fingerprint"),
+            }
+            try:
+                if self.stop_flag.is_set():
+                    raise WaitCancelled("지형 그룹 프리팹 단계 시작 전 사용자 중지")
+                # Discovery starts only for an explicitly selected item whose
+                # original Push succeeded. Wind/name do not select the stage.
+                from sk_batch.debris_prefab_pipeline import run_pipeline
+
+                self.ui_queue.put(("cell", (iid, "push_status", "원본 Push 완료 · 지형 프리팹 생성 중...")))
+                receipt = run_pipeline(
+                    Path(item["spm"]),
+                    blender=Path(cfg["blender_exe"]),
+                    unreal_project=Path(cfg["unreal_project"]),
+                    send2ue_dir=Path(cfg["send2ue_dir"]),
+                    material_contract=self._push_material_contract(Path(item["spm"])),
+                    log_dir=LOG_DIR,
+                    transport=(
+                        "headless" if mode == "waiting_import"
+                        else job.get("push_transport", cfg.get("push_transport", "rpc"))
+                    ),
+                    unreal_editor_cmd=cfg.get("unreal_editor_cmd"),
+                    changelist=task_cl,
+                    cancel_event=self.stop_flag,
+                    log=self.log,
+                    source_push_report=self._debris_original_push_report(iid, original_entry),
+                )
+                if not isinstance(receipt, dict) or receipt.get("status") not in {"ok", "skipped"}:
+                    raise RuntimeError("지형 그룹 프리팹 단계의 완료 영수증이 유효하지 않음")
+            except Exception as exc:
+                cancelled = isinstance(exc, WaitCancelled) or self.stop_flag.is_set()
+                reason = compact_error_message(exc)
+                receipt = {
+                    "status": "cancelled" if cancelled else "failed",
+                    "error": reason,
+                    "report": copy.deepcopy(getattr(exc, "report", None)),
+                }
+                failed.add(iid)
+                self._phase_failed_items = set(getattr(self, "_phase_failed_items", ()) or ()) | {iid}
+                self._set_push_state(
+                    iid, "cancelled" if cancelled else "debris_prefab_error",
+                    "원본 Push 완료 · 지형 프리팹 " + ("중지" if cancelled else "실패"),
+                    message=reason,
+                )
+                self.log(f"지형 프리팹 {'중지' if cancelled else '실패'}: {Path(iid).name} · {reason}")
+            else:
+                if receipt["status"] == "ok":
+                    self._set_push_state(iid, "imported_ok", "완료 · 지형 프리팹 ✓")
+                else:
+                    self._set_push_state(iid, "imported_ok", "완료 · 지형 프리팹 건너뜀")
+            receipt = copy.deepcopy(receipt)
+            receipt_cl = receipt.get("changelist")
+            if not receipt_cl and isinstance(receipt.get("report"), dict):
+                receipt_cl = receipt["report"].get("changelist")
+            if receipt_cl:
+                task_cl = receipt_cl
+                job["debris_prefab_changelist"] = receipt_cl
+            receipt["original_push"] = original
+            with self.state_lock:
+                self.state.setdefault(iid, {})["debris_prefab_pipeline"] = receipt
+                save_state(self.state)
+        if failed and isinstance(authoritative, dict):
+            # Keep exact-repair/planned-exclusion evidence from the original
+            # pipeline; only replace targets that failed this optional stage.
+            updated = copy.deepcopy(authoritative)
+            updated["target_outcomes"] = [
+                self._target_authoritative_result(str(row["target"]), "push")
+                if str(row.get("target")) in failed else row
+                for row in updated.get("target_outcomes") or ()
+            ]
+            updated.update(self._count_target_outcomes(updated["target_outcomes"]))
+            self._phase_result_summary = updated
+        return failed
+
     def _run_queued_batch_job(self, job):
         error = None
         status = "completed"
@@ -4948,6 +5165,8 @@ class App:
                 completed = self._run_batch(
                     job["phase"], job["targets"], emit_done=False
                 )
+            if self._run_optional_debris_prefabs(job):
+                completed = False
             authoritative_summary = getattr(
                 self,
                 "_phase_result_summary",
@@ -17328,6 +17547,15 @@ class App:
             {
                 "schema_version": PUSH_MANIFEST_SCHEMA_VERSION,
                 "kind": "sk_batch_unreal_wait_queue",
+                "debris_terrain_prefab_spms": [
+                    str(item["queue_id"])
+                    for item in waiting_items
+                    if _normalized_path(item["queue_id"]) in {
+                        _normalized_path(value)
+                        for value in self.cfg.get("debris_terrain_prefab_spms", ())
+                        if isinstance(value, str) and value
+                    }
+                ],
                 "created_at": created_at,
                 "checkpoint_path": str(checkpoint_path),
                 "report_path": str(report_path),
