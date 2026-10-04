@@ -356,6 +356,7 @@ from blender_resume_receipt import (
     build_blender_resume_receipt,
     validate_blender_resume_receipt,
 )
+from speedtree_native_receipt import load_native_export_receipt
 WIND_OPTIONS = (
     ("자동 (식생 종류 기준)", "auto"),
     ("TREE", "TREE"),
@@ -1029,6 +1030,16 @@ def load_current_assembly_pipeline_report(spm, *, migrate_legacy=True):
         raise ValueError(f"Assembly report could not be read: {exc}") from exc
     if not isinstance(report, dict):
         raise ValueError("Assembly report is not an object")
+
+    # Export passthrough is only useful when the native source binding is valid.
+    # Old tagged BaseRef records could have all weights assigned to global Root.
+    # Source content freshness is checked below; this check concerns skin identity.
+    native_receipt = (
+        Path(canonical_spm).parent / "fbx"
+        / f"{Path(canonical_spm).stem}.speedtree_native_receipt.json"
+    )
+    if native_receipt.is_file():
+        load_native_export_receipt(native_receipt)
 
     bark_resolution = report.get("cluster_bark_source_resolution") or {}
     isolated_bark_input = bool(
@@ -3521,6 +3532,10 @@ class App:
 
         optional = []
         optional.append(speedtree_stmat_path(speedtree_spm))
+        optional.append(
+            Path(speedtree_spm).parent / "fbx"
+            / f"{Path(speedtree_spm).stem}.speedtree_native_receipt.json"
+        )
         if texture_paths is None:
             texture_paths = self._reported_texture_paths(spm)
         optional.extend(

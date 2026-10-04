@@ -212,6 +212,33 @@ class NativeSpeedTreeReceiptTests(unittest.TestCase):
             (0.0, 1.0, 0.0),
         )
 
+    def test_rejects_undecoded_base_ref_root_binding(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spm, receipt_path = self._write(Path(temporary))
+            payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+            row = payload["generated_instances"][0]
+            row.update(source_bone_id=0, native_source_object_id=1582183941839,
+                       source_rtti="", node_guid="")
+            receipt_path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(NativeReceiptError, "unresolved runtime source object"):
+                load_native_export_receipt(receipt_path, source_spm=spm)
+
+    def test_preserves_decoded_native_root_binding(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spm, receipt_path = self._write(Path(temporary))
+            payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+            row = payload["generated_instances"][0]
+            row.update(source_bone_id=0, native_source_object_id=123456,
+                       source_rtti=".?AVCStartNode@@")
+            row["authored_position_influences"] = [{
+                "bone_id": 0, "mapping_node": "start", "exported_cluster_name": "",
+                "native_root": True, "weight": 1.0,
+            }]
+            receipt_path.write_text(json.dumps(payload), encoding="utf-8")
+            loaded = load_native_export_receipt(receipt_path, source_spm=spm)
+            self.assertEqual(loaded["generated_instances"][0]["source_bone_id"], 0)
+            self.assertTrue(loaded["generated_instances"][0]["authored_position_influences"][0]["native_root"])
+
     def test_rejects_missing_nonzero_bone_parent(self):
         with tempfile.TemporaryDirectory() as temporary:
             spm, receipt_path = self._write(Path(temporary))
