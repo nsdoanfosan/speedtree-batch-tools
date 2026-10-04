@@ -461,6 +461,34 @@ class BlendLiveStatusTests(unittest.TestCase):
                 require_ok=True,
             )
 
+    def test_current_report_cannot_bless_unresolved_native_root_owner(self):
+        gui = load_gui_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spm = root / "tree.spm"
+            spm.write_bytes(b"spm")
+            report = gui.assembly_pipeline_report_path(spm)
+            report.parent.mkdir()
+            report.write_text(json.dumps({"speedtree_pipeline_contract": {"validated": True}}), encoding="utf-8")
+            before = report.read_bytes()
+            native = root / "fbx" / "tree.speedtree_native_receipt.json"
+            native.parent.mkdir()
+            native.write_text(json.dumps({
+                "kind": "speedtree_native_export_receipt", "schema_version": 5,
+                "status": "ready", "identity_policy": "modeler_runtime_pose_tangent_and_fbx_serializer_records_v5",
+                "coordinate_contract": {"native_unit_to_meter": .3048, "blender_xyz_from_native_xyz": ["x*0.3048", "y*0.3048", "z*0.3048"]},
+                "source": {"path": str(spm)}, "geometry_count": 1,
+                "geometries": [{"ordinal": 0, "vertex_count": 1}],
+                "bones": [{"id": 1, "parent_id": 0, "start_native": [0,0,0], "end_native": [0,0,1]}],
+                "generated_instances": [{"geometry_ordinal": 0, "source_bone_id": 0,
+                    "native_source_object_id": 1582183941839, "source_rtti": "", "vertex_ranges": [[0,0]]}],
+            }), encoding="utf-8")
+            with mock.patch.object(gui, "validate_preflight_envelope") as validate:
+                with self.assertRaisesRegex(RuntimeError, "unresolved runtime source object"):
+                    gui.load_current_assembly_pipeline_report(spm)
+                validate.assert_not_called()
+            self.assertEqual(report.read_bytes(), before)
+
     def test_isolated_bark_report_without_exact_handoff_never_migrates(self):
         gui = load_gui_module()
         with tempfile.TemporaryDirectory() as temporary:

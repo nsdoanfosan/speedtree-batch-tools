@@ -15,7 +15,8 @@ import os
 from pathlib import Path
 
 BLENDER_RESUME_RECEIPT_KIND = "sk_batch_blender_resume_receipt"
-BLENDER_RESUME_RECEIPT_VERSION = 2
+# v3 binds the native sidecar and follows the live Root-owner validity check.
+BLENDER_RESUME_RECEIPT_VERSION = 3
 
 
 class BlenderResumeReceiptError(ValueError):

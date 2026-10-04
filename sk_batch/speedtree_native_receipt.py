@@ -264,8 +264,18 @@ def load_native_export_receipt(path, *, source_spm=None):
         try:
             geometry_ordinal = int(row.get("geometry_ordinal"))
             source_bone_id = int(row.get("source_bone_id"))
+            source_object_id = int(row.get("native_source_object_id") or 0)
         except (AttributeError, TypeError, ValueError) as exc:
             raise NativeReceiptError("native generated-instance row is invalid") from exc
+        if (
+            source_bone_id == 0
+            and source_object_id != 0
+            and not str(row.get("source_rtti") or "").strip()
+        ):
+            raise NativeReceiptError(
+                "native Root binding has an unresolved runtime source object; "
+                "regenerate with the current SpeedTree exporter"
+            )
         if not 0 <= geometry_ordinal < len(checked_geometries):
             raise NativeReceiptError("native generated-instance geometry is invalid")
         maximum = checked_geometries[geometry_ordinal]["vertex_count"] - 1
