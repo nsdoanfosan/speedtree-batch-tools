@@ -34,6 +34,7 @@ from sk_common import (  # noqa: E402
     wind_preset_for_spm,
 )
 from unreal_ingest_policy import bounded_heavy_process_item_limit  # noqa: E402
+from push_state_sync import prepare_push_state, publish_push_result  # noqa: E402
 
 LOG_DIR = SK_BATCH_DIR / "logs"
 PUSH_JOB = SK_BATCH_DIR / "jobs" / "send2ue_push_job.py"
@@ -480,6 +481,17 @@ def run_headless_manifest(
     )
 
 
+def _serialized_outputs(outputs: dict) -> dict:
+    """Keep pre-export source proof typed across deferred runs."""
+    def serialize(value):
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {key: serialize(child) for key, child in value.items()}
+        return value
+    return serialize(outputs)
+
+
 def merge_unreal_result(outputs: dict, batch_result: dict) -> dict:
     """Promote commandlet item evidence into the exact Push report."""
     report_path = Path(outputs["report"])
@@ -505,6 +517,8 @@ def merge_unreal_result(outputs: dict, batch_result: dict) -> dict:
         json.dumps(report, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    if report.get("status") == "ok":
+        publish_push_result(outputs, report)
     return report
 
 
@@ -555,7 +569,7 @@ def main(argv=None):
         {
             "spm": str(args.spm.expanduser().resolve()),
             "command": command,
-            "outputs": {key: str(value) for key, value in outputs.items()},
+            "outputs": _serialized_outputs(outputs),
             "dry_run": bool(args.dry_run),
         },
         ensure_ascii=False,
@@ -623,6 +637,11 @@ def main(argv=None):
         "Using assembly live material contract: " + str(live_material_contract),
         flush=True,
     )
+    try:
+        prepare_push_state(command, outputs)
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"SK Exact Push source snapshot failed: {exc}", file=sys.stderr)
+        return 1
     completed = owned_run(
         command,
         source="sk_batch.exact_push.blender_export",
@@ -645,12 +664,14 @@ def main(argv=None):
                     + str(export_report)
                 )
             report = export_report
+            publish_push_result(outputs, report)
         else:
             if export_report.get("status") != "exported_pending_unreal":
                 raise ExactPushError(
                     "Blender export did not reach exported_pending_unreal: "
                     + str(export_report)
                 )
+            publish_push_result(outputs, export_report)
             if args.defer_unreal:
                 if args.prepared_report is None:
                     raise ExactPushError(
@@ -662,10 +683,7 @@ def main(argv=None):
                     json.dumps({
                         "schema_version": 1,
                         "status": "prepared_pending_unreal",
-                        "outputs": {
-                            key: str(value) if value is not None else None
-                            for key, value in outputs.items()
-                        },
+                        "outputs": _serialized_outputs(outputs),
                     }, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )

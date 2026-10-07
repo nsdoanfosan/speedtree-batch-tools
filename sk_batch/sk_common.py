@@ -522,6 +522,74 @@ def _write_unreal_wait_references(state, *, previous_state=None):
     )
 
 
+class StateSnapshot(dict):
+    """Asset state plus the disk baseline used for cross-process reconciliation."""
+
+    def __init__(self, value):
+        super().__init__(copy.deepcopy(value))
+        self.baseline = copy.deepcopy(value)
+
+
+def _merge_state_snapshot(state, current):
+    if not isinstance(state, StateSnapshot):
+        return {**current, **state}
+    merged = copy.deepcopy(current)
+    missing = object()
+    # Only locally changed fields are writes. Unchanged cached rows must not
+    # replace another command/window's newer completion or failure evidence.
+    for key, entry in state.items():
+        previous = state.baseline.get(key, missing)
+        if entry == previous:
+            continue
+        if isinstance(entry, dict) and (
+            previous is missing or isinstance(previous, dict)
+        ):
+            before = {} if previous is missing else previous
+            row = merged.setdefault(key, {})
+            if not isinstance(row, dict):
+                row = merged[key] = {}
+            for field in before.keys() | entry.keys():
+                value = entry.get(field, missing)
+                if value == before.get(field, missing):
+                    continue
+                if value is missing:
+                    row.pop(field, None)
+                else:
+                    row[field] = copy.deepcopy(value)
+        else:
+            merged[key] = copy.deepcopy(entry)
+    return merged
+
+
+def _replace_state_rows(state, merged):
+    # Workers may retain a reference to their row across a save. Keep that
+    # reference live when incorporating another process's fields.
+    for key in state.keys() - merged.keys():
+        del state[key]
+    for key, row in merged.items():
+        if isinstance(state.get(key), dict) and isinstance(row, dict):
+            state[key].clear()
+            state[key].update(copy.deepcopy(row))
+        else:
+            state[key] = copy.deepcopy(row)
+
+
+def refresh_state(state):
+    """Read command/window results while preserving this caller's unsaved edits."""
+    if not isinstance(state, StateSnapshot):
+        # Legacy callers do not have a baseline: retain their local fields.
+        return set()
+    latest = load_state()
+    merged = _merge_state_snapshot(state, latest)
+    changed = {
+        key for key in state.keys() | merged.keys()
+        if state.get(key) != merged.get(key)
+    }
+    _replace_state_rows(state, merged)
+    state.baseline = copy.deepcopy(dict(latest))
+    return changed
+
+
 def load_state():
     with _JSON_WRITE_LOCK:
         with _state_mutex().acquire():
@@ -530,7 +598,7 @@ def load_state():
                     raw = STATE_PATH.read_bytes()
                 except FileNotFoundError:
                     _write_unreal_wait_references({})
-                    return {}
+                    return StateSnapshot({})
                 except OSError as exc:
                     raise RuntimeError(
                         "state_read_failed: SK Batch state could not be read"
@@ -542,20 +610,20 @@ def load_state():
                     quarantine = _quarantine_unreadable_state(exc, raw)
                     if quarantine is None:
                         continue
-                    return {}
+                    return StateSnapshot({})
                 if pruned != loaded:
                     if not _state_bytes_unchanged(raw):
                         continue
                     _atomic_write_json(STATE_PATH, pruned)
                 _write_unreal_wait_references(pruned)
-                return pruned
+                return StateSnapshot(pruned)
     raise RuntimeError(
         "state_changed_during_load: SK Batch state changed repeatedly"
     )
 
 
 def save_state(state):
-    incoming = _prune_state_entries(state)
+    _prune_state_entries(state)
     with _JSON_WRITE_LOCK:
         with _state_mutex().acquire():
             current = {}
@@ -581,8 +649,7 @@ def save_state(state):
             # latest locked snapshot prevents a stale producer from deleting
             # a valid row created by another process; confirmed dead/backup
             # rows were already removed from both sides.
-            merged = dict(current)
-            merged.update(incoming)
+            merged = _prune_state_entries(_merge_state_snapshot(state, current))
             if raw is not None and STATE_PATH.exists():
                 if not _state_bytes_unchanged(raw):
                     raise RuntimeError(
@@ -592,6 +659,9 @@ def save_state(state):
             _write_unreal_wait_references(merged, previous_state=current)
             _atomic_write_json(STATE_PATH, merged)
             _write_unreal_wait_references(merged)
+            if isinstance(state, StateSnapshot):
+                _replace_state_rows(state, merged)
+                state.baseline = copy.deepcopy(merged)
 
 
 def file_content_fingerprint(path, digest_size=16):

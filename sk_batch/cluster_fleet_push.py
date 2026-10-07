@@ -34,6 +34,7 @@ from exact_push import (
     reset_checkpoint_item_retries,
     run_headless_manifest,
 )
+from push_state_sync import prepare_push_state, publish_push_result
 from process_lifecycle import owned_run
 from push_dependency_schedule import (
     PushDependencyError,
@@ -1495,6 +1496,7 @@ def main(argv=None):
                     + "; ".join(verification["problems"])
                 )
             export_started = perf_counter()
+            prepare_push_state(command, outputs)
             completed = owned_run(
                 command,
                 source=(
@@ -1525,6 +1527,7 @@ def main(argv=None):
                         "provider RPC Push postcondition failed: "
                         + "; ".join(verification["problems"])
                     )
+                publish_push_result(outputs, export_report)
                 result["status"] = "verified_dependency_in_unreal"
                 save_fleet()
                 return result
@@ -1541,6 +1544,7 @@ def main(argv=None):
                     "provider exact export manifest item count is "
                     f"{len(items)}, expected 1"
                 )
+            publish_push_result(outputs, export_report)
             result["status"] = "exported_pending_unreal"
             pending.append({
                 "kind": "provider",
@@ -1954,6 +1958,7 @@ def main(argv=None):
         )
         try:
             export_started = perf_counter()
+            prepare_push_state(command, outputs)
             completed = owned_run(
                 command,
                 source="sk_batch.cluster_fleet_push.blender_export",
@@ -1981,6 +1986,7 @@ def main(argv=None):
                         "production RPC Push postcondition failed: "
                         + "; ".join(verification["problems"])
                     )
+                publish_push_result(outputs, export_report)
                 result["status"] = "verified_in_unreal"
                 return None
             if export_report.get("status") != "exported_pending_unreal":
@@ -1996,6 +2002,7 @@ def main(argv=None):
                     "exact export manifest item count is "
                     f"{len(items)}, expected 1"
                 )
+            publish_push_result(outputs, export_report)
             result["status"] = "exported_pending_unreal"
             return {
                 "kind": "root",
