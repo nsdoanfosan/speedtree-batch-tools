@@ -262,6 +262,7 @@ from sk_common import (
     load_config,
     load_job_report,
     load_state,
+    refresh_state,
     manifest_item_files_match,
     push_source_cache_matches_snapshot,
     save_config,
@@ -3256,6 +3257,10 @@ class App:
             root = self.root_var.get()
             self.scan_worker = None
 
+        # A scan must consume CLI/other-window results before rendering or
+        # saving its cached rows back to the shared state file.
+        with self.state_lock:
+            refresh_state(self.state)
         for iid in self.tree.get_children():
             self.tree.delete(iid)
         self.items.clear()
@@ -3967,6 +3972,15 @@ class App:
         audit_complete = True
         error_count = 0
         try:
+            with self.state_lock:
+                external_changes = refresh_state(self.state)
+            for iid in external_changes:
+                if generation == self._scan_generation and iid in self.items:
+                    self.ui_queue.put(("cell", (
+                        iid, "push_status",
+                        self._current_push_status_text(iid, self.items[iid]["spm"]),
+                    )))
+
             def inspect_row(row):
                 legacy_snapshot = len(row) == 4
                 if legacy_snapshot:
@@ -3985,6 +3999,11 @@ class App:
                 try:
                     signature = self._live_status_signature(spm, texture_paths)
                     if signature == previous_signature:
+                        # Import/export evidence can change without touching
+                        # the SPM or Blend (including deleted manifests).
+                        self.ui_queue.put(("cell", (
+                            iid, "push_status", self._current_push_status_text(iid, spm),
+                        )))
                         # Unchanged rows need no SPM/material audit. A missing
                         # fast receipt is migrated from this saved status and
                         # current stat identity only when Blender is run.
