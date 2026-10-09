@@ -3409,7 +3409,7 @@ def _save_elm_part_bend_dependencies(item, normalization, *, durable_saves):
             details = package_file.stat()
             refreshes = list(previous.get("postbuild_refreshes") or [])
             refreshes.append({
-                "reason": "elm_part_bend_native_material_and_import_metadata",
+                "refresh_operation": "elm_part_bend_native_material_and_import_metadata",
                 "previous_size": previous["size"], "previous_mtime_ns": previous["mtime_ns"],
             })
             previous.update({"size": int(details.st_size), "mtime_ns": int(details.st_mtime_ns),
