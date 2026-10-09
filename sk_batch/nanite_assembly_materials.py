@@ -12,6 +12,25 @@ from __future__ import annotations
 import json
 import re
 from copy import deepcopy
+import hashlib
+from pathlib import Path
+
+try:
+    from .assembly_part_bend_policy import (
+        PRODUCTION_OWNER,
+        UV_IMPORT_CONTRACT,
+        UV_WRITER,
+        package_path,
+        production_assembly_bend_policy,
+    )
+except ImportError:
+    from assembly_part_bend_policy import (
+        PRODUCTION_OWNER,
+        UV_IMPORT_CONTRACT,
+        UV_WRITER,
+        package_path,
+        production_assembly_bend_policy,
+    )
 
 
 class NaniteAssemblyMaterialError(RuntimeError):
@@ -213,6 +232,152 @@ def _json_result(raw):
     result = json.loads(payload)
     result["returned_errors"] = [str(error) for error in errors]
     return result
+
+
+def _required_elm_native_report(raw, operation):
+    result = _json_result(raw)
+    if result.get("ok") is not True or result.get("errors") or result["returned_errors"]:
+        raise NaniteAssemblyMaterialError(
+            f"Elm Assembly bend {operation} failed: " + json.dumps(result, sort_keys=True)
+        )
+    return result
+
+
+def _set_elm_metadata(unreal, asset, key, value):
+    library = unreal.EditorAssetLibrary
+    if str(library.get_metadata_tag(asset, key) or "") != str(value):
+        # Metadata-only verification mode/provenance changes must participate
+        # in the caller's exact dirty-package save contract as well.
+        asset.modify()
+        library.set_metadata_tag(asset, key, str(value))
+
+
+def _verify_elm_import_payload(unreal, mesh, role, native):
+    """Verify an imported UV3; never synthesize missing Blender delivery data."""
+    library = unreal.EditorAssetLibrary
+    writer = str(library.get_metadata_tag(mesh, "CodexElmAssemblyBendUv3Writer") or "")
+    _set_elm_metadata(unreal, mesh, "CodexElmAssemblyBendProductionOptIn", PRODUCTION_OWNER)
+    _set_elm_metadata(unreal, mesh, "CodexElmAssemblyBendProductionUv3Mode", "verify_imported_payload")
+    import_data = mesh.get_editor_property("asset_import_data")
+    filenames = list(import_data.extract_filenames() or []) if import_data else []
+    expected_name = package_path(mesh.get_path_name()).rsplit("/", 1)[-1]
+    source = Path(filenames[0]).expanduser().absolute() if len(filenames) == 1 else None
+    valid_source = bool(source and source.is_file() and source.suffix.casefold() == ".fbx"
+                        and source.stem == expected_name)
+    if writer != UV_WRITER and not valid_source:
+        raise NaniteAssemblyMaterialError("Elm UV3 adoption requires the exact normalized prototype FBX source")
+    if valid_source:
+        # Refresh provenance even if a correct reimport retained an older writer
+        # stamp. Native code compares the stored import generation and payload.
+        digest = hashlib.sha1()
+        with source.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        _set_elm_metadata(unreal, mesh, "CodexElmAssemblyBendProductionImportFilename", str(source))
+        _set_elm_metadata(unreal, mesh, "CodexElmAssemblyBendProductionImportFileSHA1", digest.hexdigest())
+        _set_elm_metadata(unreal, mesh, "CodexElmAssemblyBendProductionImportContract", UV_IMPORT_CONTRACT)
+    report = _required_elm_native_report(
+        native.append_test_prototype_uv3(package_path(mesh.get_path_name()), role),
+        "imported UV3 verification",
+    )
+    before_hash = report.get("protected_mesh_description_sha1_before")
+    if (report.get("production") is not True or report.get("writer") != UV_WRITER
+            or report.get("production_uv3_mode") != "verify_imported_payload"
+            or report.get("uv_channel_count_before") != 4
+            or report.get("all_existing_mesh_description_attributes_preserved") is not True
+            or not isinstance(before_hash, str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", before_hash) is None):
+        raise NaniteAssemblyMaterialError("Elm imported UV3 native preservation proof is incomplete")
+    if report.get("mesh_description_changed") is True or (
+        report.get("changed") is True and not (
+            report.get("metadata_changed") is True
+            and report.get("mesh_description_changed") is False
+        )
+    ):
+        raise NaniteAssemblyMaterialError("Elm import verification unexpectedly changed mesh payload")
+    if before_hash != report.get("protected_mesh_description_sha1_after"):
+        raise NaniteAssemblyMaterialError("Elm UV3 verification changed protected MeshDescription data")
+    return report
+
+
+def _normalize_elm_assembly_bend(unreal, assembly, policy, *, apply, allow_dirty):
+    """Route only the three approved Elm roots through guarded native authoring."""
+    path = policy["assembly"]
+    settings_text = assembly.get_editor_property("nanite_settings").export_text()
+    parts = parse_nanite_assembly_part_remaps(settings_text)
+    if len(parts) != 7 or [package_path(row["mesh"]) for row in parts[3:]] != policy["prototypes"]:
+        raise NaniteAssemblyMaterialError("Elm Assembly leaf dependency paths/order differ from the approved policy")
+    if apply and not allow_dirty:
+        dirty = {p.get_path_name() for p in unreal.EditorLoadingAndSavingUtils.get_dirty_content_packages()}
+        if assembly.get_outermost().get_path_name() in dirty:
+            raise NaniteAssemblyMaterialError(f"Assembly already has unsaved user changes: {path}")
+    native = getattr(unreal, "CodexAssemblyPartBendUvLibrary", None)
+    if apply and (native is None or not hasattr(native, "append_test_prototype_uv3")
+                  or not hasattr(native, "configure_test_assembly_parts")):
+        raise NaniteAssemblyMaterialError("Elm production UV3/native remap verification is unavailable")
+    materials = []
+    # Missing variants fail before touching any prototype or root metadata.
+    for target in policy["variant_materials"]:
+        material = unreal.EditorAssetLibrary.load_asset(target)
+        if material is None or package_path(material.get_path_name()) != target:
+            raise NaniteAssemblyMaterialError(f"Elm Assembly bend material is missing: {target}")
+        materials.append(material)
+    before_slots = list(assembly.get_editor_property("materials") or [])
+    if len(before_slots) not in (3, 6):
+        raise NaniteAssemblyMaterialError("Elm Assembly must retain three original and zero/three bend slots")
+    prototypes = []
+    for target in policy["prototypes"]:
+        mesh = unreal.EditorAssetLibrary.load_asset(target)
+        if not isinstance(mesh, unreal.SkeletalMesh):
+            raise NaniteAssemblyMaterialError(f"Elm normalized leaf prototype is missing: {target}")
+        prototypes.append(mesh)
+    native_uv = []
+    native_remap = None
+    if apply:
+        # The default path verifies source-exported UV3 rather than manufacturing
+        # it after an incomplete Blender export. Native validation checks every
+        # corner and protected attributes before the material mutation.
+        for mesh, role in zip(prototypes, policy["roles"]):
+            native_uv.append(_verify_elm_import_payload(unreal, mesh, role, native))
+        _set_elm_metadata(unreal, assembly, "CodexElmAssemblyBendProductionOptIn", PRODUCTION_OWNER)
+        native_remap = _required_elm_native_report(
+            native.configure_test_assembly_parts(path, policy["prototypes"], True, policy["variant_materials"]),
+            "material remap",
+        )
+        if (native_remap.get("payload_checked_prototype_count") != 4
+                or native_remap.get("payload_verified_before_material_mutation") is not True
+                or native_remap.get("production_prototype_materials_directly_applied") is not True):
+            raise NaniteAssemblyMaterialError("Elm native remap did not prove all UV3 payloads and direct prototype materials")
+        if native_remap.get("root_source_mesh_description_preserved") is not True:
+            raise NaniteAssemblyMaterialError("Elm material remap did not prove authored root preservation")
+    after_slots = list(assembly.get_editor_property("materials") or [])
+    after_parts = parse_nanite_assembly_part_remaps(assembly.get_editor_property("nanite_settings").export_text())
+    part_audits = []
+    part_rows = []
+    for row in after_parts:
+        mesh = unreal.EditorAssetLibrary.load_asset(package_path(row["mesh"]))
+        slots = list(mesh.get_editor_property("materials") or [])
+        part_audits.append(audit_unreal_skeletal_mesh_material_sections(unreal, package_path(row["mesh"]), len(slots)))
+        part_rows.append({"index": row["index"], "mesh": row["mesh"],
+                          "existing_remap": parts[row["index"]]["remap"],
+                          "desired_remap": row["remap"], "slot_count": len(slots)})
+    return {
+        "assembly": assembly.get_path_name(), "apply_requested": bool(apply),
+        "would_change": len(before_slots) == 3 or any(x["remap"] != y["remap"] for x, y in zip(parts, after_parts)),
+        "changed": bool(native_remap and (native_remap.get("changed") is True
+                        or native_remap.get("status") == "configured_verified_unsaved")),
+        "before_material_count": len(before_slots), "after_material_count": len(after_slots),
+        "global_slots": [_unreal_slot_record(slot, index) for index, slot in enumerate(after_slots)],
+        "appended_slots": [_unreal_slot_record(slot, index) for index, slot in enumerate(after_slots) if index >= len(before_slots)],
+        "duplicate_global_keys": [], "parts": part_rows, "part_section_audits": part_audits,
+        "assembly_section_audit": audit_unreal_skeletal_mesh_material_sections(unreal, path, len(after_slots)),
+        "elm_part_bend_policy": policy, "uv3_verifications": native_uv, "native_material_remap": native_remap,
+        "dependent_packages_to_save": [
+            target for target in policy["prototypes"]
+            if target in {p.get_path_name() for p in unreal.EditorLoadingAndSavingUtils.get_dirty_content_packages()}
+        ] if apply else [],
+        "dependency_save_status": "caller_owned" if apply else "not_requested",
+    }
 
 
 MATERIAL_SECTION_AUDIT_SCHEMA_VERSION = 1
@@ -447,6 +612,11 @@ def normalize_unreal_nanite_assembly_materials(
     if not isinstance(assembly, unreal.SkeletalMesh):
         raise NaniteAssemblyMaterialError("target is not an Unreal SkeletalMesh")
     assembly_path = assembly.get_path_name()
+    bend_policy = production_assembly_bend_policy(assembly_path)
+    if bend_policy is not None:
+        return _normalize_elm_assembly_bend(
+            unreal, assembly, bend_policy, apply=apply, allow_dirty=allow_dirty
+        )
     package_path = assembly.get_outermost().get_path_name()
     if apply and not allow_dirty:
         dirty = {
