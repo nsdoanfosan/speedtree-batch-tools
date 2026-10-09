@@ -17,6 +17,18 @@ import blender_addon_gateway as gateway
 
 
 class BlenderAddonContractTests(unittest.TestCase):
+    def test_disk_export_operation_capability_does_not_grant_unreal_rpc(self):
+        requirements = {"send2ue": ["disk_export_operation_v1"]}
+        operations = set(contract.operations_for_requirements(requirements, "send2ue"))
+        self.assertEqual(operations, {
+            "export_pre_operation", "export_operation", "export_post_operation",
+            "execution_queue_key", "send_to_disk_path_mode", "build_manifest_items",
+            "record_unreal_commands",
+        })
+        self.assertTrue(operations.isdisjoint({
+            "is_unreal_connected", "unreal_dependency_module", "run_commands", "set_rpc_env",
+        }))
+
     def test_manifest_assigns_non_overlapping_runtime_ownership(self):
         manifest = contract.integration_manifest()
         self.assertEqual(manifest["schema_version"], 1)

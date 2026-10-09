@@ -39,6 +39,9 @@ from cluster_assembly_builder import (  # noqa: E402
 from nanite_assembly_materials import (  # noqa: E402
     audit_unreal_skeletal_mesh_material_sections,
 )
+from assembly_part_bend_policy import (  # noqa: E402
+    production_assembly_bend_policy,
+)
 from unreal_ingest_policy import (  # noqa: E402
     ASSEMBLY_INGEST_WAVE,
     bounded_heavy_process_item_limit,
@@ -3314,6 +3317,112 @@ def _ingest_cluster_assembly(
     )
 
 
+def _save_elm_part_bend_dependencies(item, normalization, *, durable_saves):
+    """Persist only native-verified Elm prototype changes before saving a root.
+
+    Provider prototypes can already have a durable prebuild receipt. The native
+    postbuild hook changes their local materials/import metadata in memory, so
+    those receipts must be refreshed after an exact package save. Their original
+    owner and role remain unchanged; unrelated packages never enter this path.
+    """
+    report = normalization if isinstance(normalization, dict) else {}
+    pending = report.get("dependent_packages_to_save") or []
+    supplied_policy = report.get("elm_part_bend_policy")
+    if supplied_policy is None:
+        if pending:
+            raise RuntimeError("dependency saves require the exact Elm bend policy")
+        return {"status": "not_requested", "saved_dependencies": [], "save_writability": []}
+    policy = production_assembly_bend_policy(report.get("assembly"))
+    if policy is None or supplied_policy != policy or report.get("apply_requested") is not True:
+        raise RuntimeError("Elm dependency save policy does not match the applied Assembly")
+    proof = report.get("native_material_remap") or {}
+    if (proof.get("payload_checked_prototype_count") != 4
+            or proof.get("payload_verified_before_material_mutation") is not True
+            or proof.get("production_prototype_materials_directly_applied") is not True
+            or proof.get("root_source_mesh_description_preserved") is not True):
+        raise RuntimeError("Elm dependencies lack verified native payload/material proof")
+    if not isinstance(pending, list):
+        raise RuntimeError("Elm dependency save list is malformed")
+    packages = [_normalize_durable_package(path) for path in pending]
+    allowed = policy["prototypes"]
+    if len(set(packages)) != len(packages) or any(path not in allowed for path in packages):
+        raise RuntimeError("Elm dependency save list contains duplicate or unrelated packages")
+    dirty = _dirty_content_packages()
+    actual_pending = [path for path in allowed if path.casefold() in dirty]
+    if packages != actual_pending:
+        raise RuntimeError("Elm dependency save list does not match the exact dirty prototypes")
+    if not packages:
+        _validate_durable_save_ledger(durable_saves)
+        return {"status": "verified_clean", "saved_dependencies": [], "save_writability": []}
+
+    # Check all declared paths, native capability, assets, and existing ownership
+    # before the first save. Only these known dirty records may be refreshed.
+    library = getattr(unreal, "CodexMaterialToolsLibrary", None)
+    saver = getattr(library, "save_asset_package_without_thumbnail", None)
+    if not callable(saver):
+        raise RuntimeError("Elm dependency thumbnail-free package save API is unavailable")
+    meshes = [unreal.EditorAssetLibrary.load_asset(path) for path in packages]
+    if any(mesh is None for mesh in meshes):
+        raise RuntimeError("Elm dependency prototype is missing before package save")
+    writable = [_ensure_declared_package_writable(item, path) for path in packages]
+    pending_keys = {path.casefold() for path in packages}
+    for sequence, record in enumerate(_durable_save_records(durable_saves)):
+        if record.get("sequence") != sequence:
+            raise RuntimeError("Elm dependency durable ledger sequence changed")
+        if str(record.get("package") or "").casefold() not in pending_keys:
+            _require_durable_save(durable_saves, record.get("package"))
+            continue
+        previous = _find_durable_save(durable_saves, record.get("package"))
+        if (previous.get("owner") not in {"assembly_prototype_prebuild", "elm_part_bend_dependency"}
+                or previous.get("role") != "prototype"
+                or previous.get("save_mode") != "thumbnail_free"
+                or previous.get("saved") is not True
+                or previous.get("dirty_after_save") is not False):
+            raise RuntimeError("Elm dependency durable ownership cannot be refreshed")
+        package_file = _durable_package_file(record["package"])
+        recorded_file = Path(str(record.get("package_file") or ""))
+        if (os.path.normcase(os.path.abspath(str(package_file)))
+                != os.path.normcase(os.path.abspath(str(recorded_file)))
+                or not package_file.is_file()):
+            raise RuntimeError("Elm dependency previous durable package file changed")
+        details = package_file.stat()
+        if details.st_size != record.get("size") or details.st_mtime_ns != record.get("mtime_ns"):
+            raise RuntimeError("Elm dependency package changed on disk before its owned refresh")
+
+    saved = []
+    for path, mesh in zip(packages, meshes):
+        previous = _find_durable_save(durable_saves, path)
+        if not saver(mesh):
+            raise RuntimeError("failed to persist Elm bend dependency without a thumbnail: " + path)
+        _refresh_headless_saved_asset_registry(path)
+        if path.casefold() in _dirty_content_packages():
+            raise RuntimeError("Elm bend dependency remained dirty after its package save: " + path)
+        package_file = _durable_package_file(path)
+        if not package_file.is_file() or package_file.stat().st_size <= 0:
+            raise RuntimeError("Elm bend dependency package save did not create a nonempty file: " + path)
+        if previous is None:
+            record = _record_durable_save(
+                durable_saves, path, owner="elm_part_bend_dependency",
+                role="prototype", save_mode="thumbnail_free",
+            )
+        else:
+            details = package_file.stat()
+            refreshes = list(previous.get("postbuild_refreshes") or [])
+            refreshes.append({
+                "reason": "elm_part_bend_native_material_and_import_metadata",
+                "previous_size": previous["size"], "previous_mtime_ns": previous["mtime_ns"],
+            })
+            previous.update({"size": int(details.st_size), "mtime_ns": int(details.st_mtime_ns),
+                             "postbuild_refreshes": refreshes, "dirty_after_save": False, "saved": True})
+            record = _require_durable_save(durable_saves, path)
+        saved.append({"asset": path, "saved": True, "dirty_after_save": False,
+                      "save_mode": "thumbnail_free", "owner": record["owner"],
+                      "role": record["role"], "refreshed_prebuild_receipt": previous is not None})
+    _validate_durable_save_ledger(durable_saves)
+    return {"status": "persisted_verified_clean", "saved_dependencies": saved,
+            "save_writability": writable}
+
+
 def _finalize_prepared_cluster_assembly(item, prepared, *, durable_saves):
     """Build one final Assembly from durable, already-normalized inputs."""
     if (prepared or {}).get("status") != "prepared_for_build":
@@ -3329,6 +3438,14 @@ def _finalize_prepared_cluster_assembly(item, prepared, *, durable_saves):
     result = build_unreal_nanite_assembly(unreal, manifest, asset_contract)
     assembly_path = result.get("assembly")
     save_writability = list(prepared.get("save_writability") or [])
+    normalization = result.get("material_normalization")
+    dependencies = _save_elm_part_bend_dependencies(
+        item, normalization, durable_saves=durable_saves,
+    )
+    save_writability.extend(dependencies["save_writability"])
+    if isinstance(normalization, dict) and normalization.get("elm_part_bend_policy"):
+        normalization["dependency_save_status"] = dependencies["status"]
+        normalization["saved_dependencies"] = dependencies["saved_dependencies"]
     if assembly_path:
         save_writability.append(
             _ensure_declared_package_writable(item, assembly_path)

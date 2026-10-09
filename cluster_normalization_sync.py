@@ -38,6 +38,10 @@ from speedtree_pipeline_contract import (
     prove_legacy_texture_normalize_semantic_migration,
     spm_file_structural_semantic_fingerprint,
 )
+from sk_batch.assembly_part_bend_policy import (
+    normalization_part_bend_policy,
+    part_bend_build_matches_policy,
+)
 
 
 class ClusterNormalizationSyncError(RuntimeError):
@@ -1319,6 +1323,12 @@ def _receipt_is_current(recipe):
     ):
         return False
     build = receipt.get("build") or {}
+    bend_policy = recipe.get("part_bend_policy")
+    if bend_policy and (
+        receipt.get("part_bend_policy") != bend_policy
+        or not part_bend_build_matches_policy(build, bend_policy)
+    ):
+        return False
     if (
         recipe.get("assembly_material_assignment_required")
         and receipt.get("assembly_material_assignment_sha256")
@@ -1645,6 +1655,11 @@ def resolve_normalization_recipe(
         "plan_refinement_levels": 1,
         **role,
     }
+    bend_policy = normalization_part_bend_policy(role["skeletal_base"])
+    if bend_policy is not None:
+        # Seal the delivered UV contract only for the authorized Elm leaf
+        # families. Other species retain their exact existing recipe hash.
+        normalization_contract["part_bend_policy"] = bend_policy
     source_fbx = blend.parent / "fbx" / f"{blend.stem}.fbx"
     if source_fbx.is_file():
         normalization_contract["source_fbx_identity"] = {

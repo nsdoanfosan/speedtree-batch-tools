@@ -352,6 +352,10 @@ def normalize_cluster_blend(recipe):
     if not raw_report:
         raise RuntimeError("Cluster Normalizer did not persist its result report")
     build = json.loads(raw_report)
+    if recipe.get("part_bend_policy"):
+        from sk_batch.assembly_part_bend_policy import part_bend_build_matches_policy
+        if not part_bend_build_matches_policy(build, recipe["part_bend_policy"]):
+            raise RuntimeError("Elm normalized prototypes did not deliver the sealed UV3 bend payload")
     cluster_handoff = (
         build.get("cluster_handoff")
         or build.get("atlas_handoff")
@@ -422,6 +426,8 @@ def normalize_cluster_blend(recipe):
         "material": recipe["material_name"],
         "build": build,
     }
+    if recipe.get("part_bend_policy"):
+        receipt["part_bend_policy"] = recipe["part_bend_policy"]
     receipt_path.parent.mkdir(parents=True, exist_ok=True)
     receipt_path.write_text(
         json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",

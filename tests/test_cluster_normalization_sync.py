@@ -137,6 +137,19 @@ def seal_receipt_source_identity(blend, receipt_path, recipe):
         blend,
         collection=recipe["plan_collection"],
     )
+    if recipe.get("part_bend_policy"):
+        policy = recipe["part_bend_policy"]
+        receipt["part_bend_policy"] = policy
+        build = receipt.setdefault("build", {})
+        build["part_bend_role"] = policy["role"]
+        build["prototype_count"] = 1
+        payload = {key: policy[key] for key in (
+            "schema_version", "role", "role_code", "uv_name", "uv_index",
+            "blender_encoding", "unreal_encoding", "growth_axis_blender",
+            "growth_axis_unreal", "anchor_local")}
+        payload.update({"vertex_count": 12, "loop_count": 30,
+                        "protected_uv_sha256": {str(i): "a" * 64 for i in range(3)}})
+        build["prototypes"] = [{"part_bend_payload": payload}]
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
 
 
@@ -1086,6 +1099,17 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
             )
 
             self.assertFalse(current["normalization_required"])
+
+            # Matching file/recipe hashes alone do not prove the new Elm UV3
+            # channel. A legacy or corrupted build receipt must rebuild.
+            accepted = json.loads(receipt.read_text(encoding="utf-8"))
+            self.assertIn("part_bend_policy", accepted)
+            accepted.pop("part_bend_policy")
+            receipt.write_text(json.dumps(accepted), encoding="utf-8")
+            legacy = resolve_normalization_recipe(
+                blend, [target], canonical_spm=source, unit_probe_path=unit_probe,
+            )
+            self.assertTrue(legacy["normalization_required"])
 
     def test_changed_source_fbx_rebuilds_stale_physical_receipt_once(self):
         with tempfile.TemporaryDirectory() as temporary:
