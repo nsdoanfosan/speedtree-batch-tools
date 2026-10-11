@@ -39,17 +39,13 @@ class HandoffResourceIdentityTests(unittest.TestCase):
             require_scopes=mock.Mock(),
             can_execute_handoff=mock.Mock(side_effect=lambda metadata: metadata["request_id"] == "request_exact"),
             heartbeat_handoff=mock.Mock(return_value=True), bind_handoff=mock.Mock())
-        send2ue = ModuleType("send2ue")
-        send2ue.coordination = SimpleNamespace(load_bridge=lambda: self.bridge)
-        self.module_patch = mock.patch.dict(sys.modules, {"send2ue": send2ue})
-        self.module_patch.start()
-        self.addCleanup(self.module_patch.stop)
+        self.addon_runtime = SimpleNamespace(operation=mock.Mock(return_value=lambda: self.bridge))
 
     def begin(self, metadata):
         self.path.write_text(json.dumps(metadata), encoding="utf-8")
         args = SimpleNamespace(workstation_phase_id="p_exact", transport="rpc",
                                workstation_handoff_json=self.path)
-        return begin_handoff(args, "main.blend")
+        return begin_handoff(args, "main.blend", self.addon_runtime)
 
     def test_actual_export_begin_accepts_canonical_lowercase_without_rewriting_binding(self):
         for resource in ("unreal:myproject2", "unreal:MyProject2"):
@@ -60,6 +56,7 @@ class HandoffResourceIdentityTests(unittest.TestCase):
         self.bridge.require_active_phase.assert_called_with("p_exact", "unreal:myproject2")
         self.bridge.require_scopes.assert_called_with("p_exact", ["editor"])
         self.bridge.bind_handoff.assert_not_called()
+        self.addon_runtime.operation.assert_called_with("send2ue", "load_workstation_bridge")
 
     def test_export_begin_rejects_wrong_resource_and_exact_binding_changes(self):
         changes = ({"resource": "unreal:OtherProject"}, {"resource": "painter:main"},

@@ -545,15 +545,14 @@ def run_owned_rpc(run_commands, lines, label):
         )
 
 
-def begin_batch_handoff(args, blend_path):
+def begin_batch_handoff(args, blend_path, addon_runtime):
     """Keep disk export and the actual RPC import under one native request."""
     phase_id = str(args.workstation_phase_id or "")
     if not phase_id and not args.workstation_handoff_json:
         return None, None
     if not phase_id or args.transport != "rpc":
         raise RuntimeError("coordinated Batch handoff requires its active phase and visible-editor RPC transport")
-    from send2ue import coordination
-    bridge = coordination.load_bridge()
+    bridge = addon_runtime.operation("send2ue", "load_workstation_bridge")()
     phase = bridge.require_active_phase(phase_id, "unreal:myproject2")
     if phase.get("workload") != "heavy":
         raise RuntimeError("coordinated Batch import requires an active heavy phase")
@@ -602,6 +601,7 @@ def main():
                 "send2ue": (
                     "headless_export_v1",
                     "unreal_rpc_v1",
+                    *(("coordinated_handoff_v1",) if args.workstation_phase_id or args.workstation_handoff_json else ()),
                 ),
                 "ue_unique_export_names_addon": (
                     "unreal_handoff_json_v1",
@@ -886,7 +886,7 @@ def main():
         emit_child_progress_marker(
             SEND2UE_DISK_EXPORT_START_MARKER, unit=unit_name
         )
-        handoff_bridge, handoff_metadata = begin_batch_handoff(args, blend_path)
+        handoff_bridge, handoff_metadata = begin_batch_handoff(args, blend_path, addon_runtime)
         report["workstation_handoff"] = handoff_metadata
         operator_context = ({"workstation_phase_id": args.workstation_phase_id,
                              "workstation_deferred_handoff": json.dumps(handoff_metadata)}
