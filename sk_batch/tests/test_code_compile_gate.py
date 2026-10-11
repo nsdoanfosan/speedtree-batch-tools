@@ -476,11 +476,12 @@ class CodeCompileGateTests(unittest.TestCase):
 
     def test_push_worker_rejects_obsolete_evidence_cli(self):
         source = PUSH_JOB_PATH.read_text(encoding="utf-8").replace(
-            "    return parser.parse_args(argv)",
+            "    args = parser.parse_args(argv)",
             '    parser.add_argument("--repair-evidence")\n'
-            "    return parser.parse_args(argv)",
+            "    args = parser.parse_args(argv)",
             1,
         )
+        self.assertIn('parser.add_argument("--repair-evidence")', source)
         with self.assertRaisesRegex(
             CompileGateError,
             "obsolete Repair evidence CLI",

@@ -279,6 +279,9 @@ ADDONS = {
             "fbx_export_v1": {
                 "operations": ["fbx_export"],
             },
+            "coordinated_handoff_v1": {
+                "operations": ["load_workstation_bridge"],
+            },
             "disk_export_operation_v1": {
                 "operations": [
                     "export_pre_operation", "export_operation", "export_post_operation",
@@ -302,6 +305,7 @@ ADDONS = {
             "run_commands": "send2ue.dependencies.unreal:run_commands",
             "set_rpc_env": "send2ue.dependencies.unreal:set_rpc_env",
             "fbx_export": "send2ue.core.io.fbx_b4:export",
+            "load_workstation_bridge": "send2ue.coordination:load_bridge",
             "export_pre_operation": "send2ue.operators:Send2Ue.pre_operation",
             "export_operation": "send2ue.core.export:send2ue",
             "export_post_operation": "send2ue.operators:Send2Ue.post_operation",

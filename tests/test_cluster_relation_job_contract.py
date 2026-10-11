@@ -29,6 +29,36 @@ def load_job_module():
 
 
 class ClusterRelationJobContractTests(unittest.TestCase):
+    def test_sealed_bend_role_is_independent_of_capture_role(self):
+        from sk_batch.assembly_part_bend_policy import normalization_part_bend_policy
+        job = load_job_module()
+        for asset, expected in (("SK_cluster_reed_01", "cluster"),
+                                ("SK_leaf_weeping_willow_01", "leaf"),
+                                ("SK_leaf_weeping_willow_side_01", "leaf_side"),
+                                ("SK_branch_other_species_01", "NONE")):
+            props = types.SimpleNamespace(part_bend_role="NONE", capture_plane="XY")
+            recipe = {"skeletal_base": asset, "role": "branch", "plan_collection": "Atlas_Branch_Plans"}
+            policy = normalization_part_bend_policy(asset)
+            if policy:
+                recipe["part_bend_policy"] = policy
+            original = dict(recipe)
+            self.assertEqual(job.configure_normalized_part_bend_role(props, recipe), expected)
+            self.assertEqual(props.part_bend_role, expected)
+            self.assertEqual(props.capture_plane, "XY")
+            self.assertEqual(recipe, original)
+
+    def test_stale_cluster_policy_or_missing_operator_property_fails_before_role_write(self):
+        from sk_batch.assembly_part_bend_policy import normalization_part_bend_policy
+        job = load_job_module()
+        props = types.SimpleNamespace(part_bend_role="NONE")
+        recipe = {"skeletal_base": "SK_cluster_reed_01"}
+        with self.assertRaisesRegex(RuntimeError, "missing or stale"):
+            job.configure_normalized_part_bend_role(props, recipe)
+        self.assertEqual(props.part_bend_role, "NONE")
+        recipe["part_bend_policy"] = normalization_part_bend_policy(recipe["skeletal_base"])
+        with self.assertRaisesRegex(RuntimeError, "property"):
+            job.configure_normalized_part_bend_role(types.SimpleNamespace(), recipe)
+
     def test_physical_handoff_reads_the_cluster_key_with_legacy_fallback(self):
         source = JOB_PATH.read_text(encoding="utf-8")
         self.assertIn('build.get("cluster_handoff")', source)

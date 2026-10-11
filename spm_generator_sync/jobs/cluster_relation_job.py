@@ -35,9 +35,11 @@ from generator_delivery_scope import (
 )
 from speedtree_pipeline_contract import read_spm_text
 from blender_addon_gateway import prepare_runtime
+from blender_production_file import install_session_safety, load_production_file
 
 
 _ATLAS_RUNTIME = None
+_PRODUCTION_BLEND_STATE = None
 
 
 def atlas_operation(name):
@@ -248,6 +250,28 @@ def validate_recipe_registry_contract(recipe, effective_paths):
     return {target: by_target[target] for target in effective}
 
 
+def configure_normalized_part_bend_role(props, recipe):
+    """Pass the sealed bend role independently of the Atlas capture role."""
+    from sk_batch.assembly_part_bend_policy import normalization_part_bend_policy
+    supplied = recipe.get("part_bend_policy")
+    requested = recipe.get("part_bend_role", "AUTO")
+    if str(requested).casefold() == "auto" and isinstance(supplied, dict):
+        requested = supplied.get("role")
+    try:
+        expected = normalization_part_bend_policy(recipe.get("skeletal_base"), role=requested)
+    except ValueError as exc:
+        raise RuntimeError("Cluster normalization recipe has an invalid normalized part bend role") from exc
+    if recipe.get("part_bend_policy") != expected:
+        raise RuntimeError("Cluster normalization recipe has a missing or stale normalized part bend policy")
+    if not hasattr(props, "part_bend_role"):
+        raise RuntimeError("Cluster Normalizer does not expose the normalized part bend role property")
+    role = expected["role"] if expected else "NONE"
+    props.part_bend_role = role
+    if str(props.part_bend_role) != role:
+        raise RuntimeError("Cluster Normalizer rejected the explicit normalized part bend role")
+    return role
+
+
 def normalize_cluster_blend(recipe):
     try:
         validate_isolated_bark_recipe_bundle(recipe)
@@ -295,6 +319,7 @@ def normalize_cluster_blend(recipe):
     unit_payload = json.loads(unit_probe.read_text(encoding="utf-8"))
     selected_unit = unit_payload.get("selected") or {}
     props = scene.speedtree_cluster_normalizer
+    configure_normalized_part_bend_role(props, recipe)
     props.workflow_mode = "PHYSICAL_DIRECT_CAPTURE"
     props.source_object = source
     props.source_xml_path = str(source_xml)
@@ -378,7 +403,9 @@ def normalize_cluster_blend(recipe):
                 default=str,
             )
         )
-    bpy.ops.wm.save_as_mainfile(
+    if _PRODUCTION_BLEND_STATE is None:
+        raise RuntimeError("Cluster production UI preservation was not prepared")
+    _PRODUCTION_BLEND_STATE.save(
         filepath=str(Path(recipe["blend"]).expanduser().absolute()),
         check_existing=False,
     )
@@ -392,6 +419,7 @@ def normalize_cluster_blend(recipe):
     )
     receipt = {
         "kind": "speedtree_cluster_sync_normalization",
+        "production_blend_save": _PRODUCTION_BLEND_STATE.receipt(),
         "version": 3,
         "status": "ready",
         "blend": str(blend_path),
@@ -884,11 +912,14 @@ def remove_targets(blend, requested):
 
 
 def main():
-    global _ATLAS_RUNTIME
+    global _ATLAS_RUNTIME, _PRODUCTION_BLEND_STATE
     args = parse_args()
     report_path = Path(args.report).expanduser().absolute()
     report = {"status": "error"}
     try:
+        install_session_safety(bpy)
+        if args.mode == "sync":
+            _PRODUCTION_BLEND_STATE = load_production_file(bpy, args.blend)
         _ATLAS_RUNTIME = prepare_runtime(
             "spm_generator_sync.jobs.cluster_relation_job",
             {
@@ -916,6 +947,8 @@ def main():
             else remove_targets(blend, targets)
         )
         report = {"status": "ok", **payload}
+        if _PRODUCTION_BLEND_STATE is not None:
+            report["production_blend_save"] = _PRODUCTION_BLEND_STATE.receipt()
     except Exception as exc:
         traceback_text = traceback.format_exc()
         report = {

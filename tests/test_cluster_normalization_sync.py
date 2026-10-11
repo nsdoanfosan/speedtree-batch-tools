@@ -146,8 +146,10 @@ def seal_receipt_source_identity(blend, receipt_path, recipe):
         payload = {key: policy[key] for key in (
             "schema_version", "role", "role_code", "uv_name", "uv_index",
             "blender_encoding", "unreal_encoding", "growth_axis_blender",
-            "growth_axis_unreal", "anchor_local")}
+            "growth_axis_unreal", "anchor_local", "aspect_policy", "reference_weight_exponent")}
         payload.update({"vertex_count": 12, "loop_count": 30,
+                        "normalized_bounds": {"minimum": [-1, 0, 0], "maximum": [1, 8, 0], "size": [2, 8, 0]},
+                        "aspect_ratio": 4, "aspect_gain": 4, "aspect_correction": 2,
                         "protected_uv_sha256": {str(i): "a" * 64 for i in range(3)}})
         build["prototypes"] = [{"part_bend_payload": payload}]
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
@@ -327,23 +329,23 @@ def delivery_scope_intent(target, provider_blend, material_id=6):
 
 
 class ClusterNormalizationSyncTests(unittest.TestCase):
-    def fixture(self, temporary):
+    def fixture(self, temporary, stem="SK_leaf_elm_01"):
         owner = Path(temporary) / "Tree_elm"
         cluster = owner / "Cluster"
         reports = cluster / "reports"
         xml_dir = cluster / "xml"
         reports.mkdir(parents=True)
         xml_dir.mkdir()
-        blend = cluster / "SK_leaf_elm_01.blend"
+        blend = cluster / (stem + ".blend")
         blend.write_bytes(b"raw-bwr-blend")
-        source = cluster / "SK_leaf_elm_01.spm"
+        source = cluster / (stem + ".spm")
         write_spm(source, "M_source_unused", 1)
         target = owner / "SK_Tree_elm_01.spm"
-        write_spm_with_frond_material(target, "M_leaf_elm_01", 6)
-        source_xml = xml_dir / "SK_leaf_elm_01.xml"
+        write_spm_with_frond_material(target, "M_" + stem.removeprefix("SK_"), 6)
+        source_xml = xml_dir / (stem + ".xml")
         source_xml.write_text("<SpeedTreeRaw />", encoding="utf-8")
         report = reports / (
-            "SK_leaf_elm_01_speedtree_assembly_pipeline_report_codex.json"
+            stem + "_speedtree_assembly_pipeline_report_codex.json"
         )
         report.write_text(
             json.dumps(
@@ -351,7 +353,7 @@ class ClusterNormalizationSyncTests(unittest.TestCase):
                     "status": "done",
                     "paths": {
                         "merged_name": (
-                            "SK_leaf_elm_01_Codex_Assembled"
+                            stem + "_Codex_Assembled"
                         )
                     },
                     "speedtree_live_source_identity": {

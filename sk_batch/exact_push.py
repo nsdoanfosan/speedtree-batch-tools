@@ -169,7 +169,6 @@ def build_assembly_refresh_command(
     """Refresh the assembled Blend from the current post-collision SPM export."""
     return [
         str(blender),
-        "--factory-startup",
         "--background",
         "--python",
         str(ASSEMBLY_JOB),
@@ -204,6 +203,11 @@ def build_exact_push_command(
     max_push_bones: int = DEFAULT_MAX_PUSH_BONES,
     rpc_timeout_min: int = DEFAULT_RPC_TIMEOUT_MIN,
     rpc_timeout_max: int = DEFAULT_RPC_TIMEOUT_MAX,
+    normalized_bend_changelist: str | None = None,
+    workstation_phase_id: str | None = None,
+    workstation_handoff_json: Path | None = None,
+    workstation_final_handoff: bool = False,
+    rpc_export_only: bool = False,
 ) -> tuple[list[str], dict]:
     spm = spm.expanduser().resolve()
     blender = blender.expanduser().resolve()
@@ -222,6 +226,8 @@ def build_exact_push_command(
     transport = str(transport).strip().casefold()
     if transport not in {"headless", "rpc"}:
         raise ExactPushError(f"unsupported exact Push transport: {transport}")
+    if rpc_export_only and (transport != "rpc" or not workstation_phase_id or not workstation_handoff_json):
+        raise ExactPushError("RPC export-only requires RPC transport, an active phase and the existing shared handoff JSON")
 
     stem = spm.stem
     if material_contract is None:
@@ -253,7 +259,6 @@ def build_exact_push_command(
     }
     command = [
         str(blender),
-        "--factory-startup",
         "--background",
         str(blend),
         "--python",
@@ -283,12 +288,26 @@ def build_exact_push_command(
         "--unreal-ingest",
         str(UNREAL_INGEST),
     ]
+    if normalized_bend_changelist:
+        command.extend(["--normalized-bend-changelist", str(normalized_bend_changelist)])
+    if workstation_phase_id:
+        command.extend(["--workstation-phase-id", str(workstation_phase_id)])
+    if workstation_handoff_json:
+        handoff_path = Path(workstation_handoff_json).expanduser().resolve()
+        if not handoff_path.is_file():
+            raise ExactPushError(f"shared native handoff JSON is missing: {handoff_path}")
+        command.extend(["--workstation-handoff-json", str(handoff_path)])
+    if workstation_final_handoff:
+        command.append("--workstation-final-handoff")
+    if rpc_export_only:
+        command.append("--rpc-export-only")
     outputs["unreal_project"] = (
         Path(unreal_project).expanduser().resolve()
         if unreal_project
         else None
     )
     outputs["transport"] = transport
+    outputs["rpc_export_only"] = bool(rpc_export_only)
     if transport == "rpc":
         send2ue_unreal_py = (
             Path(send2ue_dir).expanduser().resolve()
@@ -534,6 +553,7 @@ def parse_args(argv=None):
     parser.add_argument("--log-dir", type=Path, default=LOG_DIR)
     parser.add_argument("--material-contract", type=Path)
     parser.add_argument("--unreal-project", type=Path, default=DEFAULT_UNREAL_PROJECT)
+    parser.add_argument("--send2ue-dir", type=Path, default=DEFAULT_SEND2UE_DIR)
     parser.add_argument(
         "--unreal-editor-cmd",
         type=Path,
@@ -547,6 +567,11 @@ def parse_args(argv=None):
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--defer-unreal", action="store_true")
     parser.add_argument("--prepared-report", type=Path)
+    parser.add_argument("--normalized-bend-changelist")
+    parser.add_argument("--workstation-phase-id")
+    parser.add_argument("--workstation-handoff-json", type=Path)
+    parser.add_argument("--workstation-final-handoff", action="store_true")
+    parser.add_argument("--rpc-export-only", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -560,6 +585,12 @@ def main(argv=None):
             material_contract=args.material_contract,
             unreal_project=args.unreal_project,
             transport=args.transport,
+            send2ue_dir=args.send2ue_dir,
+            normalized_bend_changelist=args.normalized_bend_changelist,
+            workstation_phase_id=args.workstation_phase_id,
+            workstation_handoff_json=args.workstation_handoff_json,
+            workstation_final_handoff=args.workstation_final_handoff,
+            rpc_export_only=args.rpc_export_only,
         )
     except ExactPushError as exc:
         print(f"SK Exact Push failed: {exc}", file=sys.stderr)
@@ -658,6 +689,12 @@ def main(argv=None):
     try:
         export_report = json.loads(outputs["report"].read_text(encoding="utf-8"))
         if args.transport == "rpc":
+            if args.rpc_export_only:
+                if export_report.get("status") != "exported_pending_unreal" or not export_report.get("prepared_rpc"):
+                    raise ExactPushError("RPC export-only did not publish its exact prepared manifest")
+                publish_push_result(outputs, export_report)
+                print("SK_EXACT_RPC_PREPARED=" + str(outputs["report"]))
+                return 0
             if export_report.get("status") != "ok":
                 raise ExactPushError(
                     "Blender RPC Push did not reach status=ok: "

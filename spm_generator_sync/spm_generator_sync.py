@@ -1839,6 +1839,35 @@ def _atlas_binding_target_local_value(
 ) -> str:
     material_name = str(binding.get("source_material_name") or "").strip()
     source_material_id = str(binding.get("source_material_id") or "").strip()
+    source_mesh_id = str(binding.get("source_mesh_id") or "").strip()
+    if not material_name and not source_material_id and not source_mesh_id:
+        # An authored slot can already reference an adopted material when the
+        # first relationship transaction sees it, so no replacement history
+        # exists. The -10 selector means "all material cutouts" and needs no
+        # historical cutout ordinal. Accept that case only when the adoption,
+        # current binding and actual source slot agree on the material.
+        adoption = binding.get("_atlas_source_material_adoption") or {}
+        adopted_id = str(adoption.get("material_id") or "").strip()
+        adopted_name = str(adoption.get("material_name") or "").strip()
+        generator = source_document.by_guid.get(str(binding.get("generator_guid") or ""))
+        properties = {} if generator is None else {
+            _property_name(prop): _property_value(prop)
+            for prop in generator.findall("Properties/Property")
+        }
+        prefix = str(binding.get("slot_prefix") or "")
+        if (
+            binding.get("state") == "already_connected"
+            and binding.get("created_slot") is False
+            and str(binding.get("target_mesh_id")) == "-10"
+            and adopted_id == str(binding.get("target_material_id"))
+            and adopted_name == str(binding.get("target_material_name") or "")
+            and adopted_name
+            and adoption.get("original_material_snapshot")
+            and source_document.asset_names_by_id["Material_v8"].get(adopted_id) == adopted_name
+            and properties.get(prefix + ":Material") == adopted_id
+            and properties.get(prefix + ":Mesh") == "-10"
+        ):
+            material_name, source_material_id, source_mesh_id = adopted_name, adopted_id, "-10"
     if not material_name or not source_material_id:
         raise SyncError(
             "Atlas 관계 출력 Generator의 원본 Material provenance가 "
@@ -1854,7 +1883,6 @@ def _atlas_binding_target_local_value(
     if kind == "Material_v8":
         return target_material_id
 
-    source_mesh_id = str(binding.get("source_mesh_id") or "").strip()
     if source_mesh_id == "-10":
         return source_mesh_id
     if not source_mesh_id or source_mesh_id.startswith("-"):

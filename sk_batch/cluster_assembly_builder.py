@@ -42,6 +42,10 @@ from process_lifecycle import owned_run
 from artifact_content_key import (
     artifact_record_content_key,
 )
+from assembly_part_bend_policy import (
+    normalization_part_bend_policy,
+    part_bend_build_matches_policy,
+)
 from speedtree_native_receipt import (
     NativeReceiptError,
     build_exact_native_receipt_index,
@@ -55,6 +59,11 @@ from speedtree_native_receipt import (
 from nanite_assembly_materials import (
     NaniteAssemblyMaterialError,
     normalize_unreal_nanite_assembly_materials,
+    parse_nanite_assembly_part_remaps,
+    plan_nanite_assembly_material_normalization,
+    rewrite_nanite_assembly_part_remaps,
+    _unreal_slot_record,
+    unreal_asset_identity,
 )
 SCHEMA_VERSION = 1
 MANIFEST_KIND = "sk_batch_cluster_nanite_assembly_inputs"
@@ -135,6 +144,10 @@ def _coalesce_normalized_external_parts(parts):
                 or ""
             )
             != str(external.get("pivot_contract") or "")
+            or _canonical_json({key: value for key, value in
+                (accumulator.get("external_source") or {}).items() if key.startswith("part_bend_")})
+            != _canonical_json({key: value for key, value in external.items()
+                if key.startswith("part_bend_")})
         ):
             raise ClusterAssemblyBuildError(
                 "one normalized SK asset has inconsistent Assembly contracts: "
@@ -922,6 +935,78 @@ def _expected_normalized_bounds_for_variant(
     return next(iter(unique.values())) if unique else None
 
 
+def _normalized_part_bend_metadata(normalized_contract, variant, asset_name):
+    """Bind independent bend intent to one validated Normalizer prototype.
+
+    Capture/provider roles remain unchanged. Older reports without this field
+    retain their legacy behavior; an explicit disabled report emits NONE.
+    The imported FBX payload is still verified natively before material writes.
+    """
+    build = (normalized_contract or {}).get("production_normalization") or {}
+    if "part_bend_role" not in build:
+        return {}
+    role = build["part_bend_role"]
+    try:
+        policy = normalization_part_bend_policy(asset_name, role=role or "NONE")
+    except ValueError as exc:
+        raise ClusterAssemblyBuildError(str(exc)) from exc
+    if role is not None and policy is None:
+        raise ClusterAssemblyBuildError("normalized build has an invalid disabled bend role")
+    prototypes = build.get("prototypes")
+    if (not isinstance(prototypes, list) or not prototypes
+            or build.get("prototype_count") != len(prototypes)
+            or not part_bend_build_matches_policy(build, policy)):
+        raise ClusterAssemblyBuildError("normalized build has stale or missing part bend payloads")
+    if policy is None and any(not isinstance(row, dict)
+            or "part_bend_payload" not in row or row["part_bend_payload"] is not None for row in prototypes):
+        raise ClusterAssemblyBuildError("disabled normalized build contains a bend payload")
+    matches = [row for row in prototypes if isinstance(row, dict)
+        and str(row.get("skeletal_asset") or row.get("skeletal_asset_name")
+                or row.get("prototype_asset") or "").casefold() == str(asset_name).casefold()]
+    if len(matches) != 1:
+        raise ClusterAssemblyBuildError("normalized bend prototype identity is absent or ambiguous: " + str(asset_name))
+    prototype = matches[0]
+    index = prototype.get("prototype_index")
+    requested_index = (variant or {}).get("subpart_index") or (variant or {}).get("source_prototype_index")
+    if (not isinstance(index, int) or isinstance(index, bool) or index <= 0
+            or (requested_index is not None and (type(requested_index) is not int or requested_index != index))):
+        raise ClusterAssemblyBuildError("normalized bend prototype index differs from its source binding")
+    bounds = _checked_normalized_bounds(prototype.get("normalized_bounds"), "normalized bend prototype")
+    expected = _expected_normalized_bounds_for_variant(normalized_contract, variant, asset_name, index)
+    if expected is None or _canonical_json(bounds) != _canonical_json(expected):
+        raise ClusterAssemblyBuildError("normalized bend prototype bounds differ from the source binding")
+    if policy and any(prototype["part_bend_payload"]["normalized_bounds"].get(key) != bounds.get(key)
+            for key in ("minimum", "maximum", "size")):
+        raise ClusterAssemblyBuildError("normalized bend payload bounds differ from its prototype")
+    source = (normalized_contract or {}).get("source_blend") or {}
+    capture_hash = str(build.get("physical_capture_contract_sha256") or "")
+    capture = build.get("physical_capture_contract") or {}
+    artifacts = build.get("source_3d_contract") or (normalized_contract or {}).get("source_3d_artifacts")
+    if (normalized_contract.get("status") != "ready"
+            or build.get("workflow_mode") != "PHYSICAL_DIRECT_CAPTURE"
+            or not source.get("path") or source.get("exists") is not True
+            or type(source.get("size")) is not int or source["size"] <= 0
+            or re.fullmatch(r"[0-9a-f]{64}", str(source.get("sha256") or "")) is None
+            or re.fullmatch(r"[0-9a-f]{64}", capture_hash) is None
+            or capture.get("contract_sha256") != capture_hash
+            or not isinstance(artifacts, dict) or not artifacts):
+        raise ClusterAssemblyBuildError("normalized bend lacks its validated physical source contract")
+    return {
+        "part_bend_role": role or "NONE",
+        "part_bend_policy": deepcopy(policy),
+        "part_bend_payload": deepcopy(prototype.get("part_bend_payload")),
+        "part_bend_source_proof": {
+            "schema_version": 2,
+            "prototype_asset": str(asset_name),
+            "prototype_index": index,
+            "source_blend": deepcopy(source),
+            "normalization_build_sha256": _sha256_bytes(_canonical_json(build).encode("utf-8")),
+            "physical_capture_contract_sha256": capture_hash,
+            "source_3d_contract_sha256": _sha256_bytes(_canonical_json(artifacts).encode("utf-8")),
+        },
+    }
+
+
 def _receipt_normalized_bounds_by_asset(manifest):
     result = {}
     for role, receipt in _deduplicated_receipts(manifest or {})["normalized"]:
@@ -1072,6 +1157,88 @@ def _validate_capture_receipt(contract, role):
         "plane": plane,
         "rotation_degrees": rotation,
     }
+
+
+def _normalized_capture_bounds_frame(capture, prototype, target_units):
+    """Rotate the capture rectangle into the Normalizer's authored +Y frame.
+
+    Normalizer uses Y=aligned tangent, Z=capture normal, X=Y cross Z.
+    Its rigid in-plane rotation can make a local AABB exceed a capture width
+    or height. Reports without tangent metadata retain the original axis gate.
+    """
+    asset = str(prototype.get("skeletal_asset") or "")
+    index = prototype.get("prototype_index")
+    matches = [row for row in capture.get("attachment_pivots") or []
+        if row.get("prototype_asset") == asset and row.get("prototype_index") == index]
+    if len(matches) != 1:
+        raise ClusterAssemblyBuildError("normalized capture bounds have no exact prototype pivot: " + asset)
+    pivot = matches[0]
+    result = {"prototype_asset": asset, "prototype_index": index,
+        "policy": "legacy_capture_axes", "limits": list(target_units)}
+    if "attachment_tangent_projection" not in pivot:
+        return result
+    tangent = pivot["attachment_tangent_projection"]
+    frame = capture.get("frame") or {}
+
+    def vector(value, label):
+        if (not isinstance(value, (list, tuple)) or len(value) != 3
+                or any(isinstance(x, bool) or not isinstance(x, (int, float))
+                       or not math.isfinite(x) for x in value)):
+            raise ClusterAssemblyBuildError("normalized capture bounds have an invalid " + label + ": " + asset)
+        return [float(x) for x in value]
+
+    def dot(a, b):
+        return sum(x * y for x, y in zip(a, b))
+
+    def cross(a, b):
+        return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+
+    if not isinstance(tangent, dict):
+        raise ClusterAssemblyBuildError("normalized capture bounds tangent metadata is invalid: " + asset)
+    right, up, normal = (vector(frame.get(key), "capture " + key) for key in ("right", "up", "normal"))
+    if (any(abs(dot(axis, axis) - 1.0) > 1.0e-6 for axis in (right, up, normal))
+            or any(abs(dot(a, b)) > 1.0e-6 for a, b in ((right, up), (right, normal), (up, normal)))
+            or dot(cross(right, up), normal) < 1.0 - 1.0e-6):
+        raise ClusterAssemblyBuildError("normalized capture bounds require an orthonormal right-handed capture basis: " + asset)
+    aligned = vector(tangent.get("aligned_capture_plane_world"), "aligned tangent")
+    projected = vector(tangent.get("capture_plane_world"), "projected tangent")
+    source = vector(tangent.get("source_world"), "source tangent")
+    length = math.sqrt(dot(aligned, aligned))
+    source_length = math.sqrt(dot(source, source))
+    if not math.isfinite(length) or not math.isfinite(source_length) or length <= 1.0e-12 or source_length <= 1.0e-12:
+        raise ClusterAssemblyBuildError("normalized capture bounds tangent length is invalid: " + asset)
+    tolerance = max(source_length * 1.0e-6, 1.0e-9)
+    projection = [value - axis * dot(source, normal) for value, axis in zip(source, normal)]
+    if (length <= 1.0e-12 or abs(dot(aligned, normal)) > max(length * 1.0e-6, 1.0e-9)
+            or any(abs(a - b) > tolerance for a, b in zip(projected, projection))
+            or tangent.get("normalized_local_xy") != [0.0, 1.0]):
+        raise ClusterAssemblyBuildError("normalized capture bounds tangent does not prove the authored in-plane +Y frame: " + asset)
+    axis_y = [value / length for value in aligned]
+    if abs(dot(axis_y, normal)) > 1.0e-6:
+        raise ClusterAssemblyBuildError("normalized capture bounds aligned tangent is not in the capture plane: " + asset)
+    policy = tangent.get("direction_policy")
+    if policy == "project_xml_attachment_into_capture_plane":
+        valid = all(abs(a - b) <= tolerance for a, b in zip(aligned, projected))
+    elif policy == "capture_up_for_capture_normal_attachment":
+        projection_tolerance = tangent.get("projection_tolerance")
+        valid = (isinstance(projection_tolerance, (int, float)) and not isinstance(projection_tolerance, bool)
+            and math.isfinite(projection_tolerance) and projection_tolerance >= 0.0
+            and math.sqrt(dot(projected, projected)) <= projection_tolerance
+            and all(abs(a - b) <= 1.0e-6 for a, b in zip(axis_y, up)))
+    else:
+        valid = False
+    if not valid:
+        raise ClusterAssemblyBuildError("normalized capture bounds tangent policy/evidence is invalid: " + asset)
+    axis_x = cross(axis_y, normal)
+    axis_x_length = math.sqrt(dot(axis_x, axis_x))
+    if not math.isfinite(axis_x_length) or axis_x_length <= 1.0e-12:
+        raise ClusterAssemblyBuildError("normalized capture bounds authored X axis is degenerate: " + asset)
+    axis_x = [value / axis_x_length for value in axis_x]
+    width, height = target_units
+    limits = [abs(dot(axis, right)) * width + abs(dot(axis, up)) * height for axis in (axis_x, axis_y)]
+    result.update({"policy": "capture_rectangle_in_authored_positive_y_frame", "limits": limits,
+        "tangent_capture_right_up": [dot(axis_y, right), dot(axis_y, up)], "direction_policy": policy})
+    return result
 
 
 def _validate_unit_probe_receipt(contract):
@@ -1752,7 +1919,11 @@ def validate_normalized_prototype_unit_contract(manifest):
                 )
         target_units = capture_report["target_blender_units"]
         bounds_tolerance = max(max(target_units) * 1.0e-6, 1.0e-9)
+        capture_report["prototype_bounds_frames"] = []
         for prototype in receipt_prototypes:
+            bounds_frame = _normalized_capture_bounds_frame(capture, prototype, target_units)
+            capture_report["prototype_bounds_frames"].append(bounds_frame)
+            limits = bounds_frame["limits"]
             size = (prototype.get("normalized_bounds") or {}).get("size")
             if (
                 not isinstance(size, (list, tuple))
@@ -1761,12 +1932,14 @@ def validate_normalized_prototype_unit_contract(manifest):
                     not math.isfinite(float(value)) or float(value) < 0.0
                     for value in size
                 )
-                or float(size[0]) > target_units[0] + bounds_tolerance
-                or float(size[1]) > target_units[1] + bounds_tolerance
+                or float(size[0]) > limits[0] + bounds_tolerance
+                or float(size[1]) > limits[1] + bounds_tolerance
             ):
                 raise ClusterAssemblyBuildError(
                     f"{provider_key} prototype physical bounds exceed the "
-                    "declared 0.1m capture contract"
+                    "declared 0.1m capture contract: "
+                    f"asset={bounds_frame['prototype_asset']}, size={size}, "
+                    f"authored_frame_limits={limits}"
                 )
 
         for receipt_variant in normalized.get("variants") or []:
@@ -1904,6 +2077,11 @@ def validate_manifest_artifacts(manifest):
             "ready Assembly manifest has no instantiated parts; prepared-only "
             "content must be pass_through and cannot publish an Assembly"
         )
+    from normalized_assembly_bend import NormalizedAssemblyBendError, validate_manifest_bend_metadata
+    try:
+        validate_manifest_bend_metadata(manifest)
+    except NormalizedAssemblyBendError as exc:
+        raise ClusterAssemblyBuildError(str(exc)) from exc
     normalized_contract = validate_normalized_prototype_unit_contract(manifest)
     _validate_public_export_names(manifest)
     checked = {
@@ -2852,7 +3030,16 @@ def _component_groups(mesh, polygon_indices):
     # shared attachment point is not connectivity: several separately
     # rendered cards legitimately meet at the same authored pivot.
     coordinate_pair_owners = {}
+    index_pair_owners = {}
     for polygon_index in polygon_indices:
+        # Preserve real topology before spatial welding: a narrow authored
+        # triangle can have an entire edge collapsed by the FBX noise tolerance.
+        # That must not disconnect faces which share the original vertex IDs.
+        for pair in itertools.combinations(sorted(set(
+            int(vertex) for vertex in mesh.polygons[polygon_index].vertices
+        )), 2):
+            previous = index_pair_owners.setdefault(pair, polygon_index)
+            polygon_union(polygon_index, previous)
         coordinate_vertices = sorted({
             vertex_find(int(vertex))
             for vertex in mesh.polygons[polygon_index].vertices
@@ -4114,12 +4301,34 @@ def _exact_normalized_authored_line(
         or len(normalized_xy) != 2
         or normalized_xy != [0.0, 1.0]
         or tangent.get("direction_policy")
-        != "project_xml_attachment_into_capture_plane"
+        not in {
+            "project_xml_attachment_into_capture_plane",
+            "capture_up_for_capture_normal_attachment",
+        }
     ):
         raise ClusterAssemblyBuildError(
             "normalized Assembly authored line does not declare the exact local "
             f"+Y contract: {asset_name}"
         )
+    if tangent["direction_policy"] == "capture_up_for_capture_normal_attachment":
+        # The normalizer explicitly authors capture-up when the 3D attachment
+        # projects to zero in the capture plane. Consume its stored line only
+        # when the recorded projection proves that case; never infer a line.
+        try:
+            projected = [float(value) for value in tangent["capture_plane_world"]]
+            tolerance = float(tangent["projection_tolerance"])
+            valid_fallback = (
+                len(projected) == 3
+                and all(math.isfinite(value) for value in projected)
+                and math.isfinite(tolerance) and tolerance >= 0.0
+                and math.sqrt(sum(value * value for value in projected)) <= tolerance
+            )
+        except (KeyError, TypeError, ValueError):
+            valid_fallback = False
+        if not valid_fallback:
+            raise ClusterAssemblyBuildError(
+                f"normalized Assembly capture-normal line evidence is invalid: {asset_name}"
+            )
     source_length = math.sqrt(sum(value * value for value in aligned)) * fit_scale
     if not math.isfinite(source_length) or source_length <= 1.0e-12:
         raise ClusterAssemblyBuildError(
@@ -4366,7 +4575,9 @@ def _prepare_exact_source_plan_line(
     if len(source_candidates) != 1:
         raise ClusterAssemblyBuildError(
             "exact Assembly authored line endpoint must belong to one exact "
-            f"source geometry triangle, got {len(source_candidates)}"
+            f"source geometry triangle, got {len(source_candidates)}; "
+            f"source={source_obj.name!r}, origin={source_origin!r}, "
+            f"endpoint={source_endpoint_xy!r}, length={normalized_line_length!r}"
         )
     return {
         "source_origin": source_origin,
@@ -5428,6 +5639,24 @@ def _export_selected_fbx(bpy, path, objects, *, full_skeleton_root=False):
     return validation
 
 
+def _production_assembly_ui_receipt(stdout, target):
+    prefix = "PRODUCTION_ASSEMBLY_UI="
+    records = [line[len(prefix):] for line in str(stdout or "").splitlines() if line.startswith(prefix)]
+    if len(records) != 1:
+        raise ClusterAssemblyBuildError("standalone Assembly save omitted its unique production UI receipt")
+    try:
+        receipt = json.loads(records[0])
+    except (TypeError, ValueError) as exc:
+        raise ClusterAssemblyBuildError("standalone Assembly production UI receipt is malformed") from exc
+    if (not isinstance(receipt, dict)
+            or os.path.normcase(os.path.abspath(str(receipt.get("path") or ""))) != os.path.normcase(os.path.abspath(str(target)))
+            or receipt.get("saved") is not True or receipt.get("ui_preserved") is not True
+            or receipt.get("save_version_restored") is not True or receipt.get("preferences_persisted") is not False
+            or not re.fullmatch(r"[a-f0-9]{64}", str(receipt.get("ui_sha256") or ""))):
+        raise ClusterAssemblyBuildError("standalone Assembly production UI/prefs/path verification failed")
+    return receipt
+
+
 def _write_assembly_source_blend(bpy, path, objects, contract):
     """Write a standalone Full-SK-space Assembly authoring source.
 
@@ -5463,9 +5692,17 @@ def _write_assembly_source_blend(bpy, path, objects, contract):
         )
         bootstrap = "\n".join(
             [
-                "import bpy, sys",
-                "library, target, collection_name, text_name = sys.argv[sys.argv.index('--') + 1:]",
+                "import bpy, sys, json",
+                "library, target, collection_name, text_name, repo = sys.argv[sys.argv.index('--') + 1:]",
+                "sys.path.insert(0, repo)",
+                "from blender_production_file import install_session_safety, load_production_file",
+                "install_session_safety(bpy)",
+                "production_state = load_production_file(bpy, target)",
                 "for obj in list(bpy.data.objects): bpy.data.objects.remove(obj, do_unlink=True)",
+                "old_collection = bpy.data.collections.get(collection_name)",
+                "if old_collection is not None: bpy.data.collections.remove(old_collection, do_unlink=True)",
+                "old_text = bpy.data.texts.get(text_name)",
+                "if old_text is not None: bpy.data.texts.remove(old_text, do_unlink=True)",
                 "with bpy.data.libraries.load(library, link=False) as (source, destination):",
                 "    destination.collections = [collection_name]",
                 "    destination.texts = [text_name]",
@@ -5474,15 +5711,16 @@ def _write_assembly_source_blend(bpy, path, objects, contract):
                 "bpy.context.scene.unit_settings.system = 'METRIC'",
                 "bpy.context.scene.unit_settings.scale_length = 1.0",
                 "bpy.context.scene.name = collection_name.rsplit('_Objects', 1)[0]",
-                "bpy.ops.wm.save_as_mainfile(filepath=target, check_existing=False, compress=True)",
+                "production_state.save(filepath=target, check_existing=False, compress=True)",
+                "print('PRODUCTION_ASSEMBLY_UI=' + json.dumps(production_state.receipt(), sort_keys=True))",
             ]
         )
         standalone_save_started = perf_counter()
         completed = owned_run(
             [
                 bpy.app.binary_path,
-                "--factory-startup",
                 "--background",
+                *([str(target)] if target.is_file() else []),
                 "--python-expr",
                 "exec(" + repr(bootstrap) + ")",
                 "--",
@@ -5490,6 +5728,7 @@ def _write_assembly_source_blend(bpy, path, objects, contract):
                 str(target),
                 collection.name,
                 text.name,
+                str(REPO_DIR),
             ],
             source="sk_batch.cluster_assembly_builder.standalone_blender",
             run_factory=subprocess.run,
@@ -5506,6 +5745,7 @@ def _write_assembly_source_blend(bpy, path, objects, contract):
                 "standalone Assembly Blender source creation failed: "
                 + (completed.stderr or completed.stdout or "unknown error")[-4000:]
             )
+        production_save = _production_assembly_ui_receipt(completed.stdout, target)
     finally:
         if collection.name in bpy.data.collections:
             bpy.data.collections.remove(collection, do_unlink=True)
@@ -5515,6 +5755,7 @@ def _write_assembly_source_blend(bpy, path, objects, contract):
             library_path.unlink()
     fingerprint = file_fingerprint(target)
     fingerprint["write_timings_seconds"] = timings
+    fingerprint["production_blend_save"] = production_save
     return fingerprint
 
 
@@ -6628,6 +6869,8 @@ def build_blender_assembly_inputs(
                                     external_source[
                                         "expected_normalized_bounds_source"
                                     ] = "normalized_variant_build_metadata"
+                                external_source.update(_normalized_part_bend_metadata(
+                                    normalized_contract, subpart, subpart_asset))
                                 accumulator = {
                                     "prototype_id": (
                                         f"{role}_composite_{subpart_index:02d}_"
@@ -6742,6 +6985,8 @@ def build_blender_assembly_inputs(
                         external_source[
                             "expected_normalized_bounds_source"
                         ] = "normalized_variant_build_metadata"
+                    external_source.update(_normalized_part_bend_metadata(
+                        normalized_contract, variant, part_asset_name))
                     parts.append({
                         "prototype_id": prototype_id,
                         "asset_name": part_asset_name,
@@ -7233,6 +7478,8 @@ def _generated_material_sidecar(
     generated_mesh_name,
     output_dir,
     expected_material_slots=None,
+    *,
+    staging_root=None,
 ):
     source_value = str(template_data.get("_material_pipeline_json_path") or "")
     source_path = Path(source_value)
@@ -7331,12 +7578,22 @@ def _generated_material_sidecar(
                 child["material_slots"] = list(expected_material_slots)
                 child["handoff_materials"] = list(expected_material_slots)
     target_dir = Path(output_dir) / "material_sidecars"
-    target_dir.mkdir(parents=True, exist_ok=True)
     target_path = target_dir / f"{generated_mesh_name}.json"
     encoded = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
     temporary = target_path.with_name(
         f".{target_path.name}.{os.getpid()}.tmp"
     )
+    if staging_root is not None:
+        resolved_staging_root = Path(staging_root).resolve()
+        for write_path in (target_dir, target_path, temporary):
+            try:
+                write_path.resolve().relative_to(resolved_staging_root)
+            except ValueError as exc:
+                raise ClusterAssemblyBuildError(
+                    "generated material sidecar staging path escapes its run-owned root: "
+                    f"{write_path}"
+                ) from exc
+    target_dir.mkdir(parents=True, exist_ok=True)
     temporary.write_text(encoded, encoding="utf-8")
     os.replace(temporary, target_path)
     return {
@@ -7684,8 +7941,19 @@ def _apply_generated_fbx_import_contract(manifest_asset):
     }
 
 
-def build_unreal_ingest_plan(manifest, full_manifest_asset, full_asset_path, unreal_folder):
-    """Derive generated imports from the existing Send2UE Full-mesh contract."""
+def build_unreal_ingest_plan(
+    manifest,
+    full_manifest_asset,
+    full_asset_path,
+    unreal_folder,
+    *,
+    generated_material_output_dir=None,
+):
+    """Derive generated imports from the existing Send2UE Full-mesh contract.
+
+    Native export jobs supply their run-owned output directory for generated
+    material sidecars. Other callers retain the existing default location.
+    """
     if (manifest or {}).get("status") == "pass_through":
         return {"status": "pass_through", "assets": [], "asset_contract": None}
     if (manifest or {}).get("status") != "ready":
@@ -7709,6 +7977,13 @@ def build_unreal_ingest_plan(manifest, full_manifest_asset, full_asset_path, unr
     generated_output_dir = Path(
         ((manifest.get("base") or {}).get("fbx") or {}).get("path")
     ).parent
+    if generated_material_output_dir is not None:
+        staged_output_dir = Path(generated_material_output_dir).resolve()
+        if staged_output_dir == generated_output_dir.resolve():
+            raise ClusterAssemblyBuildError(
+                "generated material staging root must not be the managed Assembly source directory"
+            )
+        generated_output_dir = staged_output_dir
 
     def generated_asset(
         file_path,
@@ -7754,6 +8029,10 @@ def build_unreal_ingest_plan(manifest, full_manifest_asset, full_asset_path, unr
             asset_name,
             generated_output_dir,
             expected_material_slots=material_slots,
+            staging_root=(
+                generated_output_dir
+                if generated_material_output_dir is not None else None
+            ),
         )
         source_sidecar = sidecar["source"]
         generated_sidecar = sidecar["generated"]
@@ -8752,13 +9031,294 @@ def _synchronous_unreal_skinned_asset_compilation(unreal):
         report["restored"] = int(get_int(_ASYNC_SKINNED_ASSET_CVAR))
 
 
-def build_unreal_nanite_assembly(unreal, manifest, asset_contract):
+def _material_preservation_path(value):
+    path = str(value or "").split(".", 1)[0]
+    if not path.casefold().startswith("/game/"):
+        raise ClusterAssemblyBuildError("Assembly material preservation requires an exact /Game asset: " + path)
+    return path
+
+
+def _material_preservation_slot_key(row):
+    name = str(row.get("slot_name") or "").strip()
+    imported = str(row.get("imported_slot_name") or "").strip()
+    if not name or name.casefold() == "none":
+        raise ClusterAssemblyBuildError("Assembly material preservation requires named slots")
+    return name.casefold(), imported.casefold()
+
+
+def _material_preservation_digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def plan_assembly_material_preservation(old_slots, old_parts, base_slots, parts, material_chains, *, old_source_count=None):
+    """Plan source-backed appearance inheritance before replacing an Assembly.
+
+    Slot/import names and exact prototype paths identify prior assignments;
+    an override must be a MIC descendant of its incoming material. New parts
+    retain their input appearance. Active bend parts require exact sources
+    because the native UV verifier does not accept arbitrary MIC ancestry.
+    """
+    inputs = deepcopy({"old_slots": list(old_slots or []), "old_parts": list(old_parts or []),
+        "base_slots": list(base_slots or []), "parts": list(parts or []),
+        "material_chains": dict(material_chains or {}), "old_source_count": old_source_count})
+    old_slots, old_parts, base_slots, parts, material_chains = (
+        inputs[key] for key in ("old_slots", "old_parts", "base_slots", "parts", "material_chains"))
+    if not base_slots or not parts:
+        raise ClusterAssemblyBuildError("Assembly material preservation needs base and ordered part slots")
+    source_count = len(old_slots) if old_source_count is None else old_source_count
+    if isinstance(source_count, bool) or not isinstance(source_count, int) or not 0 <= source_count <= len(old_slots):
+        raise ClusterAssemblyBuildError("Assembly material preservation source table count is invalid")
+    if bool(old_slots) != bool(old_parts):
+        raise ClusterAssemblyBuildError("Existing Assembly material table/parts are incomplete")
+    chains_by_identity = {}
+    for source, chain in material_chains.items():
+        if (not isinstance(chain, list) or not chain or unreal_asset_identity(chain[0]) != unreal_asset_identity(source)
+                or any(_material_preservation_path(path) != path for path in chain)
+                or len({unreal_asset_identity(path) for path in chain}) != len(chain)
+                or unreal_asset_identity(source) in chains_by_identity):
+            raise ClusterAssemblyBuildError("Assembly material inheritance proof is invalid: " + str(source))
+        chains_by_identity[unreal_asset_identity(source)] = chain
+
+    def named_slots(rows, label):
+        result = {}
+        for row in rows:
+            key = _material_preservation_slot_key(row)
+            if key in result:
+                raise ClusterAssemblyBuildError("Ambiguous Assembly material slot identity: " + label)
+            _material_preservation_path(row.get("material"))
+            result[key] = row
+        return result
+
+    old_by_name = named_slots(old_slots[:source_count], "existing source table")
+    named_slots(base_slots, "incoming base")
+    old_by_mesh = {}
+    for part in old_parts:
+        mesh = _material_preservation_path(part.get("mesh"))
+        identity = unreal_asset_identity(mesh)
+        if identity in old_by_mesh:
+            raise ClusterAssemblyBuildError("Existing Assembly has duplicate prototype identity: " + mesh)
+        remap = part.get("remap")
+        if not isinstance(remap, list) or not remap or any(isinstance(index, bool) or not isinstance(index, int)
+                or not 0 <= index < len(old_slots) for index in remap):
+            raise ClusterAssemblyBuildError("Existing Assembly has an invalid material remap: " + mesh)
+        old_by_mesh[identity] = named_slots([old_slots[index] for index in remap], mesh)
+
+    overrides = []
+    def effective(incoming, previous, scope):
+        row = deepcopy(incoming)
+        wanted = _material_preservation_path(incoming["material"])
+        prior = _material_preservation_path(previous["material"]) if previous else wanted
+        if unreal_asset_identity(prior) != unreal_asset_identity(wanted):
+            chain = chains_by_identity.get(unreal_asset_identity(prior))
+            if (not isinstance(chain, list) or len(chain) < 2 or unreal_asset_identity(chain[0]) != unreal_asset_identity(prior)
+                    or unreal_asset_identity(wanted) not in {unreal_asset_identity(path) for path in chain[1:-1]}):
+                raise ClusterAssemblyBuildError("Existing Assembly override is not a proven MIC descendant of its incoming material: " + prior + " -> " + wanted)
+            overrides.append({"scope": scope, "incoming_material": wanted, "preserved_material": prior,
+                "slot_name": row["slot_name"], "imported_slot_name": row.get("imported_slot_name"), "source_chain": list(chain)})
+        row["material"] = prior
+        return row
+
+    desired_base = [effective(row, old_by_name.get(_material_preservation_slot_key(row)), "base") for row in base_slots]
+    desired_parts = []
+    seen = set()
+    for part in parts:
+        mesh = _material_preservation_path(part.get("mesh"))
+        identity = unreal_asset_identity(mesh)
+        if identity in seen:
+            raise ClusterAssemblyBuildError("Incoming Assembly has duplicate prototype identity: " + mesh)
+        seen.add(identity)
+        bend_role = part.get("bend_role", 0)
+        if isinstance(bend_role, bool) or not isinstance(bend_role, int) or bend_role not in (0, 1, 2):
+            raise ClusterAssemblyBuildError("Assembly material preservation bend role is invalid: " + mesh)
+        local = list(part.get("slots") or [])
+        incoming_by_name = named_slots(local, mesh)
+        if not local:
+            raise ClusterAssemblyBuildError("Incoming Assembly prototype has no materials: " + mesh)
+        previous = old_by_mesh.get(identity)
+        if previous is not None and set(previous) != set(incoming_by_name):
+            raise ClusterAssemblyBuildError("Existing prototype material slot identities changed; appearance cannot be preserved: " + mesh)
+        desired = [effective(row, previous.get(_material_preservation_slot_key(row)) if previous else None, mesh) for row in local]
+        if bend_role and any(unreal_asset_identity(a["material"]) != unreal_asset_identity(b["material"]) for a, b in zip(local, desired)):
+            raise ClusterAssemblyBuildError("Active normalized bend prototype has an inherited Assembly material override unsupported by native source verification: " + mesh)
+        desired_parts.append({"mesh": mesh, "slots": desired, "remap": []})
+    union = plan_nanite_assembly_material_normalization(desired_base, desired_parts)
+    return {"schema_version": 1, "inputs": inputs, "old_state_sha256": _material_preservation_digest({"slots": old_slots, "parts": old_parts}),
+        "source_materials": [_material_preservation_path(row["material"]) for row in union["global_slots"]],
+        "global_slots": union["global_slots"], "parts": union["parts"], "overrides": overrides}
+
+
+def validate_assembly_material_preservation(plan):
+    if not isinstance(plan, dict) or plan.get("schema_version") != 1 or not isinstance(plan.get("inputs"), dict):
+        raise ClusterAssemblyBuildError("Assembly material preservation contract is invalid")
+    inputs = plan["inputs"]
+    try:
+        expected = plan_assembly_material_preservation(**inputs)
+    except (KeyError, TypeError) as exc:
+        raise ClusterAssemblyBuildError("Assembly material preservation inputs are incomplete") from exc
+    if expected != plan:
+        raise ClusterAssemblyBuildError("Assembly material preservation plan changed after preflight")
+    return plan
+
+
+def plan_unreal_assembly_material_preservation(unreal, assembly_path, base, ordered_parts):
+    """Read-only prospective source table and exact old-state fingerprint.
+
+    ``ordered_parts`` contains mesh, optional bend_role, and a loaded asset.
+    No source mesh, material, metadata, or package is modified.
+    """
+    library = unreal.EditorAssetLibrary
+    chains = {}
+
+    def source_path(interface):
+        if interface is None:
+            raise ClusterAssemblyBuildError("Assembly material preservation found an empty material")
+        owner = str(library.get_metadata_tag(interface, "CodexNormalizedAssemblyBendOwner") or "")
+        source = str(library.get_metadata_tag(interface, "CodexNormalizedAssemblyBendSourceMaterial") or "")
+        if source:
+            if owner != "NormalizedAssemblyPartBend/20261010/v2":
+                raise ClusterAssemblyBuildError("Assembly material alias lacks normalized bend ownership")
+            interface = library.load_asset(source)
+            if not isinstance(interface, unreal.MaterialInstanceConstant):
+                raise ClusterAssemblyBuildError("Assembly material alias has no exact source MIC")
+        path = _material_preservation_path(interface.get_path_name())
+        if path not in chains:
+            cursor, chain, seen = interface, [], set()
+            while isinstance(cursor, unreal.MaterialInstanceConstant):
+                current = _material_preservation_path(cursor.get_path_name())
+                if unreal_asset_identity(current) in seen or len(chain) >= 64:
+                    raise ClusterAssemblyBuildError("Assembly material inheritance is cyclic or too deep: " + path)
+                seen.add(unreal_asset_identity(current))
+                chain.append(current)
+                cursor = cursor.get_editor_property("parent")
+            if not isinstance(cursor, unreal.Material):
+                raise ClusterAssemblyBuildError("Assembly material inheritance has no supported root Material: " + path)
+            chain.append(_material_preservation_path(cursor.get_path_name()))
+            chains[path] = chain
+        return path
+
+    def records(mesh):
+        result = []
+        for index, slot in enumerate(mesh.get_editor_property("materials") or []):
+            row = _unreal_slot_record(slot, index)
+            row["actual_material"] = row["material"]
+            row["material"] = source_path(slot.get_editor_property("material_interface"))
+            result.append(row)
+        return result
+
+    existing = library.load_asset(assembly_path)
+    old_slots, old_parts, old_source_count = [], [], None
+    if existing is not None:
+        if not isinstance(existing, unreal.SkeletalMesh):
+            raise ClusterAssemblyBuildError("Existing Assembly target is not a SkeletalMesh")
+        old_slots = records(existing)
+        old_parts = [{"mesh": _material_preservation_path(row["mesh"]), "remap": row["remap"]}
+            for row in parse_nanite_assembly_part_remaps(existing.get_editor_property("nanite_settings").export_text())]
+        contract = str(library.get_metadata_tag(existing, "CodexNormalizedAssemblyBendContract") or "")
+        if contract:
+            try:
+                prior = json.loads(contract)
+                sources = prior["source_materials"]
+                old_source_count = len(sources)
+            except (ValueError, KeyError, TypeError) as exc:
+                raise ClusterAssemblyBuildError("Existing normalized Assembly source contract is invalid") from exc
+            if (prior.get("schema_version") != 2 or unreal_asset_identity(prior.get("assembly")) != unreal_asset_identity(assembly_path)
+                    or len(old_slots) not in (old_source_count, 2 * old_source_count)
+                    or [unreal_asset_identity(row["material"]) for row in old_slots[:old_source_count]]
+                    != [unreal_asset_identity(path) for path in sources]):
+                raise ClusterAssemblyBuildError("Existing normalized Assembly source table differs from its contract")
+    for row in ordered_parts:
+        asset = row["asset"]
+        if (not isinstance(asset, unreal.SkeletalMesh)
+                or unreal_asset_identity(row["mesh"]) != unreal_asset_identity(asset.get_path_name())
+                or library.load_asset(row["mesh"]) != asset):
+            raise ClusterAssemblyBuildError("Incoming Assembly prototype identity does not match its loaded SkeletalMesh")
+    incoming_parts = [{"mesh": _material_preservation_path(row["mesh"]), "bend_role": row.get("bend_role", 0),
+        "slots": records(row["asset"])} for row in ordered_parts]
+    return plan_assembly_material_preservation(old_slots, old_parts, records(base), incoming_parts, chains,
+        old_source_count=old_source_count)
+
+
+def apply_unreal_assembly_material_preservation(unreal, assembly, plan):
+    """Apply the frozen appearance plan only to the newly built Assembly."""
+    validate_assembly_material_preservation(plan)
+    settings = assembly.get_editor_property("nanite_settings")
+    before_text = settings.export_text()
+    actual_parts = parse_nanite_assembly_part_remaps(before_text)
+    incoming = plan["inputs"]["parts"]
+    if [unreal_asset_identity(row["mesh"]) for row in actual_parts] != [unreal_asset_identity(row["mesh"]) for row in incoming]:
+        raise ClusterAssemblyBuildError("Fresh Assembly prototype order differs from the preservation preflight")
+    for actual, expected in zip(actual_parts, incoming):
+        actual_mesh = unreal.EditorAssetLibrary.load_asset(actual["mesh"])
+        expected_mesh = unreal.EditorAssetLibrary.load_asset(expected["mesh"])
+        if (not isinstance(actual_mesh, unreal.SkeletalMesh) or actual_mesh != expected_mesh
+                or unreal_asset_identity(actual_mesh.get_path_name()) != unreal_asset_identity(expected["mesh"])):
+            raise ClusterAssemblyBuildError("Fresh Assembly prototype identity differs from its loaded preflight SkeletalMesh")
+    original_slots = list(assembly.get_editor_property("materials") or [])
+    before_slots = [_unreal_slot_record(slot, index) for index, slot in enumerate(original_slots)]
+    for actual, expected in zip(before_slots, plan["inputs"]["base_slots"]):
+        if (_material_preservation_slot_key(actual) != _material_preservation_slot_key(expected)
+                or unreal_asset_identity(actual["material"]) != unreal_asset_identity(expected["material"])):
+            raise ClusterAssemblyBuildError("Fresh Assembly base materials changed since the preservation preflight")
+    if len(before_slots) < len(plan["inputs"]["base_slots"]):
+        raise ClusterAssemblyBuildError("Fresh Assembly lost a protected base material slot")
+    for actual, expected in zip(actual_parts, incoming):
+        if len(actual["remap"]) != len(expected["slots"]):
+            raise ClusterAssemblyBuildError("Fresh Assembly prototype material count changed")
+        for index, local in zip(actual["remap"], expected["slots"]):
+            if not 0 <= index < len(before_slots) or unreal_asset_identity(before_slots[index]["material"]) != unreal_asset_identity(local["material"]):
+                raise ClusterAssemblyBuildError("Fresh Assembly prototype material assignment changed before preservation")
+    desired = [row["desired_remap"] for row in plan["parts"]]
+    after_text = rewrite_nanite_assembly_part_remaps(before_text, desired)
+    candidate = type(settings)()
+    candidate.import_text(after_text)
+    if [row["remap"] for row in parse_nanite_assembly_part_remaps(candidate.export_text())] != desired:
+        raise ClusterAssemblyBuildError("Preserved Assembly remaps did not round-trip")
+    updated = []
+    for row in plan["global_slots"]:
+        if "source_part_index" in row:
+            part = incoming[row["source_part_index"]]
+            mesh = unreal.EditorAssetLibrary.load_asset(part["mesh"])
+            template = list(mesh.get_editor_property("materials"))[row["source_slot_index"]]
+        else:
+            template = original_slots[len(updated)]
+        slot = type(template)()
+        slot.import_text(template.export_text())
+        interface = unreal.EditorAssetLibrary.load_asset(row["material"])
+        if interface is None:
+            raise ClusterAssemblyBuildError("Preserved Assembly material disappeared: " + row["material"])
+        slot.set_editor_property("material_interface", interface)
+        updated.append(slot)
+    before_settings = type(settings)()
+    before_settings.import_text(before_text)
+    try:
+        assembly.modify()
+        assembly.set_editor_property("materials", updated)
+        assembly.set_editor_property("nanite_settings", candidate)
+        after_slots = [_unreal_slot_record(slot, index) for index, slot in enumerate(assembly.get_editor_property("materials"))]
+        if ([(_material_preservation_slot_key(row), unreal_asset_identity(row["material"])) for row in after_slots]
+                != [(_material_preservation_slot_key(row), unreal_asset_identity(row["material"])) for row in plan["global_slots"]]
+                or [row["remap"] for row in parse_nanite_assembly_part_remaps(assembly.get_editor_property("nanite_settings").export_text())] != desired):
+            raise ClusterAssemblyBuildError("Assembly appearance preservation failed its readback")
+    except Exception:
+        assembly.set_editor_property("materials", original_slots)
+        assembly.set_editor_property("nanite_settings", before_settings)
+        raise
+    return {"schema_version": 1, "verified_before_build": True, "verified_after_build": True,
+        "old_state_sha256": plan["old_state_sha256"], "source_materials": plan["source_materials"],
+        "overrides": plan["overrides"], "before_global_slots": before_slots, "after_global_slots": after_slots,
+        "parts": plan["parts"], "source_meshes_and_materials_unchanged": True}
+
+
+def build_unreal_nanite_assembly(unreal, manifest, asset_contract, *, prepare_bend_dependencies=None):
     """Build with UE 5.8's unsafe async skeletal finalization disabled."""
+    options = ({"prepare_bend_dependencies": prepare_bend_dependencies}
+               if prepare_bend_dependencies is not None else {})
     with _synchronous_unreal_skinned_asset_compilation(unreal) as async_report:
         result = _build_unreal_nanite_assembly_synchronous(
             unreal,
             manifest,
             asset_contract,
+            **options,
         )
     result["skinned_asset_compilation"] = async_report
     return result
@@ -8779,7 +9339,7 @@ def _clear_post_finish_native_reference_collections(*collections):
             collection.clear()
 
 
-def _build_unreal_nanite_assembly_synchronous(unreal, manifest, asset_contract):
+def _build_unreal_nanite_assembly_synchronous(unreal, manifest, asset_contract, *, prepare_bend_dependencies=None):
     """Build and save the separate UE 5.8 Assembly from imported inputs.
 
     The existing Full SK must already have its newly generated DynamicWind data.
@@ -8878,6 +9438,18 @@ def _build_unreal_nanite_assembly_synchronous(unreal, manifest, asset_contract):
     )
 
     assembly_path = paths["assembly"]
+    # The native builder duplicates the freshly imported base, so it cannot
+    # retain assignments authored on the previous Assembly by itself.
+    from normalized_assembly_bend import manifest_part_bend_role, NORMALIZED_BEND_ROLE_CODES
+    material_preservation_plan = plan_unreal_assembly_material_preservation(
+        unreal, assembly_path, base,
+        [{"mesh": paths["parts"][part["prototype_id"]], "asset": part_assets[part["prototype_id"]],
+          "bend_role": NORMALIZED_BEND_ROLE_CODES.get(manifest_part_bend_role(part, paths["parts"][part["prototype_id"]]), 0)}
+         for part in parts],
+    )
+    expected_material_state = asset_contract.get("existing_material_state_sha256")
+    if expected_material_state is not None and expected_material_state != material_preservation_plan["old_state_sha256"]:
+        raise ClusterAssemblyBuildError("Existing Assembly appearance changed after the planned checkout baseline")
     directory, name = assembly_path.rsplit("/", 1)
     parameters = unreal.NaniteAssemblyCreateNewParameters()
     parameters.set_editor_property(
@@ -9028,12 +9600,19 @@ def _build_unreal_nanite_assembly_synchronous(unreal, manifest, asset_contract):
         raise ClusterAssemblyBuildError(
             "finished Assembly does not use the Full SK final Skeleton"
         )
+    material_preservation = apply_unreal_assembly_material_preservation(
+        unreal, assembly, material_preservation_plan,
+    )
     try:
         material_normalization = normalize_unreal_nanite_assembly_materials(
             unreal,
             assembly,
             apply=True,
             allow_dirty=True,
+            manifest=manifest,
+            asset_contract=paths,
+            prepare_dependencies=prepare_bend_dependencies,
+            material_preservation=material_preservation_plan,
         )
     except NaniteAssemblyMaterialError as exc:
         raise ClusterAssemblyBuildError(
@@ -9121,6 +9700,7 @@ def _build_unreal_nanite_assembly_synchronous(unreal, manifest, asset_contract):
         "prototype_bounds_preflight": prototype_bounds_preflight,
         "bounds_completion": bounds_completion,
         "material_normalization": material_normalization,
+        "material_preservation": material_preservation,
         "wind_json_sha256": wind_file_record.get("sha256"),
         "dynamic_wind": wind_import,
         "provenance": provenance,
@@ -9137,6 +9717,10 @@ __all__ = [
     "build_blender_assembly_inputs",
     "build_unreal_ingest_plan",
     "build_unreal_nanite_assembly",
+    "plan_assembly_material_preservation",
+    "plan_unreal_assembly_material_preservation",
+    "validate_assembly_material_preservation",
+    "apply_unreal_assembly_material_preservation",
     "content_build_decision",
     "derive_exact_plan_line_transform",
     "file_fingerprint",

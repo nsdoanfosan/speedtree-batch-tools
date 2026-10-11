@@ -625,7 +625,7 @@ class ClusterBlendSyncTests(unittest.TestCase):
             with self.assertRaises(ClusterBlendSyncError):
                 set_cluster_relation_registry(blend, external, True)
 
-    def test_on_runner_uses_factory_startup_and_rolls_back_json_on_failure(self):
+    def test_on_runner_preserves_source_ui_and_rolls_back_json_on_failure(self):
         with tempfile.TemporaryDirectory() as temporary:
             owner = Path(temporary) / "Tree_elm"
             cluster = owner / "Cluster"
@@ -653,7 +653,8 @@ class ClusterBlendSyncTests(unittest.TestCase):
                     )
 
             command = run.call_args.args[0]
-            self.assertEqual(command[1:3], ["--factory-startup", "--background"])
+            self.assertEqual(command[1], "--background")
+            self.assertNotIn("--factory-startup", command)
             self.assertFalse(blend.with_suffix(".atlas_leaf_targets.json").exists())
 
     def test_registry_is_restored_when_multi_target_registration_fails(self):

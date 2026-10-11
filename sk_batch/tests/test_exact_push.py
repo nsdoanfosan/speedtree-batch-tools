@@ -207,6 +207,12 @@ class ExactPushCommandTests(unittest.TestCase):
                 )
 
             self.assertEqual(command[0], str(blender.resolve()))
+            self.assertNotIn("--factory-startup", command)
+            refresh = exact_push.build_assembly_refresh_command(
+                spm, blender=blender, material_contract=material,
+                report_path=logs / "assembly.json",
+            )
+            self.assertNotIn("--factory-startup", refresh)
             self.assertNotIn("--require-green-signal", command)
             self.assertIn("--dependency-orchestrated", command)
             self.assertEqual(
@@ -229,6 +235,12 @@ class ExactPushCommandTests(unittest.TestCase):
                 d_export / "exact" / spm.stem / "test",
             )
             self.assertNotIn("backup", str(outputs["export_root"]).casefold())
+            for transport, phase_id, shared in (("headless", "p_verified", material), ("rpc", None, material), ("rpc", "p_verified", None)):
+                with self.subTest(export_only_transport=transport, phase=phase_id, shared=shared):
+                    with self.assertRaisesRegex(ExactPushError, "existing shared handoff"):
+                        build_exact_push_command(spm, blender=blender, log_dir=logs,
+                            material_contract=material, unreal_project=project, transport=transport,
+                            rpc_export_only=True, workstation_phase_id=phase_id, workstation_handoff_json=shared)
 
             generated_config = (
                 root / "Saved" / "Config" / "WindowsEditor" / "Engine.ini"
@@ -242,6 +254,8 @@ class ExactPushCommandTests(unittest.TestCase):
                 ]),
                 encoding="utf-8",
             )
+            handoff = logs / "shared_handoff.json"
+            handoff.write_text("{}", encoding="utf-8")
             with mock.patch.object(
                 exact_push,
                 "send2ue_export_cache_root",
@@ -255,6 +269,11 @@ class ExactPushCommandTests(unittest.TestCase):
                     material_contract=material,
                     unreal_project=project,
                     transport="rpc",
+                    normalized_bend_changelist="2374",
+                    workstation_phase_id="p_verified",
+                    workstation_handoff_json=handoff,
+                    workstation_final_handoff=True,
+                    rpc_export_only=True,
                 )
 
             self.assertEqual(
@@ -278,6 +297,12 @@ class ExactPushCommandTests(unittest.TestCase):
                 "1",
             )
             self.assertIn("--send2ue-unreal-py", rpc_command)
+            self.assertEqual(rpc_command[rpc_command.index("--normalized-bend-changelist") + 1], "2374")
+            self.assertEqual(rpc_command[rpc_command.index("--workstation-phase-id") + 1], "p_verified")
+            self.assertEqual(rpc_command[rpc_command.index("--workstation-handoff-json") + 1], str(handoff.resolve()))
+            self.assertIn("--workstation-final-handoff", rpc_command)
+            self.assertIn("--rpc-export-only", rpc_command)
+            self.assertTrue(rpc_outputs["rpc_export_only"])
             self.assertEqual(rpc_outputs["transport"], "rpc")
             self.assertEqual(
                 rpc_outputs["export_root"],

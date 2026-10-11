@@ -5,10 +5,8 @@ Run:
       --wind TREE|BUSH|WEED|NONE --material-contract preflight.json
       --report result.json
 
-Runs with --factory-startup and enables only the junction-installed
-speedtree_bone_weight_repair add-on for this process.  This avoids loading every
-interactive user add-on in a background batch. Re-running on an existing .blend
-is a clean idempotent update (the operator wipes its previous build).
+Loads the existing source with its saved UI. Add-on registration and save-version
+settings stay process-local; the caller verifies Perforce recovery before edits.
 """
 import argparse
 import copy
@@ -102,6 +100,9 @@ from cluster_bark_source_resolution import (
     load_current_isolated_bark_manifest,
 )
 from blender_addon_gateway import prepare_runtime
+from blender_production_file import (
+    install_session_safety, load_production_file,
+)
 from speedtree_native_receipt import (
     NativeReceiptError,
     load_native_export_receipt,
@@ -483,22 +484,33 @@ def reusable_preflight_export_bundle(
     }
 
 
-def save_cluster_source_mainfile(bpy_module, filepath, report):
+def disable_intermediate_blend_saves(settings, report):
+    """Persist only the production source, even if its saved setting was True."""
+    policy = {
+        "status": "applying",
+        "policy": "production_source_only_no_stage_blend_copies",
+        "previous_value": bool(settings.save_intermediate_blends),
+    }
+    report["intermediate_blend_save_policy"] = policy
+    settings.save_intermediate_blends = False
+    policy["effective_value"] = bool(settings.save_intermediate_blends)
+    if policy["effective_value"]:
+        raise RuntimeError("Intermediate blend saves must be disabled before the batch pipeline")
+    policy["status"] = "disabled"
+
+
+def save_cluster_source_mainfile(bpy_module, filepath, report, ui_state=None):
     """Save one Cluster source without Blender's redundant version rename.
 
-    The GUI owns a separate pre-assembly copy and restores it if this producer
-    transaction fails.  Blender's additional ``.blend -> .blend1`` rename is
-    therefore redundant here and can fail when OneDrive briefly holds either
-    path.  Change the preference only in memory for this operator call and
-    restore it even when Blender raises.
+    The caller verifies a Perforce revision or shelf matching the source bytes.
+    Change save_version only for this save and restore it even on failure.
     """
     filepaths = bpy_module.context.preferences.filepaths
     original_save_version = int(filepaths.save_version)
     policy = {
         "status": "applying",
         "policy": (
-            "gui_pre_assembly_transaction_authoritative_disable_blender_"
-            "version_backup"
+            "verified_perforce_recovery_disable_blender_version_backup"
         ),
         "scope": "headless_cluster_source_final_save",
         "preference": "bpy.context.preferences.filepaths.save_version",
@@ -506,7 +518,7 @@ def save_cluster_source_mainfile(bpy_module, filepath, report):
         "effective_save_version": 0,
         "preference_persisted": False,
         "preference_restored": False,
-        "transaction_backup": "sk_batch_gui_pre_assembly_copy_and_rollback",
+        "recovery_policy": "caller_verified_perforce_revision_or_shelf",
     }
     report["blend_save_policy"] = policy
     try:
@@ -514,7 +526,10 @@ def save_cluster_source_mainfile(bpy_module, filepath, report):
         policy["observed_effective_save_version"] = int(
             filepaths.save_version
         )
-        result = bpy_module.ops.wm.save_as_mainfile(filepath=filepath)
+        result = (ui_state.save(filepath=filepath) if ui_state is not None
+                  else bpy_module.ops.wm.save_as_mainfile(filepath=filepath))
+        if ui_state is not None:
+            policy["production_ui"] = ui_state.receipt()
         policy["operator_result"] = sorted(result)
         policy["status"] = (
             "committed" if "FINISHED" in result else "operator_incomplete"
@@ -1273,6 +1288,7 @@ def main():
         "errors": [],
     }
     try:
+        install_session_safety(bpy)
         validate_cluster_job_mode_arguments(
             args.cluster_source_build_only,
             args.cluster_assembly_contract,
@@ -1401,9 +1417,10 @@ def main():
         blend_exists = os.path.exists(blend_path)
         blend_open_started = perf_counter()
         if blend_exists:
-            bpy.ops.wm.open_mainfile(filepath=blend_path)
+            bpy.ops.wm.open_mainfile(filepath=blend_path, load_ui=True)
         else:
             bpy.ops.wm.read_homefile(use_empty=True)
+        production_blend_state = load_production_file(bpy, blend_path)
         record_stage_duration(report, "blend_open", blend_open_started)
         is_cluster_source = is_cluster_normalization_spm(canonical_spm)
         if args.cluster_source_build_only and not is_cluster_source:
@@ -1474,6 +1491,7 @@ def main():
 
         # This is the installed add-on's stable Blender RNA property name.
         settings = bpy.context.scene.speedtree_bwr_settings
+        disable_intermediate_blend_saves(settings, report)
         settings.spm_path = str(speedtree_spm)
         collision_cli, collision_hook = resolve_speedtree_collision_cli()
         settings.speedtree_exe_path = str(collision_cli)
@@ -1514,7 +1532,7 @@ def main():
         # rebuilds it was pure disk churn (2x full writes per Assembly).
         if not blend_exists:
             Path(blend_path).parent.mkdir(parents=True, exist_ok=True)
-            bpy.ops.wm.save_as_mainfile(filepath=blend_path)
+            production_blend_state.save(filepath=blend_path)
 
         # The add-on UI operator uses one name_stem for both the SpeedTree
         # export and the assembled Blender output. Cluster pairs deliberately
@@ -2147,9 +2165,10 @@ def main():
                     bpy,
                     blend_path,
                     report,
+                    production_blend_state,
                 )
             else:
-                save_result = bpy.ops.wm.save_as_mainfile(
+                save_result = production_blend_state.save(
                     filepath=blend_path
                 )
             report["blend_save_operator_result"] = sorted(save_result)
@@ -2159,6 +2178,7 @@ def main():
                     + ", ".join(sorted(save_result))
                 )
             report["blend_resaved"] = True
+            report["production_blend_save"] = production_blend_state.receipt()
             record_stage_duration(
                 report,
                 "blend_save",

@@ -24,6 +24,7 @@ import subprocess
 import sys
 import time
 import traceback
+import uuid
 from pathlib import Path
 
 # send2ue normally reports connection failures through a Blender popup. In
@@ -87,6 +88,10 @@ from child_progress_contract import (
 )
 from unreal_ingest_policy import manifest_item_policy_metadata
 from blender_addon_gateway import prepare_runtime
+from prepared_rpc_resume import (
+    finish_batch_handoff, prepare_rpc_pause, runner_load_lines,
+    verify_deferred_export_receipt,
+)
 
 
 def load_cluster_assembly_manifest(blend_dir, spm_path):
@@ -176,11 +181,19 @@ def parse_args():
     parser.add_argument("--item-import-report")
     parser.add_argument("--unreal-ingest")
     parser.add_argument("--send2ue-unreal-py")
-    return parser.parse_args(argv)
+    parser.add_argument("--normalized-bend-changelist", type=int)
+    parser.add_argument("--workstation-phase-id")
+    parser.add_argument("--workstation-handoff-json", type=Path)
+    parser.add_argument("--workstation-final-handoff", action="store_true")
+    parser.add_argument("--rpc-export-only", action="store_true")
+    args = parser.parse_args(argv)
+    if args.rpc_export_only and (args.transport != "rpc" or not args.workstation_phase_id or not args.workstation_handoff_json):
+        parser.error("RPC export-only requires RPC transport, an active phase and the existing shared handoff JSON")
+    return args
 
 
 def configure_send2ue_rpc_preferences(args):
-    """Apply project-matched RPC settings to this factory-startup session."""
+    """Apply project-matched RPC settings to this temporary export session."""
     addon = bpy.context.preferences.addons.get("send2ue")
     if addon is None:
         # Blender 5.1 can register an add-on's RNA classes through
@@ -532,6 +545,31 @@ def run_owned_rpc(run_commands, lines, label):
         )
 
 
+def begin_batch_handoff(args, blend_path, addon_runtime):
+    """Keep disk export and the actual RPC import under one native request."""
+    phase_id = str(args.workstation_phase_id or "")
+    if not phase_id and not args.workstation_handoff_json:
+        return None, None
+    if not phase_id or args.transport != "rpc":
+        raise RuntimeError("coordinated Batch handoff requires its active phase and visible-editor RPC transport")
+    bridge = addon_runtime.operation("send2ue", "load_workstation_bridge")()
+    phase = bridge.require_active_phase(phase_id, "unreal:myproject2")
+    if phase.get("workload") != "heavy":
+        raise RuntimeError("coordinated Batch import requires an active heavy phase")
+    bridge.require_scopes(phase_id, ["editor"])
+    if args.workstation_handoff_json:
+        metadata = json.loads(args.workstation_handoff_json.read_text(encoding="utf-8"))
+    else:
+        metadata = bridge.bind_handoff(phase_id, "speedtree_batch_send2ue", str(uuid.uuid4()), blend_path)
+        metadata.update(action="send2ue_manifest_export_rpc_ingest", project="unreal:MyProject2")
+    if (metadata.get("phase_id") != phase_id or metadata.get("pipeline") != "speedtree_batch_send2ue"
+            or str(metadata.get("resource") or "").casefold() != "unreal:myproject2" or metadata.get("project") != "unreal:MyProject2"
+            or metadata.get("action") != "send2ue_manifest_export_rpc_ingest"
+            or not bridge.can_execute_handoff(metadata)):
+        raise RuntimeError("Batch handoff metadata does not match its active native request")
+    return bridge, metadata
+
+
 def main():
     args = parse_args()
     report_path = Path(args.report).resolve()
@@ -548,12 +586,13 @@ def main():
         "stage": "startup",
         "unreal_rpc_started": False,
     }
+    handoff_bridge, handoff_metadata = None, None
     emit_child_progress_marker(
         SEND2UE_JOB_START_MARKER, transport=args.transport
     )
     try:
-        # --factory-startup keeps unrelated UI/GPU add-ons out of background
-        # Blender, so required handoff registrations must be explicit.
+        # Register only this export session's required add-ons and leave
+        # persistent Blender preferences untouched.
         report["stage"] = "addon_setup"
         addon_runtime = prepare_runtime(
             "sk_batch.jobs.send2ue_push_job",
@@ -562,6 +601,7 @@ def main():
                 "send2ue": (
                     "headless_export_v1",
                     "unreal_rpc_v1",
+                    *(("coordinated_handoff_v1",) if args.workstation_phase_id or args.workstation_handoff_json else ()),
                 ),
                 "ue_unique_export_names_addon": (
                     "unreal_handoff_json_v1",
@@ -846,9 +886,18 @@ def main():
         emit_child_progress_marker(
             SEND2UE_DISK_EXPORT_START_MARKER, unit=unit_name
         )
-        result = bpy.ops.wm.send2ue("EXEC_DEFAULT")
+        handoff_bridge, handoff_metadata = begin_batch_handoff(args, blend_path, addon_runtime)
+        report["workstation_handoff"] = handoff_metadata
+        operator_context = ({"workstation_phase_id": args.workstation_phase_id,
+                             "workstation_deferred_handoff": json.dumps(handoff_metadata)}
+                            if handoff_metadata else {})
+        result = bpy.ops.wm.send2ue("EXEC_DEFAULT", **operator_context)
         if "FINISHED" not in result:
             raise RuntimeError(f"send2ue returned {result}")
+        if handoff_metadata:
+            report["native_deferred_export_receipt"] = verify_deferred_export_receipt(
+                bpy.app.driver_namespace.get("send2ue_workstation_deferred_export_receipt"),
+                handoff_metadata, blend_path)
         report["send2ue"] = "FINISHED"
         emit_child_progress_marker(
             SEND2UE_DISK_EXPORT_DONE_MARKER, unit=unit_name
@@ -903,6 +952,7 @@ def main():
                 full_templates[0],
                 mesh_path,
                 folder,
+                generated_material_output_dir=export_root,
             )
             cluster_assembly = {
                 "manifest": cluster_manifest,
@@ -976,6 +1026,7 @@ def main():
         code_files = [
             file_fingerprint(args.unreal_ingest),
             file_fingerprint(args.send2ue_unreal_py),
+            file_fingerprint(__file__),
         ]
         wind_policy_module = (
             Path(__file__).resolve().parents[1]
@@ -992,6 +1043,10 @@ def main():
         cluster_builder = Path(__file__).resolve().parents[1] / "cluster_assembly_builder.py"
         if cluster_builder.is_file():
             code_files.append(file_fingerprint(cluster_builder))
+        for name in ("assembly_part_bend_policy.py", "normalized_assembly_bend.py", "nanite_assembly_materials.py", "prepared_rpc_resume.py"):
+            module = Path(__file__).resolve().parents[1] / name
+            if module.is_file():
+                code_files.append(file_fingerprint(module))
         material_pipeline = (
             Path(args.send2ue_unreal_py).resolve().parents[1]
             / "resources"
@@ -1020,6 +1075,9 @@ def main():
             "export_contracts": {
                 "skeleton_root": report["send2ue_skeleton_root_export"],
             },
+            "normalized_bend_changelist": args.normalized_bend_changelist,
+            "workstation_phase_id": args.workstation_phase_id,
+            "workstation_handoff": handoff_metadata,
         }
         contract.update(manifest_item_policy_metadata(contract))
         fingerprint = stable_fingerprint(contract)
@@ -1083,8 +1141,14 @@ def main():
         report["checkpoint"] = str(checkpoint_path)
         report["batch_report"] = str(batch_report_path)
         report["item_import_report"] = str(Path(item_import_report).resolve())
+        if args.rpc_export_only:
+            report["prepared_rpc"] = prepare_rpc_pause(
+                report, manifest_path, item, args.unreal_ingest,
+                source_paths=[blend_path, spm_path, args.material_contract],
+                final=bool(args.workstation_final_handoff),
+            )
 
-        if args.transport == "headless_export":
+        if args.transport == "headless_export" or args.rpc_export_only:
             report["stage"] = "exported_pending_unreal"
             report["status"] = "exported_pending_unreal"
             report["failure_kind"] = None
@@ -1092,22 +1156,8 @@ def main():
             if batch_report_path.exists():
                 batch_report_path.unlink()
             runner_path = str(Path(args.unreal_ingest).resolve())
-            runner_load_lines = [
-                "import importlib.util, sys",
-                # Unreal keeps embedded-Python modules alive across RPC jobs.
-                # Purge the Assembly contract module before loading the runner
-                # so a newly normalized public path/name cannot be validated by
-                # stale code from an earlier Push in the same Editor session.
-                "sys.modules.pop('cluster_assembly_builder', None)",
-                f"_runner_path = {runner_path!r}",
-                "_spec = importlib.util.spec_from_file_location('sk_batch_unreal_ingest_rpc', _runner_path)",
-                "if _spec is None or _spec.loader is None:",
-                "\traise RuntimeError('Could not load SK Batch Unreal ingest: ' + _runner_path)",
-                "_runner = importlib.util.module_from_spec(_spec)",
-                "sys.modules[_spec.name] = _runner",
-                "_spec.loader.exec_module(_runner)",
-            ]
-            rpc_lines = runner_load_lines + [
+            runner_bootstrap_lines = runner_load_lines(runner_path)
+            rpc_lines = runner_bootstrap_lines + [
                 (
                     f"_runner.run_manifest({str(manifest_path)!r}, "
                     f"checkpoint_path={str(checkpoint_path)!r}, "
@@ -1130,7 +1180,7 @@ def main():
                     time.sleep(0.1)
                     run_owned_rpc(
                         run_commands,
-                        runner_load_lines
+                        runner_bootstrap_lines
                         + [
                             (
                                 f"_runner.finish_runtime_probe({str(checkpoint_path)!r}, "
@@ -1154,7 +1204,7 @@ def main():
                     )
                     run_owned_rpc(
                         run_commands,
-                        runner_load_lines
+                        runner_bootstrap_lines
                         + [
                             (
                                 f"_runner.cancel_runtime_probe({str(checkpoint_path)!r}, "
@@ -1180,6 +1230,8 @@ def main():
                 raise RuntimeError(
                     item_result.get("message") or "Unreal manifest ingest failed"
                 )
+            finish_batch_handoff(handoff_bridge, handoff_metadata, item_result,
+                final=bool(args.workstation_final_handoff or not args.workstation_handoff_json))
             report["stage"] = "completed"
             report["status"] = "ok"
             report["failure_kind"] = None
@@ -1193,6 +1245,11 @@ def main():
         error_text = str(exc)
         report["error"] = error_text
         report["traceback"] = traceback.format_exc()
+        if handoff_metadata is not None:
+            try:
+                handoff_bridge.fail_handoff(handoff_metadata, error_text[:2000])
+            except Exception as coordination_error:
+                report["workstation_failure_receipt_error"] = str(coordination_error)
         try:
             classify_failure(report, error_text)
         except Exception:

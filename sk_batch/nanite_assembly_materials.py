@@ -37,6 +37,18 @@ class NaniteAssemblyMaterialError(RuntimeError):
     """Raised when material identity or a Nanite part remap is not provable."""
 
 
+def unreal_asset_identity(value):
+    """Compare UE package/FName identity without changing authored path text."""
+    text = str(value or "")
+    package, separator, object_name = text.partition(".")
+    identity = package.casefold()
+    # A package reference and its normal asset object suffix identify the same
+    # asset. A different object/subobject within that package must still differ.
+    if separator and object_name.casefold() != package.rsplit("/", 1)[-1].casefold():
+        identity += "." + object_name.casefold()
+    return identity
+
+
 _PART_PATTERN = re.compile(
     r'\(MeshObjectPath="(?P<mesh>[^"]+)",\s*'
     r'MaterialRemap=\((?P<remap>[^)]*)\)\)'
@@ -479,7 +491,7 @@ def audit_unreal_skeletal_mesh_material_sections(unreal, mesh_path, slot_count=N
             f"expected={MATERIAL_SECTION_AUDIT_KIND!r}, "
             f"actual={result.get('audit')!r}"
         )
-    if result.get("skeletal_mesh") != expected_mesh:
+    if unreal_asset_identity(result.get("skeletal_mesh")) != unreal_asset_identity(expected_mesh):
         raise NaniteAssemblyMaterialError(
             "skeletal mesh material-section audit target mismatch: "
             f"expected={expected_mesh!r}, "
@@ -601,6 +613,10 @@ def normalize_unreal_nanite_assembly_materials(
     *,
     apply=False,
     allow_dirty=False,
+    manifest=None,
+    asset_contract=None,
+    prepare_dependencies=None,
+    material_preservation=None,
 ):
     """Audit or normalize one loaded ``unreal.SkeletalMesh`` Assembly.
 
@@ -611,8 +627,48 @@ def normalize_unreal_nanite_assembly_materials(
 
     if not isinstance(assembly, unreal.SkeletalMesh):
         raise NaniteAssemblyMaterialError("target is not an Unreal SkeletalMesh")
+    if material_preservation is not None:
+        # Only the builder's independently frozen, ancestry-checked plan may
+        # replace prototype appearances during ordinary slot normalization.
+        from cluster_assembly_builder import validate_assembly_material_preservation
+        try:
+            validate_assembly_material_preservation(material_preservation)
+        except RuntimeError as exc:
+            raise NaniteAssemblyMaterialError(str(exc)) from exc
+        actual_slots = [_unreal_slot_record(slot, index) for index, slot in enumerate(assembly.get_editor_property("materials") or [])]
+        def preserved_key(row):
+            return (str(row["slot_name"]).casefold(), str(row.get("imported_slot_name") or "").casefold(),
+                    unreal_asset_identity(row["material"]))
+        if [preserved_key(row) for row in actual_slots] != [preserved_key(row) for row in material_preservation["global_slots"]]:
+            raise NaniteAssemblyMaterialError("preserved Assembly global source table changed")
+        actual_parts = parse_nanite_assembly_part_remaps(assembly.get_editor_property("nanite_settings").export_text())
+        if [(unreal_asset_identity(row["mesh"]), row["remap"]) for row in actual_parts] != [
+                (unreal_asset_identity(row["mesh"]), row["desired_remap"]) for row in material_preservation["parts"]]:
+            raise NaniteAssemblyMaterialError("preserved Assembly prototype/remap changed")
     assembly_path = assembly.get_path_name()
-    bend_policy = production_assembly_bend_policy(assembly_path)
+    independent_bend_intent = False
+    if manifest is not None:
+        try:
+            from .normalized_assembly_bend import normalize_assembly, NormalizedAssemblyBendError
+        except ImportError:
+            from normalized_assembly_bend import normalize_assembly, NormalizedAssemblyBendError
+        try:
+            normalized = normalize_assembly(
+                unreal, assembly, manifest, asset_contract, apply=apply,
+                allow_dirty=allow_dirty, parse_parts=parse_nanite_assembly_part_remaps,
+                native_json=_json_result, slot_record=_unreal_slot_record,
+                audit=audit_unreal_skeletal_mesh_material_sections,
+                prepare_dependencies=prepare_dependencies,
+            )
+        except NormalizedAssemblyBendError as exc:
+            raise NaniteAssemblyMaterialError(str(exc)) from exc
+        if normalized is not None:
+            return normalized
+        # A verified explicit NONE remains authoritative when there are no
+        # active bend parts; historical Elm opt-in must not reactivate it.
+        independent_bend_intent = any("part_bend_role" in (part.get("external_source") or {})
+            for part in manifest.get("parts") or [])
+    bend_policy = None if independent_bend_intent else production_assembly_bend_policy(assembly_path)
     if bend_policy is not None:
         return _normalize_elm_assembly_bend(
             unreal, assembly, bend_policy, apply=apply, allow_dirty=allow_dirty
@@ -623,7 +679,7 @@ def normalize_unreal_nanite_assembly_materials(
             package.get_path_name()
             for package in unreal.EditorLoadingAndSavingUtils.get_dirty_content_packages()
         }
-        if package_path in dirty:
+        if unreal_asset_identity(package_path) in {unreal_asset_identity(path) for path in dirty}:
             raise NaniteAssemblyMaterialError(
                 f"Assembly already has unsaved user changes: {package_path}"
             )
@@ -664,6 +720,27 @@ def normalize_unreal_nanite_assembly_materials(
                 "slots": records,
             }
         )
+
+    if material_preservation is not None:
+        planned_parts = material_preservation["parts"]
+        incoming = material_preservation["inputs"]["parts"]
+        planned_slots = material_preservation["global_slots"]
+        if len(part_rows) != len(planned_parts):
+            raise NaniteAssemblyMaterialError("preserved Assembly part count changed")
+        for row, source, planned in zip(part_rows, incoming, planned_parts):
+            if (unreal_asset_identity(row["mesh"]) != unreal_asset_identity(source["mesh"])
+                    or row["remap"] != planned["desired_remap"]
+                    or len(row["slots"]) != len(source["slots"])):
+                raise NaniteAssemblyMaterialError("preserved Assembly prototype/remap changed")
+            for actual, expected in zip(row["slots"], source["slots"]):
+                expected_source = {**expected, "material": expected.get("actual_material") or expected["material"]}
+                if preserved_key(actual) != preserved_key(expected_source):
+                    raise NaniteAssemblyMaterialError("preserved Assembly prototype source assignment changed")
+            row["slots"] = [deepcopy(planned_slots[index]) for index in planned["desired_remap"]]
+        # The normalizer uses object paths as its material identity throughout.
+        for row in part_rows:
+            for index, slot in enumerate(row["slots"]):
+                slot["material"] = global_records[row["remap"][index]]["material"]
 
     plan = plan_nanite_assembly_material_normalization(global_records, part_rows)
     desired_remaps = [row["desired_remap"] for row in plan["parts"]]

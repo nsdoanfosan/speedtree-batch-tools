@@ -40,8 +40,10 @@ from nanite_assembly_materials import (  # noqa: E402
     audit_unreal_skeletal_mesh_material_sections,
 )
 from assembly_part_bend_policy import (  # noqa: E402
+    NORMALIZED_BEND_ROLE_CODES,
     production_assembly_bend_policy,
 )
+from normalized_assembly_bend import validate_manifest_bend_metadata  # noqa: E402
 from unreal_ingest_policy import (  # noqa: E402
     ASSEMBLY_INGEST_WAVE,
     bounded_heavy_process_item_limit,
@@ -61,6 +63,7 @@ FINAL_SKELETON_HASH_METADATA = (
 )
 FINAL_SKELETON_BONE_COUNT_METADATA = "SKBatchFinalSkeletonBoneCount"
 DURABLE_SAVE_SCHEMA_VERSION = 1
+_NORMALIZED_BEND_DEPENDENCY_SCOPES = {}
 
 
 def _now():
@@ -586,6 +589,9 @@ def _ensure_declared_package_writable(item, asset_path):
         for value in (item.get("checkout_asset_paths") or [])
         if str(value or "").strip()
     }
+    derived = _NORMALIZED_BEND_DEPENDENCY_SCOPES.get(id(item))
+    if derived and derived.get("verified") is True:
+        declared.update(path.casefold() for path in derived["materials"])
     if package.casefold() not in declared:
         raise RuntimeError(
             "durable save package is absent from the immutable checkout "
@@ -3317,6 +3323,114 @@ def _ingest_cluster_assembly(
     )
 
 
+def _prepare_normalized_bend_dependency_scope(item, plan):
+    """Freeze only native-preflighted material derivatives in this execution."""
+    from normalized_assembly_bend import checkout_material_scope, require_active_dependency_phase
+    prototypes = plan.get("prototypes") or []
+    declared = {_normalize_durable_package(path).casefold() for path in item.get("checkout_asset_paths") or []}
+    if (not prototypes or len(set(prototypes)) != len(prototypes)
+            or any(_normalize_durable_package(path).casefold() not in declared for path in prototypes)
+            or _normalize_durable_package(plan.get("assembly")).casefold() not in declared):
+        raise RuntimeError("normalized bend prototypes/root are absent from the immutable checkout manifest")
+    phase_id = str(item.get("workstation_phase_id") or "")
+    if phase_id:
+        require_active_dependency_phase(phase_id, [plan["assembly"]] + prototypes + plan["materials"])
+    previous = _NORMALIZED_BEND_DEPENDENCY_SCOPES.get(id(item))
+    if previous and (previous["materials"] != plan["materials"] or previous["prototypes"] != prototypes):
+        raise RuntimeError("normalized bend dependency scope changed after it was frozen")
+    receipt = checkout_material_scope(unreal, plan["materials"], item.get("normalized_bend_changelist"), allow_manual=not phase_id)
+    receipt.update({"phase_id": phase_id, "assembly": plan["assembly"],
+                    "workstation_handoff": deepcopy(item.get("workstation_handoff")),
+                    "prototypes": list(prototypes), "source_materials": list(plan["source_materials"]),
+                    "source_parents": list(plan["source_parents"])})
+    _NORMALIZED_BEND_DEPENDENCY_SCOPES[id(item)] = deepcopy(receipt)
+    return receipt
+
+
+def _save_normalized_part_bend_dependencies(item, report, *, durable_saves):
+    """Save compiled wrappers/MIs, then exact native-verified prototypes."""
+    from normalized_assembly_bend import dependency_policy, require_active_dependency_phase, register_new_material_packages
+    policy = dependency_policy(report)
+    frozen = _NORMALIZED_BEND_DEPENDENCY_SCOPES.get(id(item))
+    if (not frozen or report.get("dependency_checkout") != frozen
+            or set(frozen["materials"]) != set(policy["materials"])
+            or frozen["prototypes"] != policy["prototypes"]):
+        raise RuntimeError("normalized dependencies do not match the verified frozen checkout scope")
+    if frozen["phase_id"]:
+        require_active_dependency_phase(frozen["phase_id"], [frozen["assembly"]] + policy["allowed"])
+    pending = report.get("dependent_packages_to_save")
+    if not isinstance(pending, list):
+        raise RuntimeError("normalized dependency save list is malformed")
+    packages = [_normalize_durable_package(path) for path in pending]
+    dirty = _dirty_content_packages()
+    actual = [path for path in policy["allowed"] if path.casefold() in dirty]
+    if len(set(packages)) != len(packages) or packages != actual:
+        raise RuntimeError("normalized dependency save list includes unrelated packages or omits dirty dependencies")
+    library = getattr(unreal, "CodexMaterialToolsLibrary", None)
+    saver = getattr(library, "save_asset_package_without_thumbnail", None)
+    if not callable(saver):
+        raise RuntimeError("normalized dependency thumbnail-free package save API is unavailable")
+    assets = [unreal.EditorAssetLibrary.load_asset(path) for path in packages]
+    if any(asset is None for asset in assets):
+        raise RuntimeError("normalized dependency is missing before package save")
+    writable = [_ensure_declared_package_writable(item, path) for path in packages]
+    pending_keys = {path.casefold() for path in packages}
+    material_keys = {path.casefold() for path in policy["materials"]}
+    for sequence, record in enumerate(_durable_save_records(durable_saves)):
+        if record.get("sequence") != sequence:
+            raise RuntimeError("normalized dependency durable ledger sequence changed")
+        path = record.get("package")
+        if str(path).casefold() not in pending_keys:
+            _require_durable_save(durable_saves, path)
+            continue
+        role = "material" if str(path).casefold() in material_keys else "prototype"
+        if (record.get("owner") not in {"assembly_prototype_prebuild", "normalized_part_bend_dependency"}
+                or record.get("role") != role or record.get("save_mode") != "thumbnail_free"
+                or record.get("saved") is not True or record.get("dirty_after_save") is not False):
+            raise RuntimeError("normalized dependency durable ownership cannot be refreshed")
+        package_file = _durable_package_file(path)
+        recorded_file = Path(str(record.get("package_file") or ""))
+        if (os.path.normcase(os.path.abspath(str(package_file))) != os.path.normcase(os.path.abspath(str(recorded_file)))
+                or not package_file.is_file()):
+            raise RuntimeError("normalized dependency durable package file changed before refresh")
+        details = package_file.stat()
+        if details.st_size != record.get("size") or details.st_mtime_ns != record.get("mtime_ns"):
+            raise RuntimeError("normalized dependency changed on disk before its owned refresh")
+    saved = []
+    for path, asset in zip(packages, assets):
+        previous = _find_durable_save(durable_saves, path)
+        if not saver(asset):
+            raise RuntimeError("failed to persist normalized bend dependency without a thumbnail: " + path)
+        _refresh_headless_saved_asset_registry(path)
+        if path.casefold() in _dirty_content_packages():
+            raise RuntimeError("normalized bend dependency remained dirty after save: " + path)
+        file = _durable_package_file(path)
+        if not file.is_file() or file.stat().st_size <= 0:
+            raise RuntimeError("normalized bend dependency save did not create a nonempty file: " + path)
+        role = "material" if path.casefold() in material_keys else "prototype"
+        if previous is None:
+            record = _record_durable_save(durable_saves, path, owner="normalized_part_bend_dependency",
+                                          role=role, save_mode="thumbnail_free")
+        else:
+            details = file.stat()
+            refreshes = list(previous.get("postbuild_refreshes") or [])
+            refreshes.append({"refresh_operation": "normalized_part_bend_native_material_delivery",
+                              "previous_size": previous["size"], "previous_mtime_ns": previous["mtime_ns"]})
+            previous.update({"size": int(details.st_size), "mtime_ns": int(details.st_mtime_ns),
+                             "postbuild_refreshes": refreshes, "saved": True, "dirty_after_save": False})
+            record = _require_durable_save(durable_saves, path)
+        saved.append({"asset": path, "saved": True, "dirty_after_save": False, "save_mode": "thumbnail_free",
+                      "owner": record["owner"], "role": role, "refreshed_prebuild_receipt": previous is not None})
+    _validate_durable_save_ledger(durable_saves)
+    registered = register_new_material_packages(frozen)
+    for path in policy["allowed"]:
+        if path.casefold() in _dirty_content_packages():
+            raise RuntimeError("normalized bend dependency became dirty before root save: " + path)
+    return {"status": "persisted_verified_clean" if packages else "verified_clean",
+            "saved_dependencies": saved, "save_writability": writable,
+            "new_materials_added": registered, "changelist": frozen["changelist"]}
+
+
 def _save_elm_part_bend_dependencies(item, normalization, *, durable_saves):
     """Persist only native-verified Elm prototype changes before saving a root.
 
@@ -3435,15 +3549,22 @@ def _finalize_prepared_cluster_assembly(item, prepared, *, durable_saves):
     validate_manifest_artifacts(manifest)
     asset_contract = plan.get("asset_contract") or {}
     _validate_durable_save_ledger(durable_saves)
-    result = build_unreal_nanite_assembly(unreal, manifest, asset_contract)
+    build_options = {}
+    bend_roles = validate_manifest_bend_metadata(manifest, asset_contract)
+    if any(role in NORMALIZED_BEND_ROLE_CODES for role in bend_roles):
+        build_options["prepare_bend_dependencies"] = lambda plan: _prepare_normalized_bend_dependency_scope(item, plan)
+    result = build_unreal_nanite_assembly(unreal, manifest, asset_contract, **build_options)
     assembly_path = result.get("assembly")
     save_writability = list(prepared.get("save_writability") or [])
     normalization = result.get("material_normalization")
-    dependencies = _save_elm_part_bend_dependencies(
+    save_dependencies = (_save_normalized_part_bend_dependencies
+        if isinstance(normalization, dict) and normalization.get("normalized_part_bend_policy")
+        else _save_elm_part_bend_dependencies)
+    dependencies = save_dependencies(
         item, normalization, durable_saves=durable_saves,
     )
     save_writability.extend(dependencies["save_writability"])
-    if isinstance(normalization, dict) and normalization.get("elm_part_bend_policy"):
+    if isinstance(normalization, dict) and (normalization.get("elm_part_bend_policy") or normalization.get("normalized_part_bend_policy")):
         normalization["dependency_save_status"] = dependencies["status"]
         normalization["saved_dependencies"] = dependencies["saved_dependencies"]
     if assembly_path:
@@ -3474,6 +3595,7 @@ def _finalize_prepared_cluster_assembly(item, prepared, *, durable_saves):
             "asset": thumbnail_free_saved,
         } if thumbnail_free_saved else None,
     })
+    _NORMALIZED_BEND_DEPENDENCY_SCOPES.pop(id(item), None)
     return finalized
 
 

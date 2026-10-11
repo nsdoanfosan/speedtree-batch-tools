@@ -339,7 +339,6 @@ def build_assembly_command(
     spm = Path(target["spm"]).resolve()
     command = [
         str(Path(blender).resolve()),
-        "--factory-startup",
         "-b",
         "--python",
         str(ASSEMBLY_JOB),

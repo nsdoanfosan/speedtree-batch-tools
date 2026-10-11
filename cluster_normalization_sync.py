@@ -358,7 +358,8 @@ def inspect_normalization_source_identity(blend):
     }
 
 
-def cluster_role_contract(blend):
+def cluster_role_contract(blend, *, capture_plane_override=None):
+    """Override projection only; retain the existing Atlas semantic and names."""
     stem = Path(blend).stem
     base = stem[3:] if stem.casefold().startswith("sk_") else stem
     tokens = {token for token in base.casefold().split("_") if token}
@@ -371,6 +372,12 @@ def cluster_role_contract(blend):
     else:
         role = "branch"
         plane = "XY"
+    if capture_plane_override is not None:
+        if not isinstance(capture_plane_override, str):
+            raise ClusterNormalizationSyncError("Capture plane override must be XY, XZ or YZ")
+        plane = capture_plane_override.strip().upper()
+        if plane not in {"XY", "XZ", "YZ"}:
+            raise ClusterNormalizationSyncError("Capture plane override must be XY, XZ or YZ")
     return {
         "role": role,
         "capture_plane": plane,
@@ -1405,6 +1412,11 @@ def _receipt_is_current(recipe):
     if recorded_contract_hash == recipe["normalization_contract_sha256"]:
         return True
 
+    # Historical projection selection cannot authorize legacy hash migration.
+    # An explicit plane requires a receipt sealed to this exact physical recipe.
+    if recipe.get("capture_plane_override") is not None:
+        return False
+
     # Isolated bark recipes are sealed to an exact provider filename, cache
     # manifest, XML SourceTree, and SPM hash. They have no safe legacy hash
     # migration path; any contract mismatch requires a fresh normalization.
@@ -1472,9 +1484,13 @@ def resolve_normalization_recipe(
     unit_probe_path,
     capture_resolution=1024,
     delivery_scope_intents=None,
+    part_bend_role="AUTO",
+    capture_plane_override=None,
 ):
     """Build a fail-closed Blender recipe from current Assembly and SPM evidence."""
     blend = Path(blend).expanduser().absolute()
+    role = cluster_role_contract(blend, **({"capture_plane_override": capture_plane_override}
+        if capture_plane_override is not None else {}))
     canonical = Path(canonical_spm or blend.with_suffix(".spm")).expanduser().absolute()
     targets = [Path(path).expanduser().absolute() for path in target_spms]
     if not canonical.is_file():
@@ -1528,7 +1544,6 @@ def resolve_normalization_recipe(
         source_xml,
         canonical,
     )
-    role = cluster_role_contract(blend)
     target_material_bindings = [
         _resolve_target_role_material(
             target,
@@ -1655,10 +1670,13 @@ def resolve_normalization_recipe(
         "plan_refinement_levels": 1,
         **role,
     }
-    bend_policy = normalization_part_bend_policy(role["skeletal_base"])
+    try:
+        bend_policy = normalization_part_bend_policy(role["skeletal_base"], role=part_bend_role)
+    except ValueError as exc:
+        raise ClusterNormalizationSyncError(str(exc)) from exc
     if bend_policy is not None:
-        # Seal the delivered UV contract only for the authorized Elm leaf
-        # families. Other species retain their exact existing recipe hash.
+        # Seal the common normalized part contract, invalidating legacy masks
+        # across species; branches retain their existing recipe hash.
         normalization_contract["part_bend_policy"] = bend_policy
     source_fbx = blend.parent / "fbx" / f"{blend.stem}.fbx"
     if source_fbx.is_file():
@@ -1693,6 +1711,14 @@ def resolve_normalization_recipe(
         "source_material_id": first_binding["source_material_id"],
         "adopt_source_material": first_binding["adopt_source_material"],
     }
+    # The complete policy above seals the effective semantic role. Retain the
+    # user's explicit selector as execution metadata without hashing the same
+    # role twice; selecting the existing leaf policy keeps valid receipts current.
+    if str(part_bend_role or "AUTO").strip().casefold() != "auto":
+        recipe["part_bend_role"] = str(part_bend_role).strip().lower()
+    if capture_plane_override is not None:
+        # The effective capture_plane above already seals the physical choice.
+        recipe["capture_plane_override"] = role["capture_plane"]
     recipe["normalization_required"] = not _receipt_is_current(recipe)
     return recipe
 
