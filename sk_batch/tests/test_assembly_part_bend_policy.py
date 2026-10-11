@@ -28,9 +28,10 @@ class PolicyTests(unittest.TestCase):
             self.assertEqual(elm_leaf_role(name), "leaf")
         for name in ("SK_leaf_elm_side_01", "SK_leaf_side_elm_01"):
             self.assertEqual(elm_leaf_role(name), "leaf_side")
-        for name in ("SK_branch_elm_01", "SK_leaf_oak_01", "SK_leaf_elmwood_01",
-                     "SK_leaf_red_elm_01", "SK_Tree_elm_01"):
+        for name in ("SK_branch_elm_01", "SK_Tree_elm_01"):
             self.assertIsNone(normalization_part_bend_policy(name))
+        for name in ("SK_leaf_oak_01", "SK_leaf_elmwood_01", "SK_leaf_red_elm_01"):
+            self.assertEqual(normalization_part_bend_policy(name)["role"], "leaf")
         self.assertEqual(DEFAULT_SCALARS["AssemblyBranchIndependence"], 0.75)
         self.assertEqual(DEFAULT_SCALARS["AssemblyBranchSpeed"], 0.025)
 
@@ -39,8 +40,10 @@ class PolicyTests(unittest.TestCase):
         payload = {key: deepcopy(policy[key]) for key in (
             "schema_version", "role", "role_code", "uv_name", "uv_index",
             "blender_encoding", "unreal_encoding", "growth_axis_blender",
-            "growth_axis_unreal", "anchor_local")}
+            "growth_axis_unreal", "anchor_local", "aspect_policy", "reference_weight_exponent")}
         payload.update({"vertex_count": 12, "loop_count": 30,
+                        "normalized_bounds": {"minimum": [-1, 0, 0], "maximum": [1, 8, 0], "size": [2, 8, 0]},
+                        "aspect_ratio": 4, "aspect_gain": 4, "aspect_correction": 2,
                         "protected_uv_sha256": {str(i): "a" * 64 for i in range(3)}})
         return {"part_bend_role": policy["role"], "prototype_count": 1,
                 "prototypes": [{"part_bend_payload": payload}]}
@@ -55,11 +58,29 @@ class PolicyTests(unittest.TestCase):
             lambda x: x["prototypes"][0]["part_bend_payload"].update(role_code=2),
             lambda x: x["prototypes"][0]["part_bend_payload"].update(protected_uv_sha256={}),
             lambda x: x.update(prototype_count=2),
+            lambda x: x["prototypes"][0]["part_bend_payload"].update(aspect_gain=1),
+            lambda x: x["prototypes"][0]["part_bend_payload"].update(schema_version=1),
         ]
         for corrupt in corruptions:
             candidate = deepcopy(valid)
             corrupt(candidate)
             self.assertFalse(part_bend_build_matches_policy(candidate, policy))
+
+    def test_cluster_policy_preserves_semantics_and_rejects_stale_receipts(self):
+        for name in ("SK_cluster_reed_01", "SK_cluster_other_species_02"):
+            policy = normalization_part_bend_policy(name)
+            self.assertEqual((policy["role"], policy["role_code"]), ("cluster", 1))
+            valid = self.valid_build(policy)
+            self.assertTrue(part_bend_build_matches_policy(valid, policy))
+            for mutation in (lambda value: value.update(part_bend_role=None),
+                             lambda value: value["prototypes"][0].pop("part_bend_payload"),
+                             lambda value: value["prototypes"][0]["part_bend_payload"].update(role="leaf")):
+                stale = deepcopy(valid)
+                mutation(stale)
+                self.assertFalse(part_bend_build_matches_policy(stale, policy))
+        for name in ("SK_branch_reed_01", "SK_tree_reed_01", "SK_cluster", "SK_leaf", "SK_raw_cluster_reed_01"):
+            self.assertIsNone(normalization_part_bend_policy(name))
+        self.assertEqual(normalization_part_bend_policy("SK_leaf_weeping_willow_side_01")["role_code"], 2)
 
     def test_root_scope_and_original_mapping_are_stable(self):
         for root in ELM_ASSEMBLIES:

@@ -308,6 +308,38 @@ def with_assets(text, assets):
 
 
 class GeneratorSyncTests(unittest.TestCase):
+    def test_adopted_authored_all_cutouts_slot_maps_without_replacement_history(self):
+        source_text = spm_xml([generator_xml(
+            "authored-leaf", "Leaf 24", "Leaf Mesh", 2,
+            [property_xml("Leaves:Type:2:Material", "2"),
+             property_xml("Leaves:Type:2:Mesh", "-10")],
+        )], []).replace("<Nodes />", '<Assets><Material_v8 ID="2" Name="M_cluster" /></Assets><Nodes />')
+        target_text = spm_xml([], []).replace(
+            "<Nodes />", '<Assets><Material_v8 ID="9" Name="M_cluster" /></Assets><Nodes />'
+        )
+        source = sync.SPMDocument(Path("master.spm"), source_text, False, full=True)
+        target = sync.SPMDocument(Path("follower.spm"), target_text, False, full=True)
+        binding = {
+            "state": "already_connected", "created_slot": False,
+            "generator_guid": "authored-leaf", "generator_name": "Leaf 24",
+            "slot_prefix": "Leaves:Type:2", "target_material_id": 2,
+            "target_material_name": "M_cluster", "target_mesh_id": -10,
+            "_atlas_source_material_adoption": {
+                "material_id": 2, "material_name": "M_cluster",
+                "original_material_snapshot": "recorded-adoption-baseline",
+            },
+        }
+        self.assertEqual(sync._atlas_binding_target_local_value(source, target, binding, "Material_v8"), "9")
+        self.assertEqual(sync._atlas_binding_target_local_value(source, target, binding, "Mesh"), "-10")
+        for changed in [
+            {"target_mesh_id": 18}, {"created_slot": True},
+            {"target_material_id": 8}, {"target_material_name": "Other"},
+            {"generator_guid": "missing"}, {"slot_prefix": "Leaves:Type:3"},
+            {"_atlas_source_material_adoption": {}}, {"source_material_id": 7},
+        ]:
+            with self.subTest(changed=changed), self.assertRaises(sync.SyncError):
+                sync._atlas_binding_target_local_value(source, target, {**binding, **changed}, "Material_v8")
+
     def atlas_ownership_block(self, bindings):
         return {
             "contract": GENERATOR_BINDING_OWNERSHIP_CONTRACT,

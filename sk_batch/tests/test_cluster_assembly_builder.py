@@ -1003,6 +1003,21 @@ def stacked_uv_test_mesh(*, identical_faces=False, reverse_polygons=False):
 
 
 class ComponentTopologyTests(unittest.TestCase):
+    def test_weld_tolerance_cannot_disconnect_real_shared_edge(self):
+        mesh = SimpleNamespace(
+            vertices=[SimpleNamespace(co=co) for co in [
+                (0., 0., 0.), (0., 0.0000001, 0.),
+                (0.0000001, 0., 0.), (1., 1., 0.),
+            ]],
+            polygons=[
+                SimpleNamespace(vertices=(0, 1, 2)),
+                SimpleNamespace(vertices=(1, 2, 3)),
+            ],
+        )
+        self.assertEqual(_component_groups(mesh, [0, 1]), [
+            {"vertices": [0, 1, 2, 3], "polygons": [0, 1]},
+        ])
+
     def test_position_weld_preserves_card_topology_across_seam_split(self):
         source = seam_split_test_mesh(False)
         split = seam_split_test_mesh(True)

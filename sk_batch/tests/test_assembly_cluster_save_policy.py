@@ -84,6 +84,42 @@ class FakeBlender:
 
 
 class ClusterSavePolicyTests(unittest.TestCase):
+    def test_batch_disables_saved_intermediate_setting_and_preserves_other_values(self):
+        helper = load_job_functions(["disable_intermediate_blend_saves"])["disable_intermediate_blend_saves"]
+        for previous in (True, False):
+            settings = types.SimpleNamespace(save_intermediate_blends=previous, wind_preset="TREE", export_fbx=True)
+            report = {}
+            helper(settings, report)
+            self.assertIs(settings.save_intermediate_blends, False)
+            self.assertEqual((settings.wind_preset, settings.export_fbx), ("TREE", True))
+            self.assertEqual(report["intermediate_blend_save_policy"], {
+                "status": "disabled", "policy": "production_source_only_no_stage_blend_copies",
+                "previous_value": previous, "effective_value": False,
+            })
+
+    def test_batch_rejects_intermediate_setting_that_did_not_disable(self):
+        helper = load_job_functions(["disable_intermediate_blend_saves"])["disable_intermediate_blend_saves"]
+        class StuckSetting:
+            @property
+            def save_intermediate_blends(self):
+                return True
+            @save_intermediate_blends.setter
+            def save_intermediate_blends(self, value):
+                pass
+        report = {}
+        with self.assertRaisesRegex(RuntimeError, "must be disabled"):
+            helper(StuckSetting(), report)
+        self.assertEqual(report["intermediate_blend_save_policy"]["status"], "applying")
+        self.assertIs(report["intermediate_blend_save_policy"]["effective_value"], True)
+
+    def test_batch_disables_intermediate_saves_before_snapshotting_export_settings(self):
+        tree = ast.parse(JOB_PATH.read_text(encoding="utf-8"))
+        main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+        calls = [node for node in ast.walk(main) if isinstance(node, ast.Call)]
+        guard = next(node for node in calls if isinstance(node.func, ast.Name) and node.func.id == "disable_intermediate_blend_saves")
+        snapshot = next(node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == "as_dict")
+        self.assertLess(guard.lineno, snapshot.lineno)
+
     def test_speedtree_export_timeout_layering_is_fail_closed(self):
         helper = load_job_functions(
             ["validate_speedtree_export_timeout_layering"]
@@ -877,8 +913,8 @@ class ClusterSavePolicyTests(unittest.TestCase):
         self.assertTrue(policy["preference_restored"])
         self.assertFalse(policy["preference_persisted"])
         self.assertEqual(
-            policy["transaction_backup"],
-            "sk_batch_gui_pre_assembly_copy_and_rollback",
+            policy["recovery_policy"],
+            "caller_verified_perforce_revision_or_shelf",
         )
 
     def test_cluster_save_restores_preference_after_operator_failure(self):

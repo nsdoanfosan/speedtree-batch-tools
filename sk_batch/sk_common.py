@@ -121,9 +121,20 @@ STATE_RECOVERY_LOG_MAX_BYTES = 64 * 1024
 PUSH_MANIFEST_SCHEMA_VERSION = 1
 PUSH_SOURCE_FINGERPRINT_CACHE_VERSION = 1
 PUSH_SOURCE_FINGERPRINT_CONTRACT = "content_only_v2"
-DEFAULT_SEND2UE_DIR = Path(
+LEGACY_SEND2UE_DIR = Path(
     r"C:\Users\PARK\Documents\GitHub\BlenderTools\src\addons\send2ue"
 )
+
+
+def installed_send2ue_dir(version="5.2", scripts_root=None):
+    """Use the same installed add-on for native export and Unreal RPC import."""
+    root = Path(scripts_root) if scripts_root is not None else Path(
+        os.environ.get("APPDATA", str(Path.home() / "AppData/Roaming"))) / "Blender Foundation/Blender"
+    addon = root / version / "scripts/addons/send2ue"
+    return addon.resolve() if (addon / "dependencies/unreal.py").is_file() else LEGACY_SEND2UE_DIR
+
+
+DEFAULT_SEND2UE_DIR = installed_send2ue_dir()
 DEFAULT_SEND2UE_EXPORT_CACHE_ROOT = Path(
     r"D:\SpeedTreeBatchTools\send2ue_fbx"
 )
@@ -332,6 +343,8 @@ def load_config():
         except Exception:
             pass
     cfg["blender_exe"] = DEFAULT_CONFIG["blender_exe"]
+    if Path(cfg["send2ue_dir"]).resolve() == LEGACY_SEND2UE_DIR.resolve():
+        cfg["send2ue_dir"] = str(DEFAULT_SEND2UE_DIR)
     return cfg
 
 

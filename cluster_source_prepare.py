@@ -22,6 +22,7 @@ from speedtree_cli_runtime import (
 
 from cluster_normalization_sync import (
     ClusterSourceBuildRequiredError,
+    cluster_role_contract,
     resolve_normalization_recipe,
 )
 from sk_batch.assembly_runtime_contract import write_assembly_runtime_receipt
@@ -246,7 +247,6 @@ def _build_cluster_source(
         previous_pipeline_report = None
     job_command = [
         cfg["blender_exe"],
-        "--factory-startup",
         "-b",
         "--python",
         SK_BATCH_DIR / "jobs" / "assembly_headless_job.py",
@@ -323,6 +323,8 @@ def prepare_cluster_source_if_required(
     capture_resolution=1024,
     progress_callback=None,
     known_required=None,
+    part_bend_role="AUTO",
+    capture_plane_override=None,
 ):
     """Return immediately when current; otherwise rebuild and revalidate once.
 
@@ -333,6 +335,12 @@ def prepare_cluster_source_if_required(
     blend = Path(blend).expanduser().absolute()
     targets = [Path(path).expanduser().absolute() for path in target_spms]
     canonical_spm = blend.with_suffix(".spm")
+    bend_options = ({"part_bend_role": part_bend_role}
+                    if str(part_bend_role or "AUTO").strip().casefold() != "auto" else {})
+    if capture_plane_override is not None:
+        bend_options["capture_plane_override"] = cluster_role_contract(
+            blend, capture_plane_override=capture_plane_override,
+        )["capture_plane"]
     if known_required is not None:
         if not isinstance(known_required, ClusterSourceBuildRequiredError):
             raise TypeError(
@@ -360,6 +368,7 @@ def prepare_cluster_source_if_required(
                 canonical_spm=canonical_spm,
                 unit_probe_path=unit_probe_path,
                 capture_resolution=capture_resolution,
+                **bend_options,
             )
             return {
                 "status": "current",
@@ -402,6 +411,7 @@ def prepare_cluster_source_if_required(
             canonical_spm=canonical_spm,
             unit_probe_path=unit_probe_path,
             capture_resolution=capture_resolution,
+            **bend_options,
         )
     except Exception as exc:
         raise ClusterSourcePreparationError(

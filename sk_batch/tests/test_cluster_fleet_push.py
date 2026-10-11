@@ -812,6 +812,7 @@ class ClusterFleetPushTests(unittest.TestCase):
             )
 
             self.assertIn("assembly_headless_job.py", " ".join(command))
+            self.assertNotIn("--factory-startup", command)
             self.assertEqual(command[command.index("--spm") + 1], str(spm))
             self.assertEqual(
                 command[command.index("--material-contract") + 1],

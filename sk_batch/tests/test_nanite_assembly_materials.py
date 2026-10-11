@@ -222,6 +222,18 @@ class SkeletalMeshMaterialSectionAuditTests(unittest.TestCase):
                         slot_count=2,
                     )
 
+    def test_native_case_only_target_accepts_same_asset_but_other_asset_rejects(self):
+        payload = self.payload()
+        payload["skeletal_mesh"] = self.MESH.lower()
+        report = audit_unreal_skeletal_mesh_material_sections(
+            self.fake_unreal((True, json.dumps(payload), [])), self.MESH, slot_count=2)
+        self.assertEqual(report["status"], "ok")
+        for different in (self.MESH + "_unrelated", self.MESH.split(".", 1)[0] + ".DifferentObject"):
+            payload["skeletal_mesh"] = different
+            with self.assertRaisesRegex(NaniteAssemblyMaterialError, "target mismatch"):
+                audit_unreal_skeletal_mesh_material_sections(
+                    self.fake_unreal((True, json.dumps(payload), [])), self.MESH, slot_count=2)
+
     def test_schema_counts_and_section_shape_fail_closed(self):
         cases = []
 

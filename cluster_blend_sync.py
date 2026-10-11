@@ -46,6 +46,7 @@ from cluster_spm_pair_contract import (
 from cluster_normalization_sync import (
     ClusterNormalizationSyncError,
     ClusterSourceBuildRequiredError,
+    cluster_role_contract,
     inspect_assembly_material_assignment_freshness,
     inspect_normalization_source_identity,
     resolve_normalization_recipe,
@@ -911,8 +912,14 @@ def _resolve_normalization_recipe_with_source_rebuild(
     unit_probe_path,
     capture_resolution,
     progress_callback,
+    part_bend_role="AUTO",
+    capture_plane_override=None,
 ):
     """Resolve once, rebuilding a proven-stale source and reusing validation."""
+    bend_options = ({"part_bend_role": part_bend_role}
+                    if str(part_bend_role or "AUTO").strip().casefold() != "auto" else {})
+    if capture_plane_override is not None:
+        bend_options["capture_plane_override"] = capture_plane_override
     try:
         recipe = resolve_normalization_recipe(
             blend,
@@ -920,6 +927,7 @@ def _resolve_normalization_recipe_with_source_rebuild(
             canonical_spm=Path(blend).with_suffix(".spm"),
             unit_probe_path=unit_probe_path,
             capture_resolution=capture_resolution,
+            **bend_options,
         )
         return recipe, None
     except ClusterSourceBuildRequiredError as required:
@@ -936,6 +944,7 @@ def _resolve_normalization_recipe_with_source_rebuild(
             capture_resolution=capture_resolution,
             progress_callback=progress_callback,
             known_required=required,
+            **bend_options,
         )
         recipe = preparation.pop(
             "validated_normalization_recipe",
@@ -1777,6 +1786,8 @@ def run_cluster_relation_transaction(
     force_refresh=False,
     progress_callback=None,
     timeout=1800,
+    part_bend_role="AUTO",
+    capture_plane_override=None,
 ):
     """Apply ON through automatic Normalizer + Atlas, or reversible OFF.
 
@@ -1788,6 +1799,12 @@ def run_cluster_relation_transaction(
     alongside the existing Atlas target sidecar rollback.
     """
     blend = Path(blend).expanduser().absolute()
+    if capture_plane_override is not None:
+        capture_plane_override = cluster_role_contract(
+            blend, capture_plane_override=capture_plane_override,
+        )["capture_plane"]
+        if not enabled or not auto_normalize:
+            raise ClusterBlendSyncError("Capture plane override requires automatic ON normalization")
     targets = []
     seen = set()
     for raw_target in target_spms:
@@ -1812,7 +1829,7 @@ def run_cluster_relation_transaction(
         else list(registered_before)
     )
     preflight_state = None
-    if enabled and not force_refresh:
+    if enabled and not force_refresh and capture_plane_override is None:
         _emit_cluster_relation_progress(
             progress_callback,
             "verify_existing_relation",
@@ -1913,6 +1930,10 @@ def run_cluster_relation_transaction(
                 unit_probe_path=unit_probe_path,
                 capture_resolution=capture_resolution,
                 progress_callback=progress_callback,
+                **({"part_bend_role": part_bend_role}
+                   if str(part_bend_role or "AUTO").strip().casefold() != "auto" else {}),
+                **({"capture_plane_override": capture_plane_override}
+                   if capture_plane_override is not None else {}),
             )
         except (
             ClusterNormalizationSyncError,
@@ -1973,7 +1994,7 @@ def run_cluster_relation_transaction(
         snapshots = []
         normalization_snapshots = []
         artifact_recipe = None
-        command = [str(blender), "--factory-startup"]
+        command = [str(blender)]
         if enabled:
             command.extend(["--background", str(blend)])
         else:
@@ -2250,6 +2271,8 @@ def run_cluster_folder_relation_transaction(
     force_refresh=False,
     progress_callback=None,
     timeout=1800,
+    part_bend_role="AUTO",
+    capture_plane_override=None,
 ):
     """Normalize one Cluster blend relationship across every owner SK SPM."""
     blend = Path(blend).expanduser().absolute()
@@ -2306,6 +2329,10 @@ def run_cluster_folder_relation_transaction(
         force_refresh=force_refresh,
         progress_callback=progress_callback,
         timeout=timeout,
+        **({"part_bend_role": part_bend_role}
+           if str(part_bend_role or "AUTO").strip().casefold() != "auto" else {}),
+        **({"capture_plane_override": capture_plane_override}
+           if capture_plane_override is not None else {}),
     )
     result["folder_target_count"] = len(owner_targets)
     return result
