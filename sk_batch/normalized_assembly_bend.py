@@ -246,12 +246,13 @@ def manual_material_changelist(paths, mappings, records, *, p4=p4_records):
     return int(match.group(1))
 
 
-def checkout_material_scope(unreal, paths, changelist, *, p4=p4_records, allow_manual=False):
+def checkout_material_scope(unreal, paths, changelist, *, p4=p4_records, allow_manual=False, destination_root=DESTINATION):
     """Confirm mapping/open CL for every frozen destination before editing."""
     require((allow_manual and changelist is None) or isinstance(changelist, int) and not isinstance(changelist, bool) and changelist > 0,
             "normalized bend requires its explicit numbered UnrealProjects changelist")
-    require(paths and len({unreal_asset_identity(path) for path in paths}) == len(paths)
-            and all(path.casefold().startswith((DESTINATION + "/").casefold()) for path in paths),
+    require(destination_root in (DESTINATION, "/Game/Material/Tree/AssetTree/AssemblyNoTess")
+            and paths and len({unreal_asset_identity(path) for path in paths}) == len(paths)
+            and all(path.casefold().startswith((destination_root + "/").casefold()) for path in paths),
             "normalized material checkout scope is malformed")
     content = Path(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_content_dir())).resolve()
     files = [content.joinpath(*path[len("/Game/"):].split("/")).with_suffix(".uasset") for path in paths]
@@ -570,6 +571,71 @@ def destination_snapshot(unreal, helpers, path):
             "tags": tags, "signature": signature}
 
 
+def verified_legacy_notess_parent(unreal, helpers, asset, expected_parent):
+    """Retain the existing Willow NoTess parent without changing a shared MI.
+
+    Only an exact graph/root/WPO clone of the expected master qualifies.
+    Artist wind overrides are retained using the unchanged source stamp and
+    non-wind parameter proof; ordinary source/inheritance guards still apply.
+    """
+    parent = asset.get_editor_property("parent")
+    expected = unreal.EditorAssetLibrary.load_asset(expected_parent)
+    if not (isinstance(parent, unreal.Material) and isinstance(expected, unreal.Material)
+            and package_path(parent.get_path_name()) == package_path(expected_parent) + "_NoTess"):
+        return False
+    from assembly_part_notess import _normalize
+    identities = {}
+    for value in (parent, expected):
+        path = package_path(value.get_path_name())
+        identities[path] = "<master>"; identities[value.get_path_name()] = "<master>"
+    require(parent.get_editor_property("enable_tessellation") is False and
+            _normalize(material_root_snapshot(helpers, parent), identities) ==
+            _normalize(material_root_snapshot(helpers, expected), identities),
+            "legacy NoTess master differs from its original graph/WPO")
+    current = helpers["mi_signature"](asset)
+    previous = _normalize(deepcopy(current), {parent.get_path_name():expected.get_path_name(),
+        package_path(parent.get_path_name()):package_path(expected.get_path_name())})
+    previous["parent"] = expected.get_path_name()
+    stored = unreal.EditorAssetLibrary.get_metadata_tag(asset, SIGNATURE_TAG)
+    candidates = [helpers["digest"](current), helpers["digest"](previous)]
+    # The adopted trial changed exactly these two Tessellation override bits
+    # along with the parent. Reconstruct only those finite historical values;
+    # any tint/texture/static/bend/WPO change still invalidates the digest.
+    for override in ("False", "True"):
+        for enabled in ("False", "True"):
+            candidate = deepcopy(previous)
+            text = candidate.get("base_property_overrides", "")
+            text = re.sub(r"\bbOverride_bEnableTessellation=(?:True|False)",
+                          "bOverride_bEnableTessellation="+override, text)
+            text = re.sub(r"\bbEnableTessellation=(?:True|False)", "bEnableTessellation="+enabled, text)
+            candidate["base_property_overrides"] = text
+            candidates.append(helpers["digest"](candidate))
+    if stored not in candidates:
+        # Existing production leaf variants also have artist-tuned wind
+        # overrides. They are legitimate part values, not a reason to flatten
+        # the chain or restore TessON. Keep their exact values; all non-wind
+        # source fields and the independently stored source stamp must match.
+        library = unreal.EditorAssetLibrary
+        source = library.load_asset(library.get_metadata_tag(asset, SOURCE_TAG))
+        require(isinstance(source, unreal.MaterialInstanceConstant)
+                and library.get_metadata_tag(asset, OWNER_TAG) == OWNER
+                and library.get_metadata_tag(asset, SOURCE_SIGNATURE_TAG) == helpers["digest"](helpers["mi_signature"](source)),
+                "legacy NoTess MI changed more than its verified parent")
+        actual = protected_mi_signature(unreal, helpers, asset)
+        original = protected_mi_signature(unreal, helpers, source)
+        for signature in (actual, original):
+            signature["base_property_overrides"] = tuple(token for token in signature["base_property_overrides"]
+                if token.partition('=')[0].strip() not in {"bOverride_bEnableTessellation", "bEnableTessellation"})
+        require(actual == original and
+                unreal.MaterialEditingLibrary.get_material_instance_static_switch_parameter_value(asset, helpers["SWITCH"]),
+                "legacy NoTess MI changed more than its verified parent")
+        base = asset.get_editor_property("base_property_overrides")
+        require(base.get_editor_property("override_max_world_position_offset_displacement") is True
+                and math.isclose(base.get_editor_property("max_world_position_offset_displacement"), 300.0, abs_tol=1e-6),
+                "legacy NoTess MI has an unverified WPO bound")
+    return True
+
+
 def inspect_material_variants(unreal, source_paths, *, function=None, active_source_indices=None):
     """Freeze every source layer and reject all destinations before checkout."""
     if function is not None:
@@ -590,18 +656,19 @@ def inspect_material_variants(unreal, source_paths, *, function=None, active_sou
             continue
         asset = library.load_asset(path)
         require(isinstance(asset, unreal.MaterialInstanceConstant), "normalized bend destination is not a MIC: " + path)
+        parent_path = hierarchy["parents"][source_path]
+        expected_parent = variant_path(parent_path, master=parent_path in hierarchy["roots"])
+        legacy_notess = verified_legacy_notess_parent(unreal, helpers, asset, expected_parent)
         require(library.get_metadata_tag(asset, OWNER_TAG) == OWNER
                 and unreal_asset_identity(library.get_metadata_tag(asset, SOURCE_TAG)) == unreal_asset_identity(source_path)
                 and library.load_asset(library.get_metadata_tag(asset, SOURCE_TAG)) == source
-                and library.get_metadata_tag(asset, SIGNATURE_TAG) == helpers["digest"](helpers["mi_signature"](asset)),
+                and (legacy_notess or library.get_metadata_tag(asset, SIGNATURE_TAG) == helpers["digest"](helpers["mi_signature"](asset))),
                 "existing normalized bend MI is unowned or changed: " + path)
         require(library.get_metadata_tag(asset, STATE_TAG) == "complete", "existing normalized bend MI is incomplete: " + path)
         require(library.get_metadata_tag(asset, SOURCE_SIGNATURE_TAG) == helpers["digest"](source_snapshots[source_path]),
                 "source MI changed since generated bend variant: " + path)
-        parent_path = hierarchy["parents"][source_path]
-        expected_parent = variant_path(parent_path, master=parent_path in hierarchy["roots"])
         parent = asset.get_editor_property("parent")
-        require(parent is not None and unreal_asset_identity(parent.get_path_name()) == unreal_asset_identity(expected_parent)
+        require(legacy_notess or parent is not None and unreal_asset_identity(parent.get_path_name()) == unreal_asset_identity(expected_parent)
                 and library.load_asset(expected_parent) == parent,
                 "existing normalized bend MI flattened or changed its immediate parent: " + path)
         stored_chain = library.get_metadata_tag(asset, CHAIN_SIGNATURE_TAG)
@@ -687,6 +754,9 @@ def make_material_variants(unreal, source_paths, function, *, admission=None, in
                      else inherited_layer_signature(helpers, source))
         parent_path = inspection["parents"][source_path]
         parent = wrappers[parent_path] if parent_path in wrappers else clones[parent_path]
+        legacy_notess = verified_legacy_notess_parent(unreal, helpers, target, parent.get_path_name())
+        if legacy_notess:
+            parent = target.get_editor_property("parent")
         target.modify()
         edit.set_material_instance_parent(target, parent)
         require(target.get_editor_property("parent") == parent, "normalized bend immediate parent readback failed")
@@ -694,6 +764,8 @@ def make_material_variants(unreal, source_paths, function, *, admission=None, in
             edit.set_material_instance_static_switch_parameter_value(target, helpers["SWITCH"], True)
             require(set(parameters) <= {str(name) for name in edit.get_scalar_parameter_names(target)}, "upgraded function does not expose the normalized bend scalar contract")
             for name, value in parameters.items():
+                if legacy_notess and edit.is_material_instance_parameter_overridden(target, name):
+                    continue  # Preserve the adopted production wind tuning.
                 edit.set_material_instance_scalar_parameter_value(target, name, value)
                 require(math.isclose(edit.get_material_instance_scalar_parameter_value(target, name), value, rel_tol=0, abs_tol=1e-6)
                         and edit.is_material_instance_parameter_overridden(target, name), "normalized bend scalar readback failed: " + name)

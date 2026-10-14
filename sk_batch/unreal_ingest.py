@@ -3567,6 +3567,12 @@ def _finalize_prepared_cluster_assembly(item, prepared, *, durable_saves):
     if isinstance(normalization, dict) and (normalization.get("elm_part_bend_policy") or normalization.get("normalized_part_bend_policy")):
         normalization["dependency_save_status"] = dependencies["status"]
         normalization["saved_dependencies"] = dependencies["saved_dependencies"]
+    # This is a production default for every Assembly part, including NONE
+    # wind roles. Run after wind delivery and before the final root save.
+    part_notess = (_finalize_assembly_part_notess(item, assembly_path, durable_saves=durable_saves)
+                   if assembly_path else {"status": "not_requested_no_assembly", "save_writability": []})
+    result["assembly_part_notess"] = part_notess
+    save_writability.extend(part_notess["save_writability"])
     if assembly_path:
         save_writability.append(
             _ensure_declared_package_writable(item, assembly_path)
@@ -3597,6 +3603,63 @@ def _finalize_prepared_cluster_assembly(item, prepared, *, durable_saves):
     })
     _NORMALIZED_BEND_DEPENDENCY_SCOPES.pop(id(item), None)
     return finalized
+
+
+def _finalize_assembly_part_notess(item, assembly_path, *, durable_saves):
+    from assembly_part_notess import DESTINATION, apply_default_part_notess
+    from normalized_assembly_bend import (checkout_material_scope, require_active_dependency_phase,
+                                        p4_records, register_new_material_packages)
+    phase_id = str(item.get("workstation_phase_id") or "")
+    declared = {_normalize_durable_package(path).casefold() for path in item.get("checkout_asset_paths") or []}
+    if not assembly_path or _normalize_durable_package(assembly_path).casefold() not in declared:
+        raise RuntimeError("NoTess target is absent from the immutable Assembly checkout manifest")
+    if phase_id:
+        require_active_dependency_phase(phase_id, [assembly_path])
+    assembly = unreal.EditorAssetLibrary.load_asset(assembly_path)
+    if not isinstance(assembly, unreal.SkeletalMesh):
+        raise RuntimeError("NoTess final target is not a SkeletalMesh")
+
+    def admit(plan):
+        if phase_id:
+            require_active_dependency_phase(phase_id, [assembly_path] + plan["materials"])
+        receipt = checkout_material_scope(unreal, plan["materials"], item.get("normalized_bend_changelist"),
+            allow_manual=True, destination_root=DESTINATION)
+        receipt.update(phase_id=phase_id, assembly=assembly_path, prototypes=[])
+        return receipt
+
+    report = apply_default_part_notess(unreal, assembly, prepare_dependencies=admit)
+    admission = report.get("dependency_checkout")
+    writes = report["material_packages"]
+    if admission and phase_id:
+        require_active_dependency_phase(phase_id, [assembly_path] + writes)
+    # Exact native duplicates may have been automatically added to default.
+    # Only this execution's newly created destinations can be moved here.
+    if admission and report["created_packages"]:
+        from pathlib import Path
+        content = Path(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_content_dir()))
+        created_files = [content.joinpath(*p[len("/Game/"):].split("/")).with_suffix(".uasset") for p in report["created_packages"]]
+        for row in p4_records("fstat", *created_files):
+            if row.get("clientFile") and row.get("action"):
+                if row.get("action") != "add" or str(row.get("change")) not in ("default", str(admission["changelist"])):
+                    raise RuntimeError("NoTess duplicate is opened by another task")
+                if str(row.get("change")) == "default":
+                    changed = p4_records("reopen", "-c", admission["changelist"], row["clientFile"])
+                    if any(r.get("code") == "error" for r in changed):
+                        raise RuntimeError("NoTess new-package admission failed")
+    saver = unreal.CodexMaterialToolsLibrary.save_asset_package_without_thumbnail
+    saved = []
+    for path in writes:
+        asset = unreal.EditorAssetLibrary.load_asset(path)
+        if not saver(asset) or path.casefold() in _dirty_content_packages():
+            raise RuntimeError("NoTess dependency did not save cleanly: " + path)
+        _record_durable_save(durable_saves, path, owner="assembly_part_notess_dependency", role="material", save_mode="thumbnail_free")
+        saved.append(path)
+    registered = register_new_material_packages(admission) if admission else []
+    _validate_durable_save_ledger(durable_saves)
+    report.update(saved_dependencies=saved, new_materials_added=registered,
+                  save_writability=[{"asset": path, "dependency_checkout_verified": True} for path in writes],
+                  dependency_save_status="persisted_verified_clean" if writes else "verified_clean")
+    return report
 
 
 def _ensure_nanite_voxel_material_usage(base_material):

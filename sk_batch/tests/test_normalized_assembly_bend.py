@@ -434,6 +434,8 @@ class NormalizedDependencySaveTests(unittest.TestCase):
 
     def test_cluster_only_manifest_installs_dependency_callback_before_build(self):
         callbacks = []
+        notess = []
+        self.runner._finalize_assembly_part_notess = lambda _item, path, **_kwargs: notess.append(path) or {"status": "verified_part_notess", "save_writability": []}
         self.runner.validate_manifest_artifacts = lambda manifest: None
         self.runner._prepare_normalized_bend_dependency_scope = lambda item, plan: callbacks.append((item, plan))
         def build(_unreal, _manifest, _contract, **kwargs):
@@ -446,11 +448,14 @@ class NormalizedDependencySaveTests(unittest.TestCase):
         self.runner._save_large_assembly_without_thumbnail = lambda *args, **kwargs: ROOT
         self.item["cluster_assembly"] = {"manifest": {"parts": [{"role": "cluster"}]}, "ingest_plan": {"status": "ready"}}
         result = self.runner._finalize_prepared_cluster_assembly(self.item, {"status": "prepared_for_build"}, durable_saves=self.ledger)
+        self.assertEqual(notess, [ROOT])
         self.assertEqual(callbacks, [(self.item, {"assembly": ROOT})])
         self.assertEqual(result["status"], "ready_for_runtime")
 
     def test_independent_bend_metadata_controls_dependency_callback(self):
         from sk_batch.tests.test_explicit_bend_manifest import manifest_part, normalized_contract
+        notess = []
+        self.runner._finalize_assembly_part_notess = lambda _item, path, **_kwargs: notess.append(path) or {"status": "verified_part_notess", "save_writability": []}
         self.runner.validate_manifest_artifacts = lambda manifest: None
         self.runner._ensure_declared_package_writable = lambda item, path: {"asset": path}
         self.runner._material_postbuild_slot_audit = lambda path: {"status": "ok"}
@@ -466,6 +471,7 @@ class NormalizedDependencySaveTests(unittest.TestCase):
                 "asset_contract": {"parts": {part["prototype_id"]: "/Game/Trees/Cluster/SK_CustomFlow_01"}}}}
             self.runner._finalize_prepared_cluster_assembly(self.item,
                 {"status": "prepared_for_build"}, durable_saves=self.ledger)
+        self.assertEqual(notess, [ROOT, ROOT])  # Includes the explicit NONE wind role.
 
     def test_invalid_independent_metadata_fails_ingest_before_assembly_build(self):
         from sk_batch.tests.test_explicit_bend_manifest import manifest_part, normalized_contract

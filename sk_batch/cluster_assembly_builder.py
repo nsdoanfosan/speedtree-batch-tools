@@ -9196,11 +9196,18 @@ def plan_unreal_assembly_material_preservation(unreal, assembly_path, base, orde
             chains[path] = chain
         return path
 
-    def records(mesh):
+    def records(mesh, *, previous_assembly=False):
         result = []
-        for index, slot in enumerate(mesh.get_editor_property("materials") or []):
+        slots = list(mesh.get_editor_property("materials") or [])
+        original_slots = slots
+        if previous_assembly:
+            from assembly_part_notess import unwrap_previous_no_tess_slots
+            slots = unwrap_previous_no_tess_slots(unreal, slots)
+        for index, slot in enumerate(slots):
             row = _unreal_slot_record(slot, index)
-            row["actual_material"] = row["material"]
+            row["actual_material"] = _unreal_slot_record(original_slots[index], index)["material"]
+            if slot is not original_slots[index]:
+                row["part_notess_alias"] = True
             row["material"] = source_path(slot.get_editor_property("material_interface"))
             result.append(row)
         return result
@@ -9210,7 +9217,7 @@ def plan_unreal_assembly_material_preservation(unreal, assembly_path, base, orde
     if existing is not None:
         if not isinstance(existing, unreal.SkeletalMesh):
             raise ClusterAssemblyBuildError("Existing Assembly target is not a SkeletalMesh")
-        old_slots = records(existing)
+        old_slots = records(existing, previous_assembly=True)
         old_parts = [{"mesh": _material_preservation_path(row["mesh"]), "remap": row["remap"]}
             for row in parse_nanite_assembly_part_remaps(existing.get_editor_property("nanite_settings").export_text())]
         contract = str(library.get_metadata_tag(existing, "CodexNormalizedAssemblyBendContract") or "")
@@ -9221,8 +9228,16 @@ def plan_unreal_assembly_material_preservation(unreal, assembly_path, base, orde
                 old_source_count = len(sources)
             except (ValueError, KeyError, TypeError) as exc:
                 raise ClusterAssemblyBuildError("Existing normalized Assembly source contract is invalid") from exc
+            # Part-only NoTess aliases are outside the normalized wind table.
+            # Its current compact table uses only active source indices.
+            original_count = sum(not row.get("part_notess_alias") for row in old_slots)
+            active = prior.get("active_source_indices")
+            if active is not None and (not isinstance(active, list) or any(type(i) is not int or not 0 <= i < old_source_count for i in active)
+                    or active != sorted(set(active))):
+                raise ClusterAssemblyBuildError("Existing normalized active material contract is invalid")
+            valid_counts = (old_source_count, old_source_count + len(active)) if active is not None else (old_source_count, 2 * old_source_count)
             if (prior.get("schema_version") != 2 or unreal_asset_identity(prior.get("assembly")) != unreal_asset_identity(assembly_path)
-                    or len(old_slots) not in (old_source_count, 2 * old_source_count)
+                    or original_count not in valid_counts
                     or [unreal_asset_identity(row["material"]) for row in old_slots[:old_source_count]]
                     != [unreal_asset_identity(path) for path in sources]):
                 raise ClusterAssemblyBuildError("Existing normalized Assembly source table differs from its contract")

@@ -2711,6 +2711,10 @@ class DurableSaveOwnershipTests(unittest.TestCase):
             runner._material_postbuild_slot_audit = (
                 lambda path: events.append(("audit", path)) or {"mesh": path}
             )
+            runner._finalize_assembly_part_notess = (
+                lambda _item, path, **_kwargs: events.append(("part_notess", path))
+                or {"status": "verified_part_notess", "save_writability": []}
+            )
 
             result = runner._ingest_cluster_assembly(
                 object(),
@@ -2758,6 +2762,7 @@ class DurableSaveOwnershipTests(unittest.TestCase):
                     ("prebuild", mesh.path),
                     ("prebuild", prototype),
                     "build",
+                    ("part_notess", assembly_path),
                     ("audit", assembly_path),
                 ],
             )
