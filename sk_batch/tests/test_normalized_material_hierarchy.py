@@ -630,5 +630,30 @@ class MaterialHierarchyTests(unittest.TestCase):
         self.assert_prewrite_rejection(lambda: bend.inspect_material_variants(self.h.unreal, [self.tint.path]))
 
 
+class LegacyNoTessWindTuningTests(unittest.TestCase):
+    setUp = MaterialHierarchyTests.setUp
+    make = MaterialHierarchyTests.make
+    def test_adopted_off_parent_and_artist_wind_values_survive_reimport(self):
+        source = self.h.add(MIC("/Game/Trees/MI_LegacyWillow", self.root))
+        self.make([source.path]);self.h.dirty.clear()
+        target = self.h.load(bend.variant_path(source.path))
+        expected = self.h.load(bend.variant_path(self.root.path, master=True))
+        off = self.h.duplicate(expected.get_path_name(), expected.path + "_NoTess")
+        off.get_editor_property = lambda key: False if key == "enable_tessellation" else getattr(off, key)
+        target.parent = off
+        self.h.set_scalar(target, "AssemblyBranchFlexibility", 0.5)
+        self.h.set_scalar(target, "AssemblyBranchOscillationCm", 8.0)
+        self.h.dirty.clear()
+        self.assertTrue(bend.verified_legacy_notess_parent(self.h.unreal,self.h.helpers,target,expected.path))
+        self.make([source.path])
+        self.assertIs(target.parent,off)
+        self.assertEqual(self.h.effective(target,"scalars","AssemblyBranchFlexibility"),0.5)
+        self.assertEqual(self.h.effective(target,"scalars","AssemblyBranchOscillationCm"),8.0)
+        self.h.dirty.clear()
+        target.vectors["UNRELATED_TINT"] = [1.0,0.0,0.0,1.0]
+        with self.assertRaisesRegex(bend.NormalizedAssemblyBendError,"changed more than"):
+            bend.verified_legacy_notess_parent(self.h.unreal,self.h.helpers,target,expected.path)
+
+
 if __name__ == "__main__":
     unittest.main()

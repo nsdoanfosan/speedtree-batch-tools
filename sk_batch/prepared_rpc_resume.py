@@ -271,7 +271,7 @@ def runner_load_lines(runner_path):
     """Use the same shared ingest entrypoint as the normal Batch RPC worker."""
     return [
         "import importlib.util, sys",
-        *[f"sys.modules.pop({name!r}, None)" for name in ("cluster_assembly_builder", "normalized_assembly_bend", "assembly_part_bend_policy", "nanite_assembly_materials")],
+        *[f"sys.modules.pop({name!r}, None)" for name in ("cluster_assembly_builder", "normalized_assembly_bend", "assembly_part_bend_policy", "nanite_assembly_materials", "assembly_part_notess")],
         f"_runner_path = {str(runner_path)!r}",
         "_spec = importlib.util.spec_from_file_location('sk_batch_unreal_ingest_rpc', _runner_path)",
         "if _spec is None or _spec.loader is None:",
