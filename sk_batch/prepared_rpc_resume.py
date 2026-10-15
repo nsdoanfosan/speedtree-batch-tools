@@ -271,7 +271,7 @@ def runner_load_lines(runner_path):
     """Use the same shared ingest entrypoint as the normal Batch RPC worker."""
     return [
         "import importlib.util, sys",
-        *[f"sys.modules.pop({name!r}, None)" for name in ("cluster_assembly_builder", "normalized_assembly_bend", "assembly_part_bend_policy", "nanite_assembly_materials", "assembly_part_notess")],
+        *[f"sys.modules.pop({name!r}, None)" for name in ("cluster_assembly_builder", "normalized_assembly_bend", "assembly_part_bend_policy", "nanite_assembly_materials", "assembly_part_notess", "preserved_assembly_carc")],
         f"_runner_path = {str(runner_path)!r}",
         "_spec = importlib.util.spec_from_file_location('sk_batch_unreal_ingest_rpc', _runner_path)",
         "if _spec is None or _spec.loader is None:",
@@ -359,6 +359,25 @@ def _validate_result_saves(item, item_result):
                         or not all(exact_hash_pair(*pair) for pair in pairs)):
                     raise RuntimeError("Prepared RPC unchanged prototype lacks complete native preservation proof")
                 unchanged_references.append(row["asset"])
+        elif normalization.get("preserved_assembly_wind_policy"):
+            from .preserved_assembly_carc import OWNER, validate_alias
+            policy = normalization["preserved_assembly_wind_policy"]
+            before, after = policy.get("prototype_streams_before"), policy.get("prototype_streams_after")
+            expected = {str(p).split(".", 1)[0].casefold() for p in (contract.get("parts") or {}).values()}
+            if (policy.get("owner") != OWNER or policy.get("verified") is not True or not policy.get("aliases")
+                    or not isinstance(before, dict) or before != after
+                    or {str(p).split(".", 1)[0].casefold() for p in before} != expected):
+                raise RuntimeError("Prepared RPC authored C-arc preservation lacks exact unchanged references")
+            for path, proof in policy["aliases"].items():
+                validate_alias(path, proof)
+            for path, proof in before.items():
+                file = Path(str(proof.get("package_file") or ""))
+                if (proof.get("live_clean") is not True or not file.is_file()
+                        or file.stat().st_size != proof.get("package_size")
+                        or file.stat().st_mtime_ns != proof.get("package_mtime_ns")
+                        or hashlib.md5(file.read_bytes()).hexdigest() != proof.get("package_md5")):
+                    raise RuntimeError("Prepared RPC authored C-arc prototype bytes changed: " + path)
+                unchanged_references.append(path)
         else:
             required.update(str(path).split(".", 1)[0] for path in (contract.get("parts") or {}).values())
     missing = {path.casefold() for path in required if path} - packages

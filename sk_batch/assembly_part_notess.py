@@ -83,7 +83,7 @@ def _assert_equivalent_runtime(source, target):
         require(source.get(field) == target.get(field), "NoTess delivery changed " + field)
 
 
-def inspect_materials(unreal, source_paths, *, read_only=False):
+def inspect_materials(unreal, source_paths, *, read_only=False, preserve_verified_legacy=False):
     """Read-only complete hierarchy and exact existing-derivative collision guard."""
     from normalized_assembly_bend import material_helpers
     helpers, library = material_helpers(unreal), unreal.EditorAssetLibrary
@@ -141,7 +141,7 @@ def inspect_materials(unreal, source_paths, *, read_only=False):
             require(library.get_metadata_tag(asset, SOURCE_TAG) == source and
                     library.get_metadata_tag(asset, SIGNATURE_TAG) == digest(signatures[source]),
                     "NoTess ownership/source signature changed")
-        else:
+        elif not preserve_verified_legacy:
             # Legacy 51-root derivatives are adopted only after exact graph,
             # overrides, chain, runtime and deterministic-path verification.
             writes.append(target)
@@ -223,7 +223,7 @@ def set_alias_slot_names(slot, name):
             str(slot.get_editor_property("imported_material_slot_name"))==name,"NoTess alias slot name readback differs")
 
 
-def apply_default_part_notess(unreal, assembly, *, prepare_dependencies):
+def apply_default_part_notess(unreal, assembly, *, prepare_dependencies, preserve_verified_legacy=False):
     """Pipeline-owned dirty root allowed; exact native preflight, no source writes."""
     from nanite_assembly_materials import _json_result, parse_nanite_assembly_part_remaps, rewrite_nanite_assembly_part_remaps
     from normalized_assembly_bend import check_dependency_admission
@@ -241,7 +241,7 @@ def apply_default_part_notess(unreal, assembly, *, prepare_dependencies):
         slot_counts[row["mesh"]] = len(mesh.get_editor_property("materials"))
         used.update(row["expected_remap"] or range(slot_counts[row["mesh"]]))
     source_paths = list(dict.fromkeys(baseline["current_materials"][i] for i in sorted(used)))
-    inspection = inspect_materials(unreal, source_paths)
+    inspection = inspect_materials(unreal, source_paths, preserve_verified_legacy=preserve_verified_legacy)
     admission = None
     if inspection["write_packages"]:
         require(callable(prepare_dependencies), "NoTess dependencies require exact caller ownership")

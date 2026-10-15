@@ -170,6 +170,23 @@ class PartNoTessTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'differs from its source'):
                 nt.inspect_materials(h.u,[tint.path])
             self.assertEqual(len(h.writes),3)
+    def test_preserved_legacy_derivatives_remain_readonly_but_changed_graph_rejects(self):
+        h,root,common,tint,proto,assembly=self.fixture()
+        with patch.object(bend,'material_helpers',return_value=h.helpers):
+            first=nt.apply_default_part_notess(h.u,assembly,prepare_dependencies=h.admit)
+            for p in first['material_packages']:h.load(p).tags={}
+            existing_before={p:deepcopy(h.load(p).tags) for p in first['material_packages']}
+            inspected=nt.inspect_materials(h.u,[tint.path],preserve_verified_legacy=True)
+            self.assertEqual(inspected['write_packages'],[])
+            second=nt.apply_default_part_notess(h.u,assembly,prepare_dependencies=lambda p:self.fail('read-only references need no checkout'),
+                                               preserve_verified_legacy=True)
+            self.assertEqual(second['material_packages'],[])
+            self.assertEqual(second['created_packages'],[])
+            self.assertEqual(existing_before,{p:h.load(p).tags for p in existing_before})
+            h.load(nt.destination(tint)).params['texture']='USER_CHANGED'
+            with self.assertRaisesRegex(RuntimeError,'differs from its source'):
+                nt.inspect_materials(h.u,[tint.path],preserve_verified_legacy=True)
+
     def test_forged_alias_cannot_replace_base_or_an_unrelated_material(self):
         h,root,common,tint,proto,assembly=self.fixture()
         fake=h.add(MIC(nt.destination(tint),root));fake.values['parent']=root

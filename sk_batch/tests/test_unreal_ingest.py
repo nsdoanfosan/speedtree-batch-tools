@@ -2681,6 +2681,9 @@ class DurableSaveOwnershipTests(unittest.TestCase):
             )
             assembly = environment.add_asset(assembly_path)
             environment.install_thumbnail_free_saver()
+            runner.unreal.EditorAssetLibrary.save_asset(assembly_path)
+            runner._record_durable_save(ledger, assembly_path, owner="terminal_directory", role="auxiliary",
+                                        save_mode="directory_dirty_only")
             runner.validate_manifest_artifacts = lambda _manifest: None
             runner.validate_file_fingerprint = lambda *_args: None
             runner._without_generated_physics_assets = lambda _module: nullcontext(True)
@@ -2719,12 +2722,14 @@ class DurableSaveOwnershipTests(unittest.TestCase):
             result = runner._ingest_cluster_assembly(
                 object(),
                 {
+                    "checkout_asset_paths": [assembly_path],
                     "cluster_assembly": {
                         "manifest": {"status": "ready"},
                         "ingest_plan": {
                             "status": "ready",
                             "asset_contract": {
                                 "full_skeletal_mesh": mesh.path,
+                                "assembly": assembly_path,
                             },
                             "assets": [
                                 {
