@@ -78,6 +78,37 @@ class CompletedRpcTests(unittest.TestCase):
                   "cluster_assembly": {"status": "ok", "runtime": runtime, "build": {"material_normalization": normalization}}}
         return result
 
+    def unchanged_fixture(self):
+        _,_,item,_=self.prepared(final=True)
+        result=self.normalized(item)
+        checks=result['cluster_assembly']['build']['material_normalization']['native_material_remap']['prototype_material_checks']
+        for row in checks:
+            row.update(changed=False,entire_mesh_description_preserved=True,slot_names_and_other_authored_fields_preserved=True)
+            for field in ['entire_mesh_description_sha1_before','entire_mesh_description_sha1_after','protected_mesh_description_sha1_before','protected_mesh_description_sha1_after','materials_authored_sha1_before','materials_authored_sha1_expected','materials_authored_sha1_actual']:
+                row[field]='a'*40
+        records=result['durable_saves']['records']
+        records[:]=[row for row in records if row['role']!='prototype']
+        for index,row in enumerate(records):row['sequence']=index
+        return item,result,checks
+
+    def test_reused_clean_prototypes_need_complete_native_proof_instead_of_fresh_saves(self):
+        item,result,checks=self.unchanged_fixture()
+        proof=resume._validate_result_saves(item,result)
+        self.assertEqual(set(proof['unchanged_reference_packages']),{r['asset'] for r in checks})
+
+    def test_changed_prototype_still_needs_its_actual_save(self):
+        item,result,checks=self.unchanged_fixture()
+        checks[0]['changed']=True
+        with self.assertRaisesRegex(RuntimeError,'misses exact packages'):
+            resume._validate_result_saves(item,result)
+
+    def test_missing_or_different_native_hash_cannot_exempt_a_save(self):
+        item,result,checks=self.unchanged_fixture()
+        for value in ['', 'b'*40, None]:
+            checks[0]['entire_mesh_description_sha1_after']=value
+            with self.assertRaisesRegex(RuntimeError,'complete native preservation proof'):
+                resume._validate_result_saves(item,result)
+
     def fixture(self):
         outer = self.root
         old = dict(self.metadata, target=str(outer / "main" / "source.blend"))

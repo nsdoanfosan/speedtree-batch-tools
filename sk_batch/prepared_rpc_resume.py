@@ -289,6 +289,7 @@ def _validate_result_saves(item, item_result):
     if ledger.get("schema_version") != 1 or not records:
         raise RuntimeError("Prepared RPC lacks its native durable save ledger")
     packages = set()
+    unchanged_references = []
     for index, record in enumerate(records):
         package = str(record.get("package") or "").split(".", 1)[0]
         file = Path(str(record.get("package_file") or ""))
@@ -338,13 +339,33 @@ def _validate_result_saves(item, item_result):
                     != {unreal_asset_identity(path) for path in dependencies["prototypes"]}
                     or len(checked) != len(dependencies["prototypes"])):
                 raise RuntimeError("Prepared RPC native prototype mutation scope differs from normalized ownership")
-            required.update(dependencies["allowed"])
+            required.update(dependencies["materials"])
+            for row in checked:
+                if type(row.get("changed")) is not bool:
+                    raise RuntimeError("Prepared RPC prototype check lacks an exact mutation flag")
+                if row["changed"]:
+                    required.add(str(row["asset"]).split(".", 1)[0])
+                    continue
+                pairs = [("entire_mesh_description_sha1_before", "entire_mesh_description_sha1_after"),
+                         ("protected_mesh_description_sha1_before", "protected_mesh_description_sha1_after"),
+                         ("materials_authored_sha1_before", "materials_authored_sha1_expected"),
+                         ("materials_authored_sha1_expected", "materials_authored_sha1_actual")]
+                def exact_hash_pair(first, second):
+                    values = [row.get(first), row.get(second)]
+                    return all(isinstance(value, str) and len(value) == 40 and
+                               all(c in "0123456789abcdefABCDEF" for c in value) for value in values) and values[0].casefold() == values[1].casefold()
+                if (row.get("entire_mesh_description_preserved") is not True
+                        or row.get("slot_names_and_other_authored_fields_preserved") is not True
+                        or not all(exact_hash_pair(*pair) for pair in pairs)):
+                    raise RuntimeError("Prepared RPC unchanged prototype lacks complete native preservation proof")
+                unchanged_references.append(row["asset"])
         else:
             required.update(str(path).split(".", 1)[0] for path in (contract.get("parts") or {}).values())
     missing = {path.casefold() for path in required if path} - packages
     if missing:
         raise RuntimeError("Prepared RPC final save validation misses exact packages: " + ", ".join(sorted(missing)))
-    return {"required_packages": sorted(path for path in required if path), "durable_package_count": len(records)}
+    return {"required_packages": sorted(path for path in required if path), "durable_package_count": len(records),
+            "unchanged_reference_packages": unchanged_references}
 
 
 def _completed_validator_ast_sha256(source):

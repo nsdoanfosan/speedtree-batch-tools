@@ -3624,7 +3624,8 @@ def _finalize_assembly_part_notess(item, assembly_path, *, durable_saves):
             require_active_dependency_phase(phase_id, [assembly_path] + plan["materials"])
         receipt = checkout_material_scope(unreal, plan["materials"], item.get("normalized_bend_changelist"),
             allow_manual=True, destination_root=DESTINATION)
-        receipt.update(phase_id=phase_id, assembly=assembly_path, prototypes=[])
+        receipt.update(phase_id=phase_id, assembly=assembly_path, prototypes=[],
+                       workstation_handoff=deepcopy(item.get("workstation_handoff")))
         return receipt
 
     report = apply_default_part_notess(unreal, assembly, prepare_dependencies=admit)

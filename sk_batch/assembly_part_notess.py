@@ -212,6 +212,17 @@ def authored_slot_export(text):
     return result
 
 
+def set_alias_slot_names(slot, name):
+    """Import the copied FName field; UE exposes it as Python read-only."""
+    slot.set_editor_property("material_slot_name", name)
+    text,count=re.subn(r'(?<![A-Za-z0-9_])ImportedMaterialSlotName=(?:"(?:\\.|[^"\\])*"|[^,)]+)',
+        lambda match:'ImportedMaterialSlotName='+json.dumps(name,ensure_ascii=False),slot.export_text())
+    require(count==1,"NoTess alias lacks one exact imported slot name field")
+    slot.import_text(text)
+    require(str(slot.get_editor_property("material_slot_name"))==name and
+            str(slot.get_editor_property("imported_material_slot_name"))==name,"NoTess alias slot name readback differs")
+
+
 def apply_default_part_notess(unreal, assembly, *, prepare_dependencies):
     """Pipeline-owned dirty root allowed; exact native preflight, no source writes."""
     from nanite_assembly_materials import _json_result, parse_nanite_assembly_part_remaps, rewrite_nanite_assembly_part_remaps
@@ -297,7 +308,7 @@ def apply_default_part_notess(unreal, assembly, *, prepare_dependencies):
         while name.casefold() in names:
             suffix += 1; name = stem + "_" + str(suffix)
         names.add(name.casefold())
-        slot.set_editor_property("material_slot_name", name); slot.set_editor_property("imported_material_slot_name", name)
+        set_alias_slot_names(slot, name)
         updated.append(slot)
     remaps = [row["target_remap"] for row in plan["parts"]]
     candidate = type(settings)(); candidate.import_text(rewrite_nanite_assembly_part_remaps(before_text, remaps))

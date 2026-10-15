@@ -1,6 +1,7 @@
 """Part-only defaults, real chain copying, repeat ingest, and owned-save order."""
 from copy import copy, deepcopy
 import json
+import re
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -50,9 +51,15 @@ class Slot(Value):
     registry = {}
     def __init__(self, name=None, mat=None):
         super().__init__(material_slot_name=name, imported_material_slot_name=name, material_interface=mat, uv_channel_data=[1.5, 2.5])
-    def export_text(self): return json.dumps({**self.values, 'material_interface': self.values['material_interface'].path})
+    def set_editor_property(self,key,value):
+        if key=='imported_material_slot_name':
+            raise RuntimeError('ImportedMaterialSlotName is read-only')
+        super().set_editor_property(key,value)
+    def export_text(self):
+        return '(MaterialSlotName='+json.dumps(self.values['material_slot_name'])+',ImportedMaterialSlotName='+json.dumps(self.values['imported_material_slot_name'])+',MaterialInterface='+json.dumps(self.values['material_interface'].path)+',UVChannelData=(bOverrideDensities=True,bInitialized=True,LocalUVDensities=('+','.join(map(str,self.values['uv_channel_data']))+')))'
     def import_text(self, text):
-        self.values = json.loads(text); self.values['material_interface'] = self.registry[self.values['material_interface']]
+        fields={key:json.loads(re.search(key+r'=("(?:\\.|[^"\\])*")',text).group(1)) for key in ['MaterialSlotName','ImportedMaterialSlotName','MaterialInterface']}
+        self.values={'material_slot_name':fields['MaterialSlotName'],'imported_material_slot_name':fields['ImportedMaterialSlotName'],'material_interface':self.registry[fields['MaterialInterface']],'uv_channel_data':list(map(float,re.search(r'LocalUVDensities=\(([^)]*)\)',text).group(1).split(',')))}
 
 
 class Settings:

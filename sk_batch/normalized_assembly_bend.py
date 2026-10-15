@@ -46,6 +46,9 @@ EXTRA_SCALARS = {
     "AssemblyWindRestThreshold": 0.0, "AssemblyWindResponseScale": 1.0,
 }
 WPO_FIELDS = {"bOverride_MaxWorldPositionOffsetDisplacement", "MaxWorldPositionOffsetDisplacement"}
+AUTHORED_WIND_SCALARS = {"AssemblyLeafArcRadiusCm", "AssemblyLeafArcMaxAngleDegrees",
+    "AssemblyLeafArcMotionAmount", "AssemblyLeafArcMotionPeriodSeconds", "AssemblyLeafArcAspectBlend", "AssemblyLeafTierBlend"}
+AUTHORED_WIND_VECTORS = {"AssemblyLeafTierCalmRange", "AssemblyLeafTierStrongRange", "AssemblyLeafTierVeryStrongRange"}
 
 
 class NormalizedAssemblyBendError(RuntimeError):
@@ -465,6 +468,38 @@ def require_native_proof(report, parts, *, validate_only=False):
     return report
 
 
+def align_verified_function_call_names(source_graph, source_roots, target_graph):
+    """Resolve unique function identity after editor-generated node renumbering.
+
+    Names are mapped only for MaterialFunctionCall expressions with the exact
+    same function asset. The normal full node/input/root proof still checks
+    every value and connection after this read-only correspondence step.
+    """
+    import copy
+    mapping = {}
+    targets = list(target_graph.get("expressions") or [])
+    for source in source_graph.get("expressions") or []:
+        function = source.get("function")
+        if not function:
+            continue
+        direct = [row for row in targets if row.get("name") == source["name"]
+                  and row.get("class") == source.get("class") and row.get("function") == function]
+        candidates = direct or [row for row in targets
+                      if row.get("class") == source.get("class") and row.get("function") == function]
+        require(len(candidates) == 1, "source function call identity is missing or ambiguous")
+        mapping[source["name"]] = candidates[0]["name"]
+    require(len(set(mapping.values())) == len(mapping), "source function call name mapping is ambiguous")
+    def mapped(value):
+        if isinstance(value, dict):
+            return {key: mapped(child) for key, child in value.items()}
+        if isinstance(value, list):
+            return [mapped(child) for child in value]
+        if isinstance(value, str):
+            return mapping.get(value, value)
+        return value
+    return mapped(copy.deepcopy(source_graph)), mapped(copy.deepcopy(source_roots))
+
+
 def material_helpers(unreal):
     """Load the audited graph/copy helpers, excluding every top-level action."""
     script = Path(unreal.Paths.project_dir()) / "Scripts/NaniteAssemblyPartBend/materials.py"
@@ -475,6 +510,11 @@ def material_helpers(unreal):
     scope = {"__name__": "normalized_bend_material_helpers"}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(script), "exec"), scope)
     scope["REPORT"] = {"resumed_after_inspection": [], "setter_return_diagnostics": {}}
+    validate = scope["validate_master_contract"]
+    def validate_current_source(target, function, source_graph, source_roots):
+        aligned_graph, aligned_roots = align_verified_function_call_names(source_graph, source_roots, scope["graph"](target))
+        return validate(target, function, aligned_graph, aligned_roots)
+    scope["validate_master_contract"] = validate_current_source
     return scope
 
 
@@ -508,13 +548,19 @@ def protected_base_fields(text):
     return tuple(token for token, field in zip(result, fields) if field not in WPO_FIELDS)
 
 
-def protected_mi_signature(unreal, helpers, asset):
+def protected_mi_signature(unreal, helpers, asset, *, verified_notess=False):
     signature = helpers["mi_signature"](asset)
     signature.pop("parent", None)
     signature["base_property_overrides"] = protected_base_fields(signature["base_property_overrides"])
-    ignored = set(DEFAULT_SCALARS) | set(EXTRA_SCALARS)
+    if verified_notess:
+        signature["base_property_overrides"] = tuple(token for token in signature["base_property_overrides"]
+            if token.partition("=")[0].strip() not in {"bOverride_bEnableTessellation", "bEnableTessellation"})
+    ignored = set(DEFAULT_SCALARS) | set(EXTRA_SCALARS) | AUTHORED_WIND_SCALARS
     signature["scalar_parameter_values"] = [helpers["stable_value"](row) for row in asset.get_editor_property("scalar_parameter_values")
         if not (str(row.get_editor_property("parameter_info").get_editor_property("name")) in ignored
+                and row.get_editor_property("parameter_info").get_editor_property("association") == unreal.MaterialParameterAssociation.GLOBAL_PARAMETER)]
+    signature["vector_parameter_values"] = [helpers["stable_value"](row) for row in asset.get_editor_property("vector_parameter_values")
+        if not (str(row.get_editor_property("parameter_info").get_editor_property("name")) in AUTHORED_WIND_VECTORS
                 and row.get_editor_property("parameter_info").get_editor_property("association") == unreal.MaterialParameterAssociation.GLOBAL_PARAMETER)]
     signature["effective_static_switches"].pop(helpers["SWITCH"], None)
     signature["layers"].pop("material_interface", None)
@@ -580,8 +626,13 @@ def verified_legacy_notess_parent(unreal, helpers, asset, expected_parent):
     """
     parent = asset.get_editor_property("parent")
     expected = unreal.EditorAssetLibrary.load_asset(expected_parent)
-    if not (isinstance(parent, unreal.Material) and isinstance(expected, unreal.Material)
-            and package_path(parent.get_path_name()) == package_path(expected_parent) + "_NoTess"):
+    if not (isinstance(parent, unreal.Material) and isinstance(expected, unreal.Material)):
+        return False
+    alias = package_path(parent.get_path_name()) == package_path(expected_parent) + "_NoTess"
+    same_parent = parent == expected
+    if not (alias or same_parent):
+        return False
+    if same_parent and parent.get_editor_property("enable_tessellation") is not False:
         return False
     from assembly_part_notess import _normalize
     identities = {}
@@ -677,7 +728,7 @@ def inspect_material_variants(unreal, source_paths, *, function=None, active_sou
         require(stored_chain == chain_signatures[source_path] or not stored_chain and parent_path in hierarchy["roots"],
                 "source material inheritance changed since generated bend variant: " + path)
         if source_path in plan["active_source_materials"]:
-            require(protected_mi_signature(unreal, helpers, asset) == protected_mi_signature(unreal, helpers, source),
+            require(protected_mi_signature(unreal, helpers, asset, verified_notess=legacy_notess) == protected_mi_signature(unreal, helpers, source, verified_notess=legacy_notess),
                     "existing bend clone changed protected source overrides: " + path)
         else:
             require(inherited_layer_signature(helpers, asset) == inherited_layer_signature(helpers, source),
@@ -757,6 +808,8 @@ def make_material_variants(unreal, source_paths, function, *, admission=None, in
         legacy_notess = verified_legacy_notess_parent(unreal, helpers, target, parent.get_path_name())
         if legacy_notess:
             parent = target.get_editor_property("parent")
+            if leaf:
+                preserved = protected_mi_signature(unreal, helpers, source, verified_notess=True)
         target.modify()
         edit.set_material_instance_parent(target, parent)
         require(target.get_editor_property("parent") == parent, "normalized bend immediate parent readback failed")
@@ -777,7 +830,7 @@ def make_material_variants(unreal, source_paths, function, *, admission=None, in
         if leaf:
             require(edit.get_material_instance_static_switch_parameter_value(target, helpers["SWITCH"])
                     and edit.is_material_instance_parameter_overridden(target, helpers["SWITCH"]), "normalized bend static switch readback failed")
-        actual = (protected_mi_signature(unreal, helpers, target) if leaf
+        actual = (protected_mi_signature(unreal, helpers, target, verified_notess=legacy_notess) if leaf
                   else inherited_layer_signature(helpers, target))
         require(actual == preserved, "normalized bend MIC changed protected source overrides/inheritance: " + source_path)
         require(helpers["mi_signature"](source) == inspection["source_snapshots"][source_path], "normalized bend changed original source MIC")
@@ -796,8 +849,11 @@ def make_material_variants(unreal, source_paths, function, *, admission=None, in
             source_path = library.get_metadata_tag(asset, SOURCE_TAG)
             source = inspection["instances"][source_path]
             leaf = source_path in plan["active_source_materials"]
-            actual = (protected_mi_signature(unreal, helpers, asset) if leaf else inherited_layer_signature(helpers, asset))
-            preserved = (protected_mi_signature(unreal, helpers, source) if leaf else inherited_layer_signature(helpers, source))
+            parent_path = inspection["parents"][source_path]
+            expected_parent = variant_path(parent_path, master=parent_path in inspection["roots"])
+            legacy_notess = verified_legacy_notess_parent(unreal, helpers, asset, expected_parent)
+            actual = (protected_mi_signature(unreal, helpers, asset, verified_notess=legacy_notess) if leaf else inherited_layer_signature(helpers, asset))
+            preserved = (protected_mi_signature(unreal, helpers, source, verified_notess=legacy_notess) if leaf else inherited_layer_signature(helpers, source))
             require(actual == preserved and library.get_metadata_tag(asset, SIGNATURE_TAG) == helpers["digest"](helpers["mi_signature"](asset)),
                     "compiled bend clone changed authored inheritance/overrides: " + path)
         library.set_metadata_tag(asset, STATE_TAG, "complete")
