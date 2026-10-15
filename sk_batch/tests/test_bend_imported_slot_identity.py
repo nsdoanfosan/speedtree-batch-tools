@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import cluster_assembly_builder as builder
-from test_assembly_material_preservation import AssemblyMaterialPreservationTests, MIC, Slot, Mesh
+from sk_batch.tests.test_assembly_material_preservation import AssemblyMaterialPreservationTests, MIC, Slot, Mesh
 
 
 class BendImportedSlotIdentityTests(unittest.TestCase):
