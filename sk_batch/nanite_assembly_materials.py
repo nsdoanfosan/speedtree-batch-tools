@@ -647,7 +647,14 @@ def normalize_unreal_nanite_assembly_materials(
             raise NaniteAssemblyMaterialError("preserved Assembly prototype/remap changed")
     assembly_path = assembly.get_path_name()
     independent_bend_intent = False
-    if manifest is not None:
+    preserved_wind = (material_preservation or {}).get("preserved_wind_policy")
+    preserved_streams = None
+    if preserved_wind:
+        from preserved_assembly_carc import verify_aliases, prototype_streams
+        verify_aliases(unreal, preserved_wind["aliases"])
+        preserved_streams = prototype_streams(unreal, preserved_wind["prototypes"])
+        independent_bend_intent = True
+    if manifest is not None and not preserved_wind:
         try:
             from .normalized_assembly_bend import normalize_assembly, NormalizedAssemblyBendError
         except ImportError:
@@ -750,6 +757,10 @@ def normalize_unreal_nanite_assembly_materials(
     )
     remaps_changed = [row["remap"] for row in parsed_parts] != desired_remaps
     would_change = bool(plan["appended_slots"] or remaps_changed)
+    if preserved_wind:
+        verify_aliases(unreal, preserved_wind["aliases"])
+        if prototype_streams(unreal, preserved_wind["prototypes"]) != preserved_streams:
+            raise NaniteAssemblyMaterialError("Authored C-arc prototype streams changed during material preservation")
     report = {
         "assembly": assembly_path,
         "apply_requested": bool(apply),
@@ -763,6 +774,10 @@ def normalize_unreal_nanite_assembly_materials(
         "parts": plan["parts"],
         "part_section_audits": part_section_audits,
     }
+    if preserved_wind:
+        report["preserved_assembly_wind_policy"] = {**preserved_wind,
+            "verified": True, "prototype_streams_before": preserved_streams,
+            "prototype_streams_after": prototype_streams(unreal, preserved_wind["prototypes"])}
     if not apply or not would_change:
         report["assembly_section_audit"] = (
             audit_unreal_skeletal_mesh_material_sections(

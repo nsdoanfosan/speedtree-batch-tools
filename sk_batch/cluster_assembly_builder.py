@@ -9074,7 +9074,7 @@ def _canonicalize_previous_bend_imported_slot_names(rows, owned_alias_indices):
     return rows
 
 
-def plan_assembly_material_preservation(old_slots, old_parts, base_slots, parts, material_chains, *, old_source_count=None):
+def plan_assembly_material_preservation(old_slots, old_parts, base_slots, parts, material_chains, *, old_source_count=None, owned_material_aliases=None):
     """Plan source-backed appearance inheritance before replacing an Assembly.
 
     Slot/import names and exact prototype paths identify prior assignments;
@@ -9084,7 +9084,8 @@ def plan_assembly_material_preservation(old_slots, old_parts, base_slots, parts,
     """
     inputs = deepcopy({"old_slots": list(old_slots or []), "old_parts": list(old_parts or []),
         "base_slots": list(base_slots or []), "parts": list(parts or []),
-        "material_chains": dict(material_chains or {}), "old_source_count": old_source_count})
+        "material_chains": dict(material_chains or {}), "old_source_count": old_source_count,
+        "owned_material_aliases": dict(owned_material_aliases or {})})
     old_slots, old_parts, base_slots, parts, material_chains = (
         inputs[key] for key in ("old_slots", "old_parts", "base_slots", "parts", "material_chains"))
     if not base_slots or not parts:
@@ -9095,6 +9096,12 @@ def plan_assembly_material_preservation(old_slots, old_parts, base_slots, parts,
     if bool(old_slots) != bool(old_parts):
         raise ClusterAssemblyBuildError("Existing Assembly material table/parts are incomplete")
     chains_by_identity = {}
+    from preserved_assembly_carc import validate_alias
+    aliases = inputs["owned_material_aliases"]
+    for path, proof in aliases.items():
+        validate_alias(path, proof)
+    def owned_alias(prior, wanted):
+        return prior in aliases and unreal_asset_identity(aliases[prior]["source"]) == unreal_asset_identity(wanted)
     for source, chain in material_chains.items():
         if (not isinstance(chain, list) or not chain or unreal_asset_identity(chain[0]) != unreal_asset_identity(source)
                 or any(_material_preservation_path(path) != path for path in chain)
@@ -9113,7 +9120,11 @@ def plan_assembly_material_preservation(old_slots, old_parts, base_slots, parts,
             result[key] = row
         return result
 
-    old_by_name = named_slots(old_slots[:source_count], "existing source table")
+    # Verified part-only NoTess aliases reuse their original slot identity.
+    # Legacy roots have no normalized-bend source_count contract, so these
+    # appended aliases must not become a second Base/source-table assignment.
+    old_by_name = named_slots([row for row in old_slots[:source_count]
+                              if row.get("part_notess_alias") is not True], "existing source table")
     named_slots(base_slots, "incoming base")
     old_by_mesh = {}
     for part in old_parts:
@@ -9134,11 +9145,11 @@ def plan_assembly_material_preservation(old_slots, old_parts, base_slots, parts,
         prior = _material_preservation_path(previous["material"]) if previous else wanted
         if unreal_asset_identity(prior) != unreal_asset_identity(wanted):
             chain = chains_by_identity.get(unreal_asset_identity(prior))
-            if (not isinstance(chain, list) or len(chain) < 2 or unreal_asset_identity(chain[0]) != unreal_asset_identity(prior)
-                    or unreal_asset_identity(wanted) not in {unreal_asset_identity(path) for path in chain[1:-1]}):
+            if (not owned_alias(prior, wanted) and (not isinstance(chain, list) or len(chain) < 2 or unreal_asset_identity(chain[0]) != unreal_asset_identity(prior)
+                    or unreal_asset_identity(wanted) not in {unreal_asset_identity(path) for path in chain[1:-1]})):
                 raise ClusterAssemblyBuildError("Existing Assembly override is not a proven MIC descendant of its incoming material: " + prior + " -> " + wanted)
             overrides.append({"scope": scope, "incoming_material": wanted, "preserved_material": prior,
-                "slot_name": row["slot_name"], "imported_slot_name": row.get("imported_slot_name"), "source_chain": list(chain)})
+                "slot_name": row["slot_name"], "imported_slot_name": row.get("imported_slot_name"), "source_chain": list(chain or [])})
         row["material"] = prior
         return row
 
@@ -9162,13 +9173,23 @@ def plan_assembly_material_preservation(old_slots, old_parts, base_slots, parts,
         if previous is not None and set(previous) != set(incoming_by_name):
             raise ClusterAssemblyBuildError("Existing prototype material slot identities changed; appearance cannot be preserved: " + mesh)
         desired = [effective(row, previous.get(_material_preservation_slot_key(row)) if previous else None, mesh) for row in local]
-        if bend_role and any(unreal_asset_identity(a["material"]) != unreal_asset_identity(b["material"]) for a, b in zip(local, desired)):
+        if bend_role and any(unreal_asset_identity(a["material"]) != unreal_asset_identity(b["material"])
+                and not owned_alias(b["material"], a["material"]) for a, b in zip(local, desired)):
             raise ClusterAssemblyBuildError("Active normalized bend prototype has an inherited Assembly material override unsupported by native source verification: " + mesh)
         desired_parts.append({"mesh": mesh, "slots": desired, "remap": []})
+    active = [(source, target) for part, target_part in zip(parts, desired_parts) if part.get("bend_role", 0)
+              for source, target in zip(part["slots"], target_part["slots"])]
+    preserved_wind = None
+    if any(owned_alias(target["material"], source["material"]) for source, target in active):
+        if not all(owned_alias(target["material"], source["material"]) for source, target in active):
+            raise ClusterAssemblyBuildError("Cannot mix authored C-arc and default normalized wind on active parts")
+        preserved_wind = {"owner": "AssemblyLeafCArcRootBinding/20261013/v1", "aliases": deepcopy(aliases),
+                          "prototypes": [part["mesh"] for part in parts if part.get("bend_role", 0)]}
     union = plan_nanite_assembly_material_normalization(desired_base, desired_parts)
     return {"schema_version": 1, "inputs": inputs, "old_state_sha256": _material_preservation_digest({"slots": old_slots, "parts": old_parts}),
         "source_materials": [_material_preservation_path(row["material"]) for row in union["global_slots"]],
-        "global_slots": union["global_slots"], "parts": union["parts"], "overrides": overrides}
+        "global_slots": union["global_slots"], "parts": union["parts"], "overrides": overrides,
+        "preserved_wind_policy": preserved_wind}
 
 
 def validate_assembly_material_preservation(plan):
@@ -9192,8 +9213,11 @@ def plan_unreal_assembly_material_preservation(unreal, assembly_path, base, orde
     """
     library = unreal.EditorAssetLibrary
     chains = {}
+    owned_aliases = {}
+    alias_helpers = None
 
     def source_path(interface):
+        nonlocal alias_helpers
         if interface is None:
             raise ClusterAssemblyBuildError("Assembly material preservation found an empty material")
         owner = str(library.get_metadata_tag(interface, "CodexNormalizedAssemblyBendOwner") or "")
@@ -9205,6 +9229,13 @@ def plan_unreal_assembly_material_preservation(unreal, assembly_path, base, orde
             if not isinstance(interface, unreal.MaterialInstanceConstant):
                 raise ClusterAssemblyBuildError("Assembly material alias has no exact source MIC")
         path = _material_preservation_path(interface.get_path_name())
+        from preserved_assembly_carc import OWNER_TAG, OWNER, inspect_alias
+        if library.get_metadata_tag(interface, OWNER_TAG) == OWNER:
+            if alias_helpers is None:
+                from normalized_assembly_bend import material_helpers
+                alias_helpers = material_helpers(unreal)
+            proof = inspect_alias(unreal, interface, alias_helpers)
+            owned_aliases[path] = proof
         if path not in chains:
             cursor, chain, seen = interface, [], set()
             while isinstance(cursor, unreal.MaterialInstanceConstant):
@@ -9281,7 +9312,7 @@ def plan_unreal_assembly_material_preservation(unreal, assembly_path, base, orde
     incoming_parts = [{"mesh": _material_preservation_path(row["mesh"]), "bend_role": row.get("bend_role", 0),
         "slots": records(row["asset"])} for row in ordered_parts]
     return plan_assembly_material_preservation(old_slots, old_parts, records(base), incoming_parts, chains,
-        old_source_count=old_source_count)
+        old_source_count=old_source_count, owned_material_aliases=owned_aliases)
 
 
 def apply_unreal_assembly_material_preservation(unreal, assembly, plan):

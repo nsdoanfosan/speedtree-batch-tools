@@ -3549,6 +3549,21 @@ def _finalize_prepared_cluster_assembly(item, prepared, *, durable_saves):
     validate_manifest_artifacts(manifest)
     asset_contract = plan.get("asset_contract") or {}
     _validate_durable_save_ledger(durable_saves)
+    # A preceding failed attempt can leave this root dirty. The preparation
+    # wave preserves it as a terminal-directory save, then this build replaces
+    # it deliberately. Retire only that verified receipt; the final root save
+    # below must obtain a fresh receipt after the NoTess remap.
+    replaced_root_save = None
+    replacement_path = asset_contract.get("assembly")
+    if replacement_path and _find_durable_save(durable_saves, replacement_path) is not None:
+        declared = {_normalize_durable_package(p).casefold() for p in item.get("checkout_asset_paths") or []}
+        if _normalize_durable_package(replacement_path).casefold() not in declared:
+            raise RuntimeError("Replacement Assembly is absent from the immutable checkout manifest")
+        replaced_root_save = deepcopy(_require_durable_save(durable_saves, replacement_path,
+            owner="terminal_directory", role="auxiliary", save_mode="directory_dirty_only"))
+        records = _durable_save_records(durable_saves)
+        records[:] = [r for r in records if r["package"].casefold() != _normalize_durable_package(replacement_path).casefold()]
+        for sequence, record in enumerate(records): record["sequence"] = sequence
     build_options = {}
     bend_roles = validate_manifest_bend_metadata(manifest, asset_contract)
     if any(role in NORMALIZED_BEND_ROLE_CODES for role in bend_roles):
@@ -3569,7 +3584,8 @@ def _finalize_prepared_cluster_assembly(item, prepared, *, durable_saves):
         normalization["saved_dependencies"] = dependencies["saved_dependencies"]
     # This is a production default for every Assembly part, including NONE
     # wind roles. Run after wind delivery and before the final root save.
-    part_notess = (_finalize_assembly_part_notess(item, assembly_path, durable_saves=durable_saves)
+    part_notess = (_finalize_assembly_part_notess(item, assembly_path, durable_saves=durable_saves,
+                       preserve_verified_legacy=bool((normalization or {}).get("preserved_assembly_wind_policy")))
                    if assembly_path else {"status": "not_requested_no_assembly", "save_writability": []})
     result["assembly_part_notess"] = part_notess
     save_writability.extend(part_notess["save_writability"])
@@ -3593,6 +3609,7 @@ def _finalize_prepared_cluster_assembly(item, prepared, *, durable_saves):
     finalized = deepcopy(prepared)
     finalized.update({
         "status": "ready_for_runtime",
+        "replaced_prebuild_assembly_save": replaced_root_save,
         "save_writability": save_writability,
         "build": result,
         "materials": materials,
@@ -3605,7 +3622,7 @@ def _finalize_prepared_cluster_assembly(item, prepared, *, durable_saves):
     return finalized
 
 
-def _finalize_assembly_part_notess(item, assembly_path, *, durable_saves):
+def _finalize_assembly_part_notess(item, assembly_path, *, durable_saves, preserve_verified_legacy=False):
     from assembly_part_notess import DESTINATION, apply_default_part_notess
     from normalized_assembly_bend import (checkout_material_scope, require_active_dependency_phase,
                                         p4_records, register_new_material_packages)
@@ -3628,7 +3645,8 @@ def _finalize_assembly_part_notess(item, assembly_path, *, durable_saves):
                        workstation_handoff=deepcopy(item.get("workstation_handoff")))
         return receipt
 
-    report = apply_default_part_notess(unreal, assembly, prepare_dependencies=admit)
+    report = apply_default_part_notess(unreal, assembly, prepare_dependencies=admit,
+                                      preserve_verified_legacy=preserve_verified_legacy)
     admission = report.get("dependency_checkout")
     writes = report["material_packages"]
     if admission and phase_id:

@@ -256,6 +256,21 @@ class AssemblyMaterialPreservationTests(unittest.TestCase):
         result = builder.plan_unreal_assembly_material_preservation(unreal, old.path, base, ordered)
         self.assertEqual(result["parts"][0]["desired_remap"], [1, 0])
 
+    def test_legacy_notess_aliases_without_normalized_source_count_preserve_base_and_parts(self):
+        unreal, registry, base, branch, foliage, old, ordered = self.fixture()
+        plan = builder.plan_unreal_assembly_material_preservation(unreal, old.path, base, ordered)
+        inputs = deepcopy(plan["inputs"])
+        for source in (0, 1):
+            alias = deepcopy(inputs["old_slots"][source])
+            alias["part_notess_alias"] = True
+            inputs["old_slots"].append(alias)
+        inputs["old_parts"][0]["remap"] = [3, 4]
+        self.assertIsNone(inputs["old_source_count"])
+        result = builder.plan_assembly_material_preservation(**inputs)
+        self.assertEqual(result["source_materials"], plan["source_materials"])
+        self.assertEqual(result["parts"], plan["parts"])
+        self.assertEqual(len(result["inputs"]["old_slots"]), 5)
+
     def test_unrelated_parent_cycle_slot_ambiguity_and_active_override_reject_before_write(self):
         for change, message in (("unrelated", "descendant"), ("cycle", "cyclic"),
                                 ("ambiguous", "Ambiguous"), ("active", "unsupported"),
