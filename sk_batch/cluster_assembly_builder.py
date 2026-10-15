@@ -9050,6 +9050,30 @@ def _material_preservation_digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
+def _canonicalize_previous_bend_imported_slot_names(rows, owned_alias_indices):
+    """Resolve UE's generated duplicate FNames through verified source slots.
+
+    Only owned normalized-bend aliases are eligible. Artist-authored names,
+    unknown suffixes and ambiguous source matches retain the strict identity
+    check used by appearance preservation.
+    """
+    aliases = set(owned_alias_indices)
+    canonical = [row for index, row in enumerate(rows)
+                 if index not in aliases and not row.get("part_notess_alias")]
+    for index in aliases:
+        row = rows[index]
+        matches = [source for source in canonical
+                   if str(source["slot_name"]).casefold() == str(row["slot_name"]).casefold()
+                   and unreal_asset_identity(source["material"]) == unreal_asset_identity(row["material"])]
+        if len(matches) != 1:
+            continue
+        expected = str(matches[0].get("imported_slot_name") or "")
+        current = str(row.get("imported_slot_name") or "")
+        if expected and re.fullmatch(re.escape(expected) + r"_\d+", current, re.IGNORECASE):
+            row["imported_slot_name"] = expected
+    return rows
+
+
 def plan_assembly_material_preservation(old_slots, old_parts, base_slots, parts, material_chains, *, old_source_count=None):
     """Plan source-backed appearance inheritance before replacing an Assembly.
 
@@ -9198,6 +9222,7 @@ def plan_unreal_assembly_material_preservation(unreal, assembly_path, base, orde
 
     def records(mesh, *, previous_assembly=False):
         result = []
+        owned_alias_indices = []
         slots = list(mesh.get_editor_property("materials") or [])
         original_slots = slots
         if previous_assembly:
@@ -9208,8 +9233,14 @@ def plan_unreal_assembly_material_preservation(unreal, assembly_path, base, orde
             row["actual_material"] = _unreal_slot_record(original_slots[index], index)["material"]
             if slot is not original_slots[index]:
                 row["part_notess_alias"] = True
-            row["material"] = source_path(slot.get_editor_property("material_interface"))
+            interface = slot.get_editor_property("material_interface")
+            row["material"] = source_path(interface)
+            if previous_assembly and library.get_metadata_tag(interface, "CodexNormalizedAssemblyBendSourceMaterial"):
+                # source_path has already verified ownership and exact source.
+                owned_alias_indices.append(index)
             result.append(row)
+        if previous_assembly:
+            _canonicalize_previous_bend_imported_slot_names(result, owned_alias_indices)
         return result
 
     existing = library.load_asset(assembly_path)
@@ -9280,7 +9311,11 @@ def apply_unreal_assembly_material_preservation(unreal, assembly, plan):
         if len(actual["remap"]) != len(expected["slots"]):
             raise ClusterAssemblyBuildError("Fresh Assembly prototype material count changed")
         for index, local in zip(actual["remap"], expected["slots"]):
-            if not 0 <= index < len(before_slots) or unreal_asset_identity(before_slots[index]["material"]) != unreal_asset_identity(local["material"]):
+            # Native construction copies the actual prototype interface. The
+            # preflight also records its verified canonical source for the
+            # appearance plan; an owned bend alias can legitimately differ.
+            expected_interface = local.get("actual_material", local["material"])
+            if not 0 <= index < len(before_slots) or unreal_asset_identity(before_slots[index]["material"]) != unreal_asset_identity(expected_interface):
                 raise ClusterAssemblyBuildError("Fresh Assembly prototype material assignment changed before preservation")
     desired = [row["desired_remap"] for row in plan["parts"]]
     after_text = rewrite_nanite_assembly_part_remaps(before_text, desired)
