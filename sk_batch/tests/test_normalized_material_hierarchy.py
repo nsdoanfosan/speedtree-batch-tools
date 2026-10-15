@@ -75,6 +75,11 @@ class Material(Asset):
         self.graph = {"expressions": [{"name": "Original", "defaults": deepcopy(self.scalars)}]}
         self.roots = {"root_inputs": [{"property_name": "BaseColor", "source_name": "Original"}]}
 
+    def get_editor_property(self, name):
+        if name == "enable_tessellation":
+            return getattr(self, "tessellation", True)
+        return getattr(self, name)
+
 
 class MIC(Asset):
     def __init__(self, path, parent):
@@ -87,6 +92,8 @@ class MIC(Asset):
             return self.parent
         if name == "scalar_parameter_values":
             return self.scalars
+        if name == "vector_parameter_values":
+            return [Row(name, value, "vector-"+name) for name,value in self.vectors.items()]
         if name == "base_property_overrides":
             return deepcopy(self.base)
         raise KeyError(name)
@@ -633,6 +640,32 @@ class MaterialHierarchyTests(unittest.TestCase):
 class LegacyNoTessWindTuningTests(unittest.TestCase):
     setUp = MaterialHierarchyTests.setUp
     make = MaterialHierarchyTests.make
+    def test_existing_notess_leaf_parent_retains_arc_and_tier_tuning(self):
+        source = self.h.add(MIC("/Game/Trees/MI_LeafWind", self.root))
+        self.make([source.path]); self.h.dirty.clear()
+        target = self.h.load(bend.variant_path(source.path))
+        expected = self.h.load(bend.variant_path(self.root.path, master=True))
+        expected.tessellation = False
+        self.h.set_scalar(target, "AssemblyBranchFlexibility", 0.5)
+        self.h.set_scalar(target, "AssemblyLeafArcRadiusCm", 240.0)
+        target.vectors["AssemblyLeafTierCalmRange"] = [0.6,0.75,1.12,1.0]
+        self.h.dirty.clear()
+        self.assertTrue(bend.verified_legacy_notess_parent(self.h.unreal,self.h.helpers,target,expected.path))
+        self.make([source.path])
+        self.assertEqual(self.h.effective(target,"scalars","AssemblyBranchFlexibility"),0.5)
+        self.assertEqual(self.h.effective(target,"scalars","AssemblyLeafArcRadiusCm"),240.0)
+        self.assertEqual(target.vectors["AssemblyLeafTierCalmRange"],[0.6,0.75,1.12,1.0])
+        self.h.dirty.clear()
+        target.vectors["UNRELATED_TINT"] = [1.0,0.0,0.0,1.0]
+        with self.assertRaisesRegex(bend.NormalizedAssemblyBendError,"changed more than"):
+            bend.verified_legacy_notess_parent(self.h.unreal,self.h.helpers,target,expected.path)
+
+    def test_arc_vector_in_material_layer_remains_protected(self):
+        source = self.h.add(MIC("/Game/Trees/MI_LayerWind", self.root))
+        previous = bend.protected_mi_signature(self.h.unreal,self.h.helpers,source)
+        original_get = source.get_editor_property
+        source.get_editor_property = lambda name: [Row("AssemblyLeafTierCalmRange",[1,2,3,4],"layer",association=1)] if name=="vector_parameter_values" else original_get(name)
+        self.assertNotEqual(bend.protected_mi_signature(self.h.unreal,self.h.helpers,source),previous)
     def test_adopted_off_parent_and_artist_wind_values_survive_reimport(self):
         source = self.h.add(MIC("/Game/Trees/MI_LegacyWillow", self.root))
         self.make([source.path]);self.h.dirty.clear()

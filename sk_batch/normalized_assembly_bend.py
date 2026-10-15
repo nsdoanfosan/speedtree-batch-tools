@@ -46,6 +46,9 @@ EXTRA_SCALARS = {
     "AssemblyWindRestThreshold": 0.0, "AssemblyWindResponseScale": 1.0,
 }
 WPO_FIELDS = {"bOverride_MaxWorldPositionOffsetDisplacement", "MaxWorldPositionOffsetDisplacement"}
+AUTHORED_WIND_SCALARS = {"AssemblyLeafArcRadiusCm", "AssemblyLeafArcMaxAngleDegrees",
+    "AssemblyLeafArcMotionAmount", "AssemblyLeafArcMotionPeriodSeconds", "AssemblyLeafArcAspectBlend", "AssemblyLeafTierBlend"}
+AUTHORED_WIND_VECTORS = {"AssemblyLeafTierCalmRange", "AssemblyLeafTierStrongRange", "AssemblyLeafTierVeryStrongRange"}
 
 
 class NormalizedAssemblyBendError(RuntimeError):
@@ -552,9 +555,12 @@ def protected_mi_signature(unreal, helpers, asset, *, verified_notess=False):
     if verified_notess:
         signature["base_property_overrides"] = tuple(token for token in signature["base_property_overrides"]
             if token.partition("=")[0].strip() not in {"bOverride_bEnableTessellation", "bEnableTessellation"})
-    ignored = set(DEFAULT_SCALARS) | set(EXTRA_SCALARS)
+    ignored = set(DEFAULT_SCALARS) | set(EXTRA_SCALARS) | AUTHORED_WIND_SCALARS
     signature["scalar_parameter_values"] = [helpers["stable_value"](row) for row in asset.get_editor_property("scalar_parameter_values")
         if not (str(row.get_editor_property("parameter_info").get_editor_property("name")) in ignored
+                and row.get_editor_property("parameter_info").get_editor_property("association") == unreal.MaterialParameterAssociation.GLOBAL_PARAMETER)]
+    signature["vector_parameter_values"] = [helpers["stable_value"](row) for row in asset.get_editor_property("vector_parameter_values")
+        if not (str(row.get_editor_property("parameter_info").get_editor_property("name")) in AUTHORED_WIND_VECTORS
                 and row.get_editor_property("parameter_info").get_editor_property("association") == unreal.MaterialParameterAssociation.GLOBAL_PARAMETER)]
     signature["effective_static_switches"].pop(helpers["SWITCH"], None)
     signature["layers"].pop("material_interface", None)
@@ -620,8 +626,13 @@ def verified_legacy_notess_parent(unreal, helpers, asset, expected_parent):
     """
     parent = asset.get_editor_property("parent")
     expected = unreal.EditorAssetLibrary.load_asset(expected_parent)
-    if not (isinstance(parent, unreal.Material) and isinstance(expected, unreal.Material)
-            and package_path(parent.get_path_name()) == package_path(expected_parent) + "_NoTess"):
+    if not (isinstance(parent, unreal.Material) and isinstance(expected, unreal.Material)):
+        return False
+    alias = package_path(parent.get_path_name()) == package_path(expected_parent) + "_NoTess"
+    same_parent = parent == expected
+    if not (alias or same_parent):
+        return False
+    if same_parent and parent.get_editor_property("enable_tessellation") is not False:
         return False
     from assembly_part_notess import _normalize
     identities = {}
