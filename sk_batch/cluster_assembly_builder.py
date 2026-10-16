@@ -9220,6 +9220,8 @@ def plan_unreal_assembly_material_preservation(unreal, assembly_path, base, orde
         nonlocal alias_helpers
         if interface is None:
             raise ClusterAssemblyBuildError("Assembly material preservation found an empty material")
+        from assembly_part_notess import original_interface
+        interface = original_interface(unreal, interface)
         owner = str(library.get_metadata_tag(interface, "CodexNormalizedAssemblyBendOwner") or "")
         source = str(library.get_metadata_tag(interface, "CodexNormalizedAssemblyBendSourceMaterial") or "")
         if source:

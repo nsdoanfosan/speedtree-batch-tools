@@ -12,6 +12,7 @@ SK_BATCH = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SK_BATCH))
 import cluster_assembly_builder as builder
 import nanite_assembly_materials as materials
+import assembly_part_notess as notess
 
 
 def slot(name, material):
@@ -119,6 +120,24 @@ class AssemblyMaterialPreservationTests(unittest.TestCase):
         ordered = [{"mesh": branch.path, "asset": branch, "bend_role": 0},
                    {"mesh": foliage.path, "asset": foliage, "bend_role": 1}]
         return unreal, registry, base, branch, foliage, old, ordered
+
+    def test_canonical_prototype_matches_exact_original_source_during_reimport(self):
+        unreal, registry, base, branch, foliage, old, ordered = self.fixture()
+        source = registry['/Game/M/MI_Leaf']
+        canonical = MIC(notess.destination(source), source.parent)
+        registry[canonical.path] = canonical
+        foliage.values['materials'][1].values['material_interface'] = canonical
+        tags = {notess.OWNER_TAG: notess.OWNER, notess.SOURCE_TAG: source.path.swapcase()}
+        unreal.EditorAssetLibrary.get_metadata_tag = lambda asset, key: tags.get(key, '') if asset is canonical else ''
+        unreal.EditorAssetLibrary.load_asset = lambda path: next(
+            (asset for key, asset in registry.items() if notess.identity(key) == notess.identity(path)), None)
+        before = [row.export_text() for row in foliage.values['materials']]
+        plan = builder.plan_unreal_assembly_material_preservation(unreal, old.path, base, ordered)
+        self.assertEqual(plan['source_materials'], ['/Game/M/MI_Common_Tint', '/Game/M/MI_Bark', source.path])
+        self.assertEqual([row['desired_remap'] for row in plan['parts']], [[0, 1], [1, 2]])
+        self.assertNotIn(canonical.path, plan['source_materials'])
+        self.assertEqual(before, [row.export_text() for row in foliage.values['materials']])
+        self.assertEqual(foliage.modify_count, 0)
 
     def test_readonly_snapshot_preserves_root_and_existing_branch_effective_tint(self):
         unreal, registry, base, branch, foliage, old, ordered = self.fixture()

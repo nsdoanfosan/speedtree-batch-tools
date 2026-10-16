@@ -3645,8 +3645,27 @@ def _finalize_assembly_part_notess(item, assembly_path, *, durable_saves, preser
                        workstation_handoff=deepcopy(item.get("workstation_handoff")))
         return receipt
 
+    def admit_prototypes(paths):
+        for path in paths:
+            if _normalize_durable_package(path).casefold() not in declared:
+                raise RuntimeError('NoTess prototype is absent from the immutable checkout manifest: ' + path)
+        if phase_id:
+            require_active_dependency_phase(phase_id, [assembly_path] + paths)
+        for path in paths:
+            if not unreal.get_editor_subsystem(unreal.EditorAssetSubsystem).checkout_asset(path):
+                raise RuntimeError('NoTess prototype checkout failed: ' + path)
+        return True
+
+    def preserve_root(path):
+        if _normalize_durable_package(path).casefold() not in declared:
+            raise RuntimeError('NoTess root preservation is outside the immutable manifest')
+        if phase_id:
+            require_active_dependency_phase(phase_id, [path])
+        return bool(unreal.CodexMaterialToolsLibrary.save_asset_package_without_thumbnail(assembly))
+
     report = apply_default_part_notess(unreal, assembly, prepare_dependencies=admit,
-                                      preserve_verified_legacy=preserve_verified_legacy)
+                                      preserve_verified_legacy=preserve_verified_legacy,
+                                      prepare_prototypes=admit_prototypes, prepare_root=preserve_root)
     admission = report.get("dependency_checkout")
     writes = report["material_packages"]
     if admission and phase_id:
@@ -3672,6 +3691,19 @@ def _finalize_assembly_part_notess(item, assembly_path, *, durable_saves, preser
         if not saver(asset) or path.casefold() in _dirty_content_packages():
             raise RuntimeError("NoTess dependency did not save cleanly: " + path)
         _record_durable_save(durable_saves, path, owner="assembly_part_notess_dependency", role="material", save_mode="thumbnail_free")
+        saved.append(path)
+    for path in report.get('prototype_packages', []):
+        asset = unreal.EditorAssetLibrary.load_asset(path)
+        if not saver(asset) or path.casefold() in _dirty_content_packages():
+            raise RuntimeError('NoTess prototype did not save cleanly: ' + path)
+        previous = _find_durable_save(durable_saves, path)
+        if previous:
+            details = _durable_package_file(path).stat()
+            previous.update(size=int(details.st_size), mtime_ns=int(details.st_mtime_ns),
+                            postprocess='assembly_part_notess_v2', dirty_after_save=False)
+        else:
+            _record_durable_save(durable_saves, path, owner='assembly_part_notess_prototype',
+                                 role='skeletal_mesh', save_mode='thumbnail_free')
         saved.append(path)
     registered = register_new_material_packages(admission) if admission else []
     _validate_durable_save_ledger(durable_saves)

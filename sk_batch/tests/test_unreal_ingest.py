@@ -6,6 +6,7 @@ import tempfile
 import types
 import unittest
 import stat
+from unittest.mock import patch
 from copy import deepcopy
 from contextlib import nullcontext
 from pathlib import Path
@@ -2544,6 +2545,52 @@ class DurableSaveOwnershipTests(unittest.TestCase):
             durable_saves=ledger,
         )
         return mesh, skeleton, ledger, receipt
+
+    def test_notess_prototype_resave_preserves_prior_owner_and_updates_actual_file_receipt(self):
+        import assembly_part_notess
+        for previously_saved in (False, True):
+            with self.subTest(previously_saved=previously_saved), tempfile.TemporaryDirectory() as temporary:
+                runner = load_runner()
+                environment = _DurableSaveFake(runner, Path(temporary) / 'Content')
+                root_path, prototype_path = '/Game/Trees/Assembly', '/Game/Trees/Part'
+                root = self.FakeMesh(root_path, None)
+                prototype = self.FakeMesh(prototype_path, None)
+                environment.add_asset(root_path, root)
+                environment.add_asset(prototype_path, prototype)
+                environment.install_thumbnail_free_saver()
+                runner.unreal.SkeletalMesh = self.FakeMesh
+                runner.unreal.EditorAssetSubsystem = object
+                checkouts = []
+                runner.unreal.get_editor_subsystem = lambda _kind: types.SimpleNamespace(
+                    checkout_asset=lambda path: checkouts.append(path) or True)
+                ledger = runner._new_durable_save_ledger()
+                if previously_saved:
+                    environment.write_package(prototype_path, 'original-import')
+                    runner._record_durable_save(ledger, prototype_path, owner='assembly_prototype_prebuild',
+                                               role='prototype', save_mode='thumbnail_free')
+                item = {'checkout_asset_paths': [root_path, prototype_path]}
+
+                def apply(_unreal, asset, **callbacks):
+                    self.assertIs(asset, root)
+                    self.assertTrue(callbacks['prepare_prototypes']([prototype_path]))
+                    environment.dirty.add(root_path.casefold())
+                    self.assertTrue(callbacks['prepare_root'](root_path))
+                    environment.dirty.add(prototype_path.casefold())
+                    return {'material_packages': [], 'created_packages': [],
+                            'prototype_packages': [prototype_path], 'dependency_checkout': None}
+
+                with patch.object(assembly_part_notess, 'apply_default_part_notess', side_effect=apply):
+                    result = runner._finalize_assembly_part_notess(item, root_path, durable_saves=ledger)
+                self.assertEqual(checkouts, [prototype_path])
+                self.assertEqual(environment.native_save_calls, [root_path, prototype_path])
+                self.assertEqual(environment.save_directory_calls, [])
+                self.assertEqual(len(ledger['records']), 1)
+                receipt = runner._find_durable_save(ledger, prototype_path)
+                self.assertEqual(receipt['owner'], 'assembly_prototype_prebuild' if previously_saved else 'assembly_part_notess_prototype')
+                self.assertEqual(receipt['role'], 'prototype' if previously_saved else 'skeletal_mesh')
+                self.assertEqual(receipt['size'], environment.package_file(prototype_path).stat().st_size)
+                self.assertTrue(runner._validate_durable_save_ledger(ledger))
+                self.assertEqual(result['saved_dependencies'], [prototype_path])
 
     def test_headless_thumbnail_free_save_rescans_exact_package(self):
         runner = load_runner()
