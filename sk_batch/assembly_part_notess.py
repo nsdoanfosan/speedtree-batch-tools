@@ -1,7 +1,8 @@
 """Default part-only NoTess delivery after Assembly wind/material normalization.
 
-The original table (and therefore the Base) is never overwritten. Prototypes,
-UVs, nodes and skeletons are read-only. Dependencies are admitted/saved by the
+The original table (and therefore the Base) is never overwritten. Prototype
+materials follow the same rule; geometry, UVs, nodes and skeletons are read-only.
+Dependencies are admitted/saved by the
 ingest caller before the final Assembly save. Importing this module is inert.
 """
 from copy import deepcopy
@@ -10,7 +11,8 @@ import json
 import re
 
 DESTINATION = "/Game/Material/Tree/AssetTree/AssemblyNoTess"
-OWNER = "SpeedTreeBatch/AssemblyPartNoTess/v1"
+OWNER = "SpeedTreeBatch/AssemblyPartNoTess/v2"
+LEGACY_OWNER = "SpeedTreeBatch/AssemblyPartNoTess/v1"
 OWNER_TAG = "SKBatchAssemblyPartNoTessOwner"
 SOURCE_TAG = "SKBatchAssemblyPartNoTessSource"
 SIGNATURE_TAG = "SKBatchAssemblyPartNoTessSignature"
@@ -26,13 +28,49 @@ def package(value):
     return (value if isinstance(value, str) else value.get_path_name()).split(".", 1)[0]
 
 
-def destination(source, *, master=False):
+def identity(value):
+    """UE package identity is case-insensitive; authored graph values are not."""
+    return package(value).casefold()
+
+
+def legacy_destination(source, *, master=False):
     path = package(source)
     require(path.startswith("/Game/"), "NoTess source must be project-owned")
     prefix = "M_" if master else "MI_"
     stem = path.rsplit("/", 1)[-1].removeprefix(prefix)
     # Reuse the derivatives already adopted by the 51 production Assemblies.
     return DESTINATION + "/" + prefix + stem + "_PartNoTess_" + hashlib.sha256(path.encode()).hexdigest()[:12]
+
+
+def destination(source, *, master=False):
+    """One explicit, stable name for every assembly material, including OFF foliage."""
+    path = package(source)
+    require(identity(path).startswith('/game/'), 'NoTess source must be project-owned')
+    stem = path.rsplit('/', 1)[-1]
+    if identity(path).startswith(identity(DESTINATION) + '/') and stem.casefold().endswith('_notess'):
+        return path
+    if stem.casefold().endswith('_notess'):
+        # A legacy OFF source outside this folder must not share a case-folded
+        # short name with its independent assembly-only derivative.
+        stem = stem[:-7] + '_Assembly'
+    require(stem.casefold().startswith('m_' if master else 'mi_'), 'Unexpected NoTess material prefix')
+    return DESTINATION + '/' + stem + '_notess'
+
+
+def original_interface(unreal, asset):
+    """Canonical derivatives retain their exact source, never resolve by short name."""
+    path = package(asset)
+    if not (identity(path).startswith(identity(DESTINATION) + '/') and path.casefold().endswith('_notess')):
+        return asset
+    library = unreal.EditorAssetLibrary
+    require(library.get_metadata_tag(asset, OWNER_TAG) == OWNER, 'Unowned canonical NoTess material: ' + path)
+    source = str(library.get_metadata_tag(asset, SOURCE_TAG) or '')
+    require(source and identity(source) != identity(path), 'Canonical NoTess material lacks exact source: ' + path)
+    original = library.load_asset(source)
+    require(original is not None and type(original) is type(asset), 'NoTess original is missing or changed class')
+    require(identity(destination(original, master=isinstance(original, unreal.Material))) == identity(path),
+            'NoTess source identity/name collision: ' + path)
+    return original
 
 
 def digest(value):
@@ -45,7 +83,9 @@ def _normalize(value, identities):
     if isinstance(value, (list, tuple)):
         return [_normalize(v, identities) for v in value]
     if isinstance(value, str):
-        return identities.get(value, value)
+        # Only complete, known material package/object references are folded.
+        # Parameter names, shader source and arbitrary string values stay exact.
+        return identities.get(value, identities.get(value.casefold(), value))
     return value
 
 
@@ -68,9 +108,26 @@ def _signature(unreal, helpers, asset, identities):
 def _runtime(unreal, paths):
     from nanite_assembly_materials import _json_result
     data = _json_result(unreal.CodexMaterialToolsLibrary.dump_nanite_displacement_runtime(list(paths)))
-    rows = {package(r["path"]): r for r in data.get("materials", [])}
-    require(set(rows) == set(paths) and all(r.get("loaded") for r in rows.values()), "Incomplete NoTess material runtime audit")
-    return rows
+    rows = {identity(r["path"]): r for r in data.get("materials", [])}
+    require(set(rows) == {identity(p) for p in paths} and all(r.get("loaded") for r in rows.values()), "Incomplete NoTess material runtime audit")
+    return {path: rows[identity(path)] for path in paths}
+
+
+def _name_collision(unreal, sources, targets, conflicting_sources):
+    """An explicit diagnostic precedes any checkout, duplication or save."""
+    library = unreal.EditorAssetLibrary
+    details = []
+    for source in sorted(conflicting_sources, key=identity):
+        asset, target = sources[source], targets[source]
+        existing = library.load_asset(target) if library.does_asset_exist(target) else None
+        parent = asset.get_editor_property('parent') if isinstance(asset, unreal.MaterialInstanceConstant) else None
+        existing_parent = existing.get_editor_property('parent') if isinstance(existing, unreal.MaterialInstanceConstant) else None
+        details.append({'source': source, 'source_parent': package(parent) if parent else None,
+            'expected_target': target, 'existing_target': package(existing) if existing else None,
+            'existing_parent': package(existing_parent) if existing_parent else None,
+            'existing_owner': library.get_metadata_tag(existing, OWNER_TAG) if existing else None,
+            'existing_source': library.get_metadata_tag(existing, SOURCE_TAG) if existing else None})
+    raise RuntimeError('NoTess canonical name collision: ' + json.dumps(details, sort_keys=True))
 
 
 def _off(row):
@@ -83,23 +140,31 @@ def _assert_equivalent_runtime(source, target):
         require(source.get(field) == target.get(field), "NoTess delivery changed " + field)
 
 
-def inspect_materials(unreal, source_paths, *, read_only=False, preserve_verified_legacy=False):
+def inspect_materials(unreal, source_paths, *, read_only=False, preserve_verified_legacy=False, legacy=False):
     """Read-only complete hierarchy and exact existing-derivative collision guard."""
     from normalized_assembly_bend import material_helpers
     helpers, library = material_helpers(unreal), unreal.EditorAssetLibrary
-    runtime = _runtime(unreal, source_paths)
-    sources, bindings, targets = {}, {}, {}
-    for path in source_paths:
-        asset = library.load_asset(path)
-        require(asset is not None, "Assembly part material is missing: " + path)
-        if _off(runtime[path]):
-            bindings[path] = path
+    references = {}
+    for requested in source_paths:
+        asset = library.load_asset(requested)
+        require(asset is not None, "Assembly part material is missing: " + requested)
+        references[package(requested)] = asset
+        references.setdefault(package(asset), asset)
+    actual_runtime = _runtime(unreal, list(dict.fromkeys(package(a) for a in references.values())))
+    runtime = {path: actual_runtime[package(asset)] for path, asset in references.items()}
+    sources, requested_sources, bindings, targets = {}, {}, {}, {}
+    for path, asset in references.items():
+        if legacy and _off(runtime[path]):
+            bindings[path] = package(asset)
             continue
+        if not legacy:
+            asset = original_interface(unreal, asset)
+        requested_source = package(asset)
         chain, seen = [], set()
         while asset is not None:
             current = package(asset)
-            require(current not in seen and len(chain) < 64, "NoTess material parent cycle")
-            seen.add(current); chain.append(asset)
+            require(identity(current) not in seen and len(chain) < 64, "NoTess material parent cycle")
+            seen.add(identity(current)); chain.append(asset)
             if isinstance(asset, unreal.Material):
                 break
             require(isinstance(asset, unreal.MaterialInstanceConstant), "Unsupported NoTess parent class")
@@ -107,22 +172,41 @@ def inspect_materials(unreal, source_paths, *, read_only=False, preserve_verifie
         require(chain and isinstance(chain[-1], unreal.Material), "NoTess material lacks a base master")
         for asset in reversed(chain):
             current = package(asset)
-            if isinstance(asset, unreal.Material) and not asset.get_editor_property("enable_tessellation"):
+            if legacy and isinstance(asset, unreal.Material) and not asset.get_editor_property("enable_tessellation"):
                 continue
             sources.setdefault(current, asset)
-            targets[current] = destination(asset, master=isinstance(asset, unreal.Material))
-        bindings[path] = targets[path]
+            targets[current] = (legacy_destination if legacy else destination)(asset, master=isinstance(asset, unreal.Material))
+        requested_sources[path] = requested_source
+    groups = {}
+    for source, target in targets.items():
+        groups.setdefault(identity(target), []).append(source)
+    conflicts = [source for group in groups.values() if len(group) > 1 for source in group]
+    if conflicts:
+        _name_collision(unreal, sources, targets, conflicts)
+    for source, target in targets.items():
+        if not library.does_asset_exist(target):
+            continue
+        asset = library.load_asset(target)
+        require(asset is not None and identity(asset) == identity(target), 'NoTess target identity changed: ' + target)
+        targets[source] = package(asset)
+        stamped_source = library.get_metadata_tag(asset, SOURCE_TAG)
+        if type(asset) is not type(sources[source]) or (stamped_source and identity(stamped_source) != identity(source)):
+            _name_collision(unreal, sources, targets, [source])
+    bindings.update({path: targets[source] for path, source in requested_sources.items()})
     identities = {}
     for source, target in targets.items():
         for p in (source, target):
             identities[p] = "<material:" + source + ">"
             identities[p + "." + p.rsplit("/", 1)[-1]] = identities[p]
+            identities[p.casefold()] = identities[p]
+            identities[(p + "." + p.rsplit("/", 1)[-1]).casefold()] = identities[p]
     signatures = {p: _signature(unreal, helpers, a, identities) for p, a in sources.items()}
-    dirty = {package(p) for p in unreal.EditorLoadingAndSavingUtils.get_dirty_content_packages()}
-    require(read_only or not (set(sources) & dirty), "NoTess original source material is dirty: " + str(sorted(set(sources) & dirty)))
+    dirty = {identity(p) for p in unreal.EditorLoadingAndSavingUtils.get_dirty_content_packages()}
+    dirty_sources = [p for p in sources if identity(p) in dirty]
+    require(read_only or not dirty_sources, "NoTess original source material is dirty: " + str(sorted(dirty_sources)))
     existing, writes = {}, []
     for source, target in targets.items():
-        require(read_only or target not in dirty, "NoTess derivative has unsaved edits: " + target)
+        require(read_only or identity(target) not in dirty, "NoTess derivative has unsaved edits: " + target)
         if not library.does_asset_exist(target):
             writes.append(target)
             continue
@@ -133,23 +217,25 @@ def inspect_materials(unreal, source_paths, *, read_only=False, preserve_verifie
         if isinstance(asset, unreal.MaterialInstanceConstant):
             parent = sources[source].get_editor_property("parent")
             expected = targets.get(package(parent), package(parent))
-            require(package(asset.get_editor_property("parent")) == expected, "NoTess parent chain was flattened/changed")
+            require(identity(asset.get_editor_property("parent")) == identity(expected), "NoTess parent chain was flattened/changed")
         require(_off(_runtime(unreal, [target])[target]), "Existing derivative base/interface is TessON")
         owner = library.get_metadata_tag(asset, OWNER_TAG)
-        require(not owner or owner == OWNER, "NoTess destination has another owner")
+        require(not owner or owner == (LEGACY_OWNER if legacy else OWNER), "NoTess destination has another owner")
         if owner:
-            require(library.get_metadata_tag(asset, SOURCE_TAG) == source and
+            require(identity(str(library.get_metadata_tag(asset, SOURCE_TAG) or '')) == identity(source) and
                     library.get_metadata_tag(asset, SIGNATURE_TAG) == digest(signatures[source]),
                     "NoTess ownership/source signature changed")
-        elif not preserve_verified_legacy:
+        elif not (legacy and preserve_verified_legacy):
             # Legacy 51-root derivatives are adopted only after exact graph,
             # overrides, chain, runtime and deterministic-path verification.
+            # Canonical prototype interfaces always need their exact source
+            # stamp so the next import can safely unwrap them.
             writes.append(target)
         existing[source] = asset
     return {"helpers": helpers, "sources": sources, "targets": targets, "bindings": bindings,
             "signatures": signatures, "identities": identities, "existing": existing,
             "write_packages": writes, "runtime_before": runtime,
-            "dirty_inputs_observed": sorted((set(sources) | set(targets.values())) & dirty), "read_only": bool(read_only)}
+            "dirty_inputs_observed": sorted(p for p in set(sources) | set(targets.values()) if identity(p) in dirty), "read_only": bool(read_only)}
 
 
 def plan_remaps(snapshot, bindings, slot_counts):
@@ -164,7 +250,7 @@ def plan_remaps(snapshot, bindings, slot_counts):
         for index in indices:
             require(type(index) is int and 0 <= index < len(before), "Invalid part source index")
             source = before[index]; replacement = bindings[source]
-            if replacement == source:
+            if identity(replacement) == identity(source):
                 target.append(index)
                 continue
             if index not in aliases:
@@ -223,9 +309,10 @@ def set_alias_slot_names(slot, name):
             str(slot.get_editor_property("imported_material_slot_name"))==name,"NoTess alias slot name readback differs")
 
 
-def apply_default_part_notess(unreal, assembly, *, prepare_dependencies, preserve_verified_legacy=False):
+def apply_default_part_notess(unreal, assembly, *, prepare_dependencies, preserve_verified_legacy=False,
+                             prepare_prototypes=None, prepare_root=None):
     """Pipeline-owned dirty root allowed; exact native preflight, no source writes."""
-    from nanite_assembly_materials import _json_result, parse_nanite_assembly_part_remaps, rewrite_nanite_assembly_part_remaps
+    from nanite_assembly_materials import _json_result, parse_nanite_assembly_part_remaps
     from normalized_assembly_bend import check_dependency_admission
     library, edit = unreal.EditorAssetLibrary, unreal.MaterialEditingLibrary
     path = package(assembly)
@@ -233,14 +320,16 @@ def apply_default_part_notess(unreal, assembly, *, prepare_dependencies, preserv
     baseline = _json_result(native(path, json.dumps({"schema_version": 2, "assembly": path,
         "kind": "assembly_part_notess_remap_v1", "validate_only": True})))
     require(baseline.get("status") == "native_part_remap_snapshot_read_only", "NoTess native snapshot unavailable")
-    slot_counts = {}
+    slot_counts = {}; prototypes = {}; prototype_materials = []
     used = set()
     for row in baseline["current_parts"]:
         mesh = library.load_asset(row["mesh"])
         require(isinstance(mesh, unreal.SkeletalMesh), "NoTess prototype is missing")
         slot_counts[row["mesh"]] = len(mesh.get_editor_property("materials"))
+        prototypes[package(mesh)] = mesh
+        prototype_materials.extend(package(s.get_editor_property('material_interface')) for s in mesh.get_editor_property('materials'))
         used.update(row["expected_remap"] or range(slot_counts[row["mesh"]]))
-    source_paths = list(dict.fromkeys(baseline["current_materials"][i] for i in sorted(used)))
+    source_paths = list(dict.fromkeys([baseline["current_materials"][i] for i in sorted(used)] + prototype_materials))
     inspection = inspect_materials(unreal, source_paths, preserve_verified_legacy=preserve_verified_legacy)
     admission = None
     if inspection["write_packages"]:
@@ -284,6 +373,18 @@ def apply_default_part_notess(unreal, assembly, *, prepare_dependencies, preserv
                 "NoTess generation changed an original material")
     for source, target in inspection["bindings"].items():
         _assert_equivalent_runtime(inspection["runtime_before"][source], runtime[target])
+    prototype_changes = []
+    for proto_path, mesh in prototypes.items():
+        slots = list(mesh.get_editor_property('materials'))
+        changes = [(i, inspection['bindings'][package(s.get_editor_property('material_interface'))])
+                   for i, s in enumerate(slots)
+                   if inspection['bindings'][package(s.get_editor_property('material_interface'))] != package(s.get_editor_property('material_interface'))]
+        if changes:
+            prototype_changes.append((proto_path, mesh, slots, changes))
+    if prototype_changes:
+        require(callable(prepare_prototypes), 'NoTess prototypes require exact caller ownership')
+        admitted = prepare_prototypes([p for p, _, _, _ in prototype_changes])
+        require(admitted is True, 'NoTess prototype admission failed')
     plan = plan_remaps(baseline, inspection["bindings"], slot_counts)
     contract = {"schema_version": 2, "assembly": path, "kind": "assembly_part_notess_remap_v1",
         "validate_only": True, "expected_materials": baseline["current_materials"],
@@ -295,46 +396,47 @@ def apply_default_part_notess(unreal, assembly, *, prepare_dependencies, preserv
     require(preflight.get("status") == "native_part_notess_plan_verified_read_only", "NoTess native plan was rejected")
     before_slots = list(assembly.get_editor_property("materials"))
     before_exports = [authored_slot_export(slot.export_text()) for slot in before_slots]
-    settings = assembly.get_editor_property("nanite_settings"); before_text = settings.export_text()
-    updated = list(before_slots); names = {str(s.get_editor_property(k)).casefold() for s in before_slots
-        for k in ("material_slot_name", "imported_material_slot_name")}
-    for row in plan["append_materials"]:
-        source_slot = before_slots[row["source_slot"]]
-        slot = type(source_slot)(); slot.import_text(source_slot.export_text())
-        slot.set_editor_property("material_interface", library.load_asset(row["material"]))
-        source_name = str(source_slot.get_editor_property("material_slot_name"))
-        stem = (source_name if source_name.casefold() != "none" else "Material") + "_AssemblyNoTess_" + str(row["source_slot"])
-        name = stem; suffix = 0
-        while name.casefold() in names:
-            suffix += 1; name = stem + "_" + str(suffix)
-        names.add(name.casefold())
-        set_alias_slot_names(slot, name)
-        updated.append(slot)
     remaps = [row["target_remap"] for row in plan["parts"]]
-    candidate = type(settings)(); candidate.import_text(rewrite_nanite_assembly_part_remaps(before_text, remaps))
-    try:
-        if plan["append_materials"]:
-            assembly.modify(); assembly.set_editor_property("materials", updated)
-            assembly.set_editor_property("nanite_settings", candidate)
-        after = _json_result(native(path, json.dumps({"schema_version": 2, "assembly": path,
-            "kind": "assembly_part_notess_remap_v1", "validate_only": True})))
-        require(after.get("status") == "native_part_remap_snapshot_read_only" and not after.get("returned_errors"),
-                "NoTess native readback failed")
-        for field in ("root_source_mesh_description_sha1", "nodes_binary_sha1", "reference_skeleton_sha1"):
-            require(after[field] == baseline[field], "NoTess changed original Base/geometry/nodes/skeleton")
-        require([authored_slot_export(s.export_text()) for s in assembly.get_editor_property("materials")][:len(before_exports)] == before_exports,
-                "NoTess changed an original material slot")
-        require([r["remap"] for r in parse_nanite_assembly_part_remaps(assembly.get_editor_property("nanite_settings").export_text())] == remaps,
-                "NoTess part remap readback differs")
-    except Exception:
-        old = type(settings)(); old.import_text(before_text)
-        assembly.set_editor_property("materials", before_slots); assembly.set_editor_property("nanite_settings", old)
-        raise
+    # Native copies preserve full-precision transforms and protected node data.
+    # An export_text/import_text round trip of MeshNaniteSettings does not.
+    if plan['append_materials']:
+        dirty = {package(p) for p in unreal.EditorLoadingAndSavingUtils.get_dirty_content_packages()}
+        if path in dirty:
+            require(callable(prepare_root) and prepare_root(path) is True,
+                    'NoTess dirty root requires exact caller preservation save')
+        applied = _json_result(native(path, json.dumps({**contract, 'validate_only': False})))
+        require(applied.get('status') == 'native_part_notess_remap_applied_unsaved' and not applied.get('returned_errors'),
+                'NoTess native mutation failed: ' + str(applied))
+    after = _json_result(native(path, json.dumps({"schema_version": 2, "assembly": path,
+        "kind": "assembly_part_notess_remap_v1", "validate_only": True})))
+    require(after.get("status") == "native_part_remap_snapshot_read_only" and not after.get("returned_errors"),
+            "NoTess native readback failed")
+    for field in ("root_source_mesh_description_sha1", "nodes_binary_sha1", "reference_skeleton_sha1"):
+        require(after[field] == baseline[field], "NoTess changed original Base/geometry/nodes/skeleton")
+    require([authored_slot_export(s.export_text()) for s in assembly.get_editor_property("materials")][:len(before_exports)] == before_exports,
+            "NoTess changed an original material slot")
+    require([r["remap"] for r in parse_nanite_assembly_part_remaps(assembly.get_editor_property("nanite_settings").export_text())] == remaps,
+            "NoTess part remap readback differs")
+    for proto_path, mesh, slots, changes in prototype_changes:
+        updated_slots = []
+        old_settings = mesh.get_editor_property('nanite_settings').export_text()
+        for slot in slots:
+            copied = type(slot)(); copied.import_text(slot.export_text()); updated_slots.append(copied)
+        for index, target in changes:
+            updated_slots[index].set_editor_property('material_interface', library.load_asset(target))
+        mesh.modify(); mesh.set_editor_property('materials', updated_slots)
+        require(mesh.get_editor_property('nanite_settings').export_text() == old_settings,
+                'NoTess prototype edit changed Nanite geometry/settings')
+        require([package(s.get_editor_property('material_interface')) for s in mesh.get_editor_property('materials')] ==
+                [inspection['bindings'][package(s.get_editor_property('material_interface'))] for s in slots],
+                'NoTess prototype material readback differs')
     proof = {"schema_version": 1, "assembly": path, "original_material_count": len(before_slots),
-        "final_material_count": len(updated), "parts": plan["parts"], "aliases": plan["append_materials"]}
-    library.set_metadata_tag(assembly, CONTRACT_TAG, json.dumps(proof, sort_keys=True))
+        "final_material_count": len(assembly.get_editor_property('materials')), "parts": plan["parts"], "aliases": plan["append_materials"]}
+    if plan['append_materials']:
+        library.set_metadata_tag(assembly, CONTRACT_TAG, json.dumps(proof, sort_keys=True))
     return {"status": "verified_part_notess", "assembly": path, "changed": bool(plan["append_materials"]),
-        "base_and_original_slots_preserved": True, "prototypes_edited": False, "uvs_edited": False,
+        "base_and_original_slots_preserved": True, "prototypes_edited": bool(prototype_changes), "uvs_edited": False,
+        "prototype_packages": [p for p, _, _, _ in prototype_changes],
         "bindings": inspection["bindings"], "material_packages": inspection["write_packages"],
         "created_packages": created, "dependency_checkout": admission, "compile": compile_proofs,
         "native_preflight": preflight, "native_after": after, "contract": proof}
@@ -349,19 +451,21 @@ def unwrap_previous_no_tess_slots(unreal, slots, *, read_only=False):
     originals = list(slots); result = list(slots)
     for index, slot in enumerate(originals):
         interface = slot.get_editor_property("material_interface")
-        if interface is None or not package(interface).startswith(DESTINATION + "/"):
+        if interface is None or not identity(interface).startswith(identity(DESTINATION) + "/"):
             continue
-        match = re.fullmatch(r"(.+)_AssemblyNoTess_([0-9]+)(?:_[0-9]+)?", str(slot.get_editor_property("material_slot_name")))
+        match = re.fullmatch(r"(.+)_AssemblyNoTess_([0-9]+)(?:_[0-9]+)?", str(slot.get_editor_property("material_slot_name")), flags=re.IGNORECASE)
         if not match:
             continue  # An authored NoTess Base/source is not a generated alias.
         require(int(match[2]) < index, "Unproven NoTess alias source slot")
         source_slot = originals[int(match[2])]; source = source_slot.get_editor_property("material_interface")
         source_name = str(source_slot.get_editor_property("material_slot_name"))
-        require(match[1] == (source_name if source_name.casefold() != 'none' else 'Material'), "NoTess alias source name differs")
-        require(package(interface) == destination(source, master=isinstance(source, unreal.Material)), "NoTess alias source path differs")
+        require(match[1].casefold() == (source_name if source_name.casefold() != 'none' else 'Material').casefold(), "NoTess alias source name differs")
+        modern = package(interface).casefold().endswith('_notess')
+        expected = (destination if modern else legacy_destination)(source, master=isinstance(source, unreal.Material))
+        require(identity(interface) == identity(expected), "NoTess alias source path differs")
         # Legacy adoption is read-only and exact: clones cannot become arbitrary
         # user overrides or make their original Base slot inherit NoTess.
-        check = inspect_materials(unreal, [package(source)], read_only=read_only)
-        require(check["bindings"][package(source)] == package(interface), "NoTess alias no longer represents its exact source")
+        check = inspect_materials(unreal, [package(source)], read_only=read_only, legacy=not modern)
+        require(identity(check["bindings"][package(source)]) == identity(interface), "NoTess alias no longer represents its exact source")
         result[index] = source_slot
     return result

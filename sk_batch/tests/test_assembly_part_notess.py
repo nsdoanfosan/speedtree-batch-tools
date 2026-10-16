@@ -66,6 +66,7 @@ class Settings:
     def __init__(self, text=''): self.text=text
     def export_text(self): return self.text
     def import_text(self, text): self.text=text
+    def copy(self):return deepcopy(self)
 
 
 class Mesh(Material):
@@ -78,7 +79,7 @@ class Mesh(Material):
 class Harness:
     def __init__(self):
         self.assets={};self.writes=[]
-        lib=SimpleNamespace(load_asset=self.load, does_asset_exist=lambda p:p in self.assets,
+        lib=SimpleNamespace(load_asset=self.load, does_asset_exist=lambda p:self.load(p) is not None,
             get_metadata_tag=lambda a,k:a.tags.get(k,''), set_metadata_tag=lambda a,k,v:a.tags.update({k:v}))
         self.u=SimpleNamespace(Material=Material,MaterialInstanceConstant=MIC,SkeletalMesh=Mesh,EditorAssetLibrary=lib,
             EditorLoadingAndSavingUtils=SimpleNamespace(get_dirty_content_packages=lambda:[]),
@@ -90,7 +91,8 @@ class Harness:
             'property_text':lambda a,k:'300.0','mi_signature':self.signature,
             'compile_resource':lambda a:{'asset':a.path,'shader_count':4,'native_finish_compilation_waited':True}}
     def add(self, obj): self.assets[obj.path]=obj;Slot.registry=self.assets;return obj
-    def load(self, p): return self.assets.get(nt.package(p))
+    def load(self, p):
+        return next((asset for key,asset in self.assets.items() if nt.identity(key)==nt.identity(p)),None)
     def duplicate(self, name, folder, source):
         obj=copy(source);obj.path=folder+'/'+name;obj.values=deepcopy(source.values);obj.tags={}
         if isinstance(obj,MIC): obj.params=deepcopy(source.params);obj.values['parent']=source.values['parent']
@@ -118,12 +120,26 @@ class Harness:
             'current_parts':[{'index':i,'mesh':nt.package(r['mesh']),'expected_remap':r['remap']} for i,r in enumerate(parts)],
             'root_source_mesh_description_sha1':'BODY','nodes_binary_sha1':'NODES','reference_skeleton_sha1':'BONES','materials_authored_sha1':'SLOTS'}
         if 'parts' in cfg:
-            assert cfg['validate_only'] is True
             assert cfg['expected_materials']==snap['current_materials']
-            snap['status']='native_part_notess_plan_verified_read_only'
+            if cfg['validate_only']:
+                snap['status']='native_part_notess_plan_verified_read_only'
+            else:
+                slots=list(a.values['materials'])
+                for row in cfg['append_materials']:
+                    slot=deepcopy(slots[row['source_slot']])
+                    name=str(slot.values['material_slot_name'])+'_AssemblyNoTess_'+str(row['source_slot'])
+                    slot.values['material_slot_name']=name;slot.values['imported_material_slot_name']=name
+                    slot.values['material_interface']=self.load(row['material']);slots.append(slot)
+                a.values['materials']=slots
+                preserved=settings.copy()
+                preserved.text=nm.rewrite_nanite_assembly_part_remaps(settings.export_text(),[r['target_remap'] for r in cfg['parts']])
+                a.values['nanite_settings']=preserved
+                snap['status']='native_part_notess_remap_applied_unsaved'
         return json.dumps(snap)
     @staticmethod
     def admit(plan): return {'verified':True,'materials':plan['materials']}
+    @staticmethod
+    def admit_prototypes(paths): return True
 
 
 class PartNoTessTests(unittest.TestCase):
@@ -144,13 +160,14 @@ class PartNoTessTests(unittest.TestCase):
         h,root,common,tint,proto,assembly=self.fixture()
         original=assembly.values['materials'][0].export_text();source=deepcopy(tint.params)
         with patch.object(bend,'material_helpers',return_value=h.helpers):
-            report=nt.apply_default_part_notess(h.u,assembly,prepare_dependencies=h.admit)
+            report=nt.apply_default_part_notess(h.u,assembly,prepare_dependencies=h.admit,prepare_prototypes=h.admit_prototypes)
             self.assertEqual(len(report['created_packages']),3)
             target=h.load(report['bindings'][tint.path]);parent=target.values['parent']
             self.assertEqual(target.params,source);self.assertEqual(parent.params,common.params)
             self.assertEqual(parent.values['parent'].values['enable_tessellation'],False)
             self.assertTrue(root.values['enable_tessellation'])
-            self.assertIs(proto.values['materials'][0].values['material_interface'],tint)
+            self.assertIs(proto.values['materials'][0].values['material_interface'],target)
+            self.assertEqual(report['prototype_packages'],[proto.path])
             self.assertEqual(assembly.values['materials'][0].export_text(),original)
             self.assertEqual(assembly.values['materials'][1].values['uv_channel_data'],[1.5,2.5])
             self.assertEqual(nm.parse_nanite_assembly_part_remaps(assembly.values['nanite_settings'].export_text())[0]['remap'],[1])
@@ -162,7 +179,7 @@ class PartNoTessTests(unittest.TestCase):
     def test_legacy_derivative_adopted_only_if_unchanged_and_collision_rejected(self):
         h,root,common,tint,proto,assembly=self.fixture()
         with patch.object(bend,'material_helpers',return_value=h.helpers):
-            first=nt.apply_default_part_notess(h.u,assembly,prepare_dependencies=h.admit)
+            first=nt.apply_default_part_notess(h.u,assembly,prepare_dependencies=h.admit,prepare_prototypes=h.admit_prototypes)
             for p in first['created_packages']:h.load(p).tags.clear()
             inspected=nt.inspect_materials(h.u,[tint.path])
             self.assertEqual(len(inspected['write_packages']),3)
@@ -173,8 +190,7 @@ class PartNoTessTests(unittest.TestCase):
     def test_preserved_legacy_derivatives_remain_readonly_but_changed_graph_rejects(self):
         h,root,common,tint,proto,assembly=self.fixture()
         with patch.object(bend,'material_helpers',return_value=h.helpers):
-            first=nt.apply_default_part_notess(h.u,assembly,prepare_dependencies=h.admit)
-            for p in first['material_packages']:h.load(p).tags={}
+            first=nt.apply_default_part_notess(h.u,assembly,prepare_dependencies=h.admit,prepare_prototypes=h.admit_prototypes)
             existing_before={p:deepcopy(h.load(p).tags) for p in first['material_packages']}
             inspected=nt.inspect_materials(h.u,[tint.path],preserve_verified_legacy=True)
             self.assertEqual(inspected['write_packages'],[])
@@ -186,6 +202,25 @@ class PartNoTessTests(unittest.TestCase):
             h.load(nt.destination(tint)).params['texture']='USER_CHANGED'
             with self.assertRaisesRegex(RuntimeError,'differs from its source'):
                 nt.inspect_materials(h.u,[tint.path],preserve_verified_legacy=True)
+
+    def test_unowned_canonical_requires_source_stamp_even_when_legacy_preservation_is_enabled(self):
+        h,root,common,tint,proto,assembly=self.fixture()
+        with patch.object(bend,'material_helpers',return_value=h.helpers):
+            first=nt.apply_default_part_notess(h.u,assembly,prepare_dependencies=h.admit,prepare_prototypes=h.admit_prototypes)
+            for path in first['created_packages']:h.load(path).tags.clear()
+            fresh_proto=h.add(Mesh('/Game/Trees/OtherPart',[Slot('Bark',tint)]))
+            fresh_root=h.add(Mesh('/Game/Trees/OtherAssembly',[Slot('Bark',tint)],[(fresh_proto.path,[0])]))
+            adopted=nt.apply_default_part_notess(h.u,fresh_root,prepare_dependencies=h.admit,
+                prepare_prototypes=h.admit_prototypes,preserve_verified_legacy=True)
+            self.assertEqual(set(adopted['material_packages']),set(first['created_packages']))
+            self.assertEqual(adopted['created_packages'],[])
+            target=h.load(adopted['bindings'][tint.path])
+            self.assertEqual(target.tags[nt.OWNER_TAG],nt.OWNER)
+            self.assertEqual(target.tags[nt.SOURCE_TAG],tint.path)
+            repeated=nt.apply_default_part_notess(h.u,fresh_root,
+                prepare_dependencies=lambda p:self.fail('canonical metadata was not retained'),
+                preserve_verified_legacy=True)
+            self.assertFalse(repeated['changed']);self.assertEqual(repeated['material_packages'],[])
 
     def test_forged_alias_cannot_replace_base_or_an_unrelated_material(self):
         h,root,common,tint,proto,assembly=self.fixture()
@@ -199,6 +234,138 @@ class PartNoTessTests(unittest.TestCase):
         off={'interface_tessellation_enabled':False,'base_tessellation_enabled':False,'relevance_uses_displacement':False,'relevance_uses_wpo':True}
         with self.assertRaisesRegex(RuntimeError,'relevance_uses_wpo'):
             nt._assert_equivalent_runtime({'relevance_uses_wpo':False},off)
+    def test_already_off_foliage_still_gets_dedicated_named_mi_and_master(self):
+        h,root,common,tint,proto,assembly=self.fixture()
+        root.values['enable_tessellation']=False
+        with patch.object(bend,'material_helpers',return_value=h.helpers):
+            result=nt.apply_default_part_notess(h.u,assembly,prepare_dependencies=h.admit,prepare_prototypes=h.admit_prototypes)
+            self.assertEqual(len(result['created_packages']),3)
+            self.assertTrue(all(p.endswith('_notess') for p in result['created_packages']))
+            self.assertIs(proto.values['materials'][0].values['material_interface'],h.load(nt.destination(tint)))
+            repeated=nt.apply_default_part_notess(h.u,assembly,prepare_dependencies=lambda p:self.fail('duplicate creation'),
+                                                prepare_prototypes=lambda p:self.fail('duplicate prototype mutation'))
+            self.assertFalse(repeated['changed']);self.assertFalse(repeated['prototype_packages'])
+    def test_same_short_name_from_distinct_sources_is_rejected_before_creation(self):
+        for name in ('MI_Tint','MI_tint'):
+            with self.subTest(name=name):
+                h,root,common,tint,proto,assembly=self.fixture()
+                collision=h.add(MIC('/Game/Other/'+name,root))
+                with patch.object(bend,'material_helpers',return_value=h.helpers):
+                    with self.assertRaisesRegex(RuntimeError,'canonical name collision') as failure:
+                        nt.inspect_materials(h.u,[tint.path,collision.path])
+                details=json.loads(str(failure.exception).partition(': ')[2])
+                self.assertEqual({row['source'] for row in details},{tint.path,collision.path})
+                self.assertEqual({row['source_parent'] for row in details},{common.path,root.path})
+                self.assertEqual({row['expected_target'].casefold() for row in details},{nt.destination(tint).casefold()})
+                self.assertEqual(h.writes,[])
+    def test_case_variant_references_and_metadata_resolve_to_the_same_actual_asset(self):
+        h,root,common,tint,proto,assembly=self.fixture()
+        with patch.object(bend,'material_helpers',return_value=h.helpers):
+            first=nt.apply_default_part_notess(h.u,assembly,prepare_dependencies=h.admit,prepare_prototypes=h.admit_prototypes)
+            original_paths={source:target for source,target in first['bindings'].items()}
+            target=h.load(original_paths[tint.path]);target.tags[nt.SOURCE_TAG]=tint.path.swapcase()
+            inspected=nt.inspect_materials(h.u,[tint.path.lower(),tint.path.upper(),tint.path])
+            self.assertEqual(inspected['write_packages'],[])
+            self.assertEqual(set(inspected['bindings'].values()),{original_paths[tint.path]})
+            self.assertEqual(set(inspected['sources']),{root.path,common.path,tint.path})
+            self.assertIs(nt.original_interface(h.u,target),tint)
+            canonical=nt.inspect_materials(h.u,[target.path.upper()])
+            self.assertEqual(canonical['bindings'][target.path.upper()],target.path)
+            self.assertEqual(canonical['write_packages'],[])
+            self.assertEqual(nt.destination(target),target.path)
+            before={p:deepcopy(a.tags) for p,a in h.assets.items()}
+            repeated=nt.apply_default_part_notess(h.u,assembly,prepare_dependencies=lambda p:self.fail('case-only change created packages'))
+            self.assertFalse(repeated['changed']);self.assertFalse(repeated['prototypes_edited'])
+            self.assertEqual(before,{p:a.tags for p,a in h.assets.items()})
+    def test_alias_fname_casing_is_identity_but_unrelated_source_names_are_rejected(self):
+        h,root,common,tint,proto,assembly=self.fixture()
+        with patch.object(bend,'material_helpers',return_value=h.helpers):
+            nt.apply_default_part_notess(h.u,assembly,prepare_dependencies=h.admit,prepare_prototypes=h.admit_prototypes)
+            alias=assembly.values['materials'][1]
+            alias.values['material_slot_name']='bArK_aSsEmBlYnOtEsS_0'
+            unwrapped=nt.unwrap_previous_no_tess_slots(h.u,assembly.values['materials'])
+            self.assertIs(unwrapped[1],unwrapped[0])
+            alias.values['material_slot_name']='Unrelated_AssemblyNoTess_0'
+            with self.assertRaisesRegex(RuntimeError,'source name differs'):
+                nt.unwrap_previous_no_tess_slots(h.u,assembly.values['materials'])
+    def test_legacy_alias_accepts_mixed_case_package_and_fname_without_rewriting_it(self):
+        h,root,common,tint,proto,assembly=self.fixture()
+        with patch.object(bend,'material_helpers',return_value=h.helpers):
+            initial=nt.inspect_materials(h.u,[tint.path],legacy=True)
+            clones={}
+            for source,asset in initial['sources'].items():
+                path=initial['targets'][source]
+                clone=h.duplicate(path.rsplit('/',1)[-1],path.rsplit('/',1)[0],asset)
+                if isinstance(asset,Material):
+                    clone.values['enable_tessellation']=False
+                else:
+                    clone.values['parent']=clones[nt.package(asset.values['parent'])]
+                clone.tags={nt.OWNER_TAG:nt.LEGACY_OWNER,nt.SOURCE_TAG:source.swapcase(),
+                            nt.SIGNATURE_TAG:nt.digest(initial['signatures'][source])}
+                clones[source]=clone
+            target=clones[tint.path]
+            target.path=target.path.swapcase()
+            slots=[Slot('Bark',tint),Slot('bArK_aSsEmBlYnOtEsS_0',target)]
+            before=[slot.export_text() for slot in slots]
+            writes=list(h.writes)
+            unwrapped=nt.unwrap_previous_no_tess_slots(h.u,slots)
+            self.assertIs(unwrapped[1],slots[0])
+            self.assertEqual(before,[slot.export_text() for slot in slots])
+            self.assertEqual(writes,h.writes)
+    def test_collision_order_does_not_change_diagnostic_or_write_any_assets(self):
+        h,root,common,tint,proto,assembly=self.fixture()
+        collision=h.add(MIC('/Game/Other/MI_Tint',root))
+        messages=[]
+        for paths in ([tint.path,collision.path],[collision.path,tint.path]):
+            with patch.object(bend,'material_helpers',return_value=h.helpers):
+                with self.assertRaisesRegex(RuntimeError,'canonical name collision') as failure:
+                    nt.inspect_materials(h.u,paths)
+            messages.append(str(failure.exception))
+        self.assertEqual(messages[0],messages[1]);self.assertEqual(h.writes,[])
+    def test_existing_target_owned_by_another_source_stops_before_creation(self):
+        h,root,common,tint,proto,assembly=self.fixture()
+        occupied=h.add(MIC(nt.destination(tint),root))
+        occupied.tags={nt.OWNER_TAG:nt.OWNER,nt.SOURCE_TAG:'/Game/Other/MI_Tint'}
+        before=deepcopy(occupied.tags)
+        with patch.object(bend,'material_helpers',return_value=h.helpers):
+            with self.assertRaisesRegex(RuntimeError,'canonical name collision') as failure:
+                nt.apply_default_part_notess(h.u,assembly,prepare_dependencies=lambda p:self.fail('collision admitted writes'))
+        details=json.loads(str(failure.exception).partition(': ')[2])
+        self.assertEqual(details[0]['source'],tint.path)
+        self.assertEqual(details[0]['expected_target'],occupied.path)
+        self.assertEqual(details[0]['existing_owner'],nt.OWNER)
+        self.assertEqual(details[0]['existing_source'],'/Game/Other/MI_Tint')
+        self.assertEqual(details[0]['existing_parent'],root.path)
+        self.assertEqual(occupied.tags,before);self.assertEqual(h.writes,[])
+        self.assertEqual(len(assembly.values['materials']),1)
+        self.assertIs(proto.values['materials'][0].values['material_interface'],tint)
+    def test_casefold_does_not_hide_authored_parameter_or_owner_changes(self):
+        h,root,common,tint,proto,assembly=self.fixture()
+        with patch.object(bend,'material_helpers',return_value=h.helpers):
+            first=nt.apply_default_part_notess(h.u,assembly,prepare_dependencies=h.admit,prepare_prototypes=h.admit_prototypes)
+            target=h.load(first['bindings'][tint.path])
+            target.tags[nt.OWNER_TAG]='DifferentOwner'
+            with self.assertRaisesRegex(RuntimeError,'another owner'):
+                nt.inspect_materials(h.u,[tint.path.upper()])
+            target.tags[nt.OWNER_TAG]=nt.OWNER
+            target.params['texture']=target.params['texture'].lower()
+            with self.assertRaisesRegex(RuntimeError,'differs from its source'):
+                nt.inspect_materials(h.u,[tint.path.lower()])
+    def test_native_remap_preserves_non_exported_node_data_without_text_roundtrip(self):
+        h,root,common,tint,proto,assembly=self.fixture()
+        settings=assembly.values['nanite_settings']
+        settings.hidden_node_transform=[1.23456789012345,987.6543219876543]
+        settings.import_text=lambda text:self.fail('Nanite settings text import loses native node precision')
+        with patch.object(bend,'material_helpers',return_value=h.helpers):
+            nt.apply_default_part_notess(h.u,assembly,prepare_dependencies=h.admit,prepare_prototypes=h.admit_prototypes)
+        self.assertEqual(assembly.values['nanite_settings'].hidden_node_transform,settings.hidden_node_transform)
+    def test_unadmitted_prototypes_cannot_change_root_or_prototype_assignments(self):
+        h,root,common,tint,proto,assembly=self.fixture()
+        with patch.object(bend,'material_helpers',return_value=h.helpers):
+            with self.assertRaisesRegex(RuntimeError,'prototype admission failed'):
+                nt.apply_default_part_notess(h.u,assembly,prepare_dependencies=h.admit,prepare_prototypes=lambda paths:False)
+        self.assertEqual(len(assembly.values['materials']),1)
+        self.assertIs(proto.values['materials'][0].values['material_interface'],tint)
     def test_derived_uv_density_cache_can_change_but_authored_override_cannot(self):
         template='(MaterialInterface="Keep",UVChannelData=(bInitialized={0},bOverrideDensities={1},LocalUVDensities=({2})))'
         self.assertEqual(nt.authored_slot_export(template.format('False','False','0,0,0,0')),
@@ -222,7 +389,12 @@ class PartNoTessTests(unittest.TestCase):
             bend.verified_legacy_notess_parent(h.u,helpers,leaf,expected.path)
     def test_canonical_existing_derivative_names_match_the_adopted_production_paths(self):
         self.assertEqual(nt.destination('/Game/Material/Tree/AssetTree/Master/M_TreeAsset_Master',master=True),
-            '/Game/Material/Tree/AssetTree/AssemblyNoTess/M_TreeAsset_Master_PartNoTess_1b362b0a33a5')
+            '/Game/Material/Tree/AssetTree/AssemblyNoTess/M_TreeAsset_Master_notess')
+    def test_legacy_off_master_does_not_collide_with_its_new_canonical_derivative(self):
+        source='/Game/AssemblyBend/M_Bark_Master_NoTess'
+        target=nt.destination(source,master=True)
+        self.assertEqual(target,nt.DESTINATION+'/M_Bark_Master_Assembly_notess')
+        self.assertNotEqual(source.rsplit('/',1)[-1].casefold(),target.rsplit('/',1)[-1].casefold())
     def test_reed_three_stem_slots_use_stem_master_and_keep_base_stem_on(self):
         h=Harness()
         root=h.add(Material('/Game/Material/Tree/AssetTree/AssemblyBend/CArc/M_TreeAsset_Stem_Master_6664166816ef_CArc_Master'))
@@ -241,9 +413,9 @@ class PartNoTessTests(unittest.TestCase):
              Slot('StemEnd',stems[1]),Slot('Stem05',stems[2])],[(proto.path,[2,4,5])]))
         original=[s.export_text() for s in assembly.values['materials']]
         with patch.object(bend,'material_helpers',return_value=h.helpers):
-            report=nt.apply_default_part_notess(h.u,assembly,prepare_dependencies=h.admit)
+            report=nt.apply_default_part_notess(h.u,assembly,prepare_dependencies=h.admit,prepare_prototypes=h.admit_prototypes)
         stem_master=nt.destination(root,master=True)
-        self.assertEqual(stem_master,'/Game/Material/Tree/AssetTree/AssemblyNoTess/M_TreeAsset_Stem_Master_6664166816ef_CArc_Master_PartNoTess_9744956b76d9')
+        self.assertEqual(stem_master,'/Game/Material/Tree/AssetTree/AssemblyNoTess/M_TreeAsset_Stem_Master_6664166816ef_CArc_Master_notess')
         self.assertEqual(len(report['created_packages']),4)
         for stem in stems:
             target=h.load(report['bindings'][stem.path])
@@ -257,7 +429,7 @@ class PartNoTessTests(unittest.TestCase):
     def test_dirty_source_can_be_inspected_readonly_but_cannot_be_used_for_writes(self):
         h,root,common,tint,proto,assembly=self.fixture()
         with patch.object(bend,'material_helpers',return_value=h.helpers):
-            nt.apply_default_part_notess(h.u,assembly,prepare_dependencies=h.admit)
+            nt.apply_default_part_notess(h.u,assembly,prepare_dependencies=h.admit,prepare_prototypes=h.admit_prototypes)
             h.u.EditorLoadingAndSavingUtils.get_dirty_content_packages=lambda:[root]
             with self.assertRaisesRegex(RuntimeError,'source material is dirty'):
                 nt.inspect_materials(h.u,[tint.path])
