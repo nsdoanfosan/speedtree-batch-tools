@@ -83,13 +83,19 @@ class Harness:
             get_metadata_tag=lambda a,k:a.tags.get(k,''), set_metadata_tag=lambda a,k,v:a.tags.update({k:v}))
         self.u=SimpleNamespace(Material=Material,MaterialInstanceConstant=MIC,SkeletalMesh=Mesh,EditorAssetLibrary=lib,
             EditorLoadingAndSavingUtils=SimpleNamespace(get_dirty_content_packages=lambda:[]),
-            MaterialEditingLibrary=SimpleNamespace(set_material_instance_parent=lambda a,p:a.set_editor_property('parent',p)),
+            MaterialEditingLibrary=SimpleNamespace(set_material_instance_parent=lambda a,p:a.set_editor_property('parent',p),
+                get_material_default_static_switch_parameter_value=lambda a,n:a.values.get('wpo_enabled',False),
+                get_material_instance_static_switch_parameter_value=lambda a,n:self.wpo_enabled(a)),
             AssetToolsHelpers=SimpleNamespace(get_asset_tools=lambda:SimpleNamespace(duplicate_asset=self.duplicate)),
             CodexMaterialToolsLibrary=SimpleNamespace(dump_nanite_displacement_runtime=self.runtime),
             CodexAssemblyPartBendUvLibrary=SimpleNamespace(configure_normalized_assembly_bend=self.native))
         self.helpers={'graph':lambda a:deepcopy(a.graph),'roots':lambda a:deepcopy(a.roots),
             'property_text':lambda a,k:'300.0','mi_signature':self.signature,
             'compile_resource':lambda a:{'asset':a.path,'shader_count':4,'native_finish_compilation_waited':True}}
+    @staticmethod
+    def wpo_enabled(a):
+        while isinstance(a,MIC):a=a.values['parent']
+        return a.values.get('wpo_enabled',False)
     def add(self, obj): self.assets[obj.path]=obj;Slot.registry=self.assets;return obj
     def load(self, p):
         return next((asset for key,asset in self.assets.items() if nt.identity(key)==nt.identity(p)),None)
@@ -143,6 +149,29 @@ class Harness:
 
 
 class PartNoTessTests(unittest.TestCase):
+    def test_authored_canonical_wind_is_final_delivery_and_is_not_cloned_again(self):
+        import assembly_wpo_contract as wpo
+        h,root,common,tint,proto,assembly=self.fixture()
+        with patch.object(bend,'material_helpers',return_value=h.helpers):
+            first=nt.apply_default_part_notess(h.u,assembly,prepare_dependencies=h.admit,prepare_prototypes=h.admit_prototypes)
+            wind_root=h.load(nt.destination(root,master=True))
+            wind_root.values['wpo_enabled']=True
+            wind_root.tags[wpo.WPO_GATE_TAG]=wpo.WPO_GATE_OWNER
+            wind_root.graph['expressions'].append('AuthoredArcWPO')
+            wind_leaf=h.load(nt.destination(tint))
+            wind_leaf.params['artist_arc_radius']=240.0
+            for source in (root,common,tint):
+                target=h.load(nt.destination(source,master=isinstance(source,Material)))
+                wpo.stamp_wind(h.u,target,source,helpers=h.helpers)
+            before=list(h.writes)
+            repeated=nt.apply_default_part_notess(h.u,assembly,
+                prepare_dependencies=lambda p:self.fail('canonical wind was cloned again'))
+            self.assertEqual(h.writes,before)
+            self.assertEqual(repeated['material_packages'],[])
+            self.assertEqual(wind_leaf.params['artist_arc_radius'],240.0)
+            self.assertIn('AuthoredArcWPO',wind_root.graph['expressions'])
+            self.assertIs(nt.original_interface(h.u,wind_leaf),tint)
+
     def fixture(self):
         h=Harness();root=h.add(Material('/Game/M/M_Master'));common=h.add(MIC('/Game/M/MI_Common',root))
         tint=h.add(MIC('/Game/M/MI_Tint',common));tint.params['tint']=[.8,.6,.4]
@@ -397,13 +426,13 @@ class PartNoTessTests(unittest.TestCase):
         self.assertNotEqual(source.rsplit('/',1)[-1].casefold(),target.rsplit('/',1)[-1].casefold())
     def test_reed_three_stem_slots_use_stem_master_and_keep_base_stem_on(self):
         h=Harness()
-        root=h.add(Material('/Game/Material/Tree/AssetTree/AssemblyBend/CArc/M_TreeAsset_Stem_Master_6664166816ef_CArc_Master'))
+        root=h.add(Material('/Game/Material/Tree/AssetTree/Master/M_TreeAsset_Stem_Master'))
         atlas_root=h.add(Material('/Game/M/M_Atlas'));atlas_root.values['enable_tessellation']=False
         atlas=h.add(MIC('/Game/M/MI_Atlas',atlas_root))
         source_paths=[
-            '/Game/Material/Tree/AssetTree/AssemblyBend/CArc/MI_stem_common_01_23b355ad2f70_CArc',
-            '/Game/Material/Tree/AssetTree/AssemblyBend/CArc/MI_stem_common_end_01_571b64f8aa6d_CArc',
-            '/Game/Material/Tree/AssetTree/AssemblyBend/CArc/MI_stem_common_05_07235339a85d_CArc']
+            '/Game/Material/Tree/AssetTree/MI/MI_stem_common_01',
+            '/Game/Material/Tree/AssetTree/MI/MI_stem_common_end_01',
+            '/Game/Material/Tree/AssetTree/MI/MI_stem_common_05']
         stems=[h.add(MIC(p,root)) for p in source_paths]
         base_stem=h.add(MIC('/Game/Material/Tree/AssetTree/MI/MI_stem_common_02',root))
         proto=h.add(Mesh('/Game/Trees/SK_cluster_reed_01_01',
@@ -415,7 +444,7 @@ class PartNoTessTests(unittest.TestCase):
         with patch.object(bend,'material_helpers',return_value=h.helpers):
             report=nt.apply_default_part_notess(h.u,assembly,prepare_dependencies=h.admit,prepare_prototypes=h.admit_prototypes)
         stem_master=nt.destination(root,master=True)
-        self.assertEqual(stem_master,'/Game/Material/Tree/AssetTree/AssemblyNoTess/M_TreeAsset_Stem_Master_6664166816ef_CArc_Master_notess')
+        self.assertEqual(stem_master,'/Game/Material/Tree/AssetTree/AssemblyNoTess/M_TreeAsset_Stem_Master_notess')
         self.assertEqual(len(report['created_packages']),4)
         for stem in stems:
             target=h.load(report['bindings'][stem.path])

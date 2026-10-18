@@ -1043,7 +1043,7 @@ def main():
         cluster_builder = Path(__file__).resolve().parents[1] / "cluster_assembly_builder.py"
         if cluster_builder.is_file():
             code_files.append(file_fingerprint(cluster_builder))
-        for name in ("assembly_part_bend_policy.py", "normalized_assembly_bend.py", "nanite_assembly_materials.py", "assembly_part_notess.py", "prepared_rpc_resume.py", "preserved_assembly_carc.py"):
+        for name in ("assembly_part_bend_policy.py", "normalized_assembly_bend.py", "nanite_assembly_materials.py", "assembly_part_notess.py", "assembly_wpo_contract.py", "prepared_rpc_resume.py", "preserved_assembly_carc.py"):
             module = Path(__file__).resolve().parents[1] / name
             if module.is_file():
                 code_files.append(file_fingerprint(module))

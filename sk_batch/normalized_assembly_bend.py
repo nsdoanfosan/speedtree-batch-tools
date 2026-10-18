@@ -25,8 +25,8 @@ except ImportError:
     from assembly_part_bend_policy import ASPECT_POLICY, DEFAULT_SCALARS, NORMALIZED_BEND_ROLE_CODES, package_path, normalization_part_bend_policy, part_bend_build_matches_policy
     from nanite_assembly_materials import unreal_asset_identity
 
-DESTINATION = "/Game/Material/Tree/AssetTree/AssemblyBend"
-FUNCTION = DESTINATION + "/MF_NaniteAssemblyPartBend"
+DESTINATION = "/Game/Material/Tree/AssetTree/AssemblyNoTess"
+FUNCTION = "/Game/Material/Tree/AssetTree/AssemblyBend/MF_NaniteAssemblyPartBend"
 ASPECT_TAG = "CodexAssemblyPartBendAspectPolicy"
 OWNER = "NormalizedAssemblyPartBend/20261010/v2"
 OWNER_TAG = "CodexNormalizedAssemblyBendOwner"
@@ -69,10 +69,9 @@ def sha1_file(path):
 
 
 def variant_path(source, master=False):
-    source = package_path(source)
-    require(source.casefold().startswith("/game/"), "bend source material must be project owned")
-    suffix = hashlib.sha1(source.encode("utf-8")).hexdigest()[:12]
-    return DESTINATION + "/" + source.rsplit("/", 1)[-1] + "_" + suffix + ("_AspectBend_Master" if master else "_AspectBend")
+    """Wind is authored directly into the final Assembly NoTess hierarchy."""
+    from assembly_part_notess import destination
+    return destination(source, master=master)
 
 
 def validate_active_source_indices(source_count, indices):
@@ -123,6 +122,8 @@ def resolve_material_hierarchy(unreal, source_paths, *, active_source_indices=No
     source_parents = []
     for index, requested in enumerate(source_paths):
         source = library.load_asset(requested)
+        from assembly_wpo_contract import original_source
+        source = original_source(unreal, source, reject_unmigrated_wind=True) if source is not None else None
         require(isinstance(source, unreal.MaterialInstanceConstant),
                 "normalized part bend requires source MaterialInstanceConstants: " + str(requested))
         sources.append(source)
@@ -138,6 +139,8 @@ def resolve_material_hierarchy(unreal, source_paths, *, active_source_indices=No
             require(isinstance(current, (unreal.MaterialInstanceConstant, unreal.Material)),
                     "material inheritance has a missing or unsupported parent: " + str(requested))
             path = package_path(current.get_path_name())
+            require(original_source(unreal, current) == current,
+                    'Original hierarchy contains an intermediate Assembly derivative: ' + path)
             require(path.casefold().startswith("/game/"), "bend source material must be project owned: " + path)
             require(unreal_asset_identity(path) not in seen, "material inheritance cycle: " + path)
             require(library.load_asset(path) == current, "material inheritance asset is unavailable: " + path)
@@ -167,7 +170,12 @@ def resolve_material_hierarchy(unreal, source_paths, *, active_source_indices=No
         "root_materials": list(roots),
         "source_instance_layers": list(instances),
     }
-    require(len({unreal_asset_identity(path) for path in plan["materials"]}) == len(plan["materials"]), "material hierarchy destinations collide")
+    destinations = {}
+    for source in list(roots) + list(instances):
+        target = variant_path(source, master=source in roots)
+        destinations.setdefault(unreal_asset_identity(target), []).append(source)
+    collisions = {target: sources for target, sources in destinations.items() if len(sources) > 1}
+    require(not collisions, 'Canonical NoTess material name collision; exact source paths: ' + json.dumps(collisions, sort_keys=True))
     return {"plan": plan, "sources": sources, "instances": instances,
             "roots": roots, "parents": parents}
 
@@ -563,6 +571,8 @@ def protected_mi_signature(unreal, helpers, asset, *, verified_notess=False):
         if not (str(row.get_editor_property("parameter_info").get_editor_property("name")) in AUTHORED_WIND_VECTORS
                 and row.get_editor_property("parameter_info").get_editor_property("association") == unreal.MaterialParameterAssociation.GLOBAL_PARAMETER)]
     signature["effective_static_switches"].pop(helpers["SWITCH"], None)
+    from assembly_wpo_contract import WPO_SWITCH
+    signature["effective_static_switches"].pop(WPO_SWITCH, None)
     signature["layers"].pop("material_interface", None)
     return signature
 
@@ -571,7 +581,12 @@ def inherited_layer_signature(helpers, asset):
     """An intermediate clone may change only parent and the new bend switch view."""
     signature = deepcopy(helpers["mi_signature"](asset))
     signature.pop("parent", None)
+    signature['base_property_overrides'] = re.sub(
+        r'(?<![A-Za-z0-9_])(bOverride_bEnableTessellation|bEnableTessellation|EnableTessellation)=(True|False|true|false|0|1)',
+        lambda match: match.group(1) + '=False', signature['base_property_overrides'])
     signature["effective_static_switches"].pop(helpers["SWITCH"], None)
+    from assembly_wpo_contract import WPO_SWITCH
+    signature["effective_static_switches"].pop(WPO_SWITCH, None)
     signature["layers"].pop("material_interface", None)
     return signature
 
@@ -615,6 +630,14 @@ def destination_snapshot(unreal, helpers, path):
                  else helpers["mi_signature"](asset))
     return {"kind": "Material" if isinstance(asset, unreal.Material) else "MIC",
             "tags": tags, "signature": signature}
+
+
+def canonical_wind_proof(unreal, asset, helpers):
+    from assembly_wpo_contract import verify_wind
+    try:
+        return verify_wind(unreal, asset, helpers=helpers)
+    except (RuntimeError, ValueError, TypeError) as exc:
+        raise NormalizedAssemblyBendError(str(exc)) from exc
 
 
 def verified_legacy_notess_parent(unreal, helpers, asset, expected_parent):
@@ -693,6 +716,12 @@ def inspect_material_variants(unreal, source_paths, *, function=None, active_sou
         material_scalar_defaults(unreal, function)
     hierarchy = resolve_material_hierarchy(unreal, source_paths, active_source_indices=active_source_indices)
     helpers, library = material_helpers(unreal), unreal.EditorAssetLibrary
+    from assembly_wpo_contract import require_original_wpo_disabled
+    try:
+        require_original_wpo_disabled(unreal, hierarchy['roots'].values(), hierarchy['instances'].values())
+    except RuntimeError as exc:
+        raise NormalizedAssemblyBendError(str(exc)) from exc
+    reusable = {}
     plan = hierarchy["plan"]
     dirty = {unreal_asset_identity(package.get_path_name()) for package in unreal.EditorLoadingAndSavingUtils.get_dirty_content_packages()}
     require(not ({unreal_asset_identity(path) for path in plan["materials"]} & dirty), "normalized bend destination scope has dirty packages")
@@ -707,6 +736,15 @@ def inspect_material_variants(unreal, source_paths, *, function=None, active_sou
             continue
         asset = library.load_asset(path)
         require(isinstance(asset, unreal.MaterialInstanceConstant), "normalized bend destination is not a MIC: " + path)
+        proof = canonical_wind_proof(unreal, asset, helpers)
+        if proof:
+            require(unreal_asset_identity(proof['source']) == unreal_asset_identity(source_path), 'Canonical wind source identity differs')
+            parent_path = hierarchy['parents'][source_path]
+            require(unreal_asset_identity(asset.get_editor_property('parent').get_path_name()) ==
+                    unreal_asset_identity(variant_path(parent_path, master=parent_path in hierarchy['roots'])),
+                    'Canonical wind immediate parent chain changed')
+            reusable[source_path] = asset
+            continue
         parent_path = hierarchy["parents"][source_path]
         expected_parent = variant_path(parent_path, master=parent_path in hierarchy["roots"])
         legacy_notess = verified_legacy_notess_parent(unreal, helpers, asset, expected_parent)
@@ -735,6 +773,13 @@ def inspect_material_variants(unreal, source_paths, *, function=None, active_sou
                     "existing intermediate bend clone changed local source overrides: " + path)
     for path, root in hierarchy["roots"].items():
         snapshot = root_snapshots[path]
+        canonical = library.load_asset(variant_path(path, master=True))
+        if canonical is not None and canonical_wind_proof(unreal, canonical, helpers):
+            if function is None:
+                function = library.load_asset(FUNCTION)
+            require(function is not None, 'Canonical wind reuse requires the installed bend function')
+            reusable[path] = canonical
+            continue
         existing = helpers["owned_existing"](variant_path(path, master=True),
             helpers["digest"]({"graph": snapshot["graph"], "roots": snapshot["roots"]}), allow_building=True)
         if existing:
@@ -748,7 +793,7 @@ def inspect_material_variants(unreal, source_paths, *, function=None, active_sou
     return {**hierarchy, "helpers": helpers, "source_snapshots": source_snapshots,
             "root_snapshots": root_snapshots, "chain_signatures": chain_signatures,
             "destinations": {path: destination_snapshot(unreal, helpers, path) for path in plan["materials"]},
-            "function": function}
+            "function": function, "reusable": reusable}
 
 
 def verify_material_inspection(unreal, inspection, *, before_write=False):
@@ -786,39 +831,46 @@ def make_material_variants(unreal, source_paths, function, *, admission=None, in
     check_dependency_admission(admission)
     verify_material_inspection(unreal, inspection, before_write=True)
     library, edit = unreal.EditorAssetLibrary, unreal.MaterialEditingLibrary
+    from assembly_wpo_contract import WPO_SWITCH, WPO_GATE_TAG, WPO_GATE_OWNER, install_wpo_gate, stamp_wind, verify_wind
     parameters = material_scalar_defaults(unreal, function)
     generated, wrappers, clones, compile_proofs = {}, {}, {}, []
     for source_path, root in inspection["roots"].items():
         check_dependency_admission(admission)
         snapshot = inspection["root_snapshots"][source_path]
-        wrapper, created = helpers["make_master"](root, variant_path(source_path, master=True), function,
-                                                  snapshot["graph"], snapshot["roots"])
+        wrapper = inspection.get('reusable', {}).get(source_path)
+        if wrapper is None:
+            wrapper, created = helpers["make_master"](root, variant_path(source_path, master=True), function,
+                                                      snapshot["graph"], snapshot["roots"])
+            wrapper.set_editor_property('enable_tessellation', False)
+            # Some duplication APIs omit package metadata. The existing helper
+            # has independently verified every copied source expression.
+            library.set_metadata_tag(wrapper, WPO_GATE_TAG, WPO_GATE_OWNER)
+            install_wpo_gate(unreal, wrapper, enabled=True, helpers=helpers)
         wrappers[source_path] = wrapper
         generated[package_path(wrapper.get_path_name())] = wrapper
     for source_path, source in inspection["instances"].items():
         check_dependency_admission(admission)
         target_path = variant_path(source_path)
+        if source_path in inspection.get('reusable', {}):
+            target = inspection['reusable'][source_path]
+            clones[source_path] = target
+            generated[target_path] = target
+            continue
         target = library.load_asset(target_path) if library.does_asset_exist(target_path) else library.duplicate_asset(source.get_path_name(), target_path)
         require(isinstance(target, unreal.MaterialInstanceConstant), "normalized bend MIC duplication failed")
         leaf = source_path in plan["active_source_materials"]
-        preserved = (protected_mi_signature(unreal, helpers, source) if leaf
+        preserved = (protected_mi_signature(unreal, helpers, source, verified_notess=True) if leaf
                      else inherited_layer_signature(helpers, source))
         parent_path = inspection["parents"][source_path]
         parent = wrappers[parent_path] if parent_path in wrappers else clones[parent_path]
-        legacy_notess = verified_legacy_notess_parent(unreal, helpers, target, parent.get_path_name())
-        if legacy_notess:
-            parent = target.get_editor_property("parent")
-            if leaf:
-                preserved = protected_mi_signature(unreal, helpers, source, verified_notess=True)
         target.modify()
         edit.set_material_instance_parent(target, parent)
         require(target.get_editor_property("parent") == parent, "normalized bend immediate parent readback failed")
         if leaf:
             edit.set_material_instance_static_switch_parameter_value(target, helpers["SWITCH"], True)
+            edit.set_material_instance_static_switch_parameter_value(target, WPO_SWITCH, True)
             require(set(parameters) <= {str(name) for name in edit.get_scalar_parameter_names(target)}, "upgraded function does not expose the normalized bend scalar contract")
             for name, value in parameters.items():
-                if legacy_notess and edit.is_material_instance_parameter_overridden(target, name):
-                    continue  # Preserve the adopted production wind tuning.
                 edit.set_material_instance_scalar_parameter_value(target, name, value)
                 require(math.isclose(edit.get_material_instance_scalar_parameter_value(target, name), value, rel_tol=0, abs_tol=1e-6)
                         and edit.is_material_instance_parameter_overridden(target, name), "normalized bend scalar readback failed: " + name)
@@ -826,11 +878,15 @@ def make_material_variants(unreal, source_paths, function, *, admission=None, in
             base.set_editor_property("override_max_world_position_offset_displacement", True)
             base.set_editor_property("max_world_position_offset_displacement", 300.0)
             target.set_editor_property("base_property_overrides", base)
+        base = target.get_editor_property('base_property_overrides')
+        base.set_editor_property('override_b_enable_tessellation', False)
+        base.set_editor_property('enable_tessellation', False)
+        target.set_editor_property('base_property_overrides', base)
         edit.update_material_instance(target)
         if leaf:
             require(edit.get_material_instance_static_switch_parameter_value(target, helpers["SWITCH"])
                     and edit.is_material_instance_parameter_overridden(target, helpers["SWITCH"]), "normalized bend static switch readback failed")
-        actual = (protected_mi_signature(unreal, helpers, target, verified_notess=legacy_notess) if leaf
+        actual = (protected_mi_signature(unreal, helpers, target, verified_notess=True) if leaf
                   else inherited_layer_signature(helpers, target))
         require(actual == preserved, "normalized bend MIC changed protected source overrides/inheritance: " + source_path)
         require(helpers["mi_signature"](source) == inspection["source_snapshots"][source_path], "normalized bend changed original source MIC")
@@ -842,24 +898,29 @@ def make_material_variants(unreal, source_paths, function, *, admission=None, in
         clones[source_path] = target
         generated[target_path] = target
     require([unreal_asset_identity(path) for path in generated] == [unreal_asset_identity(path) for path in plan["materials"]], "material generation escaped its exact parent-chain plan")
+    source_by_target = {unreal_asset_identity(variant_path(source, master=source in inspection['roots'])): source
+                        for source in list(inspection['roots']) + list(inspection['instances'])}
     for path, asset in generated.items():
         check_dependency_admission(admission)
         compile_proofs.append(helpers["compile_resource"](asset))
+        source_path = source_by_target[unreal_asset_identity(path)]
         if isinstance(asset, unreal.MaterialInstanceConstant):
-            source_path = library.get_metadata_tag(asset, SOURCE_TAG)
             source = inspection["instances"][source_path]
             leaf = source_path in plan["active_source_materials"]
-            parent_path = inspection["parents"][source_path]
-            expected_parent = variant_path(parent_path, master=parent_path in inspection["roots"])
-            legacy_notess = verified_legacy_notess_parent(unreal, helpers, asset, expected_parent)
-            actual = (protected_mi_signature(unreal, helpers, asset, verified_notess=legacy_notess) if leaf else inherited_layer_signature(helpers, asset))
-            preserved = (protected_mi_signature(unreal, helpers, source, verified_notess=legacy_notess) if leaf else inherited_layer_signature(helpers, source))
-            require(actual == preserved and library.get_metadata_tag(asset, SIGNATURE_TAG) == helpers["digest"](helpers["mi_signature"](asset)),
-                    "compiled bend clone changed authored inheritance/overrides: " + path)
+            if source_path not in inspection.get('reusable', {}):
+                actual = (protected_mi_signature(unreal, helpers, asset, verified_notess=True) if leaf else inherited_layer_signature(helpers, asset))
+                preserved = (protected_mi_signature(unreal, helpers, source, verified_notess=True) if leaf else inherited_layer_signature(helpers, source))
+                require(actual == preserved and library.get_metadata_tag(asset, SIGNATURE_TAG) == helpers["digest"](helpers["mi_signature"](asset)),
+                        "compiled bend clone changed authored inheritance/overrides: " + path)
         library.set_metadata_tag(asset, STATE_TAG, "complete")
         if isinstance(asset, unreal.Material):
             library.set_metadata_tag(asset, helpers["GRAPH_TAG"], helpers["graph_signature"](asset))
             library.set_metadata_tag(asset, helpers["STATE_TAG"], "complete")
+        if source_path in inspection.get('reusable', {}):
+            verify_wind(unreal, asset, helpers=helpers)
+        else:
+            source = inspection['roots'].get(source_path) or inspection['instances'][source_path]
+            stamp_wind(unreal, asset, source, helpers=helpers, mode='normalized')
     verify_material_inspection(unreal, inspection)
     return {"variants": [variant_path(path) if index in plan["active_source_indices"] else path
                          for index, path in enumerate(plan["source_materials"])],

@@ -1,7 +1,8 @@
 # Assembly reimport material defaults
 
-Every Assembly item built through SK Batch ingest applies part-only NoTess
-materials after wind/material normalization and before saving the final root.
+Every Assembly item built through SK Batch ingest delivers one canonical
+part-only NoTess hierarchy before saving the final root. Wind is generated
+directly in that hierarchy, without CArc or AspectBend intermediate materials.
 This includes parts whose wind role is `NONE`. No additional Push option is
 needed. Static-only imports and ordinary Full/Base meshes keep their material
 route.
@@ -20,8 +21,13 @@ source for import matching, then reapplies the same NoTess destinations.
 `sk_batch/assembly_part_notess.py` clones the full material-instance hierarchy
 under `/Game/Material/Tree/AssetTree/AssemblyNoTess`. The master and effective
 interface names end in `_notess`, including already-disabled foliage and Stem.
-The master and effective interface must both disable tessellation. Other graph outputs, parameters,
-static switches, layers and WPO bounds remain source-equivalent. Existing
+The master and effective interface must both disable tessellation. Other graph
+outputs, appearance parameters, layers and WPO bounds remain source-equivalent.
+The complete WPO output is behind `Enable Foliage WPO`: original non-NoTess
+masters and interfaces must resolve false (zero WPO), while the canonical wind
+hierarchy resolves true. Full/Base tessellation and displacement are retained.
+An original that has not adopted this policy stops wind generation before any
+duplication or checkout. Existing
 production derivatives are reused only after graph/parameter/parent/runtime
 verification. An incompatible or edited derivative stops the operation rather
 than silently replacing it or publishing a TessON Assembly.
@@ -37,6 +43,21 @@ canonical destination stop in read-only preflight with both source/parent paths,
 the expected destination and existing ownership metadata. No automatic hash name,
 fallback name, short-name lookup, merge or overwrite is allowed.
 Legacy `_PartNoTess_<hash>` aliases remain readable for existing reimports.
+An unowned material inside a generated Assembly folder cannot become a new
+source merely because its filename resembles an original. Its exact source must
+be proven during migration. Source resolution follows owned NoTess, normalized
+bend and CArc metadata back to the original asset, never strips filename text.
+
+`assembly_wpo_contract.py` provides the migration gate and signature API.
+After original WPO gates are disabled and canonical graphs, parents and artist
+tuning are final, `stamp_wind(..., mode='authored')` records exact original paths
+and source/appearance signatures in `SKBatchAssemblyWindContract`. The canonical
+master and interface must both be NoTess and enable their WPO gate. Later ingest
+verifies this contract and reuses the authored graph and tuning without replacing
+them with defaults. Changed sources, unverified appearance edits, incompatible
+parents and canonical name collisions stop in read-only preflight. A legacy CArc
+binding requires this verified canonical destination before reimport; ingest does
+not regenerate or continue assigning the CArc material.
 
 Ingest admits exact derivative packages to Perforce, saves them without
 thumbnails, records their durable-save ownership, and only then saves the root.

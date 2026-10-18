@@ -16,6 +16,7 @@ LEGACY_OWNER = "SpeedTreeBatch/AssemblyPartNoTess/v1"
 OWNER_TAG = "SKBatchAssemblyPartNoTessOwner"
 SOURCE_TAG = "SKBatchAssemblyPartNoTessSource"
 SIGNATURE_TAG = "SKBatchAssemblyPartNoTessSignature"
+STATE_TAG = "SKBatchAssemblyPartNoTessState"
 CONTRACT_TAG = "SKBatchAssemblyPartNoTessContract"
 
 
@@ -70,7 +71,8 @@ def original_interface(unreal, asset):
     require(original is not None and type(original) is type(asset), 'NoTess original is missing or changed class')
     require(identity(destination(original, master=isinstance(original, unreal.Material))) == identity(path),
             'NoTess source identity/name collision: ' + path)
-    return original
+    from assembly_wpo_contract import original_source
+    return original_source(unreal, original, reject_unmigrated_wind=True)
 
 
 def digest(value):
@@ -89,7 +91,7 @@ def _normalize(value, identities):
     return value
 
 
-def _signature(unreal, helpers, asset, identities):
+def _signature(unreal, helpers, asset, identities, *, assume_wpo_disabled=False):
     if isinstance(asset, unreal.Material):
         value = {"graph": helpers["graph"](asset), "roots": helpers["roots"](asset),
                  "wpo_bound": helpers["property_text"](asset, "max_world_position_offset_displacement")}
@@ -97,12 +99,45 @@ def _signature(unreal, helpers, asset, identities):
         value = deepcopy(helpers["mi_signature"](asset))
         value.pop("parent", None)
         value.get("layers", {}).pop("material_interface", None)
-        # Unlike the bend helper, preserve WPO bounds and every other override.
+        from assembly_wpo_contract import WPO_SWITCH
+        switches = value.get('effective_static_switches', {})
+        if assume_wpo_disabled:
+            switches[WPO_SWITCH] = False
+        wpo_disabled = switches.get(WPO_SWITCH) is False
+        if wpo_disabled:
+            # The entire WPO graph is compiled out. A shared wind master adds
+            # the internal bend selector, but its value cannot affect a NONE
+            # clone whose complete WPO gate is explicitly false.
+            switches.pop(WPO_SWITCH, None)
+            switches.pop(helpers.get('SWITCH', 'Enable Assembly Part Bend'), None)
+        # Preserve active/explicit WPO bounds and every other override. UE may
+        # replace an inactive stored bound with its parent value while copying
+        # the overrides, even though override=False and full WPO is disabled.
         text = value["base_property_overrides"]
+        if wpo_disabled and re.search(
+                r"(?<![A-Za-z0-9_])bOverride_MaxWorldPositionOffsetDisplacement=(?:False|false|0)(?=[,)])", text):
+            text = re.sub(
+                r"(?<![A-Za-z0-9_])MaxWorldPositionOffsetDisplacement=[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?(?=[,)])",
+                "MaxWorldPositionOffsetDisplacement=0", text)
         value["base_property_overrides"] = re.sub(
             r"(?<![A-Za-z0-9_])(bOverride_bEnableTessellation|bEnableTessellation|EnableTessellation)=(True|False|true|false|0|1)",
             lambda m: m.group(1) + "=False", text)
     return _normalize(value, identities)
+
+
+def _preserve_disabled_wpo(unreal, helpers, source):
+    if not isinstance(source, unreal.MaterialInstanceConstant):
+        return False
+    from assembly_wpo_contract import WPO_SWITCH
+    return helpers['mi_signature'](source).get('effective_static_switches', {}).get(WPO_SWITCH) is False
+
+
+def _require_wpo_override_api(unreal):
+    edit = unreal.MaterialEditingLibrary
+    for name in ('set_material_instance_static_switch_parameter_value',
+                 'get_material_instance_static_switch_parameter_value',
+                 'is_material_instance_parameter_overridden'):
+        require(callable(getattr(edit, name, None)), 'NoTess WPO preservation API is unavailable: ' + name)
 
 
 def _runtime(unreal, paths):
@@ -143,6 +178,7 @@ def _assert_equivalent_runtime(source, target):
 def inspect_materials(unreal, source_paths, *, read_only=False, preserve_verified_legacy=False, legacy=False):
     """Read-only complete hierarchy and exact existing-derivative collision guard."""
     from normalized_assembly_bend import material_helpers
+    from assembly_wpo_contract import original_source, verify_wind
     helpers, library = material_helpers(unreal), unreal.EditorAssetLibrary
     references = {}
     for requested in source_paths:
@@ -159,10 +195,13 @@ def inspect_materials(unreal, source_paths, *, read_only=False, preserve_verifie
             continue
         if not legacy:
             asset = original_interface(unreal, asset)
+            asset = original_source(unreal, asset, reject_unmigrated_wind=True, helpers=helpers)
         requested_source = package(asset)
         chain, seen = [], set()
         while asset is not None:
             current = package(asset)
+            require(legacy or original_source(unreal, asset) == asset,
+                    'NoTess original hierarchy contains an intermediate Assembly derivative: ' + current)
             require(identity(current) not in seen and len(chain) < 64, "NoTess material parent cycle")
             seen.add(identity(current)); chain.append(asset)
             if isinstance(asset, unreal.Material):
@@ -204,16 +243,32 @@ def inspect_materials(unreal, source_paths, *, read_only=False, preserve_verifie
     dirty = {identity(p) for p in unreal.EditorLoadingAndSavingUtils.get_dirty_content_packages()}
     dirty_sources = [p for p in sources if identity(p) in dirty]
     require(read_only or not dirty_sources, "NoTess original source material is dirty: " + str(sorted(dirty_sources)))
-    existing, writes = {}, []
+    existing, writes, wpo_preservation, resumed = {}, [], [], []
     for source, target in targets.items():
-        require(read_only or identity(target) not in dirty, "NoTess derivative has unsaved edits: " + target)
+        preserve_wpo = _preserve_disabled_wpo(unreal, helpers, sources[source])
         if not library.does_asset_exist(target):
             writes.append(target)
+            if preserve_wpo:
+                wpo_preservation.append(source)
             continue
         asset = library.load_asset(target)
         require(type(asset) is type(sources[source]), "NoTess destination class collision: " + target)
-        require(_signature(unreal, helpers, asset, identities) == signatures[source],
-                "Existing NoTess derivative differs from its source; preserve its changes: " + target)
+        wind = None if legacy else verify_wind(unreal, asset, helpers=helpers)
+        building = library.get_metadata_tag(asset, STATE_TAG) == 'building'
+        if building:
+            require(not wind and preserve_wpo
+                    and library.get_metadata_tag(asset, OWNER_TAG) == (LEGACY_OWNER if legacy else OWNER)
+                    and identity(str(library.get_metadata_tag(asset, SOURCE_TAG) or '')) == identity(source)
+                    and library.get_metadata_tag(asset, SIGNATURE_TAG) == digest(signatures[source])
+                    and _signature(unreal, helpers, asset, identities, assume_wpo_disabled=True) == signatures[source],
+                    'Incomplete NoTess clone changed protected source data: ' + target)
+        require(read_only or identity(target) not in dirty or building,
+                "NoTess derivative has unsaved edits: " + target)
+        if wind:
+            require(identity(wind['source']) == identity(source), 'Canonical NoTess wind source differs')
+        else:
+            require(building or _signature(unreal, helpers, asset, identities) == signatures[source],
+                    "Existing NoTess derivative differs from its source; preserve its changes: " + target)
         if isinstance(asset, unreal.MaterialInstanceConstant):
             parent = sources[source].get_editor_property("parent")
             expected = targets.get(package(parent), package(parent))
@@ -221,21 +276,29 @@ def inspect_materials(unreal, source_paths, *, read_only=False, preserve_verifie
         require(_off(_runtime(unreal, [target])[target]), "Existing derivative base/interface is TessON")
         owner = library.get_metadata_tag(asset, OWNER_TAG)
         require(not owner or owner == (LEGACY_OWNER if legacy else OWNER), "NoTess destination has another owner")
-        if owner:
+        if owner and not wind:
             require(identity(str(library.get_metadata_tag(asset, SOURCE_TAG) or '')) == identity(source) and
                     library.get_metadata_tag(asset, SIGNATURE_TAG) == digest(signatures[source]),
                     "NoTess ownership/source signature changed")
-        elif not (legacy and preserve_verified_legacy):
+        elif not owner and not (legacy and preserve_verified_legacy):
             # Legacy 51-root derivatives are adopted only after exact graph,
             # overrides, chain, runtime and deterministic-path verification.
             # Canonical prototype interfaces always need their exact source
             # stamp so the next import can safely unwrap them.
             writes.append(target)
+        if building:
+            writes.append(target)
+            wpo_preservation.append(source)
+            resumed.append(target)
         existing[source] = asset
+    if wpo_preservation:
+        _require_wpo_override_api(unreal)
     return {"helpers": helpers, "sources": sources, "targets": targets, "bindings": bindings,
             "signatures": signatures, "identities": identities, "existing": existing,
             "write_packages": writes, "runtime_before": runtime,
-            "dirty_inputs_observed": sorted(p for p in set(sources) | set(targets.values()) if identity(p) in dirty), "read_only": bool(read_only)}
+            "dirty_inputs_observed": sorted(p for p in set(sources) | set(targets.values()) if identity(p) in dirty),
+            "wpo_preservation_sources": wpo_preservation, "resumed_building_packages": resumed,
+            "read_only": bool(read_only)}
 
 
 def plan_remaps(snapshot, bindings, slot_counts):
@@ -346,11 +409,17 @@ def apply_default_part_notess(unreal, assembly, *, prepare_dependencies, preserv
         require(_signature(unreal, inspection["helpers"], original, inspection["identities"]) == inspection["signatures"][source],
                 "NoTess source changed after admission")
         asset = generated.get(source)
+        newly_created = asset is None
         if asset is None:
             asset = unreal.AssetToolsHelpers.get_asset_tools().duplicate_asset(
                 target_path.rsplit("/", 1)[-1], target_path.rsplit("/", 1)[0], original)
             require(asset is not None and type(asset) is type(original), "NoTess native duplication failed")
             created.append(target_path)
+            if source in inspection['wpo_preservation_sources']:
+                for key, value in ((OWNER_TAG, OWNER), (SOURCE_TAG, source),
+                                   (SIGNATURE_TAG, digest(inspection['signatures'][source])),
+                                   (STATE_TAG, 'building')):
+                    library.set_metadata_tag(asset, key, value)
             if isinstance(asset, unreal.Material):
                 asset.set_editor_property("enable_tessellation", False)
             else:
@@ -360,19 +429,34 @@ def apply_default_part_notess(unreal, assembly, *, prepare_dependencies, preserv
                 overrides.set_editor_property("override_b_enable_tessellation", False)
                 overrides.set_editor_property("enable_tessellation", False)
                 asset.set_editor_property("base_property_overrides", overrides)
+        if source in inspection['wpo_preservation_sources']:
+            from assembly_wpo_contract import WPO_SWITCH
+            # Do not touch an existing authored wind interface: only newly
+            # duplicated or exactly verified incomplete NONE clones enter here.
+            edit.set_material_instance_static_switch_parameter_value(asset, WPO_SWITCH, False)
+            require(edit.get_material_instance_static_switch_parameter_value(asset, WPO_SWITCH) is False
+                    and edit.is_material_instance_parameter_overridden(asset, WPO_SWITCH),
+                    'NoTess could not preserve the original disabled WPO gate: ' + target_path)
+        if newly_created or target_path in inspection['resumed_building_packages']:
             compile_proofs.append(inspection["helpers"]["compile_resource"](asset))
         generated[source] = asset
         require(_signature(unreal, inspection["helpers"], asset, inspection["identities"]) == inspection["signatures"][source],
                 "NoTess clone changed authored graph/parameters/WPO")
         asset.modify()
-        for key, value in ((OWNER_TAG, OWNER), (SOURCE_TAG, source), (SIGNATURE_TAG, digest(inspection["signatures"][source]))):
+        for key, value in ((OWNER_TAG, OWNER), (SOURCE_TAG, source),
+                           (SIGNATURE_TAG, digest(inspection["signatures"][source])), (STATE_TAG, 'complete')):
             library.set_metadata_tag(asset, key, value)
     runtime = _runtime(unreal, list(dict.fromkeys(inspection["bindings"].values())))
     for source, original in inspection["sources"].items():
         require(_signature(unreal, inspection["helpers"], original, inspection["identities"]) == inspection["signatures"][source],
                 "NoTess generation changed an original material")
+    from assembly_wpo_contract import verify_wind
     for source, target in inspection["bindings"].items():
-        _assert_equivalent_runtime(inspection["runtime_before"][source], runtime[target])
+        if verify_wind(unreal, library.load_asset(target), helpers=inspection['helpers']):
+            require(_off(runtime[target]) and runtime[target].get('relevance_uses_displacement') is False,
+                    'Canonical Assembly wind runtime is not NoTess')
+        else:
+            _assert_equivalent_runtime(inspection["runtime_before"][source], runtime[target])
     prototype_changes = []
     for proto_path, mesh in prototypes.items():
         slots = list(mesh.get_editor_property('materials'))

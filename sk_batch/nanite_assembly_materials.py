@@ -313,82 +313,77 @@ def _verify_elm_import_payload(unreal, mesh, role, native):
 
 
 def _normalize_elm_assembly_bend(unreal, assembly, policy, *, apply, allow_dirty):
-    """Route only the three approved Elm roots through guarded native authoring."""
+    """Verify migrated Elm roots without the retired three/six-slot writer.
+
+    Batch builds supply a manifest and use normalize_assembly() above this
+    fallback. A manifest-free call may inspect or reuse an already canonical
+    root; rebuilding material bindings requires that current manifest route.
+    No geometry, UV metadata, prototype or material is mutated here.
+    """
     path = policy["assembly"]
     settings_text = assembly.get_editor_property("nanite_settings").export_text()
     parts = parse_nanite_assembly_part_remaps(settings_text)
     if len(parts) != 7 or [package_path(row["mesh"]) for row in parts[3:]] != policy["prototypes"]:
         raise NaniteAssemblyMaterialError("Elm Assembly leaf dependency paths/order differ from the approved policy")
-    if apply and not allow_dirty:
-        dirty = {p.get_path_name() for p in unreal.EditorLoadingAndSavingUtils.get_dirty_content_packages()}
-        if assembly.get_outermost().get_path_name() in dirty:
-            raise NaniteAssemblyMaterialError(f"Assembly already has unsaved user changes: {path}")
-    native = getattr(unreal, "CodexAssemblyPartBendUvLibrary", None)
-    if apply and (native is None or not hasattr(native, "append_test_prototype_uv3")
-                  or not hasattr(native, "configure_test_assembly_parts")):
-        raise NaniteAssemblyMaterialError("Elm production UV3/native remap verification is unavailable")
-    materials = []
-    # Missing variants fail before touching any prototype or root metadata.
+    from assembly_wpo_contract import verify_wind
     for target in policy["variant_materials"]:
         material = unreal.EditorAssetLibrary.load_asset(target)
         if material is None or package_path(material.get_path_name()) != target:
             raise NaniteAssemblyMaterialError(f"Elm Assembly bend material is missing: {target}")
-        materials.append(material)
+        try:
+            if verify_wind(unreal, material) is None:
+                raise RuntimeError('Missing canonical wind ownership/signature')
+        except (RuntimeError, ValueError, TypeError) as exc:
+            raise NaniteAssemblyMaterialError('Elm canonical _notess contract is not verified: ' + target + ': ' + str(exc)) from exc
     before_slots = list(assembly.get_editor_property("materials") or [])
-    if len(before_slots) not in (3, 6):
-        raise NaniteAssemblyMaterialError("Elm Assembly must retain three original and zero/three bend slots")
-    prototypes = []
-    for target in policy["prototypes"]:
-        mesh = unreal.EditorAssetLibrary.load_asset(target)
-        if not isinstance(mesh, unreal.SkeletalMesh):
-            raise NaniteAssemblyMaterialError(f"Elm normalized leaf prototype is missing: {target}")
-        prototypes.append(mesh)
-    native_uv = []
-    native_remap = None
-    if apply:
-        # The default path verifies source-exported UV3 rather than manufacturing
-        # it after an incomplete Blender export. Native validation checks every
-        # corner and protected attributes before the material mutation.
-        for mesh, role in zip(prototypes, policy["roles"]):
-            native_uv.append(_verify_elm_import_payload(unreal, mesh, role, native))
-        _set_elm_metadata(unreal, assembly, "CodexElmAssemblyBendProductionOptIn", PRODUCTION_OWNER)
-        native_remap = _required_elm_native_report(
-            native.configure_test_assembly_parts(path, policy["prototypes"], True, policy["variant_materials"]),
-            "material remap",
-        )
-        if (native_remap.get("payload_checked_prototype_count") != 4
-                or native_remap.get("payload_verified_before_material_mutation") is not True
-                or native_remap.get("production_prototype_materials_directly_applied") is not True):
-            raise NaniteAssemblyMaterialError("Elm native remap did not prove all UV3 payloads and direct prototype materials")
-        if native_remap.get("root_source_mesh_description_preserved") is not True:
-            raise NaniteAssemblyMaterialError("Elm material remap did not prove authored root preservation")
-    after_slots = list(assembly.get_editor_property("materials") or [])
-    after_parts = parse_nanite_assembly_part_remaps(assembly.get_editor_property("nanite_settings").export_text())
+    actual = [package_path(slot.get_editor_property('material_interface').get_path_name()) for slot in before_slots]
+    if len(actual) < 3 or actual[:3] != policy['source_materials']:
+        raise NaniteAssemblyMaterialError('Elm fallback must preserve its three original Base material slots')
+    aliases = {source: target for source, target in zip(policy['source_materials'], policy['variant_materials'])}
+    aliases.update({target: target for target in policy['variant_materials']})
+    planned = list(actual)
+    desired_parts = []
+    for index, row in enumerate(parts):
+        desired = list(row['remap'])
+        if index >= 3:
+            if not desired:
+                raise NaniteAssemblyMaterialError('Elm fallback requires explicit leaf material remaps')
+            for local, slot_index in enumerate(row['remap']):
+                if not 0 <= slot_index < len(actual) or actual[slot_index] not in aliases:
+                    raise NaniteAssemblyMaterialError('Elm leaf uses an unproven material; migrate with its current manifest')
+                target = aliases[actual[slot_index]]
+                # Preserve existing indices even when canonical pointers occur
+                # more than once in the historical global table.
+                if actual[slot_index] == target:
+                    continue
+                if target not in planned:
+                    planned.append(target)
+                desired[local] = planned.index(target)
+        desired_parts.append(desired)
+    would_change = planned != actual or any(row['remap'] != wanted for row, wanted in zip(parts, desired_parts))
+    if apply and would_change:
+        raise NaniteAssemblyMaterialError('Manifest-free Elm reconstruction is retired; supply the current manifest to the canonical _notess normalization pipeline')
     part_audits = []
     part_rows = []
-    for row in after_parts:
+    for row, desired in zip(parts, desired_parts):
         mesh = unreal.EditorAssetLibrary.load_asset(package_path(row["mesh"]))
+        if not isinstance(mesh, unreal.SkeletalMesh):
+            raise NaniteAssemblyMaterialError('Elm prototype is missing: ' + row['mesh'])
         slots = list(mesh.get_editor_property("materials") or [])
         part_audits.append(audit_unreal_skeletal_mesh_material_sections(unreal, package_path(row["mesh"]), len(slots)))
         part_rows.append({"index": row["index"], "mesh": row["mesh"],
-                          "existing_remap": parts[row["index"]]["remap"],
-                          "desired_remap": row["remap"], "slot_count": len(slots)})
+                          "existing_remap": row['remap'], "desired_remap": desired, "slot_count": len(slots)})
     return {
         "assembly": assembly.get_path_name(), "apply_requested": bool(apply),
-        "would_change": len(before_slots) == 3 or any(x["remap"] != y["remap"] for x, y in zip(parts, after_parts)),
-        "changed": bool(native_remap and (native_remap.get("changed") is True
-                        or native_remap.get("status") == "configured_verified_unsaved")),
-        "before_material_count": len(before_slots), "after_material_count": len(after_slots),
-        "global_slots": [_unreal_slot_record(slot, index) for index, slot in enumerate(after_slots)],
-        "appended_slots": [_unreal_slot_record(slot, index) for index, slot in enumerate(after_slots) if index >= len(before_slots)],
+        "would_change": would_change, "changed": False,
+        "before_material_count": len(before_slots), "after_material_count": len(before_slots),
+        "global_slots": [_unreal_slot_record(slot, index) for index, slot in enumerate(before_slots)],
+        "appended_slots": [],
         "duplicate_global_keys": [], "parts": part_rows, "part_section_audits": part_audits,
-        "assembly_section_audit": audit_unreal_skeletal_mesh_material_sections(unreal, path, len(after_slots)),
-        "elm_part_bend_policy": policy, "uv3_verifications": native_uv, "native_material_remap": native_remap,
-        "dependent_packages_to_save": [
-            target for target in policy["prototypes"]
-            if target in {p.get_path_name() for p in unreal.EditorLoadingAndSavingUtils.get_dirty_content_packages()}
-        ] if apply else [],
-        "dependency_save_status": "caller_owned" if apply else "not_requested",
+        "assembly_section_audit": audit_unreal_skeletal_mesh_material_sections(unreal, path, len(before_slots)),
+        "canonical_elm_material_policy": policy, "uv3_verifications": [], "native_material_remap": None,
+        "dependent_packages_to_save": [], "dependency_save_status": "not_requested",
+        "material_reconstruction_requires_manifest": would_change,
     }
 
 
@@ -627,6 +622,8 @@ def normalize_unreal_nanite_assembly_materials(
 
     if not isinstance(assembly, unreal.SkeletalMesh):
         raise NaniteAssemblyMaterialError("target is not an Unreal SkeletalMesh")
+    if (material_preservation or {}).get('preserved_wind_policy'):
+        raise NaniteAssemblyMaterialError('Legacy CArc delivery must migrate to its verified canonical _notess hierarchy before reimport')
     if material_preservation is not None:
         # Only the builder's independently frozen, ancestry-checked plan may
         # replace prototype appearances during ordinary slot normalization.
@@ -647,14 +644,7 @@ def normalize_unreal_nanite_assembly_materials(
             raise NaniteAssemblyMaterialError("preserved Assembly prototype/remap changed")
     assembly_path = assembly.get_path_name()
     independent_bend_intent = False
-    preserved_wind = (material_preservation or {}).get("preserved_wind_policy")
-    preserved_streams = None
-    if preserved_wind:
-        from preserved_assembly_carc import verify_aliases, prototype_streams
-        verify_aliases(unreal, preserved_wind["aliases"])
-        preserved_streams = prototype_streams(unreal, preserved_wind["prototypes"])
-        independent_bend_intent = True
-    if manifest is not None and not preserved_wind:
+    if manifest is not None:
         try:
             from .normalized_assembly_bend import normalize_assembly, NormalizedAssemblyBendError
         except ImportError:
@@ -757,10 +747,6 @@ def normalize_unreal_nanite_assembly_materials(
     )
     remaps_changed = [row["remap"] for row in parsed_parts] != desired_remaps
     would_change = bool(plan["appended_slots"] or remaps_changed)
-    if preserved_wind:
-        verify_aliases(unreal, preserved_wind["aliases"])
-        if prototype_streams(unreal, preserved_wind["prototypes"]) != preserved_streams:
-            raise NaniteAssemblyMaterialError("Authored C-arc prototype streams changed during material preservation")
     report = {
         "assembly": assembly_path,
         "apply_requested": bool(apply),
@@ -774,10 +760,6 @@ def normalize_unreal_nanite_assembly_materials(
         "parts": plan["parts"],
         "part_section_audits": part_section_audits,
     }
-    if preserved_wind:
-        report["preserved_assembly_wind_policy"] = {**preserved_wind,
-            "verified": True, "prototype_streams_before": preserved_streams,
-            "prototype_streams_after": prototype_streams(unreal, preserved_wind["prototypes"])}
     if not apply or not would_change:
         report["assembly_section_audit"] = (
             audit_unreal_skeletal_mesh_material_sections(

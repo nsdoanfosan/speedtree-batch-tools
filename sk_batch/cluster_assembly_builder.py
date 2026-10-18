@@ -9222,6 +9222,8 @@ def plan_unreal_assembly_material_preservation(unreal, assembly_path, base, orde
             raise ClusterAssemblyBuildError("Assembly material preservation found an empty material")
         from assembly_part_notess import original_interface
         interface = original_interface(unreal, interface)
+        from assembly_wpo_contract import original_source
+        interface = original_source(unreal, interface, reject_unmigrated_wind=True)
         owner = str(library.get_metadata_tag(interface, "CodexNormalizedAssemblyBendOwner") or "")
         source = str(library.get_metadata_tag(interface, "CodexNormalizedAssemblyBendSourceMaterial") or "")
         if source:

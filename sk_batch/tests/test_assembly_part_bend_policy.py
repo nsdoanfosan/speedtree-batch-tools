@@ -140,6 +140,15 @@ class FakeMesh(FakeAsset):
 
 
 class NativePolicyTests(unittest.TestCase):
+    def setUp(self):
+        self.wind_proof=patch('assembly_wpo_contract.verify_wind',return_value={'verified':True})
+        self.wind_proof.start();self.addCleanup(self.wind_proof.stop)
+
+    def canonical_fixture(self):
+        unreal,root,assets,events=self.fixture()
+        root.values['materials'].extend(FakeSlot(i,assets[path]) for i,path in enumerate(VARIANT_MATERIALS))
+        root.values['nanite_settings'].remaps[3:]=[[3,4,5] for _ in range(4)]
+        return unreal,root,assets,events
     def fixture(self):
         assets = {path: FakeAsset(path) for path in SOURCE_MATERIALS + VARIANT_MATERIALS}
         slots = lambda: [FakeSlot(i, assets[path]) for i, path in enumerate(SOURCE_MATERIALS)]
@@ -194,20 +203,22 @@ class NativePolicyTests(unittest.TestCase):
         return unreal, root, assets, events
 
     def test_all_payloads_verified_before_remap_and_original_indices_preserved(self):
-        unreal, root, assets, events = self.fixture()
+        unreal, root, assets, events = self.canonical_fixture()
         original_slots = list(root.values["materials"])
         original_branch_remaps = deepcopy(root.values["nanite_settings"].remaps[:3])
         with patch.object(materials, "audit_unreal_skeletal_mesh_material_sections",
                           side_effect=lambda _u, path, count: {"status": "ok", "mesh": path, "slot_count": count}):
             result = materials.normalize_unreal_nanite_assembly_materials(unreal, root, apply=True)
-        self.assertEqual(root.values["materials"][:3], original_slots)
+        self.assertEqual(root.values["materials"][:3], original_slots[:3])
         self.assertEqual(root.values["nanite_settings"].remaps[:3], original_branch_remaps)
-        self.assertEqual([row[0] for row in events], ["verify"] * 4 + ["configure"])
+        self.assertEqual(events, [])
         self.assertEqual(result["after_material_count"], 6)
         self.assertEqual(len(result["part_section_audits"]), 7)
-        self.assertEqual(root.metadata["CodexElmAssemblyBendProductionOptIn"], PRODUCTION_OWNER)
-        self.assertEqual(root.modifications, 1)
-        self.assertTrue(all(assets[path].modifications == 2 for path in ELM_PROTOTYPES))
+        self.assertEqual(root.metadata, {})
+        self.assertEqual(root.modifications, 0)
+        self.assertTrue(all(assets[path].modifications == 0 for path in ELM_PROTOTYPES))
+        self.assertFalse(result['changed'])
+        self.assertFalse(result['would_change'])
 
     def test_missing_mi_fails_before_any_metadata_or_payload_operation(self):
         unreal, root, assets, events = self.fixture()
@@ -222,10 +233,34 @@ class NativePolicyTests(unittest.TestCase):
         unreal, root, _assets, events = self.fixture()
         unreal.CodexAssemblyPartBendUvLibrary.append_test_prototype_uv3 = (
             lambda path, role: (json.dumps({"ok": False, "errors": ["UV3 source payload mismatch"]}), []))
-        with self.assertRaisesRegex(materials.NaniteAssemblyMaterialError, "imported UV3 verification failed"):
+        with self.assertRaisesRegex(materials.NaniteAssemblyMaterialError, "supply the current manifest"):
             materials.normalize_unreal_nanite_assembly_materials(unreal, root, apply=True)
         self.assertEqual(events, [])
         self.assertEqual(len(root.values["materials"]), 3)
+
+    def test_canonical_eleven_slot_table_keeps_duplicate_pointer_indices(self):
+        unreal,root,assets,events=self.canonical_fixture()
+        root.values['materials'].extend(FakeSlot(i,assets[VARIANT_MATERIALS[i%3]]) for i in range(5))
+        root.values['nanite_settings'].remaps[3:]=[[8,9,10] for _ in range(4)]
+        with patch.object(materials,'audit_unreal_skeletal_mesh_material_sections',return_value={'status':'ok'}):
+            result=materials.normalize_unreal_nanite_assembly_materials(unreal,root,apply=True)
+        self.assertFalse(result['would_change']);self.assertFalse(result['changed'])
+        self.assertEqual(result['after_material_count'],11)
+        self.assertEqual([r['desired_remap'] for r in result['parts'][3:]],[[8,9,10]]*4)
+        self.assertEqual(events,[])
+
+    def test_canonical_contract_is_required_before_any_legacy_operation(self):
+        unreal,root,_assets,events=self.canonical_fixture()
+        with patch('assembly_wpo_contract.verify_wind',return_value=None):
+            with self.assertRaisesRegex(materials.NaniteAssemblyMaterialError,'contract is not verified'):
+                materials.normalize_unreal_nanite_assembly_materials(unreal,root,apply=True)
+        self.assertEqual(events,[])
+
+    def test_production_policy_never_targets_deleted_legacy_materials(self):
+        for target in VARIANT_MATERIALS:
+            self.assertIn('/AssemblyNoTess/',target)
+            self.assertTrue(target.endswith('_notess'))
+            self.assertNotIn('_AssemblyBend',target)
 
     def test_audit_mode_never_writes_metadata_or_calls_native_authoring(self):
         unreal, root, assets, events = self.fixture()
@@ -242,7 +277,7 @@ class NativePolicyTests(unittest.TestCase):
         unreal, root, _assets, events = self.fixture()
         unreal.CodexAssemblyPartBendUvLibrary.append_test_prototype_uv3 = (
             lambda path, role: (json.dumps({"ok": True, "changed": False}), []))
-        with self.assertRaisesRegex(materials.NaniteAssemblyMaterialError, "proof is incomplete"):
+        with self.assertRaisesRegex(materials.NaniteAssemblyMaterialError, "supply the current manifest"):
             materials.normalize_unreal_nanite_assembly_materials(unreal, root, apply=True)
         self.assertEqual(events, [])
         self.assertEqual(len(root.values["materials"]), 3)

@@ -33,7 +33,7 @@ SOURCE_MATERIALS = tuple(
     for name in ("MI_bark_common_end_01", "MI_Bark_elm_01", "MI_leaf_elm_atlas_01")
 )
 VARIANT_MATERIALS = tuple(
-    "/Game/Material/Tree/AssetTree/AssemblyBend/" + name + "_AssemblyBend"
+    "/Game/Material/Tree/AssetTree/AssemblyNoTess/" + name + "_notess"
     for name in ("MI_bark_common_end_01", "MI_Bark_elm_01", "MI_leaf_elm_atlas_01")
 )
 DEFAULT_SCALARS = {

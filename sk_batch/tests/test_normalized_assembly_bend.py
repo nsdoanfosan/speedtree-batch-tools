@@ -285,9 +285,10 @@ class ManifestAndProofTests(unittest.TestCase):
         self.assertEqual(bend.protected_base_fields(source), bend.protected_base_fields(changed))
         self.assertNotEqual(bend.protected_base_fields(source), bend.protected_base_fields(changed.replace("BLEND_Masked", "BLEND_Opaque")))
 
-    def test_generated_paths_include_full_source_identity(self):
-        self.assertNotEqual(bend.variant_path("/Game/A/MI_Leaf"), bend.variant_path("/Game/B/MI_Leaf"))
-        self.assertNotEqual(bend.variant_path("/Game/A/MI_Leaf"), bend.variant_path("/Game/A/MI_Leaf", master=True))
+    def test_generated_paths_are_canonical_and_collisions_need_preflight(self):
+        self.assertEqual(bend.variant_path("/Game/A/MI_Leaf"), '/Game/Material/Tree/AssetTree/AssemblyNoTess/MI_Leaf_notess')
+        self.assertEqual(bend.variant_path("/Game/A/MI_Leaf"), bend.variant_path("/Game/B/MI_Leaf"))
+        self.assertNotEqual(bend.variant_path("/Game/A/MI_Leaf"), bend.variant_path("/Game/A/M_Leaf", master=True))
 
 
 class CheckoutTests(unittest.TestCase):

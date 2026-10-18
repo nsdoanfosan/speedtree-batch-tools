@@ -19,6 +19,14 @@ def proof_for(source):
 
 
 class PreservedCArcTests(unittest.TestCase):
+    def test_legacy_delivery_cannot_bypass_canonical_wind_normalization(self):
+        from sk_batch import nanite_assembly_materials as materials
+        class Mesh: pass
+        unreal=SimpleNamespace(SkeletalMesh=Mesh)
+        with self.assertRaisesRegex(materials.NaniteAssemblyMaterialError,'canonical _notess'):
+            materials.normalize_unreal_nanite_assembly_materials(unreal,Mesh(),
+                material_preservation={'preserved_wind_policy':{'owner':carc.OWNER}})
+
     def test_exact_owner_source_destination_and_signatures_are_required(self):
         path, proof = proof_for('/Game/M/MI_Bark')
         self.assertEqual(carc.validate_alias(path, proof), proof['source'])

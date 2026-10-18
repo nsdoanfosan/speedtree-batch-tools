@@ -13,6 +13,7 @@ SK_BATCH = Path(__file__).resolve().parents[1]
 if str(SK_BATCH) not in sys.path:
     sys.path.insert(0, str(SK_BATCH))
 import normalized_assembly_bend as bend
+import assembly_wpo_contract as wpo
 
 
 def digest(value):
@@ -70,7 +71,8 @@ class Material(Asset):
         self.scalars = {"Roughness": 0.7, "DetailScale": 0.2}
         self.vectors = {"Tint": [1.0, 1.0, 1.0, 1.0]}
         self.textures = {"Albedo": "/Game/Tex/Root"}
-        self.switches = {"UseDetail": True}
+        self.switches = {"UseDetail": True, wpo.WPO_SWITCH: False}
+        self.tags[wpo.WPO_GATE_TAG] = wpo.WPO_GATE_OWNER
         self.wpo = "27.0"
         self.graph = {"expressions": [{"name": "Original", "defaults": deepcopy(self.scalars)}]}
         self.roots = {"root_inputs": [{"property_name": "BaseColor", "source_name": "Original"}]}
@@ -79,6 +81,9 @@ class Material(Asset):
         if name == "enable_tessellation":
             return getattr(self, "tessellation", True)
         return getattr(self, name)
+
+    def set_editor_property(self, name, value):
+        setattr(self, 'tessellation' if name == 'enable_tessellation' else name, value)
 
 
 class MIC(Asset):
@@ -117,6 +122,7 @@ class Harness:
             EditorLoadingAndSavingUtils=SimpleNamespace(get_dirty_content_packages=lambda:
                 [SimpleNamespace(get_path_name=lambda path=path: path) for path in self.dirty]),
             MaterialEditingLibrary=SimpleNamespace(set_material_instance_parent=self.set_parent,
+                get_material_default_static_switch_parameter_value=lambda asset, name: asset.switches.get(name),
                 set_material_instance_static_switch_parameter_value=self.set_switch,
                 get_material_instance_static_switch_parameter_value=lambda asset, name: self.effective(asset, "switches", name),
                 get_scalar_parameter_names=lambda asset: list(self.scalar_names(asset)),
@@ -262,10 +268,35 @@ class MaterialHierarchyTests(unittest.TestCase):
         self.patch = patch.object(bend, "material_helpers", return_value=self.h.helpers)
         self.patch.start()
         self.addCleanup(self.patch.stop)
+        self.gate_patch = patch.object(wpo, 'install_wpo_gate', side_effect=lambda u, target, **kw:
+            target.switches.update({wpo.WPO_SWITCH: kw['enabled']}))
+        self.gate_patch.start()
+        self.addCleanup(self.gate_patch.stop)
 
     def make(self, sources=None, inspection=None, admission=None):
         return bend.make_material_variants(self.h.unreal, sources or [self.tint.path], self.h.function,
                                           inspection=inspection, admission=admission)
+
+    def test_original_wpo_policy_is_checked_before_any_duplicate_or_checkout(self):
+        self.root.switches[wpo.WPO_SWITCH]=True
+        self.assert_prewrite_rejection(lambda:self.make())
+
+    def test_equal_short_names_stop_with_both_original_paths_before_writes(self):
+        other=self.h.add(MIC('/Game/Other/MI_WillowTint',self.root))
+        with self.assertRaisesRegex(bend.NormalizedAssemblyBendError,'Canonical NoTess material name collision') as error:
+            self.make([self.tint.path,other.path])
+        self.assertIn(self.tint.path,str(error.exception))
+        self.assertIn(other.path,str(error.exception))
+        self.assertEqual(self.h.writes,[])
+
+    def test_reimport_of_canonical_wind_uses_original_identity_and_no_intermediate_variants(self):
+        first=self.completed();target=self.h.load(first['variants'][0])
+        before={path for path in self.h.assets}
+        second=self.make([target.path])
+        self.assertEqual(second['variants'],first['variants'])
+        self.assertEqual(set(self.h.assets),before)
+        self.assertTrue(all(path.endswith('_notess') for path in first['packages']))
+        self.assertFalse(any('_CArc' in path or '_AspectBend' in path for path in first['packages']))
 
     def completed(self):
         result = self.make()
@@ -385,6 +416,8 @@ class MaterialHierarchyTests(unittest.TestCase):
         self.h.set_scalar(target, "AssemblyWindRestThreshold", 0.24)
         self.h.set_scalar(target, "AssemblyWindResponseScale", 1.7)
         target.tags[bend.SIGNATURE_TAG] = digest(self.h.mi_signature(target))
+        wpo.stamp_wind(self.h.unreal, target, self.tint, helpers=self.h.helpers)
+        self.h.dirty.clear()
         bend.inspect_material_variants(self.h.unreal, [self.tint.path], function=self.h.function)
         self.assertEqual(self.h.mi_signature(self.tint), source_before)
         self.assertEqual(target.tags[bend.CHAIN_SIGNATURE_TAG], chain_before)
@@ -649,6 +682,7 @@ class LegacyNoTessWindTuningTests(unittest.TestCase):
         self.h.set_scalar(target, "AssemblyBranchFlexibility", 0.5)
         self.h.set_scalar(target, "AssemblyLeafArcRadiusCm", 240.0)
         target.vectors["AssemblyLeafTierCalmRange"] = [0.6,0.75,1.12,1.0]
+        wpo.stamp_wind(self.h.unreal, target, source, helpers=self.h.helpers)
         self.h.dirty.clear()
         self.assertTrue(bend.verified_legacy_notess_parent(self.h.unreal,self.h.helpers,target,expected.path))
         self.make([source.path])
@@ -671,11 +705,10 @@ class LegacyNoTessWindTuningTests(unittest.TestCase):
         self.make([source.path]);self.h.dirty.clear()
         target = self.h.load(bend.variant_path(source.path))
         expected = self.h.load(bend.variant_path(self.root.path, master=True))
-        off = self.h.duplicate(expected.get_path_name(), expected.path + "_NoTess")
-        off.get_editor_property = lambda key: False if key == "enable_tessellation" else getattr(off, key)
-        target.parent = off
+        off = expected
         self.h.set_scalar(target, "AssemblyBranchFlexibility", 0.5)
         self.h.set_scalar(target, "AssemblyBranchOscillationCm", 8.0)
+        wpo.stamp_wind(self.h.unreal, target, source, helpers=self.h.helpers)
         self.h.dirty.clear()
         self.assertTrue(bend.verified_legacy_notess_parent(self.h.unreal,self.h.helpers,target,expected.path))
         self.make([source.path])

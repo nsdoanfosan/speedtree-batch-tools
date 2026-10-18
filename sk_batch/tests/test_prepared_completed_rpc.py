@@ -45,7 +45,7 @@ class CompletedRpcTests(unittest.TestCase):
         for part in parts:
             if part["role"]:
                 part.update(source_file="C:/Native/part.fbx", source_sha1="a" * 40)
-        sources = [f"/Game/Material/Source{i}" for i in range(5)]
+        sources = [f"/Game/Material/MI_Source{i}" for i in range(5)]
         variants = [bend.variant_path(path) if i in (1, 4) else path for i, path in enumerate(sources)]
         materials = [bend.variant_path("/Game/Material/M_RootA", master=True),
                      bend.variant_path("/Game/Material/M_RootB", master=True), variants[1], variants[4]]
