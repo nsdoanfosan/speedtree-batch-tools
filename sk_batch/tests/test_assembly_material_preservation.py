@@ -155,6 +155,52 @@ class AssemblyMaterialPreservationTests(unittest.TestCase):
                                        [slot.export_text() for slot in value.get_editor_property("materials")]))
             self.assertEqual(value.modify_count, 0)
 
+    def test_verified_notess_duplicate_imported_names_preserve_original_part_identity(self):
+        unreal, registry, base, branch, foliage, old, ordered = self.fixture()
+        leaf = registry['/Game/M/MI_Leaf']
+        canonical = MIC(notess.destination(leaf), leaf.parent)
+        registry[canonical.path] = canonical
+        duplicate = Slot('Leaf', canonical)
+        duplicate.values['imported_material_slot_name'] = 'Leaf_1'
+        old.values['materials'].append(duplicate)
+        # A verified appended part-only alias unwraps to the duplicate slot.
+        appended = Slot('Leaf_AssemblyNoTess_3', canonical)
+        old.values['materials'].append(appended)
+        old.values['nanite_settings'].text = old.values['nanite_settings'].text.replace(
+            'MaterialRemap=(1,2)', 'MaterialRemap=(1,4)')
+        tags = {notess.OWNER_TAG: notess.OWNER, notess.SOURCE_TAG: leaf.path}
+        contract = json.dumps({'schema_version': 2, 'assembly': old.path,
+            'source_materials': ['/Game/M/MI_Common_Tint', '/Game/M/MI_Bark', leaf.path],
+            'active_source_indices': [2]})
+        unreal.EditorAssetLibrary.get_metadata_tag = lambda asset, key: (
+            tags.get(key, '') if asset is canonical else
+            contract if asset is old and key == 'CodexNormalizedAssemblyBendContract' else '')
+        source_bytes = [row.export_text() for row in old.values['materials']]
+        with patch.object(notess, 'unwrap_previous_no_tess_slots',
+                          return_value=old.values['materials'][:4] + [duplicate]):
+            result = builder.plan_unreal_assembly_material_preservation(unreal, old.path, base, ordered)
+        self.assertEqual(result['source_materials'], ['/Game/M/MI_Common_Tint', '/Game/M/MI_Bark', leaf.path])
+        self.assertEqual([row['desired_remap'] for row in result['parts']], [[0, 1], [1, 2]])
+        self.assertEqual(result['inputs']['old_slots'][3]['imported_slot_name'], 'Leaf')
+        self.assertEqual(result['inputs']['old_slots'][4]['imported_slot_name'], 'Leaf')
+        self.assertEqual(source_bytes, [row.export_text() for row in old.values['materials']])
+        self.assertEqual(old.modify_count, 0)
+
+        # Ownership and arbitrary authored names still cannot be guessed.
+        tags[notess.OWNER_TAG] = 'foreign'
+        with patch.object(notess, 'unwrap_previous_no_tess_slots',
+                          return_value=old.values['materials'][:4] + [duplicate]), self.assertRaisesRegex(RuntimeError, 'Unowned'):
+            builder.plan_unreal_assembly_material_preservation(unreal, old.path, base, ordered)
+
+    def test_imported_name_canonicalization_rejects_unknown_or_ambiguous_sources(self):
+        original = slot('Leaf', '/Game/M/MI_Leaf')
+        for value, sources in [('AuthoredName', [original]), ('Leaf_1', [original, deepcopy(original)])]:
+            alias = slot('Leaf', original['material'])
+            alias['imported_slot_name'] = value
+            rows = deepcopy(sources) + [alias]
+            builder._canonicalize_previous_bend_imported_slot_names(rows, [len(rows)-1])
+            self.assertEqual(rows[-1]['imported_slot_name'], value)
+
     def test_actual_willow_nine_part_remaps_keep_branch_tint_and_leaf_assignments(self):
         names = ["M_bark_common_end_01", "M_bark_weeping_willow_01", "M_bark_weeping_willow_02",
                  "M_debris_weeping_willow_01", "M_leaf_Weeping_Willow_atlas_01"]

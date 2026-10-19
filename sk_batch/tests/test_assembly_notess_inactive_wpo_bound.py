@@ -54,6 +54,29 @@ class InactiveWpoBoundTests(unittest.TestCase):
     def test_retry_assumption_normalizes_only_after_full_gate_is_forced_false(self):
         self.assertEqual(self.signature('0.0', gate=True, assume=True), self.signature('300.0', gate=True, assume=True))
 
+    def test_runtime_disabled_wpo_ignores_inherited_bound_without_changing_other_fields(self):
+        source={'relevance_uses_wpo':False,'interface_max_wpo_displacement':0,
+                'interface_displacement_scaling':{'magnitude':8,'center':0}}
+        target={**deepcopy(source),'interface_max_wpo_displacement':300,
+                'interface_tessellation_enabled':False,'base_tessellation_enabled':False,
+                'relevance_uses_displacement':False}
+        nt._assert_equivalent_runtime(source,target)
+        for field,value in [('relevance_uses_wpo',True),
+                            ('interface_displacement_scaling',{'magnitude':1,'center':0}),
+                            ('interface_tessellation_enabled',True)]:
+            with self.subTest(field=field), self.assertRaises(RuntimeError):
+                nt._assert_equivalent_runtime(source,{**target,field:value})
+
+    def test_runtime_active_or_unknown_wpo_still_preserves_bound(self):
+        for gate in (True,None):
+            source={'relevance_uses_wpo':gate,'interface_max_wpo_displacement':0,
+                    'interface_displacement_scaling':{'magnitude':8,'center':0}}
+            target={**deepcopy(source),'interface_max_wpo_displacement':300,
+                    'interface_tessellation_enabled':False,'base_tessellation_enabled':False,
+                    'relevance_uses_displacement':False}
+            with self.subTest(gate=gate), self.assertRaisesRegex(RuntimeError,'interface_max_wpo_displacement'):
+                nt._assert_equivalent_runtime(source,target)
+
 
 if __name__ == '__main__':
     unittest.main()

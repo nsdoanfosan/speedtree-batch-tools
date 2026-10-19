@@ -9053,7 +9053,7 @@ def _material_preservation_digest(value):
 def _canonicalize_previous_bend_imported_slot_names(rows, owned_alias_indices):
     """Resolve UE's generated duplicate FNames through verified source slots.
 
-    Only owned normalized-bend aliases are eligible. Artist-authored names,
+    Only verified normalized-bend or canonical NoTess aliases are eligible. Artist-authored names,
     unknown suffixes and ambiguous source matches retain the strict identity
     check used by appearance preservation.
     """
@@ -9256,6 +9256,7 @@ def plan_unreal_assembly_material_preservation(unreal, assembly_path, base, orde
         return path
 
     def records(mesh, *, previous_assembly=False):
+        from assembly_part_notess import original_interface
         result = []
         owned_alias_indices = []
         slots = list(mesh.get_editor_property("materials") or [])
@@ -9270,8 +9271,13 @@ def plan_unreal_assembly_material_preservation(unreal, assembly_path, base, orde
                 row["part_notess_alias"] = True
             interface = slot.get_editor_property("material_interface")
             row["material"] = source_path(interface)
-            if previous_assembly and library.get_metadata_tag(interface, "CodexNormalizedAssemblyBendSourceMaterial"):
-                # source_path has already verified ownership and exact source.
+            if previous_assembly and (
+                    library.get_metadata_tag(interface, "CodexNormalizedAssemblyBendSourceMaterial")
+                    or unreal_asset_identity(original_interface(unreal, interface).get_path_name())
+                    != unreal_asset_identity(interface.get_path_name())):
+                # source_path/original_interface verify exact ownership and source.
+                # NoTess can replace a normalized-bend alias while retaining UE's
+                # duplicate imported FName; its appended part alias inherits it.
                 owned_alias_indices.append(index)
             result.append(row)
         if previous_assembly:

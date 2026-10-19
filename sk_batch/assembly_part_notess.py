@@ -171,8 +171,13 @@ def _off(row):
 
 def _assert_equivalent_runtime(source, target):
     require(_off(target) and target.get("relevance_uses_displacement") is False, "Assembly part master/interface is not NoTess")
-    for field in ("relevance_uses_wpo", "interface_max_wpo_displacement", "interface_displacement_scaling"):
+    for field in ("relevance_uses_wpo", "interface_displacement_scaling"):
         require(source.get(field) == target.get(field), "NoTess delivery changed " + field)
+    # A complete disabled WPO graph may inherit the canonical parent's cached
+    # bound. Its inactive stored value is already normalized in _signature.
+    if source.get('relevance_uses_wpo') is not False:
+        require(source.get('interface_max_wpo_displacement') == target.get('interface_max_wpo_displacement'),
+                'NoTess delivery changed interface_max_wpo_displacement')
 
 
 def inspect_materials(unreal, source_paths, *, read_only=False, preserve_verified_legacy=False, legacy=False):
