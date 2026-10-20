@@ -113,6 +113,9 @@ SAFE_VALUE_PARAMS = {
     "switch", "step_01", "Detail", "detail", "switch_depth", "Branch_leaf",
     "Roughness_overlay", "opacitymult", "distance", "Step_02", "Step_0",
     "Roughness_invert", "Roughness_VertexRed",
+    # Height normalization remains an explicit per-graph opt-in; keep its
+    # pre-normalization cutoff when rendering the same saved recipe directly.
+    "height_auto_levels", "start_offset",
 }
 COLOR_PASSTHROUGH_PARAMS = (
     "Height_blend", "AO_blend", "Depth_Blend", "Detail", "detail",
