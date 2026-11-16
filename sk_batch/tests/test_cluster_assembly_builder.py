@@ -235,7 +235,7 @@ class UnrealNaniteAssemblyCompilationTests(unittest.TestCase):
 
 class FinalAssemblyNanitePolicyTests(unittest.TestCase):
     def make_policy_subjects(self):
-        nanite = FakeEditorProperties(shape_preservation="VOXELIZE")
+        nanite = FakeEditorProperties(shape_preservation="VOXELIZE", max_edge_length_factor=0.0)
         target = FakeEditorProperties(nanite_settings=nanite)
         target.get_path_name = lambda: "/Game/Test/Final_NaniteAssembly"
         builder = SimpleNamespace(get_target_mesh_object=lambda: target)
@@ -249,10 +249,14 @@ class FinalAssemblyNanitePolicyTests(unittest.TestCase):
     def test_final_assembly_switches_to_preserve_area_before_finish(self):
         unreal, builder, target = self.make_policy_subjects()
 
-        report = _configure_final_assembly_preserve_area(unreal, builder)
+        report = _configure_final_assembly_preserve_area(
+            unreal, builder, "/Game/Tree/Assembly/SK_Tree_elm_01_NaniteAssembly"
+        )
 
         self.assertEqual(report["before"], "VOXELIZE")
         self.assertEqual(report["after"], "PRESERVE_AREA")
+        self.assertEqual(report["max_edge_length_factor_before"], 0.0)
+        self.assertEqual(report["max_edge_length_factor_after"], 1.0)
         self.assertTrue(report["changed"])
         self.assertTrue(report["applied_before_finish"])
         self.assertTrue(report["base_and_parts_unchanged"])
@@ -265,7 +269,9 @@ class FinalAssemblyNanitePolicyTests(unittest.TestCase):
 
     def test_finished_assembly_must_keep_preserve_area(self):
         unreal, builder, target = self.make_policy_subjects()
-        report = _configure_final_assembly_preserve_area(unreal, builder)
+        report = _configure_final_assembly_preserve_area(
+            unreal, builder, "/Game/Tree/Assembly/SK_Tree_elm_01_NaniteAssembly"
+        )
 
         result = _validate_final_assembly_preserve_area(
             unreal,
@@ -274,11 +280,14 @@ class FinalAssemblyNanitePolicyTests(unittest.TestCase):
         )
 
         self.assertEqual(result["finished"], "PRESERVE_AREA")
+        self.assertEqual(result["max_edge_length_factor_finished"], 1.0)
         self.assertTrue(result["preserved_through_finish"])
 
     def test_finished_assembly_rejects_voxelize_regression(self):
         unreal, builder, target = self.make_policy_subjects()
-        report = _configure_final_assembly_preserve_area(unreal, builder)
+        report = _configure_final_assembly_preserve_area(
+            unreal, builder, "/Game/Tree/Assembly/SK_Tree_elm_01_NaniteAssembly"
+        )
         target.get_editor_property("nanite_settings").set_editor_property(
             "shape_preservation",
             "VOXELIZE",
@@ -293,6 +302,30 @@ class FinalAssemblyNanitePolicyTests(unittest.TestCase):
                 target,
                 report,
             )
+
+    def test_finished_tree_with_reset_edge_factor_is_rejected(self):
+        unreal, builder, target = self.make_policy_subjects()
+        report = _configure_final_assembly_preserve_area(
+            unreal, builder, "/Game/Tree/Assembly/SK_Tree_elm_01_NaniteAssembly"
+        )
+        settings = target.get_editor_property("nanite_settings")
+        settings.set_editor_property("max_edge_length_factor", 0.0)
+
+        with self.assertRaisesRegex(ClusterAssemblyBuildError, "tree edge factor"):
+            _validate_final_assembly_preserve_area(unreal, target, report)
+
+    def test_other_assemblies_keep_their_edge_factor(self):
+        unreal, builder, target = self.make_policy_subjects()
+        settings = target.get_editor_property("nanite_settings")
+        settings.set_editor_property("max_edge_length_factor", 0.5)
+
+        report = _configure_final_assembly_preserve_area(
+            unreal, builder, "/Game/Tree/Assembly/SK_bush_blackgum_01_NaniteAssembly"
+        )
+        _validate_final_assembly_preserve_area(unreal, target, report)
+
+        self.assertIsNone(report["expected_max_edge_length_factor"])
+        self.assertEqual(settings.get_editor_property("max_edge_length_factor"), 0.5)
 
 
 def exact_bone_skeleton(*rows):

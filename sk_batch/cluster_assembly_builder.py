@@ -79,6 +79,7 @@ MIN_FBX_COORDINATE_TOLERANCE_METERS = 1.0e-6
 PASS_THROUGH_PROVENANCE_SCHEMA_VERSION = 1
 ASSEMBLY_BUILD_CACHE_VERSION = 20
 FINAL_ASSEMBLY_NANITE_SHAPE_PRESERVATION = "preserve_area"
+TREE_MAX_EDGE_LENGTH_FACTOR = 1.0
 PASS_THROUGH_PROVENANCE_REASON = (
     "selected_target_contract_handoff_pass_through"
 )
@@ -8916,14 +8917,22 @@ def _nanite_shape_preservation_preserve_area(unreal):
     return None
 
 
-def _configure_final_assembly_preserve_area(unreal, builder):
+def tree_assembly_edge_length_factor(asset_path):
+    """Return the edge override for canonical SpeedTree tree assemblies."""
+    name = str(asset_path).rsplit("/", 1)[-1].split(".", 1)[0].casefold()
+    if name.startswith("sk_tree_") and name.endswith("_naniteassembly"):
+        return TREE_MAX_EDGE_LENGTH_FACTOR
+    return None
+
+
+def _configure_final_assembly_preserve_area(unreal, builder, assembly_path):
     """Override the duplicated Base setting before FinishAssemblyBuild.
 
     UE duplicates the Voxelize-configured NA_Base when BeginNew creates the
     target Assembly mesh.  FinishAssemblyBuild then consumes that duplicated
     setting while building the combined DAG.  Changing the finished asset is
-    too late, so the in-progress target must be set to Preserve Area before
-    any final Assembly build occurs.  Base and part assets are left untouched.
+    too late, so set Preserve Area and the tree edge factor on the in-progress
+    target. Base, Full SK and cluster prototype assets are untouched.
     """
     get_target = getattr(builder, "get_target_mesh_object", None)
     if not callable(get_target):
@@ -8942,22 +8951,37 @@ def _configure_final_assembly_preserve_area(unreal, builder):
         )
     nanite = target.get_editor_property("nanite_settings")
     before = nanite.get_editor_property("shape_preservation")
-    if before != preserve_area:
+    target_path = target.get_path_name()
+    edge_factor = tree_assembly_edge_length_factor(assembly_path)
+    edge_before = None
+    if edge_factor is not None:
+        edge_before = nanite.get_editor_property("max_edge_length_factor")
+        nanite.set_editor_property("max_edge_length_factor", edge_factor)
+    if before != preserve_area or edge_before != edge_factor:
         nanite.set_editor_property("shape_preservation", preserve_area)
         target.set_editor_property("nanite_settings", nanite)
-    after = target.get_editor_property("nanite_settings").get_editor_property(
-        "shape_preservation"
-    )
+    accepted = target.get_editor_property("nanite_settings")
+    after = accepted.get_editor_property("shape_preservation")
+    edge_after = None
+    if edge_factor is not None:
+        edge_after = accepted.get_editor_property("max_edge_length_factor")
+        if edge_after != edge_factor:
+            raise ClusterAssemblyBuildError(
+                "Final Nanite Assembly target did not accept the tree edge factor"
+            )
     if after != preserve_area:
         raise ClusterAssemblyBuildError(
             "Final Nanite Assembly target did not accept Preserve Area"
         )
     return {
-        "target": target.get_path_name(),
+        "target": target_path,
         "policy": FINAL_ASSEMBLY_NANITE_SHAPE_PRESERVATION,
         "before": str(before),
         "after": str(after),
-        "changed": before != after,
+        "expected_max_edge_length_factor": edge_factor,
+        "max_edge_length_factor_before": edge_before,
+        "max_edge_length_factor_after": edge_after,
+        "changed": before != after or edge_before != edge_after,
         "applied_before_finish": True,
         "base_and_parts_unchanged": True,
     }
@@ -8973,6 +8997,14 @@ def _validate_final_assembly_preserve_area(unreal, assembly, report):
         raise ClusterAssemblyBuildError(
             "Finished Nanite Assembly is not Preserve Area"
         )
+    edge_factor = report["expected_max_edge_length_factor"]
+    if edge_factor is not None:
+        edge_finished = nanite.get_editor_property("max_edge_length_factor")
+        report["max_edge_length_factor_finished"] = edge_finished
+        if edge_finished != edge_factor:
+            raise ClusterAssemblyBuildError(
+                "Finished Nanite Assembly did not retain the tree edge factor"
+            )
     return report
 
 
@@ -9560,6 +9592,7 @@ def _build_unreal_nanite_assembly_synchronous(unreal, manifest, asset_contract, 
     final_nanite_shape_preservation = _configure_final_assembly_preserve_area(
         unreal,
         builder,
+        assembly_path,
     )
     built_parts = []
     bindings = []
