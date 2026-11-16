@@ -31,6 +31,8 @@ if MODULE_DIR not in sys.path:
     sys.path.insert(0, MODULE_DIR)
 
 from cluster_assembly_builder import (  # noqa: E402
+    TREE_MAX_EDGE_LENGTH_FACTOR,
+    _nanite_shape_preservation_preserve_area,
     build_unreal_nanite_assembly,
     file_fingerprint,
     validate_file_fingerprint,
@@ -1094,9 +1096,24 @@ def _default_physics_asset_preexisting(mesh_path):
     )
 
 
+def _uses_standalone_tree_nanite_policy(mesh_path, assembly_plan):
+    if assembly_plan.get("status") == "ready":
+        return False
+    folder, name = mesh_path.rsplit("/", 1)
+    if (
+        folder.rsplit("/", 1)[0].casefold() != "/game/meshes/02_nature/tree"
+        or not name.casefold().startswith("sk_tree_")
+    ):
+        return False
+    assembly_path = f"{folder}/Assembly/{name}_NaniteAssembly"
+    return not unreal.EditorAssetLibrary.does_asset_exist(assembly_path)
+
+
 def _prepare_speedtree_skeletal_optimization(
     mesh_path,
     default_physics_asset_preexisting=False,
+    *,
+    standalone_tree=False,
 ):
     """Apply the asset-level settings shared by every SpeedTree placement."""
     mesh = unreal.EditorAssetLibrary.load_asset(mesh_path)
@@ -1136,11 +1153,23 @@ def _prepare_speedtree_skeletal_optimization(
         nanite.set_editor_property("enabled", True)
         nanite_changed = True
 
-    voxelize = _nanite_shape_preservation_voxelize()
-    if voxelize is None:
-        raise RuntimeError("UE 5.8 Nanite Shape Preservation Voxelize enum missing")
-    if nanite.get_editor_property("shape_preservation") != voxelize:
-        nanite.set_editor_property("shape_preservation", voxelize)
+    if standalone_tree:
+        shape_policy = "Preserve Area"
+        expected_shape = _nanite_shape_preservation_preserve_area(unreal)
+    else:
+        shape_policy = "Voxelize"
+        expected_shape = _nanite_shape_preservation_voxelize()
+    if expected_shape is None:
+        raise RuntimeError(f"Nanite Shape Preservation {shape_policy} enum missing")
+    if nanite.get_editor_property("shape_preservation") != expected_shape:
+        nanite.set_editor_property("shape_preservation", expected_shape)
+        nanite_changed = True
+    if (
+        standalone_tree
+        and nanite.get_editor_property("max_edge_length_factor")
+        != TREE_MAX_EDGE_LENGTH_FACTOR
+    ):
+        nanite.set_editor_property("max_edge_length_factor", TREE_MAX_EDGE_LENGTH_FACTOR)
         nanite_changed = True
     if nanite_changed:
         mesh.set_editor_property("nanite_settings", nanite)
@@ -1189,8 +1218,13 @@ def _prepare_speedtree_skeletal_optimization(
         failures.append(f"PhysicsAsset is still assigned: {physics_asset_after}")
     if not nanite_enabled:
         failures.append("Nanite is still disabled")
-    if shape_preservation != voxelize:
-        failures.append("Nanite Shape Preservation is not Voxelize")
+    if shape_preservation != expected_shape:
+        failures.append(f"Nanite Shape Preservation is not {shape_policy}")
+    edge_factor = None
+    if standalone_tree:
+        edge_factor = nanite_after.get_editor_property("max_edge_length_factor")
+        if edge_factor != TREE_MAX_EDGE_LENGTH_FACTOR:
+            failures.append("Nanite Max Edge Length Factor is not the standalone tree value")
     if failures:
         raise RuntimeError(
             "SpeedTree skeletal optimization failed: " + "; ".join(failures)
@@ -1206,6 +1240,7 @@ def _prepare_speedtree_skeletal_optimization(
         "physics_asset_after": physics_asset_after,
         "nanite_enabled": nanite_enabled,
         "nanite_shape_preservation": str(shape_preservation),
+        "nanite_max_edge_length_factor": edge_factor,
         "default_physics_asset": default_physics_asset_path,
         "default_physics_asset_preexisting": bool(
             default_physics_asset_preexisting
@@ -4117,9 +4152,11 @@ def ingest_item(item, *, defer_cluster_build=False):
         prebuild_materials,
         prebuilt_material_paths,
     )
+    assembly_plan = (item.get("cluster_assembly") or {}).get("ingest_plan") or {}
     optimization = _prepare_speedtree_skeletal_optimization(
         mesh_path,
         default_physics_asset_preexisting,
+        standalone_tree=_uses_standalone_tree_nanite_policy(mesh_path, assembly_plan),
     )
     optimization["physics_asset_generation_disabled"] = generation_disabled
     optimization["existing_skeleton_binding_disabled"] = (

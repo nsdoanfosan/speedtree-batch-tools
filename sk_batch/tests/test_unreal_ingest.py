@@ -3007,7 +3007,7 @@ class UnrealIngestSaveTests(unittest.TestCase):
         )
         runner._default_physics_asset_preexisting = lambda _path: False
         runner._prepare_speedtree_skeletal_optimization = (
-            lambda _path, _preexisting: {
+            lambda _path, _preexisting, **_kwargs: {
                 "status": "ok",
                 "_delete_physics_asset_path": "",
             }
@@ -3088,7 +3088,7 @@ class UnrealIngestSaveTests(unittest.TestCase):
             lambda path: events.append("prebuild") or {"mesh": path}
         )
         runner._prepare_speedtree_skeletal_optimization = (
-            lambda _path, _preexisting: events.append("optimize") or {
+            lambda _path, _preexisting, **_kwargs: events.append("optimize") or {
                 "status": "ok",
                 "_delete_physics_asset_path": "",
             }
@@ -4142,6 +4142,21 @@ class UnrealIngestSaveTests(unittest.TestCase):
         )
         self.assertEqual(calls["renamed"], [])
 
+    def test_standalone_tree_policy_excludes_assembly_inputs(self):
+        runner = load_runner()
+        folder = "/Game/Meshes/02_nature/Tree/Tree_elm"
+        name = "SK_Tree_elm_01"
+        full = f"{folder}/{name}"
+        final = f"{folder}/Assembly/{name}_NaniteAssembly"
+        runner.unreal.EditorAssetLibrary = types.SimpleNamespace(does_asset_exist=lambda path: path == final)
+        self.assertFalse(runner._uses_standalone_tree_nanite_policy(full, {"status": "ready"}))
+        self.assertFalse(runner._uses_standalone_tree_nanite_policy(full, {}))
+        self.assertFalse(runner._uses_standalone_tree_nanite_policy(f"{folder}/Assembly/{name}_NA_Base", {}))
+        self.assertFalse(runner._uses_standalone_tree_nanite_policy(f"{folder}/Cluster/SK_branch_elm_01_01", {}))
+        self.assertTrue(runner._uses_standalone_tree_nanite_policy(
+            "/Game/Meshes/02_nature/Tree/tree_birch_river/SK_tree_birch_river_04", {}
+        ))
+
     def test_speedtree_skeletal_optimization_enforces_render_and_collision_settings(self):
         runner = load_runner()
         mesh_path = "/Game/Meshes/Trees/SK_Test"
@@ -4157,7 +4172,7 @@ class UnrealIngestSaveTests(unittest.TestCase):
 
         class FakeSettings:
             def __init__(self):
-                self.values = {"enabled": False, "shape_preservation": "KEEP"}
+                self.values = {"enabled": False, "shape_preservation": "KEEP", "max_edge_length_factor": 0.0}
 
             def get_editor_property(self, name):
                 return self.values[name]
@@ -4210,7 +4225,7 @@ class UnrealIngestSaveTests(unittest.TestCase):
         runner.unreal.SkeletalMesh = FakeMesh
         runner.unreal.EditorAssetLibrary = FakeEditorAssetLibrary
         runner.unreal.NaniteShapePreservation = types.SimpleNamespace(
-            VOXELIZE="VOXELIZE"
+            VOXELIZE="VOXELIZE", PRESERVE_AREA="PRESERVE_AREA"
         )
 
         optimization = runner._prepare_speedtree_skeletal_optimization(
@@ -4244,6 +4259,10 @@ class UnrealIngestSaveTests(unittest.TestCase):
             default_physics_asset_preexisting=True,
         )
         shared = runner._finalize_speedtree_skeletal_optimization(shared)
+
+        tree = runner._prepare_speedtree_skeletal_optimization(mesh_path, standalone_tree=True)
+        self.assertEqual(tree["nanite_shape_preservation"], "PRESERVE_AREA")
+        self.assertEqual(tree["nanite_max_edge_length_factor"], 1.0)
         self.assertEqual(deleted, [physics_asset_path])
         self.assertFalse(shared["physics_asset_deleted"])
         self.assertEqual(

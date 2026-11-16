@@ -1,4 +1,4 @@
-"""Migrate existing generated final Nanite Assemblies to Preserve Area.
+"""Migrate generated final Nanite Assemblies to the current build settings.
 
 Run this file through UnrealEditor-Cmd's PythonScript commandlet.  Targets are
 discovered only from successful SK Batch Unreal reports, then verified as
@@ -20,6 +20,7 @@ if str(TOOL_DIR) not in sys.path:
 from cluster_assembly_builder import (  # noqa: E402
     FINAL_ASSEMBLY_NANITE_SHAPE_PRESERVATION,
     _nanite_shape_preservation_preserve_area,
+    tree_assembly_edge_length_factor,
 )
 
 INPUT_REPORT_DIR_ENV = "SK_BATCH_FINAL_ASSEMBLY_REPORT_DIR"
@@ -102,7 +103,11 @@ def _migrate_target(unreal, target, preserve_area):
     overview_before = _assembly_overview(unreal, mesh)
     nanite = mesh.get_editor_property("nanite_settings")
     before = nanite.get_editor_property("shape_preservation")
-    changed = before != preserve_area
+    edge_factor = tree_assembly_edge_length_factor(asset_path)
+    edge_before = None
+    if edge_factor is not None:
+        edge_before = nanite.get_editor_property("max_edge_length_factor")
+    changed = before != preserve_area or edge_before != edge_factor
     rebuild_trigger = None
     checked_out = False
     if changed:
@@ -125,6 +130,8 @@ def _migrate_target(unreal, target, preserve_area):
         if callable(modify):
             modify()
         nanite.set_editor_property("shape_preservation", preserve_area)
+        if edge_factor is not None:
+            nanite.set_editor_property("max_edge_length_factor", edge_factor)
         # Assigning the edited NaniteSettings struct is the UE Python
         # equivalent of the details-panel edit.  USkeletalMesh's property
         # setter synchronously invokes the Nanite/SkeletalMesh rebuild; this
@@ -136,10 +143,13 @@ def _migrate_target(unreal, target, preserve_area):
             raise RuntimeError(
                 "failed to save migrated final Assembly without thumbnail rendering"
             )
-    after = (
-        mesh.get_editor_property("nanite_settings")
-        .get_editor_property("shape_preservation")
-    )
+    saved_settings = mesh.get_editor_property("nanite_settings")
+    after = saved_settings.get_editor_property("shape_preservation")
+    edge_after = None
+    if edge_factor is not None:
+        edge_after = saved_settings.get_editor_property("max_edge_length_factor")
+        if edge_after != edge_factor:
+            raise RuntimeError("final Assembly did not retain the tree edge factor")
     if after != preserve_area:
         raise RuntimeError("final Assembly did not retain Preserve Area")
     overview_after = _assembly_overview(unreal, mesh)
@@ -153,6 +163,9 @@ def _migrate_target(unreal, target, preserve_area):
         "asset_path": asset_path,
         "before": str(before),
         "after": str(after),
+        "expected_max_edge_length_factor": edge_factor,
+        "max_edge_length_factor_before": edge_before,
+        "max_edge_length_factor_after": edge_after,
         "changed": changed,
         "checked_out": checked_out,
         "rebuild_trigger": rebuild_trigger,
